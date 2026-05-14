@@ -1,4 +1,5 @@
 import argparse
+import math
 import time
 import uuid
 
@@ -18,7 +19,13 @@ def run(client: FlowClient, steps: int) -> float:
     flow_id = f"py-sdk-bench-{uuid.uuid4().hex}"
     partition = flow_id
     started = time.perf_counter()
-    client.create(flow_id, type=CounterWorkflow.type, state="step_1", partition_key=partition)
+    client.create(
+        flow_id,
+        type=CounterWorkflow.type,
+        state="step_1",
+        partition_key=partition,
+        return_record=False,
+    )
 
     for step in range(1, steps + 1):
         jobs = client.claim_due(
@@ -37,6 +44,7 @@ def run(client: FlowClient, steps: int) -> float:
                 fencing_token=job.fencing_token,
                 partition_key=job.partition_key,
                 result=b"ok",
+                return_record=False,
             )
         else:
             client.transition(
@@ -46,8 +54,17 @@ def run(client: FlowClient, steps: int) -> float:
                 lease_token=job.lease_token,
                 fencing_token=job.fencing_token,
                 partition_key=job.partition_key,
+                return_record=False,
             )
     return (time.perf_counter() - started) * 1000.0
+
+
+def percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = math.ceil((pct / 100.0) * len(ordered)) - 1
+    return ordered[min(max(index, 0), len(ordered) - 1)]
 
 
 def main() -> None:
@@ -64,6 +81,9 @@ def main() -> None:
             "steps": args.steps,
             "iterations": args.iterations,
             "avg_ms": sum(runtimes) / len(runtimes),
+            "p50_ms": percentile(runtimes, 50),
+            "p95_ms": percentile(runtimes, 95),
+            "p99_ms": percentile(runtimes, 99),
             "min_ms": min(runtimes),
             "max_ms": max(runtimes),
         }

@@ -31,6 +31,10 @@ For `N = 10`, one workflow execution sends:
 
 Total: 31 FerricStore commands.
 
+The benchmark uses ack-only mutators (`return_record=False`) for create,
+transition, and complete. That matches the command count above and avoids
+measuring extra post-mutation `FLOW.GET` calls.
+
 ## Run
 
 Start FerricStore standalone, then:
@@ -56,4 +60,3 @@ Output:
 DBOS benchmark step does a database transaction that updates a counter row.
 FerricFlow equivalent uses `INCR` as a small durable state mutation. This avoids
 measuring an empty workflow only.
-

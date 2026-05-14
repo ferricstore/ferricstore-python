@@ -54,6 +54,12 @@ class FakeRedis:
         return record
 
 
+class AckRedis(FakeRedis):
+    def execute_command(self, *args):
+        self.calls.append(args)
+        return b"OK"
+
+
 def test_create_builds_flow_create_command():
     redis = FakeRedis()
     client = FlowClient(redis)
@@ -84,6 +90,24 @@ def test_create_builds_flow_create_command():
         "RUN_AT",
         100,
     )
+
+
+def test_create_can_return_ack_without_followup_get():
+    redis = AckRedis()
+    client = FlowClient(redis)
+
+    result = client.create(
+        "f1",
+        type="order",
+        state="created",
+        partition_key="tenant:1",
+        payload=b"hello",
+        now_ms=100,
+        return_record=False,
+    )
+
+    assert result == b"OK"
+    assert len(redis.calls) == 1
 
 
 def test_claim_due_decodes_resp3_maps_and_payload():

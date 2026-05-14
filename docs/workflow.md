@@ -14,7 +14,7 @@ class PaymentWorkflow(Workflow):
     initial_state = "created"
     partition_by = ("tenant_id", "payment_id")
 
-    @state("created", lease_ms=30_000, on_error="retry")
+    @state("created", lease_ms=30_000, on_error="retry", return_record=False)
     def created(self, job):
         return transition("charged", payload=job.payload)
 
@@ -62,6 +62,10 @@ handler(job)
 FLOW.TRANSITION / FLOW.COMPLETE / FLOW.RETRY / FLOW.FAIL
 ```
 
+`@state(..., return_record=False)` makes the SDK use ack-only mutators for that
+state. Use it when the handler result is not read by local code; it avoids a
+follow-up `FLOW.GET` after each mutation.
+
 ## Handler Outcomes
 
 Transition:
@@ -101,4 +105,3 @@ Default is retry.
 
 This DSL does not replay Python code. It does not require deterministic Python
 execution. Each handler is one durable state boundary. That is intentional.
-

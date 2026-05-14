@@ -72,7 +72,8 @@ class FlowClient:
         now_ms: int | None = None,
         priority: int | None = None,
         idempotent: bool | None = None,
-    ) -> FlowRecord:
+        return_record: bool = True,
+    ) -> FlowRecord | bytes:
         now_ms = now_ms or _now_ms()
         args: list[Any] = ["FLOW.CREATE", id, "TYPE", type, "STATE", state, "NOW", now_ms]
         _append(args, "PARTITION", partition_key)
@@ -84,6 +85,8 @@ class FlowClient:
         _append(args, "PRIORITY", priority)
         _append_bool(args, "IDEMPOTENT", idempotent)
         response = self.executor.execute_command(*args)
+        if not return_record:
+            return response
         return self._record_or_get(response, id, partition_key)
 
     def create_many(
@@ -237,7 +240,8 @@ class FlowClient:
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         priority: int | None = None,
-    ) -> FlowRecord:
+        return_record: bool = True,
+    ) -> FlowRecord | bytes:
         now_ms = now_ms or _now_ms()
         args: list[Any] = [
             "FLOW.TRANSITION",
@@ -256,6 +260,8 @@ class FlowClient:
         _append(args, "RUN_AT", run_at_ms if run_at_ms is not None else now_ms)
         _append(args, "PRIORITY", priority)
         response = self.executor.execute_command(*args)
+        if not return_record:
+            return response
         return self._record_or_get(response, id, partition_key)
 
     def complete_many(
@@ -287,7 +293,8 @@ class FlowClient:
         payload: Any = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
-    ) -> FlowRecord:
+        return_record: bool = True,
+    ) -> FlowRecord | bytes:
         args: list[Any] = [
             "FLOW.COMPLETE",
             id,
@@ -302,6 +309,8 @@ class FlowClient:
         _append(args, "PAYLOAD", self.codec.encode(payload))
         _append(args, "TTL", ttl_ms)
         response = self.executor.execute_command(*args)
+        if not return_record:
+            return response
         return self._record_or_get(response, id, partition_key)
 
     def transition_many(
@@ -343,7 +352,8 @@ class FlowClient:
         payload: Any = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
-    ) -> FlowRecord:
+        return_record: bool = True,
+    ) -> FlowRecord | bytes:
         args: list[Any] = [
             "FLOW.RETRY",
             id,
@@ -358,6 +368,8 @@ class FlowClient:
         _append(args, "PAYLOAD", self.codec.encode(payload))
         _append(args, "RUN_AT", run_at_ms)
         response = self.executor.execute_command(*args)
+        if not return_record:
+            return response
         return self._record_or_get(response, id, partition_key)
 
     def retry_many(
@@ -389,7 +401,8 @@ class FlowClient:
         payload: Any = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
-    ) -> FlowRecord:
+        return_record: bool = True,
+    ) -> FlowRecord | bytes:
         args: list[Any] = [
             "FLOW.FAIL",
             id,
@@ -404,6 +417,8 @@ class FlowClient:
         _append(args, "PAYLOAD", self.codec.encode(payload))
         _append(args, "TTL", ttl_ms)
         response = self.executor.execute_command(*args)
+        if not return_record:
+            return response
         return self._record_or_get(response, id, partition_key)
 
     def fail_many(
@@ -434,13 +449,16 @@ class FlowClient:
         reason: Any = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
-    ) -> FlowRecord:
+        return_record: bool = True,
+    ) -> FlowRecord | bytes:
         args: list[Any] = ["FLOW.CANCEL", id, "FENCING", fencing_token, "NOW", now_ms or _now_ms()]
         _append(args, "LEASE_TOKEN", lease_token)
         _append(args, "PARTITION", partition_key)
         _append(args, "REASON", self.codec.encode(reason) if reason is not None else None)
         _append(args, "TTL", ttl_ms)
         response = self.executor.execute_command(*args)
+        if not return_record:
+            return response
         return self._record_or_get(response, id, partition_key)
 
     def cancel_many(
@@ -469,13 +487,16 @@ class FlowClient:
         run_at_ms: int | None = None,
         reason_ref: str | None = None,
         now_ms: int | None = None,
-    ) -> FlowRecord:
+        return_record: bool = True,
+    ) -> FlowRecord | bytes:
         args: list[Any] = ["FLOW.REWIND", id, "TO_EVENT", to_event, "NOW", now_ms or _now_ms()]
         _append(args, "PARTITION", partition_key)
         _append(args, "EXPECT_STATE", expect_state)
         _append(args, "RUN_AT", run_at_ms)
         _append(args, "REASON_REF", reason_ref)
         response = self.executor.execute_command(*args)
+        if not return_record:
+            return response
         return self._record_or_get(response, id, partition_key)
 
     def get(self, id: str, *, partition_key: str | None = None) -> FlowRecord | None:

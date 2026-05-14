@@ -59,6 +59,8 @@ Important options:
 * `run_at_ms`: due time.
 * `priority`: lower/higher depends on server ordering policy.
 * `idempotent`: let duplicate create by id return existing result when supported.
+* `return_record`: default `True`. When `False`, return the raw server response
+  and skip the SDK follow-up `FLOW.GET` used when the server returns `OK`.
 
 ## `create_many`
 
@@ -158,6 +160,9 @@ client.transition(
 )
 ```
 
+Set `return_record=False` when the caller only needs acknowledgement and not the
+new record. This removes one `FLOW.GET` from the hot path.
+
 ## `complete`
 
 Closes a flow as completed.
@@ -171,6 +176,9 @@ client.complete(
     result=b"ok",
 )
 ```
+
+`complete`, `retry`, `fail`, and `cancel` support the same `return_record=False`
+ack-only option.
 
 ## Batch Mutations
 

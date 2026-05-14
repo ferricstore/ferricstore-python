@@ -88,6 +88,11 @@ client.transition(
 )
 ```
 
+For hot paths that do not need the updated record immediately, pass
+`return_record=False` to single mutators such as `create`, `transition`,
+`complete`, `retry`, `fail`, and `cancel`. FerricStore returns `OK`; the SDK then
+skips the extra `FLOW.GET`.
+
 ## Workflow DSL
 
 ```python

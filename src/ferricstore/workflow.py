@@ -15,6 +15,7 @@ class StateConfig:
     claim_payload: bool = True
     on_error: str = "retry"
     retry: RetryPolicy | None = None
+    return_record: bool = True
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,7 @@ def state(
     claim_payload: bool = True,
     on_error: str = "retry",
     retry: RetryPolicy | None = None,
+    return_record: bool = True,
 ) -> Callable[[Handler], Handler]:
     def decorate(fn: Handler) -> Handler:
         setattr(
@@ -81,6 +83,7 @@ def state(
                 claim_payload=claim_payload,
                 on_error=on_error,
                 retry=retry,
+                return_record=return_record,
             ),
         )
         return fn
@@ -181,7 +184,7 @@ class Workflow:
         worker: str,
         partition_key: str | None = None,
         limit: int = 1,
-    ) -> list[FlowRecord]:
+    ) -> list[FlowRecord | bytes]:
         jobs = self.claim_due(
             state_name,
             worker=worker,
@@ -240,7 +243,7 @@ class Workflow:
     def child(self, id: str, *, payload: bytes = b"", partition_key: str | None = None) -> ChildSpec:
         return ChildSpec(id=id, type=self.type, payload=payload, partition_key=partition_key)
 
-    def handle(self, job: FlowRecord) -> FlowRecord:
+    def handle(self, job: FlowRecord) -> FlowRecord | bytes:
         handler = self._handler_for(job.state)
         try:
             outcome = handler(job)
@@ -248,11 +251,12 @@ class Workflow:
             return self._handle_exception(job, exc)
         return self.apply(job, outcome)
 
-    def apply(self, job: FlowRecord, outcome: Outcome) -> FlowRecord:
+    def apply(self, job: FlowRecord, outcome: Outcome) -> FlowRecord | bytes:
         common = {
             "lease_token": job.lease_token,
             "fencing_token": job.fencing_token,
             "partition_key": job.partition_key,
+            "return_record": self._states[job.state].return_record,
         }
         if isinstance(outcome, Transition):
             return self.client.transition(
@@ -282,7 +286,7 @@ class Workflow:
             return self.client.fail(job.id, error=outcome.error, payload=outcome.payload, **common)
         raise FerricStoreError(f"unknown workflow outcome: {outcome!r}")
 
-    def _handle_exception(self, job: FlowRecord, exc: Exception) -> FlowRecord:
+    def _handle_exception(self, job: FlowRecord, exc: Exception) -> FlowRecord | bytes:
         config = self._states[job.state]
         if config.on_error == "fail":
             return self.apply(job, Fail(error=str(exc)))
