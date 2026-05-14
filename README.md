@@ -2,22 +2,40 @@
 
 Python SDK for FerricStore and FerricFlow.
 
-Design goals:
+The SDK gives Python apps a typed wrapper around FerricStore Flow commands and a
+small workflow DSL. It is intentionally explicit: workflows are state pipelines,
+not hidden replay engines. That keeps handlers easy to reason about, easy to test,
+and close to the command semantics FerricStore actually stores.
 
-* default transport: `redis-py`, the common Python Redis client
-* adapter Protocol so other Redis clients can be plugged in
-* RESP3 maps normalized into typed Python dataclasses
-* raw payloads by default; optional JSON codec
-* workflow ergonomics inspired by Temporal/DBOS, without hidden replay magic
-* explicit state pipeline: claim, handle, transition/complete/retry/fail
+## What It Provides
+
+* `FlowClient`: low-level typed client for Flow commands.
+* `Workflow`: class-based state workflow helper.
+* `@state`: decorator for state handlers.
+* `Worker`: polling worker for one workflow.
+* `RedisAdapter`: default adapter for `redis-py`.
+* `RedisCommandExecutor`: Protocol for other Redis clients.
+* `RawCodec`: default raw bytes payload codec.
+* `JsonCodec`: optional JSON payload codec.
 
 ## Install
 
+Development install:
+
 ```bash
+cd /Users/yoavgea/repos/ferricstore-python
+python3 -m venv .venv
+. .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-## Client
+Runtime install, once published:
+
+```bash
+pip install ferricstore
+```
+
+## Quick Start
 
 ```python
 from ferricstore import FlowClient
@@ -28,7 +46,7 @@ flow = client.create(
     "order-1",
     type="order",
     state="created",
-    partition_key="tenant-a",
+    partition_key="tenant-a:order-1",
     payload=b"raw bytes",
 )
 
@@ -36,11 +54,12 @@ jobs = client.claim_due(
     "order",
     state="created",
     worker="worker-1",
-    partition_key="tenant-a",
-    limit=10,
+    partition_key=flow.partition_key,
+    limit=1,
 )
 
 job = jobs[0]
+
 client.transition(
     job.id,
     from_state=job.state,
@@ -48,13 +67,14 @@ client.transition(
     lease_token=job.lease_token,
     fencing_token=job.fencing_token,
     partition_key=job.partition_key,
+    payload=b"next payload",
 )
 ```
 
 ## Workflow DSL
 
 ```python
-from ferricstore import FlowClient, Workflow, state, transition, complete
+from ferricstore import FlowClient, Workflow, complete, state, transition
 
 
 class OrderWorkflow(Workflow):
@@ -62,52 +82,51 @@ class OrderWorkflow(Workflow):
     initial_state = "created"
     partition_by = ("tenant_id", "order_id")
 
-    @state("created", lease_ms=30_000, claim_payload=True, on_error="failed")
+    @state("created", lease_ms=30_000, claim_payload=True, on_error="fail")
     def created(self, job):
         return transition("charged", payload=job.payload)
 
-    @state("charged", lease_ms=30_000, claim_payload=True, on_error="failed")
+    @state("charged", lease_ms=30_000, claim_payload=True, on_error="fail")
     def charged(self, job):
         return complete(result=b"ok")
 
 
 client = FlowClient.from_url("redis://127.0.0.1:6379/0")
-wf = OrderWorkflow(client)
+workflow = OrderWorkflow(client)
 
-wf.create(
+record = workflow.create(
     "order-1",
     tenant_id="tenant-a",
     order_id="order-1",
-    payload=b"raw bytes",
+    payload=b"order payload",
 )
 
-wf.run_once("created", worker="worker-1", partition_key="tenant-a:order-1")
-wf.run_once("charged", worker="worker-1", partition_key="tenant-a:order-1")
+workflow.run_once("created", worker="worker-1", partition_key=record.partition_key)
+workflow.run_once("charged", worker="worker-1", partition_key=record.partition_key)
 ```
 
-## Adapter
+## Docs
 
-The SDK only requires an object with `execute_command(*args)`. `RedisAdapter`
-wraps `redis-py`; tests or alternate clients can implement `RedisCommandExecutor`.
+* [Concepts](docs/concepts.md)
+* [Client API](docs/client.md)
+* [Workflow DSL](docs/workflow.md)
+* [Worker](docs/worker.md)
+* [Payload Codecs](docs/codecs.md)
+* [Redis Adapters](docs/adapters.md)
+* [Children and Fanout](docs/children.md)
+* [Retry and Errors](docs/retry.md)
+* [Benchmark Example](docs/benchmark.md)
+* [Testing](docs/testing.md)
 
-```python
-from ferricstore import FlowClient, RedisCommandExecutor
+## Examples
 
+* `examples/order_workflow.py`: simple two-state workflow.
+* `examples/dbos_style_benchmark.py`: DBOS-style sequential-step benchmark.
 
-class MyAdapter:
-    def execute_command(self, *args):
-        ...
+## Current Scope
 
-
-client = FlowClient(MyAdapter())
-```
-
-## DBOS-Style Benchmark
-
-See `examples/dbos_style_benchmark.py` for a Python benchmark shape equivalent to
-the public DBOS workflow benchmark:
-
-* HTTP request starts one workflow execution
-* each step claims work, increments a counter, then transitions
-* final step completes
+This repo is an SDK layer. FerricStore remains source of truth. The SDK does not
+run a separate workflow database and does not implement deterministic replay.
+Handlers should be idempotent because claimed work may be retried after lease
+expiry or worker crash.
 
