@@ -5,7 +5,7 @@ from typing import Any, Callable
 
 from ferricstore.client import FlowClient
 from ferricstore.errors import FerricStoreError
-from ferricstore.types import FlowRecord, RetryPolicy
+from ferricstore.types import ChildSpec, CreateItem, FlowRecord, RetryPolicy
 
 
 @dataclass(frozen=True)
@@ -101,12 +101,28 @@ class Workflow:
 
     def create(self, id: str, *, payload: Any = None, **attrs: Any) -> FlowRecord:
         partition_key = attrs.pop("partition_key", None) or self.partition_key(attrs)
+        for name in self.partition_by:
+            attrs.pop(name, None)
         return self.client.create(
             id,
             type=self.type,
             state=self.initial_state,
             payload=payload,
             partition_key=partition_key,
+            **attrs,
+        )
+
+    def create_many(
+        self,
+        partition_key: str | None,
+        items: list[CreateItem],
+        **attrs: Any,
+    ) -> list[FlowRecord]:
+        return self.client.create_many(
+            partition_key,
+            items,
+            type=self.type,
+            state=attrs.pop("state", self.initial_state),
             **attrs,
         )
 
@@ -120,6 +136,9 @@ class Workflow:
             config.name: config.retry for config in self._states.values() if config.retry is not None
         }
         return self.client.install_policy(self.type, states=state_policies)
+
+    def policy_get(self, *, state: str | None = None) -> dict[Any, Any]:
+        return self.client.policy_get(self.type, state=state)
 
     def claim_due(
         self,
@@ -139,6 +158,22 @@ class Workflow:
             limit=limit,
         )
 
+    def reclaim(
+        self,
+        *,
+        worker: str,
+        partition_key: str | None = None,
+        lease_ms: int = 30_000,
+        limit: int = 1,
+    ) -> list[FlowRecord]:
+        return self.client.reclaim(
+            self.type,
+            worker=worker,
+            partition_key=partition_key,
+            lease_ms=lease_ms,
+            limit=limit,
+        )
+
     def run_once(
         self,
         state_name: str,
@@ -154,6 +189,56 @@ class Workflow:
             limit=limit,
         )
         return [self.handle(job) for job in jobs]
+
+    def get(self, id: str, *, partition_key: str | None = None) -> FlowRecord | None:
+        return self.client.get(id, partition_key=partition_key)
+
+    def history(self, id: str, **kwargs: Any) -> list[Any]:
+        return self.client.history(id, **kwargs)
+
+    def list(self, **kwargs: Any) -> list[FlowRecord]:
+        return self.client.list(self.type, **kwargs)
+
+    def terminals(self, **kwargs: Any) -> list[FlowRecord]:
+        return self.client.terminals(self.type, **kwargs)
+
+    def failures(self, **kwargs: Any) -> list[FlowRecord]:
+        return self.client.failures(self.type, **kwargs)
+
+    def by_parent(self, parent_flow_id: str, **kwargs: Any) -> list[FlowRecord]:
+        return self.client.by_parent(parent_flow_id, **kwargs)
+
+    def by_root(self, root_flow_id: str, **kwargs: Any) -> list[FlowRecord]:
+        return self.client.by_root(root_flow_id, **kwargs)
+
+    def by_correlation(self, correlation_id: str, **kwargs: Any) -> list[FlowRecord]:
+        return self.client.by_correlation(correlation_id, **kwargs)
+
+    def info(self, **kwargs: Any) -> dict[Any, Any]:
+        return self.client.info(self.type, **kwargs)
+
+    def stuck(self, **kwargs: Any) -> list[FlowRecord]:
+        return self.client.stuck(self.type, **kwargs)
+
+    def cancel(self, id: str, **kwargs: Any) -> FlowRecord:
+        return self.client.cancel(id, **kwargs)
+
+    def rewind(self, id: str, **kwargs: Any) -> FlowRecord:
+        return self.client.rewind(id, **kwargs)
+
+    def spawn_children(
+        self,
+        parent: FlowRecord,
+        children: list[ChildSpec],
+        **kwargs: Any,
+    ) -> Any:
+        kwargs.setdefault("partition_key", parent.partition_key)
+        kwargs.setdefault("lease_token", parent.lease_token)
+        kwargs.setdefault("fencing_token", parent.fencing_token)
+        return self.client.spawn_children(parent.id, children, **kwargs)
+
+    def child(self, id: str, *, payload: bytes = b"", partition_key: str | None = None) -> ChildSpec:
+        return ChildSpec(id=id, type=self.type, payload=payload, partition_key=partition_key)
 
     def handle(self, job: FlowRecord) -> FlowRecord:
         handler = self._handler_for(job.state)

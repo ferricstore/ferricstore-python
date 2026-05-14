@@ -8,6 +8,20 @@ from ferricstore import FlowClient
 client = FlowClient.from_url("redis://127.0.0.1:6379/0")
 ```
 
+## Parity
+
+`FlowClient` covers the Flow command set:
+
+| Area | Methods |
+| --- | --- |
+| Create | `create`, `create_many` |
+| Value refs | `value_put` |
+| Claim/lease | `claim_due`, `reclaim`, `extend_lease` |
+| Mutate | `transition`, `transition_many`, `complete`, `complete_many`, `retry`, `retry_many`, `fail`, `fail_many`, `cancel`, `cancel_many`, `rewind` |
+| Children | `spawn_children` |
+| Query | `get`, `history`, `list`, `terminals`, `failures`, `by_parent`, `by_root`, `by_correlation`, `info`, `stuck` |
+| Policy/cleanup | `install_policy`, `policy_get`, `retention_cleanup` |
+
 `from_url` uses `redis-py` with RESP3:
 
 ```python
@@ -46,6 +60,48 @@ Important options:
 * `priority`: lower/higher depends on server ordering policy.
 * `idempotent`: let duplicate create by id return existing result when supported.
 
+## `create_many`
+
+Creates a batch.
+
+```python
+from ferricstore import CreateItem
+
+records = client.create_many(
+    "tenant-a",
+    [
+        CreateItem("flow-1", b"payload-1"),
+        CreateItem("flow-2", b"payload-2"),
+    ],
+    type="order",
+    state="created",
+)
+```
+
+Use `partition_key=None` for mixed partitions:
+
+```python
+records = client.create_many(
+    None,
+    [
+        CreateItem("flow-1", b"payload-1", partition_key="tenant-a:1"),
+        CreateItem("flow-2", b"payload-2", partition_key="tenant-a:2"),
+    ],
+    type="order",
+)
+```
+
+Same-partition batches are atomic as one shard group. Mixed batches are grouped by
+shard; each shard group is atomic.
+
+## `value_put`
+
+Stores a reusable value and returns server metadata/reference.
+
+```python
+ref = client.value_put(b"large payload", partition_key="tenant-a", owner_flow_id="flow-1")
+```
+
 ## `claim_due`
 
 Claims due work for a type/state.
@@ -63,6 +119,28 @@ jobs = client.claim_due(
 
 Returns `list[FlowRecord]`. Each record includes `lease_token` and
 `fencing_token`; pass both into mutation commands.
+
+## `reclaim`
+
+Claims expired leases, typically for recovery workers.
+
+```python
+jobs = client.reclaim("order", worker="reaper-1", limit=100)
+```
+
+## `extend_lease`
+
+Extends a running lease.
+
+```python
+client.extend_lease(
+    job.id,
+    job.lease_token,
+    fencing_token=job.fencing_token,
+    lease_ms=60_000,
+    partition_key=job.partition_key,
+)
+```
 
 ## `transition`
 
@@ -91,6 +169,68 @@ client.complete(
     fencing_token=job.fencing_token,
     partition_key=job.partition_key,
     result=b"ok",
+)
+```
+
+## Batch Mutations
+
+Use `ClaimedItem` for commands that require lease token:
+
+```python
+from ferricstore import ClaimedItem
+
+items = [
+    ClaimedItem(job.id, job.lease_token, job.fencing_token, partition_key=job.partition_key)
+]
+
+client.complete_many(None, items, result=b"ok")
+client.retry_many(None, items, error=b"temporary")
+client.fail_many(None, items, error=b"permanent")
+```
+
+Use `FencedItem` for transition/cancel batches:
+
+```python
+from ferricstore import FencedItem
+
+client.transition_many(
+    None,
+    from_state="created",
+    to_state="charged",
+    items=[FencedItem(job.id, job.fencing_token, job.lease_token, job.partition_key)],
+)
+
+client.cancel_many(
+    None,
+    items=[FencedItem(job.id, job.fencing_token, partition_key=job.partition_key)],
+    reason=b"user cancelled",
+)
+```
+
+## `cancel`
+
+Cancels a flow.
+
+```python
+client.cancel(
+    job.id,
+    fencing_token=job.fencing_token,
+    lease_token=job.lease_token,
+    partition_key=job.partition_key,
+    reason=b"user cancelled",
+)
+```
+
+## `rewind`
+
+Rewinds to a prior history event.
+
+```python
+client.rewind(
+    "flow-1",
+    to_event="event-id",
+    partition_key="tenant-a:order-1",
+    expect_state="failed",
 )
 ```
 
@@ -141,6 +281,35 @@ Reads recent history.
 events = client.history("flow-1", partition_key="tenant-a:order-1", count=100)
 ```
 
+Supports filters:
+
+```python
+events = client.history(
+    "flow-1",
+    partition_key="tenant-a:order-1",
+    from_ms=1_000,
+    to_ms=2_000,
+    from_version=2,
+    rev=True,
+    event="transition",
+    values=True,
+    payload_max_bytes=64_000,
+)
+```
+
+## Query Commands
+
+```python
+client.list("order", state="queued", count=100)
+client.terminals("order", state="completed", rev=True, count=100)
+client.failures("order", from_ms=0, to_ms=now_ms)
+client.by_parent("parent-flow-id", terminal_only=True)
+client.by_root("root-flow-id", state="failed")
+client.by_correlation("checkout-123", include_cold=True)
+client.info("order", include_cold=True)
+client.stuck("order", older_than_ms=60_000)
+```
+
 ## `install_policy`
 
 Installs retry policy globally or per state.
@@ -157,3 +326,14 @@ client.install_policy(
 )
 ```
 
+## `policy_get`
+
+```python
+policy = client.policy_get("order", state="charge")
+```
+
+## `retention_cleanup`
+
+```python
+summary = client.retention_cleanup(limit=1_000)
+```

@@ -18,6 +18,23 @@ and close to the command semantics FerricStore actually stores.
 * `RawCodec`: default raw bytes payload codec.
 * `JsonCodec`: optional JSON payload codec.
 
+## Flow Command Coverage
+
+`FlowClient` supports the full FerricStore Flow command surface exposed over RESP3:
+
+* create: `create`, `create_many`
+* value refs: `value_put`
+* claiming/leases: `claim_due`, `reclaim`, `extend_lease`
+* mutations: `transition`, `transition_many`, `complete`, `complete_many`,
+  `retry`, `retry_many`, `fail`, `fail_many`, `cancel`, `cancel_many`, `rewind`
+* children: `spawn_children`
+* reads/queries: `get`, `history`, `list`, `terminals`, `failures`,
+  `by_parent`, `by_root`, `by_correlation`, `info`, `stuck`
+* policy/retention: `install_policy`, `policy_get`, `retention_cleanup`
+
+The workflow DSL wraps common create/claim/handle/query paths. Advanced batch and
+admin operations remain available through `workflow.client`.
+
 ## Install
 
 Development install:
@@ -129,4 +146,3 @@ This repo is an SDK layer. FerricStore remains source of truth. The SDK does not
 run a separate workflow database and does not implement deterministic replay.
 Handlers should be idempotent because claimed work may be retried after lease
 expiry or worker crash.
-

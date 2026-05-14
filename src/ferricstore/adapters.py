@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-import redis
+if TYPE_CHECKING:
+    import redis
 
 
 @runtime_checkable
@@ -20,15 +21,16 @@ class RedisAdapter:
     maintained by Redis, and supports RESP3 via `protocol=3`.
     """
 
-    def __init__(self, client: redis.Redis) -> None:
+    def __init__(self, client: "redis.Redis") -> None:
         self.client = client
 
     @classmethod
     def from_url(cls, url: str, **kwargs: Any) -> RedisAdapter:
+        import redis
+
         kwargs.setdefault("protocol", 3)
         kwargs.setdefault("decode_responses", False)
         return cls(redis.Redis.from_url(url, **kwargs))
 
     def execute_command(self, *args: Any) -> Any:
         return self.client.execute_command(*args)
-

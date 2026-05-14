@@ -54,6 +54,29 @@ class ChildSpec:
 
 
 @dataclass(frozen=True)
+class CreateItem:
+    id: str
+    payload: Any = None
+    partition_key: str | None = None
+
+
+@dataclass(frozen=True)
+class ClaimedItem:
+    id: str
+    lease_token: bytes
+    fencing_token: int
+    partition_key: str | None = None
+
+
+@dataclass(frozen=True)
+class FencedItem:
+    id: str
+    fencing_token: int
+    lease_token: bytes | None = None
+    partition_key: str | None = None
+
+
+@dataclass(frozen=True)
 class FlowRecord:
     id: str
     type: str
@@ -90,4 +113,3 @@ def _optional_str(value: Any) -> str | None:
     if value is None or value == b"" or value == "":
         return None
     return _str(value)
-
