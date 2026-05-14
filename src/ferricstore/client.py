@@ -83,7 +83,8 @@ class FlowClient:
         _append(args, "RUN_AT", run_at_ms if run_at_ms is not None else now_ms)
         _append(args, "PRIORITY", priority)
         _append_bool(args, "IDEMPOTENT", idempotent)
-        return self._record(self.executor.execute_command(*args))
+        response = self.executor.execute_command(*args)
+        return self._record_or_get(response, id, partition_key)
 
     def create_many(
         self,
@@ -220,7 +221,8 @@ class FlowClient:
             now_ms or _now_ms(),
         ]
         _append(args, "PARTITION", partition_key)
-        return self._record(self.executor.execute_command(*args))
+        response = self.executor.execute_command(*args)
+        return self._record_or_get(response, id, partition_key)
 
     def transition(
         self,
@@ -253,7 +255,8 @@ class FlowClient:
         _append(args, "PAYLOAD", self.codec.encode(payload))
         _append(args, "RUN_AT", run_at_ms if run_at_ms is not None else now_ms)
         _append(args, "PRIORITY", priority)
-        return self._record(self.executor.execute_command(*args))
+        response = self.executor.execute_command(*args)
+        return self._record_or_get(response, id, partition_key)
 
     def complete_many(
         self,
@@ -298,7 +301,8 @@ class FlowClient:
         _append(args, "RESULT", self.codec.encode(result))
         _append(args, "PAYLOAD", self.codec.encode(payload))
         _append(args, "TTL", ttl_ms)
-        return self._record(self.executor.execute_command(*args))
+        response = self.executor.execute_command(*args)
+        return self._record_or_get(response, id, partition_key)
 
     def transition_many(
         self,
@@ -353,7 +357,8 @@ class FlowClient:
         _append(args, "ERROR", self.codec.encode(error))
         _append(args, "PAYLOAD", self.codec.encode(payload))
         _append(args, "RUN_AT", run_at_ms)
-        return self._record(self.executor.execute_command(*args))
+        response = self.executor.execute_command(*args)
+        return self._record_or_get(response, id, partition_key)
 
     def retry_many(
         self,
@@ -398,7 +403,8 @@ class FlowClient:
         _append(args, "ERROR", self.codec.encode(error))
         _append(args, "PAYLOAD", self.codec.encode(payload))
         _append(args, "TTL", ttl_ms)
-        return self._record(self.executor.execute_command(*args))
+        response = self.executor.execute_command(*args)
+        return self._record_or_get(response, id, partition_key)
 
     def fail_many(
         self,
@@ -434,7 +440,8 @@ class FlowClient:
         _append(args, "PARTITION", partition_key)
         _append(args, "REASON", self.codec.encode(reason) if reason is not None else None)
         _append(args, "TTL", ttl_ms)
-        return self._record(self.executor.execute_command(*args))
+        response = self.executor.execute_command(*args)
+        return self._record_or_get(response, id, partition_key)
 
     def cancel_many(
         self,
@@ -468,7 +475,8 @@ class FlowClient:
         _append(args, "EXPECT_STATE", expect_state)
         _append(args, "RUN_AT", run_at_ms)
         _append(args, "REASON_REF", reason_ref)
-        return self._record(self.executor.execute_command(*args))
+        response = self.executor.execute_command(*args)
+        return self._record_or_get(response, id, partition_key)
 
     def get(self, id: str, *, partition_key: str | None = None) -> FlowRecord | None:
         args: list[Any] = ["FLOW.GET", id]
@@ -768,6 +776,19 @@ class FlowClient:
     def _record(self, value: dict[Any, Any]) -> FlowRecord:
         raw_payload = value.get("payload") if "payload" in value else value.get(b"payload")
         return FlowRecord.from_resp(value, payload=self.codec.decode(raw_payload))
+
+    def _record_or_get(
+        self,
+        value: Any,
+        id: str,
+        partition_key: str | None = None,
+    ) -> FlowRecord:
+        if isinstance(value, dict):
+            return self._record(value)
+        record = self.get(id, partition_key=partition_key)
+        if record is None:
+            raise RuntimeError(f"FLOW command succeeded but record {id!r} was not found")
+        return record
 
     def _records(self, values: list[dict[Any, Any]]) -> list[FlowRecord]:
         return [self._record(value) for value in values]
