@@ -36,6 +36,155 @@ def partition_for(index: int, partitions: int, prefix: str) -> str:
     return f"{prefix}:partition:{index % max(partitions, 1)}"
 
 
+class BenchFlowClient:
+    def __init__(self, url: str, transport: str) -> None:
+        self.client = FlowClient.from_url(url)
+        self.transport = transport
+        self.redis_client = getattr(self.client.executor, "client", None)
+
+    def enqueue_many(
+        self,
+        *,
+        run_id: str,
+        indices: list[int],
+        partitions: int,
+        payload: bytes,
+    ) -> int:
+        if self.transport == "pipeline":
+            self._pipeline_create(run_id=run_id, indices=indices, partitions=partitions, payload=payload)
+            return len(indices)
+
+        if len(indices) == 1:
+            index = indices[0]
+            self.client.create(
+                f"{run_id}:flow:{index}",
+                type=FLOW_TYPE,
+                state=QUEUE_STATE,
+                partition_key=partition_for(index, partitions, run_id),
+                payload=payload,
+                return_record=False,
+            )
+            return 1
+
+        items = [
+            CreateItem(
+                f"{run_id}:flow:{index}",
+                payload,
+                partition_key=partition_for(index, partitions, run_id),
+            )
+            for index in indices
+        ]
+        self.client.create_many(None, items, type=FLOW_TYPE, state=QUEUE_STATE)
+        return len(items)
+
+    def claim_due(
+        self,
+        *,
+        worker: str,
+        partition_key: str | None,
+        limit: int,
+    ):
+        return self.client.claim_due(
+            FLOW_TYPE,
+            state=QUEUE_STATE,
+            worker=worker,
+            partition_key=partition_key,
+            limit=limit,
+        )
+
+    def complete_claimed(
+        self,
+        jobs,
+        *,
+        partition_key: str | None,
+        use_many: bool,
+    ) -> None:
+        if self.transport == "pipeline":
+            self._pipeline_complete(jobs)
+            return
+
+        if use_many and len(jobs) > 1:
+            items = [
+                ClaimedItem(
+                    job.id,
+                    job.lease_token,
+                    job.fencing_token,
+                    partition_key=job.partition_key,
+                )
+                for job in jobs
+            ]
+            self.client.complete_many(partition_key, items, result=b"ok")
+            return
+
+        for job in jobs:
+            self.client.complete(
+                job.id,
+                lease_token=job.lease_token,
+                fencing_token=job.fencing_token,
+                partition_key=job.partition_key,
+                result=b"ok",
+                return_record=False,
+            )
+
+    def do_work(self, command: str, run_id: str, jobs) -> None:
+        if command != "incr":
+            return
+        for _job in jobs:
+            self.client.executor.execute_command("INCR", f"{run_id}:counter")
+
+    def _pipeline_create(
+        self,
+        *,
+        run_id: str,
+        indices: list[int],
+        partitions: int,
+        payload: bytes,
+    ) -> None:
+        if self.redis_client is None:
+            raise RuntimeError("pipeline transport requires RedisAdapter")
+        pipe = self.redis_client.pipeline(transaction=False)
+        now_ms = int(time.time() * 1000)
+        for index in indices:
+            pipe.execute_command(
+                "FLOW.CREATE",
+                f"{run_id}:flow:{index}",
+                "TYPE",
+                FLOW_TYPE,
+                "STATE",
+                QUEUE_STATE,
+                "NOW",
+                now_ms,
+                "PARTITION",
+                partition_for(index, partitions, run_id),
+                "RUN_AT",
+                now_ms,
+                "PAYLOAD",
+                payload,
+            )
+        pipe.execute()
+
+    def _pipeline_complete(self, jobs) -> None:
+        if self.redis_client is None:
+            raise RuntimeError("pipeline transport requires RedisAdapter")
+        pipe = self.redis_client.pipeline(transaction=False)
+        now_ms = int(time.time() * 1000)
+        for job in jobs:
+            pipe.execute_command(
+                "FLOW.COMPLETE",
+                job.id,
+                job.lease_token,
+                "FENCING",
+                job.fencing_token,
+                "NOW",
+                now_ms,
+                "PARTITION",
+                job.partition_key,
+                "RESULT",
+                b"ok",
+            )
+        pipe.execute()
+
+
 def create_flows(
     *,
     url: str,
@@ -44,33 +193,17 @@ def create_flows(
     partitions: int,
     create_batch_size: int,
     payload: bytes,
+    transport: str,
 ) -> int:
-    client = FlowClient.from_url(url)
+    flow = BenchFlowClient(url, transport)
     created = 0
     for batch in chunks(indices, max(create_batch_size, 1)):
-        if create_batch_size <= 1:
-            for index in batch:
-                client.create(
-                    f"{run_id}:flow:{index}",
-                    type=FLOW_TYPE,
-                    state=QUEUE_STATE,
-                    partition_key=partition_for(index, partitions, run_id),
-                    payload=payload,
-                    return_record=False,
-                )
-                created += 1
-            continue
-
-        items = [
-            CreateItem(
-                f"{run_id}:flow:{index}",
-                payload,
-                partition_key=partition_for(index, partitions, run_id),
-            )
-            for index in batch
-        ]
-        client.create_many(None, items, type=FLOW_TYPE, state=QUEUE_STATE)
-        created += len(items)
+        created += flow.enqueue_many(
+            run_id=run_id,
+            indices=batch,
+            partitions=partitions,
+            payload=payload,
+        )
     return created
 
 
@@ -84,12 +217,13 @@ def run_claim_worker(
     claim_any: bool,
     claim_batch_size: int,
     complete_batch: bool,
+    transport: str,
     work_command: str,
     total_flows: int,
     completed: list[int],
     completed_lock: threading.Lock,
 ) -> int:
-    client = FlowClient.from_url(url)
+    flow = BenchFlowClient(url, transport)
     worker = f"{run_id}:worker:{worker_index}"
     local_completed = 0
     claim_round = 0
@@ -111,9 +245,7 @@ def run_claim_worker(
             claim_round += 1
             partition_key = partition_for(partition_index, partitions, run_id)
 
-        jobs = client.claim_due(
-            FLOW_TYPE,
-            state=QUEUE_STATE,
+        jobs = flow.claim_due(
             worker=worker,
             partition_key=partition_key,
             limit=claim_batch_size,
@@ -122,31 +254,12 @@ def run_claim_worker(
             time.sleep(idle_sleep_s)
             continue
 
-        if work_command == "incr":
-            for _job in jobs:
-                client.executor.execute_command("INCR", f"{run_id}:counter")
-
-        if complete_batch and len(jobs) > 1:
-            items = [
-                ClaimedItem(
-                    job.id,
-                    job.lease_token,
-                    job.fencing_token,
-                    partition_key=job.partition_key,
-                )
-                for job in jobs
-            ]
-            client.complete_many(None if claim_any else partition_key, items, result=b"ok")
-        else:
-            for job in jobs:
-                client.complete(
-                    job.id,
-                    lease_token=job.lease_token,
-                    fencing_token=job.fencing_token,
-                    partition_key=job.partition_key,
-                    result=b"ok",
-                    return_record=False,
-                )
+        flow.do_work(work_command, run_id, jobs)
+        flow.complete_claimed(
+            jobs,
+            partition_key=None if claim_any else partition_key,
+            use_many=complete_batch,
+        )
 
         local_completed += len(jobs)
         with completed_lock:
@@ -183,6 +296,7 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
                     partitions=args.partitions,
                     create_batch_size=args.create_batch_size,
                     payload=payload,
+                    transport=args.transport,
                 ),
                 create_ranges,
             )
@@ -205,6 +319,7 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
                     claim_any=args.claim_any,
                     claim_batch_size=args.claim_batch_size,
                     complete_batch=args.complete_batch,
+                    transport=args.transport,
                     work_command=args.work_command,
                     total_flows=args.flows,
                     completed=completed,
@@ -228,6 +343,7 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
         "claim_batch_size": args.claim_batch_size,
         "create_batch_size": args.create_batch_size,
         "complete_batch": args.complete_batch,
+        "transport": args.transport,
         "payload_bytes": args.payload_bytes,
         "work_command": args.work_command,
         "create_seconds": create_seconds,
@@ -310,6 +426,7 @@ def main() -> None:
     parser.add_argument("--partitions", type=int, default=16)
     parser.add_argument("--claim-batch-size", type=int, default=100)
     parser.add_argument("--create-batch-size", type=int, default=100)
+    parser.add_argument("--transport", choices=("many", "pipeline"), default="pipeline")
     parser.add_argument("--payload-bytes", type=int, default=0)
     parser.add_argument("--work-command", choices=("none", "incr"), default="none")
     parser.add_argument("--claim-any", action=argparse.BooleanOptionalAction, default=False)

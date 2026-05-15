@@ -15,10 +15,10 @@ The DBOS published benchmark reports throughput, not one serial workflow:
 FerricFlow queued mapping:
 
 ```text
-FLOW.CREATE / FLOW.CREATE_MANY
+FLOW.CREATE pipelined, or FLOW.CREATE_MANY
 workers:
   FLOW.CLAIM_DUE limit=N
-  FLOW.COMPLETE / FLOW.COMPLETE_MANY
+  FLOW.COMPLETE pipelined, or FLOW.COMPLETE_MANY
 ```
 
 Default run:
@@ -31,7 +31,8 @@ python examples/dbos_style_benchmark.py \
   --producers 4 \
   --partitions 16 \
   --claim-batch-size 100 \
-  --create-batch-size 100
+  --create-batch-size 100 \
+  --transport pipeline
 ```
 
 Output:
@@ -51,6 +52,10 @@ Important options:
 
 * `--claim-batch-size`: `FLOW.CLAIM_DUE LIMIT`, default `100`.
 * `--create-batch-size`: `FLOW.CREATE_MANY` size, default `100`.
+* `--transport pipeline`: use redis-py pipeline for `FLOW.CREATE` and
+  `FLOW.COMPLETE`. This matches common Redis-client usage.
+* `--transport many`: use FerricFlow batch commands `FLOW.CREATE_MANY` and
+  `FLOW.COMPLETE_MANY`.
 * `--workers`: concurrent claim/complete workers.
 * `--producers`: concurrent create workers.
 * `--partitions`: partition keys used for shard parallelism.
