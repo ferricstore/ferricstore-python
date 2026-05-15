@@ -96,6 +96,10 @@ records = client.create_many(
 Same-partition batches are atomic as one shard group. Mixed batches are grouped by
 shard; each shard group is atomic.
 
+Batch commands may return either RESP3 maps or `OK`, depending on the server
+command. The SDK decodes list-of-map responses into `FlowRecord` values and
+passes `OK` through unchanged.
+
 ## `value_put`
 
 Stores a reusable value and returns server metadata/reference.

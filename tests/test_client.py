@@ -194,6 +194,31 @@ def test_create_many_mixed_builds_items():
     )
 
 
+def test_create_many_allows_ok_response():
+    redis = AckRedis()
+    client = FlowClient(redis)
+
+    result = client.create_many(
+        None,
+        [CreateItem("f1", b"p1", partition_key="p1")],
+        type="order",
+        state="queued",
+        now_ms=100,
+    )
+
+    assert result == b"OK"
+
+
+def test_complete_many_allows_ok_response():
+    redis = AckRedis()
+    client = FlowClient(redis)
+    item = ClaimedItem("f1", b"lease", 3, partition_key="p1")
+
+    result = client.complete_many(None, [item], result=b"ok", now_ms=100)
+
+    assert result == b"OK"
+
+
 def test_many_mutations_put_options_before_items():
     redis = FakeRedis()
     client = FlowClient(redis)

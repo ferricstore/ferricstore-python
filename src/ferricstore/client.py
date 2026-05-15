@@ -100,7 +100,7 @@ class FlowClient:
         now_ms: int | None = None,
         priority: int | None = None,
         idempotent: bool | None = None,
-    ) -> list[FlowRecord]:
+    ) -> list[FlowRecord] | Any:
         now_ms = now_ms or _now_ms()
         mixed = partition_key is None
         wire_partition = "MIXED" if mixed else partition_key
@@ -125,7 +125,7 @@ class FlowClient:
                 args.extend([item.id, item.partition_key, self.codec.encode(item.payload)])
             else:
                 args.extend([item.id, self.codec.encode(item.payload)])
-        return self._records(self.executor.execute_command(*args))
+        return self._records_or_response(self.executor.execute_command(*args))
 
     def value_put(
         self,
@@ -273,14 +273,14 @@ class FlowClient:
         payload: Any = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
-    ) -> list[FlowRecord]:
+    ) -> list[FlowRecord] | Any:
         args: list[Any] = ["FLOW.COMPLETE_MANY", "MIXED" if partition_key is None else partition_key]
         _append(args, "RESULT", self.codec.encode(result) if result is not None else None)
         _append(args, "PAYLOAD", self.codec.encode(payload) if payload is not None else None)
         _append(args, "TTL", ttl_ms)
         _append(args, "NOW", now_ms or _now_ms())
         self._append_claimed_items(args, partition_key, items, "FLOW.COMPLETE_MANY")
-        return self._records(self.executor.execute_command(*args))
+        return self._records_or_response(self.executor.execute_command(*args))
 
     def complete(
         self,
@@ -324,7 +324,7 @@ class FlowClient:
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         priority: int | None = None,
-    ) -> list[FlowRecord]:
+    ) -> list[FlowRecord] | Any:
         mixed = partition_key is None
         wire_partition = "MIXED" if mixed else partition_key
         args: list[Any] = ["FLOW.TRANSITION_MANY", wire_partition, from_state, to_state]
@@ -339,7 +339,7 @@ class FlowClient:
             "FLOW.TRANSITION_MANY",
             include_lease=True,
         )
-        return self._records(self.executor.execute_command(*args))
+        return self._records_or_response(self.executor.execute_command(*args))
 
     def retry(
         self,
@@ -381,14 +381,14 @@ class FlowClient:
         payload: Any = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
-    ) -> list[FlowRecord]:
+    ) -> list[FlowRecord] | Any:
         args: list[Any] = ["FLOW.RETRY_MANY", "MIXED" if partition_key is None else partition_key]
         _append(args, "ERROR", self.codec.encode(error) if error is not None else None)
         _append(args, "PAYLOAD", self.codec.encode(payload) if payload is not None else None)
         _append(args, "RUN_AT", run_at_ms)
         _append(args, "NOW", now_ms or _now_ms())
         self._append_claimed_items(args, partition_key, items, "FLOW.RETRY_MANY")
-        return self._records(self.executor.execute_command(*args))
+        return self._records_or_response(self.executor.execute_command(*args))
 
     def fail(
         self,
@@ -430,14 +430,14 @@ class FlowClient:
         payload: Any = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
-    ) -> list[FlowRecord]:
+    ) -> list[FlowRecord] | Any:
         args: list[Any] = ["FLOW.FAIL_MANY", "MIXED" if partition_key is None else partition_key]
         _append(args, "ERROR", self.codec.encode(error) if error is not None else None)
         _append(args, "PAYLOAD", self.codec.encode(payload) if payload is not None else None)
         _append(args, "TTL", ttl_ms)
         _append(args, "NOW", now_ms or _now_ms())
         self._append_claimed_items(args, partition_key, items, "FLOW.FAIL_MANY")
-        return self._records(self.executor.execute_command(*args))
+        return self._records_or_response(self.executor.execute_command(*args))
 
     def cancel(
         self,
@@ -469,13 +469,13 @@ class FlowClient:
         reason: Any = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
-    ) -> list[FlowRecord]:
+    ) -> list[FlowRecord] | Any:
         args: list[Any] = ["FLOW.CANCEL_MANY", "MIXED" if partition_key is None else partition_key]
         _append(args, "REASON", self.codec.encode(reason) if reason is not None else None)
         _append(args, "TTL", ttl_ms)
         _append(args, "NOW", now_ms or _now_ms())
         self._append_fenced_items(args, partition_key, items, "FLOW.CANCEL_MANY")
-        return self._records(self.executor.execute_command(*args))
+        return self._records_or_response(self.executor.execute_command(*args))
 
     def rewind(
         self,
@@ -813,3 +813,8 @@ class FlowClient:
 
     def _records(self, values: list[dict[Any, Any]]) -> list[FlowRecord]:
         return [self._record(value) for value in values]
+
+    def _records_or_response(self, value: Any) -> list[FlowRecord] | Any:
+        if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+            return self._records(value)
+        return value
