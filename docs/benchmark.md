@@ -52,8 +52,9 @@ Important options:
 
 * `--claim-batch-size`: `FLOW.CLAIM_DUE LIMIT`, default `100`.
 * `--create-batch-size`: `FLOW.CREATE_MANY` size, default `100`.
-* `--transport pipeline`: use redis-py pipeline for `FLOW.CREATE` and
-  `FLOW.COMPLETE`. This matches common Redis-client usage.
+* `--transport pipeline`: use normal SDK calls over a buffered Redis executor.
+  All command kinds issued before `flush` are sent through one redis-py pipeline.
+  This matches common Redis-client usage.
 * `--transport many`: use FerricFlow batch commands `FLOW.CREATE_MANY` and
   `FLOW.COMPLETE_MANY`.
 * `--workers`: concurrent claim/complete workers.

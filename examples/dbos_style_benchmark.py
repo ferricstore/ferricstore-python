@@ -36,11 +36,39 @@ def partition_for(index: int, partitions: int, prefix: str) -> str:
     return f"{prefix}:partition:{index % max(partitions, 1)}"
 
 
+class BufferedRedisExecutor:
+    def __init__(self, redis_client) -> None:
+        self.redis_client = redis_client
+        self.commands: list[tuple] = []
+
+    def execute_command(self, *args):
+        self.commands.append(args)
+        return b"QUEUED"
+
+    def flush(self):
+        if not self.commands:
+            return []
+        pipe = self.redis_client.pipeline(transaction=False)
+        for command in self.commands:
+            pipe.execute_command(*command)
+        self.commands.clear()
+        return pipe.execute()
+
+
 class BenchFlowClient:
     def __init__(self, url: str, transport: str) -> None:
-        self.client = FlowClient.from_url(url)
         self.transport = transport
-        self.redis_client = getattr(self.client.executor, "client", None)
+        base = FlowClient.from_url(url)
+        self.read_client = base
+        self.redis_client = getattr(base.executor, "client", None)
+        if transport == "pipeline":
+            if self.redis_client is None:
+                raise RuntimeError("pipeline transport requires RedisAdapter")
+            self.executor = BufferedRedisExecutor(self.redis_client)
+            self.client = FlowClient(self.executor)
+            return
+        self.executor = None
+        self.client = base
 
     def enqueue_many(
         self,
@@ -50,10 +78,6 @@ class BenchFlowClient:
         partitions: int,
         payload: bytes,
     ) -> int:
-        if self.transport == "pipeline":
-            self._pipeline_create(run_id=run_id, indices=indices, partitions=partitions, payload=payload)
-            return len(indices)
-
         if len(indices) == 1:
             index = indices[0]
             self.client.create(
@@ -64,7 +88,21 @@ class BenchFlowClient:
                 payload=payload,
                 return_record=False,
             )
-            return 1
+            self.flush()
+            return len(indices)
+
+        if self.transport == "pipeline":
+            for index in indices:
+                self.client.create(
+                    f"{run_id}:flow:{index}",
+                    type=FLOW_TYPE,
+                    state=QUEUE_STATE,
+                    partition_key=partition_for(index, partitions, run_id),
+                    payload=payload,
+                    return_record=False,
+                )
+            self.flush()
+            return len(indices)
 
         items = [
             CreateItem(
@@ -84,7 +122,7 @@ class BenchFlowClient:
         partition_key: str | None,
         limit: int,
     ):
-        return self.client.claim_due(
+        return self.read_client.claim_due(
             FLOW_TYPE,
             state=QUEUE_STATE,
             worker=worker,
@@ -100,7 +138,16 @@ class BenchFlowClient:
         use_many: bool,
     ) -> None:
         if self.transport == "pipeline":
-            self._pipeline_complete(jobs)
+            for job in jobs:
+                self.client.complete(
+                    job.id,
+                    lease_token=job.lease_token,
+                    fencing_token=job.fencing_token,
+                    partition_key=job.partition_key,
+                    result=b"ok",
+                    return_record=False,
+                )
+            self.flush()
             return
 
         if use_many and len(jobs) > 1:
@@ -132,57 +179,10 @@ class BenchFlowClient:
         for _job in jobs:
             self.client.executor.execute_command("INCR", f"{run_id}:counter")
 
-    def _pipeline_create(
-        self,
-        *,
-        run_id: str,
-        indices: list[int],
-        partitions: int,
-        payload: bytes,
-    ) -> None:
-        if self.redis_client is None:
-            raise RuntimeError("pipeline transport requires RedisAdapter")
-        pipe = self.redis_client.pipeline(transaction=False)
-        now_ms = int(time.time() * 1000)
-        for index in indices:
-            pipe.execute_command(
-                "FLOW.CREATE",
-                f"{run_id}:flow:{index}",
-                "TYPE",
-                FLOW_TYPE,
-                "STATE",
-                QUEUE_STATE,
-                "NOW",
-                now_ms,
-                "PARTITION",
-                partition_for(index, partitions, run_id),
-                "RUN_AT",
-                now_ms,
-                "PAYLOAD",
-                payload,
-            )
-        pipe.execute()
-
-    def _pipeline_complete(self, jobs) -> None:
-        if self.redis_client is None:
-            raise RuntimeError("pipeline transport requires RedisAdapter")
-        pipe = self.redis_client.pipeline(transaction=False)
-        now_ms = int(time.time() * 1000)
-        for job in jobs:
-            pipe.execute_command(
-                "FLOW.COMPLETE",
-                job.id,
-                job.lease_token,
-                "FENCING",
-                job.fencing_token,
-                "NOW",
-                now_ms,
-                "PARTITION",
-                job.partition_key,
-                "RESULT",
-                b"ok",
-            )
-        pipe.execute()
+    def flush(self):
+        if self.executor is None:
+            return []
+        return self.executor.flush()
 
 
 def create_flows(
