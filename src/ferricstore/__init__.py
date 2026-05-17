@@ -1,5 +1,5 @@
 from ferricstore.adapters import RedisAdapter, RedisCommandExecutor
-from ferricstore.client import FlowClient
+from ferricstore.client import AutobatchFlowClient, FlowClient
 from ferricstore.codecs import Codec, JsonCodec, RawCodec
 from ferricstore.errors import FerricStoreError
 from ferricstore.types import ChildSpec, ClaimedItem, CreateItem, FencedItem, FlowRecord, RetryPolicy
@@ -27,6 +27,7 @@ __all__ = [
     "FencedItem",
     "FerricStoreError",
     "FlowClient",
+    "AutobatchFlowClient",
     "FlowRecord",
     "JsonCodec",
     "RawCodec",

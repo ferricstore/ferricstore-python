@@ -88,6 +88,37 @@ client.transition(
 )
 ```
 
+For DBOS-style queued work where the worker only needs the job handle, use the
+optimized helpers. They keep the application code simple while using ack-only
+creates, minimal claim responses, and batch completion behind the scenes:
+
+```python
+client.enqueue(
+    "order-1",
+    type="order",
+    payload=b"raw bytes",
+    partition_key="tenant-a:order-1",
+)
+
+jobs = client.claim_jobs(
+    "order",
+    state="queued",
+    worker="worker-1",
+    partition_key="tenant-a:order-1",
+    limit=100,
+)
+
+for job in jobs:
+    process(job.id)
+
+client.complete_jobs(jobs)
+```
+
+For larger producer-side bursts, use `enqueue_many(...)` with no partition key.
+The SDK groups items into FerricFlow hidden auto buckets before flushing, so
+application code remains partition-free while the server still receives
+shard-local batches.
+
 For hot paths that do not need the updated record immediately, pass
 `return_record=False` to single mutators such as `create`, `transition`,
 `complete`, `retry`, `fail`, and `cancel`. FerricStore returns `OK`; the SDK then
@@ -126,6 +157,11 @@ record = workflow.create(
 workflow.run_once("created", worker="worker-1", partition_key=record.partition_key)
 workflow.run_once("charged", worker="worker-1", partition_key=record.partition_key)
 ```
+
+Use `workflow.enqueue(...)` instead of `workflow.create(...)` when enqueueing
+does not need the created record returned immediately. State handlers can set
+`claim_payload=False` and `return_record=False` when they do not need payload
+hydration or post-mutation reads.
 
 ## Docs
 

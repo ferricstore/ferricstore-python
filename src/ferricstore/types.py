@@ -67,6 +67,15 @@ class ClaimedItem:
     fencing_token: int
     partition_key: str | None = None
 
+    @classmethod
+    def from_resp(cls, value: dict[Any, Any]) -> ClaimedItem:
+        return cls(
+            id=_str(_get(value, "id")),
+            lease_token=_bytes(_get(value, "lease_token")),
+            fencing_token=_int(_get(value, "fencing_token")),
+            partition_key=_optional_str(_get(value, "partition_key")),
+        )
+
 
 @dataclass(frozen=True)
 class FencedItem:

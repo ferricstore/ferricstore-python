@@ -115,6 +115,19 @@ class Workflow:
             **attrs,
         )
 
+    def enqueue(self, id: str, *, payload: Any = None, **attrs: Any) -> FlowRecord | bytes:
+        partition_key = attrs.pop("partition_key", None) or self.partition_key(attrs)
+        for name in self.partition_by:
+            attrs.pop(name, None)
+        return self.client.enqueue(
+            id,
+            type=self.type,
+            state=attrs.pop("state", self.initial_state),
+            payload=payload,
+            partition_key=partition_key,
+            **attrs,
+        )
+
     def create_many(
         self,
         partition_key: str | None,
@@ -150,6 +163,9 @@ class Workflow:
         worker: str,
         partition_key: str | None = None,
         limit: int = 1,
+        priority: int | None = None,
+        reclaim_expired: bool | None = None,
+        reclaim_ratio: int | None = None,
     ) -> list[FlowRecord]:
         config = self._states[state_name]
         return self.client.claim_due(
@@ -159,6 +175,10 @@ class Workflow:
             partition_key=partition_key,
             lease_ms=config.lease_ms,
             limit=limit,
+            priority=priority,
+            reclaim_expired=reclaim_expired,
+            reclaim_ratio=reclaim_ratio,
+            payload=config.claim_payload,
         )
 
     def reclaim(
@@ -184,12 +204,18 @@ class Workflow:
         worker: str,
         partition_key: str | None = None,
         limit: int = 1,
+        priority: int | None = None,
+        reclaim_expired: bool | None = None,
+        reclaim_ratio: int | None = None,
     ) -> list[FlowRecord | bytes]:
         jobs = self.claim_due(
             state_name,
             worker=worker,
             partition_key=partition_key,
             limit=limit,
+            priority=priority,
+            reclaim_expired=reclaim_expired,
+            reclaim_ratio=reclaim_ratio,
         )
         return [self.handle(job) for job in jobs]
 

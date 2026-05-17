@@ -40,6 +40,15 @@ class OrderWorkflow(Workflow):
         return complete(result=b"done")
 
 
+class LeanWorkflow(Workflow):
+    type = "lean"
+    initial_state = "created"
+
+    @state("created", claim_payload=False, return_record=False)
+    def created(self, job):
+        return transition("next")
+
+
 def test_workflow_create_uses_partition_by():
     redis = FakeRedis()
     workflow = OrderWorkflow(FlowClient(redis))
@@ -47,6 +56,16 @@ def test_workflow_create_uses_partition_by():
     workflow.create("f1", tenant_id="tenant", order_id="order", payload=b"p", now_ms=100)
 
     assert "tenant:order" in redis.calls[0]
+
+
+def test_workflow_enqueue_uses_ack_only_create_with_partition_by():
+    redis = FakeRedis()
+    workflow = OrderWorkflow(FlowClient(redis))
+
+    workflow.enqueue("f1", tenant_id="tenant", order_id="order", payload=b"p", now_ms=100)
+
+    assert "tenant:order" in redis.calls[0]
+    assert len(redis.calls) == 1
 
 
 def test_run_once_claims_and_applies_transition():
@@ -60,3 +79,29 @@ def test_run_once_claims_and_applies_transition():
     assert redis.calls[1][0] == "FLOW.TRANSITION"
     assert redis.calls[1][1:4] == ("f1", "created", "next")
 
+
+def test_state_config_controls_claim_payload_and_mutation_return():
+    redis = FakeRedis()
+    workflow = LeanWorkflow(FlowClient(redis))
+
+    results = workflow.run_once("created", worker="w1", partition_key="tenant:order", priority=0)
+
+    assert len(results) == 1
+    claim = redis.calls[0]
+    assert claim[:11] == (
+        "FLOW.CLAIM_DUE",
+        "lean",
+        "STATE",
+        "created",
+        "WORKER",
+        "w1",
+        "LEASE_MS",
+        30000,
+        "LIMIT",
+        1,
+        "NOW",
+    )
+    assert claim[12:] == ("PARTITION", "tenant:order", "PRIORITY", 0, "PAYLOAD", "false")
+    assert redis.calls[1][0] == "FLOW.TRANSITION"
+    assert "PAYLOAD" not in redis.calls[1]
+    assert len(redis.calls) == 2
