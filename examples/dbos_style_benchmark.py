@@ -359,7 +359,12 @@ class PartitionWakeCoordinator:
         with self.locks[worker_index]:
             self.pending[worker_index].discard(partition_index)
             credit = self.credits[worker_index].pop(partition_index, 0)
-        return partition_index, max(credit, 1)
+        return partition_index, credit
+
+    def take_credit(self, worker_index: int, partition_index: int) -> int:
+        with self.locks[worker_index]:
+            self.pending[worker_index].discard(partition_index)
+            return self.credits[worker_index].pop(partition_index, 0)
 
 
 def create_flows(
@@ -484,6 +489,8 @@ def run_claim_worker(
     claimed_items = 0
     local_duplicate_completions = 0
     max_claim_batch = 0
+    wake_coalesce_sleeps = 0
+    wake_coalesce_seconds = 0.0
     base_idle_sleep_s = max(idle_sleep_ms, 0.0) / 1000.0
     max_idle_sleep_s = max(max_idle_sleep_ms, idle_sleep_ms, 0.0) / 1000.0
     idle_sleep_s = base_idle_sleep_s
@@ -570,6 +577,8 @@ def run_claim_worker(
             "empty_claims": empty_claims,
             "claimed_items": claimed_items,
             "max_claim_batch": max_claim_batch,
+            "wake_coalesce_sleeps": wake_coalesce_sleeps,
+            "wake_coalesce_ms": wake_coalesce_seconds * 1000.0,
             **flow.pipeline_stats("process"),
         }
 
@@ -622,8 +631,23 @@ def run_claim_worker(
                     fallback_round += 1
                 else:
                     continue
+            if partition_credit <= 0:
+                continue
             if wake_coalesce_s > 0 and not producers_done.is_set():
-                time.sleep(wake_coalesce_s)
+                if partition_credit >= claim_batch_size:
+                    coalesce_sleep_s = 0.0
+                elif partition_credit >= max(claim_batch_size // 2, 1):
+                    coalesce_sleep_s = min(wake_coalesce_s, 0.001)
+                else:
+                    coalesce_sleep_s = min(wake_coalesce_s, 0.002)
+
+                if coalesce_sleep_s > 0:
+                    time.sleep(coalesce_sleep_s)
+                    wake_coalesce_sleeps += 1
+                    wake_coalesce_seconds += coalesce_sleep_s
+                    partition_credit += wake_coordinator.take_credit(
+                        worker_index, partition_index
+                    )
             partition_key = benchmark_partition_key(
                 partition_mode=partition_mode,
                 partition_index=partition_index,
@@ -866,6 +890,10 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
     process_avg_claim_batch = (
         process_claimed_items / process_claim_calls if process_claim_calls > 0 else 0.0
     )
+    process_wake_coalesce_sleeps = sum(
+        result["wake_coalesce_sleeps"] for result in worker_results
+    )
+    process_wake_coalesce_ms = sum(result["wake_coalesce_ms"] for result in worker_results)
 
     return {
         "mode": "queued",
@@ -902,6 +930,8 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
         "claim_job_only": args.claim_job_only,
         "wake_notifications": wake_coordinator.notifications if wake_coordinator is not None else 0,
         "wake_credits": wake_coordinator.notified_jobs if wake_coordinator is not None else 0,
+        "process_wake_coalesce_sleeps": process_wake_coalesce_sleeps,
+        "process_wake_coalesce_ms": process_wake_coalesce_ms,
         "process_claim_calls": process_claim_calls,
         "process_empty_claims": process_empty_claims,
         "process_avg_claim_batch": process_avg_claim_batch,
