@@ -14,7 +14,7 @@ from ferricstore import ClaimedItem, CreateItem, FlowClient
 FLOW_TYPE = "dbos_python_sdk_bench"
 QUEUE_STATE = "queued"
 AUTO_PARTITION_PREFIX = "__flow_auto__:"
-AUTO_PARTITION_BUCKETS = 16
+AUTO_PARTITION_BUCKETS = 256
 
 
 def chunks(values: list[int], size: int) -> Iterable[list[int]]:
@@ -264,18 +264,9 @@ class BenchFlowClient:
             return
 
         if use_many and len(jobs) > 1:
-            items = [
-                ClaimedItem(
-                    job.id,
-                    job.lease_token,
-                    job.fencing_token,
-                    partition_key=job.partition_key,
-                )
-                for job in jobs
-            ]
             self.client.complete_many(
                 partition_key,
-                items,
+                jobs,
                 result=result,
                 independent=independent_many,
             )
@@ -479,6 +470,7 @@ def run_claim_worker(
     duplicate_completions: list[int],
     completed_lock: threading.Lock,
     wake_coordinator: PartitionWakeCoordinator | None,
+    track_duplicates: bool,
 ) -> dict[str, int]:
     flow = BenchFlowClient(url, transport, claim_batch_size)
     worker = f"{run_id}:worker:{worker_index}"
@@ -518,6 +510,13 @@ def run_claim_worker(
 
     def record_completed_jobs(jobs) -> None:
         nonlocal local_completed, local_duplicate_completions
+        if not track_duplicates:
+            count = len(jobs)
+            with completed_lock:
+                completed[0] += count
+            local_completed += count
+            return
+
         unique_jobs = 0
         duplicate_jobs = 0
         with completed_lock:
@@ -825,6 +824,7 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
                 duplicate_completions=duplicate_completions,
                 completed_lock=completed_lock,
                 wake_coordinator=wake_coordinator,
+                track_duplicates=args.track_duplicates,
             )
             for worker_index in range(args.workers)
         ]
@@ -928,6 +928,7 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
         "reclaim_ratio": args.reclaim_ratio,
         "claim_priority": args.claim_priority,
         "claim_job_only": args.claim_job_only,
+        "track_duplicates": args.track_duplicates,
         "wake_notifications": wake_coordinator.notifications if wake_coordinator is not None else 0,
         "wake_credits": wake_coordinator.notified_jobs if wake_coordinator is not None else 0,
         "process_wake_coalesce_sleeps": process_wake_coalesce_sleeps,
@@ -1042,6 +1043,7 @@ def main() -> None:
     parser.add_argument("--complete-batch", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--complete-async-depth", type=int, default=0)
     parser.add_argument("--independent-many", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--track-duplicates", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)

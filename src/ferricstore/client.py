@@ -14,7 +14,7 @@ from ferricstore.types import ChildSpec, ClaimedItem, CreateItem, FencedItem, Fl
 
 
 _AUTO_PARTITION_PREFIX = "__flow_auto__:"
-_AUTO_PARTITION_BUCKETS = 16
+_AUTO_PARTITION_BUCKETS = 256
 
 
 def _now_ms() -> int:

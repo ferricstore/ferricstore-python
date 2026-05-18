@@ -208,7 +208,7 @@ def test_enqueue_many_groups_no_partition_items_by_auto_bucket():
         item_args = call[call.index("ITEMS") + 1 :]
         ids = item_args[0::2]
         for id in ids:
-            assert bucket == f"__flow_auto__:{zlib.crc32(id.encode()) % 16}"
+            assert bucket == f"__flow_auto__:{zlib.crc32(id.encode()) % 256}"
 
 
 def test_autobatch_groups_no_partition_creates_by_auto_bucket():
@@ -237,7 +237,7 @@ def test_autobatch_groups_no_partition_creates_by_auto_bucket():
         item_args = call[call.index("ITEMS") + 1 :]
         ids = item_args[0::2]
         for id in ids:
-            assert bucket == f"__flow_auto__:{zlib.crc32(id.encode()) % 16}"
+            assert bucket == f"__flow_auto__:{zlib.crc32(id.encode()) % 256}"
     client.close()
 
 
