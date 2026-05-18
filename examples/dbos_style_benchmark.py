@@ -326,26 +326,40 @@ class PartitionWakeCoordinator:
         self.partitions = partitions
         self.queues = [queue.Queue() for _ in range(workers)]
         self.pending = [set() for _ in range(workers)]
+        self.credits = [dict() for _ in range(workers)]
         self.locks = [threading.Lock() for _ in range(workers)]
         self.notifications = 0
+        self.notified_jobs = 0
 
     def owner_for(self, partition_index: int) -> int:
         return partition_index % self.workers
 
-    def notify_partition(self, partition_index: int) -> None:
-        owner = self.owner_for(partition_index)
-        with self.locks[owner]:
-            if partition_index in self.pending[owner]:
-                return
-            self.pending[owner].add(partition_index)
-            self.notifications += 1
-        self.queues[owner].put(partition_index)
+    def notify_partition(self, partition_index: int, count: int = 1) -> None:
+        count = max(int(count), 0)
+        if count == 0:
+            return
 
-    def next_partition(self, worker_index: int, timeout_s: float) -> int:
+        owner = self.owner_for(partition_index)
+        should_queue = False
+        with self.locks[owner]:
+            self.credits[owner][partition_index] = (
+                self.credits[owner].get(partition_index, 0) + count
+            )
+            self.notified_jobs += count
+            if partition_index not in self.pending[owner]:
+                self.pending[owner].add(partition_index)
+                self.notifications += 1
+                should_queue = True
+
+        if should_queue:
+            self.queues[owner].put(partition_index)
+
+    def next_partition(self, worker_index: int, timeout_s: float) -> tuple[int, int]:
         partition_index = self.queues[worker_index].get(timeout=timeout_s)
         with self.locks[worker_index]:
             self.pending[worker_index].discard(partition_index)
-        return partition_index
+            credit = self.credits[worker_index].pop(partition_index, 0)
+        return partition_index, max(credit, 1)
 
 
 def create_flows(
@@ -373,6 +387,7 @@ def create_flows(
             batch = auto_buffers.get(partition_index)
             if not batch:
                 return
+            batch_count = len(batch)
             created += flow.enqueue_many(
                 run_id=run_id,
                 flow_type=flow_type,
@@ -384,7 +399,7 @@ def create_flows(
             )
             auto_buffers[partition_index] = []
             if wake_coordinator is not None:
-                wake_coordinator.notify_partition(partition_index)
+                wake_coordinator.notify_partition(partition_index, batch_count)
 
         for index in indices:
             partition_index = auto_partition_index_for_flow_id(f"{run_id}:flow:{index}")
@@ -409,13 +424,19 @@ def create_flows(
             independent_many=independent_many,
         )
         if wake_coordinator is not None and partition_mode == "auto":
-            for partition_index in {
-                auto_partition_index_for_flow_id(f"{run_id}:flow:{index}") for index in batch
-            }:
-                wake_coordinator.notify_partition(partition_index)
+            partition_counts: dict[int, int] = {}
+            for index in batch:
+                partition_index = auto_partition_index_for_flow_id(f"{run_id}:flow:{index}")
+                partition_counts[partition_index] = partition_counts.get(partition_index, 0) + 1
+            for partition_index, count in partition_counts.items():
+                wake_coordinator.notify_partition(partition_index, count)
         elif wake_coordinator is not None:
-            for partition_index in {index % partitions for index in batch}:
-                wake_coordinator.notify_partition(partition_index)
+            partition_counts: dict[int, int] = {}
+            for index in batch:
+                partition_index = index % partitions
+                partition_counts[partition_index] = partition_counts.get(partition_index, 0) + 1
+            for partition_index, count in partition_counts.items():
+                wake_coordinator.notify_partition(partition_index, count)
     return {"created": created, **flow.pipeline_stats("create")}
 
 
@@ -587,13 +608,17 @@ def run_claim_worker(
 
         partition_index = None
         partition_key = None
+        partition_credit = 0
 
         if wake_coordinator is not None and not claim_any:
             try:
-                partition_index = wake_coordinator.next_partition(worker_index, idle_sleep_s)
+                partition_index, partition_credit = wake_coordinator.next_partition(
+                    worker_index, idle_sleep_s
+                )
             except queue.Empty:
                 if producers_done.is_set() and owned_partitions:
                     partition_index = owned_partitions[fallback_round % len(owned_partitions)]
+                    partition_credit = claim_batch_size
                     fallback_round += 1
                 else:
                     continue
@@ -606,15 +631,18 @@ def run_claim_worker(
                 run_id=run_id,
             )
 
-            while True:
+            remaining_credit = max(partition_credit, 1)
+
+            while remaining_credit > 0:
                 if done():
                     return finish()
+                limit = min(claim_batch_size, remaining_credit)
                 claim_calls += 1
                 jobs = flow.claim_due(
                     flow_type=flow_type,
                     worker=worker,
                     partition_key=partition_key,
-                    limit=claim_batch_size,
+                    limit=limit,
                     reclaim_expired=reclaim_expired,
                     reclaim_ratio=reclaim_ratio,
                     claim_priority=claim_priority,
@@ -624,33 +652,8 @@ def run_claim_worker(
                     empty_claims += 1
                     break
                 handle_jobs(jobs, partition_key)
-                if len(jobs) < claim_batch_size:
-                    retried = 0
-                    continue_partition = False
-                    while not producers_done.is_set() and retried < partial_claim_retries:
-                        if partial_claim_delay_s > 0:
-                            time.sleep(partial_claim_delay_s)
-                        claim_calls += 1
-                        more_jobs = flow.claim_due(
-                            flow_type=flow_type,
-                            worker=worker,
-                            partition_key=partition_key,
-                            limit=claim_batch_size,
-                            reclaim_expired=reclaim_expired,
-                            reclaim_ratio=reclaim_ratio,
-                            claim_priority=claim_priority,
-                            claim_job_only=claim_job_only,
-                        )
-                        if not more_jobs:
-                            empty_claims += 1
-                            break
-                        handle_jobs(more_jobs, partition_key)
-                        if len(more_jobs) >= claim_batch_size:
-                            continue_partition = True
-                            break
-                        retried += 1
-                    if continue_partition:
-                        continue
+                remaining_credit -= len(jobs)
+                if len(jobs) < limit:
                     break
             continue
 
@@ -898,6 +901,7 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
         "claim_priority": args.claim_priority,
         "claim_job_only": args.claim_job_only,
         "wake_notifications": wake_coordinator.notifications if wake_coordinator is not None else 0,
+        "wake_credits": wake_coordinator.notified_jobs if wake_coordinator is not None else 0,
         "process_claim_calls": process_claim_calls,
         "process_empty_claims": process_empty_claims,
         "process_avg_claim_batch": process_avg_claim_batch,
