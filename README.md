@@ -9,10 +9,12 @@ and close to the command semantics FerricStore actually stores.
 
 ## What It Provides
 
-* `FlowClient`: low-level typed client for Flow commands.
+* `FlowClient`: low-level typed client for Flow and FerricStore-native commands.
+* `QueueFlowWorker`: high-throughput durable queue worker.
 * `Workflow`: class-based state workflow helper.
 * `@state`: decorator for state handlers.
 * `Worker`: polling worker for one workflow.
+* `client.command(...)`: passthrough for normal Redis-compatible commands.
 * `RedisAdapter`: default adapter for `redis-py`.
 * `RedisCommandExecutor`: Protocol for other Redis clients.
 * `RawCodec`: default raw bytes payload codec.
@@ -165,6 +167,7 @@ hydration or post-mutation reads.
 
 ## Docs
 
+* [SDK Guide](docs/sdk.md)
 * [Concepts](docs/concepts.md)
 * [Client API](docs/client.md)
 * [Workflow DSL](docs/workflow.md)
@@ -179,6 +182,10 @@ hydration or post-mutation reads.
 ## Examples
 
 * `examples/order_workflow.py`: simple two-state workflow.
+* `examples/queue_worker.py`: queue producer plus `QueueFlowWorker`.
+* `examples/async_queue_worker.py`: async queue worker.
+* `examples/state_machine_workflow.py`: explicit workflow runner.
+* `examples/native_commands.py`: lock, fetch-or-compute, rate limit, Redis passthrough.
 * `examples/dbos_style_benchmark.py`: DBOS-style sequential-step benchmark.
 
 ## Current Scope

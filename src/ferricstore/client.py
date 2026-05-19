@@ -10,7 +10,18 @@ from typing import Any
 
 from ferricstore.adapters import RedisAdapter, RedisCommandExecutor
 from ferricstore.codecs import Codec, RawCodec
-from ferricstore.types import ChildSpec, ClaimedItem, CreateItem, FencedItem, FlowRecord, RetryPolicy
+from ferricstore.errors import map_exception
+from ferricstore.types import (
+    ChildSpec,
+    ClaimedItem,
+    CreateItem,
+    FencedItem,
+    FetchOrComputeResult,
+    FlowRecord,
+    KeyInfo,
+    RateLimitResult,
+    RetryPolicy,
+)
 
 
 _AUTO_PARTITION_PREFIX = "__flow_auto__:"
@@ -36,10 +47,86 @@ def _append_encoded(args: list[Any], name: str, codec: Codec, value: Any) -> Non
         args.extend([name, codec.encode(value)])
 
 
+def _append_named_values(
+    args: list[Any],
+    codec: Codec,
+    *,
+    values: dict[str, Any] | None = None,
+    value_refs: dict[str, str] | None = None,
+    drop_values: list[str] | None = None,
+    override_values: list[str] | None = None,
+) -> None:
+    for name, value in (values or {}).items():
+        args.extend(["VALUE", name, codec.encode(value)])
+    for name, ref in (value_refs or {}).items():
+        args.extend(["VALUE_REF", name, ref])
+    for name in drop_values or []:
+        args.extend(["DROP_VALUE", name])
+    for name in override_values or []:
+        args.extend(["OVERRIDE_VALUE", name])
+
+
+def _merge_named_map(base: dict[str, Any] | None, item: dict[str, Any] | None) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    if base:
+        merged.update(base)
+    if item:
+        merged.update(item)
+    return merged
+
+
+def _has_named_item_values(items: list[Any]) -> bool:
+    return any(getattr(item, "values", None) or getattr(item, "value_refs", None) for item in items)
+
+
+def _append_named_counts(
+    args: list[Any],
+    codec: Codec,
+    values: dict[str, Any],
+    value_refs: dict[str, str],
+) -> None:
+    args.append(len(values))
+    for name, value in values.items():
+        args.extend([name, codec.encode(value)])
+    args.append(len(value_refs))
+    for name, ref in value_refs.items():
+        args.extend([name, ref])
+
+
+def _append_value_return(
+    args: list[Any],
+    *,
+    values: list[str] | None = None,
+    value_max_bytes: int | None = None,
+) -> None:
+    for name in values or []:
+        args.extend(["VALUE", name])
+    _append(args, "VALUE_MAX_BYTES", value_max_bytes)
+
+
 def _batch_key_value(value: Any) -> Any:
     if value is None or isinstance(value, (str, bytes, int, float, bool)):
         return value
     return repr(value)
+
+
+def _batch_named_key(
+    *,
+    values: dict[str, Any] | None = None,
+    value_refs: dict[str, str] | None = None,
+    drop_values: list[str] | None = None,
+    override_values: list[str] | None = None,
+) -> tuple[Any, Any, tuple[str, ...], tuple[str, ...]]:
+    value_items = tuple(
+        sorted((name, _batch_key_value(value)) for name, value in (values or {}).items())
+    )
+    ref_items = tuple(sorted((value_refs or {}).items()))
+    return (
+        value_items,
+        ref_items,
+        tuple(drop_values or ()),
+        tuple(override_values or ()),
+    )
 
 
 def _auto_partition_key_for_id(id: str) -> str:
@@ -76,11 +163,123 @@ def _append_read_options(
     _append_bool(args, "CONSISTENT_PROJECTION", consistent_projection)
 
 
+def _ok_response(value: Any) -> bool:
+    return value in ("OK", b"OK", True)
+
+
+def _text(value: Any) -> str:
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
+def _parse_kv_response(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return {_text(key): item for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+        if len(items) % 2 == 0:
+            return {_text(items[idx]): items[idx + 1] for idx in range(0, len(items), 2)}
+    if isinstance(value, (bytes, str)):
+        return _parse_text_sections(_text(value))
+    return {"value": value}
+
+
+def _parse_text_sections(text: str) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    section: dict[str, Any] | None = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            continue
+
+        if line.endswith(":") and not line.startswith(" "):
+            key = line[:-1]
+            section = {}
+            result[key] = section
+            continue
+
+        target = section if raw_line.startswith(" ") and section is not None else result
+        stripped = line.strip()
+        if ":" in stripped:
+            key, value = stripped.split(":", 1)
+            target[key.strip()] = _coerce_diag_value(value.strip())
+
+    return result
+
+
+def _coerce_diag_value(value: str) -> Any:
+    if value == "":
+        return value
+    if value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+class _ErrorMappingExecutor:
+    def __init__(self, executor: RedisCommandExecutor) -> None:
+        self._executor = executor
+
+    def execute_command(self, *args: Any) -> Any:
+        try:
+            return self._executor.execute_command(*args)
+        except Exception as exc:
+            mapped = map_exception(exc)
+            if mapped is exc:
+                raise
+            raise mapped from exc
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._executor, name)
+
+
+class CommandPipeline:
+    """Small mixed-command pipeline.
+
+    It accepts any Redis/FerricStore command. When backed by `RedisAdapter`, it
+    uses redis-py's pipeline. For custom executors it falls back to sequential
+    execution, preserving the same result list shape.
+    """
+
+    def __init__(self, client: FlowClient) -> None:
+        self.client = client
+        self.commands: list[tuple[Any, ...]] = []
+        self.results: list[Any] | None = None
+
+    def __enter__(self) -> CommandPipeline:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if exc_type is None and self.results is None:
+            self.execute()
+
+    def command(self, *args: Any) -> CommandPipeline:
+        self.commands.append(args)
+        return self
+
+    def execute(self) -> list[Any]:
+        raw_executor = getattr(self.client.executor, "_executor", self.client.executor)
+        redis_client = getattr(raw_executor, "client", None)
+        pipeline_factory = getattr(redis_client, "pipeline", None)
+
+        if callable(pipeline_factory):
+            pipe = pipeline_factory(transaction=False)
+            for command in self.commands:
+                pipe.execute_command(*command)
+            self.results = pipe.execute()
+            return self.results
+
+        self.results = [self.client.command(*command) for command in self.commands]
+        return self.results
+
+
 class FlowClient:
     """FerricFlow client over Redis/FerricStore commands."""
 
     def __init__(self, executor: RedisCommandExecutor, codec: Codec | None = None) -> None:
-        self.executor = executor
+        self.executor = _ErrorMappingExecutor(executor)
         self.codec = codec or RawCodec()
 
     @classmethod
@@ -94,6 +293,120 @@ class FlowClient:
         max_delay_ms: float = 1.0,
     ) -> AutobatchFlowClient:
         return AutobatchFlowClient(self, max_batch=max_batch, max_delay_ms=max_delay_ms)
+
+    def command(self, *args: Any) -> Any:
+        return self.executor.execute_command(*args)
+
+    def pipeline(self) -> CommandPipeline:
+        return CommandPipeline(self)
+
+    def cas(self, key: str, expected: Any, value: Any, *, ex: int | None = None) -> bool:
+        args: list[Any] = ["CAS", key, self.codec.encode(expected), self.codec.encode(value)]
+        _append(args, "EX", ex)
+        return bool(self.executor.execute_command(*args))
+
+    def lock(self, key: str, owner: str, ttl_ms: int) -> bool:
+        return _ok_response(self.executor.execute_command("LOCK", key, owner, ttl_ms))
+
+    def unlock(self, key: str, owner: str) -> int:
+        return int(self.executor.execute_command("UNLOCK", key, owner))
+
+    def extend_lock(self, key: str, owner: str, ttl_ms: int) -> int:
+        return int(self.executor.execute_command("EXTEND", key, owner, ttl_ms))
+
+    def ratelimit_add(
+        self,
+        key: str,
+        *,
+        window_ms: int,
+        max: int,
+        count: int = 1,
+    ) -> RateLimitResult:
+        return RateLimitResult.from_resp(
+            self.executor.execute_command("RATELIMIT.ADD", key, window_ms, max, count)
+        )
+
+    def key_info(self, key: str) -> KeyInfo:
+        return KeyInfo.from_resp(self.executor.execute_command("FERRICSTORE.KEY_INFO", key))
+
+    def fetch_or_compute(
+        self,
+        key: str,
+        *,
+        ttl_ms: int,
+        hint: str | None = None,
+    ) -> FetchOrComputeResult:
+        args: list[Any] = ["FETCH_OR_COMPUTE", key, ttl_ms]
+        if hint is not None:
+            args.append(hint)
+        response = self.executor.execute_command(*args)
+        status = response[0].decode() if isinstance(response[0], bytes) else str(response[0])
+
+        if status == "hit":
+            return FetchOrComputeResult(status="hit", value=self.codec.decode(response[1]))
+        return FetchOrComputeResult(status="compute", compute_token=response[1])
+
+    def fetch_or_compute_result(self, key: str, value: Any, *, ttl_ms: int) -> bool:
+        response = self.executor.execute_command(
+            "FETCH_OR_COMPUTE_RESULT",
+            key,
+            self.codec.encode(value),
+            ttl_ms,
+        )
+        return _ok_response(response)
+
+    def fetch_or_compute_error(self, key: str, message: str) -> bool:
+        return _ok_response(self.executor.execute_command("FETCH_OR_COMPUTE_ERROR", key, message))
+
+    def cluster_health(self) -> Any:
+        return _parse_kv_response(self.executor.execute_command("CLUSTER.HEALTH"))
+
+    def cluster_stats(self) -> Any:
+        return _parse_kv_response(self.executor.execute_command("CLUSTER.STATS"))
+
+    def cluster_keyslot(self, key: str) -> int:
+        return int(self.executor.execute_command("CLUSTER.KEYSLOT", key))
+
+    def cluster_slots(self) -> Any:
+        return self.executor.execute_command("CLUSTER.SLOTS")
+
+    def cluster_status(self) -> Any:
+        return _parse_kv_response(self.executor.execute_command("CLUSTER.STATUS"))
+
+    def cluster_role(self) -> Any:
+        return self.executor.execute_command("CLUSTER.ROLE")
+
+    def cluster_join(self, node: str, *, replace: bool = False) -> bool:
+        args: list[Any] = ["CLUSTER.JOIN", node]
+        if replace:
+            args.append("REPLACE")
+        return _ok_response(self.executor.execute_command(*args))
+
+    def cluster_leave(self) -> bool:
+        return _ok_response(self.executor.execute_command("CLUSTER.LEAVE"))
+
+    def cluster_failover(self, shard_index: int, target_node: str) -> bool:
+        return _ok_response(
+            self.executor.execute_command("CLUSTER.FAILOVER", shard_index, target_node)
+        )
+
+    def cluster_promote(self, node: str) -> bool:
+        return _ok_response(self.executor.execute_command("CLUSTER.PROMOTE", node))
+
+    def cluster_demote(self, node: str) -> bool:
+        return _ok_response(self.executor.execute_command("CLUSTER.DEMOTE", node))
+
+    def ferricstore_config(self, *args: Any) -> Any:
+        return self.executor.execute_command("FERRICSTORE.CONFIG", *args)
+
+    def ferricstore_hotness(self, *args: Any) -> Any:
+        return _parse_kv_response(self.executor.execute_command("FERRICSTORE.HOTNESS", *args))
+
+    def ferricstore_metrics(self, *args: Any) -> Any:
+        return _parse_kv_response(self.executor.execute_command("FERRICSTORE.METRICS", *args))
+
+    def ferricstore_blobgc(self, *args: Any) -> Any:
+        return self.executor.execute_command("FERRICSTORE.BLOBGC", *args)
 
     def create(
         self,
@@ -110,6 +423,8 @@ class FlowClient:
         now_ms: int | None = None,
         priority: int | None = None,
         idempotent: bool | None = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
         return_record: bool = True,
     ) -> FlowRecord | bytes:
         now_ms = now_ms or _now_ms()
@@ -122,6 +437,7 @@ class FlowClient:
         _append(args, "RUN_AT", run_at_ms if run_at_ms is not None else now_ms)
         _append(args, "PRIORITY", priority)
         _append_bool(args, "IDEMPOTENT", idempotent)
+        _append_named_values(args, self.codec, values=values, value_refs=value_refs)
         response = self.executor.execute_command(*args)
         if not return_record:
             return response
@@ -139,6 +455,8 @@ class FlowClient:
         now_ms: int | None = None,
         priority: int | None = 0,
         idempotent: bool | None = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
         return_record: bool = False,
     ) -> FlowRecord | bytes:
         """Create a queued flow using the optimized ack-only path by default."""
@@ -152,6 +470,8 @@ class FlowClient:
             now_ms=now_ms,
             priority=priority,
             idempotent=idempotent,
+            values=values,
+            value_refs=value_refs,
             return_record=return_record,
         )
 
@@ -167,6 +487,8 @@ class FlowClient:
         priority: int | None = 0,
         idempotent: bool | None = None,
         independent: bool | None = True,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
     ) -> list[Any] | Any:
         """Create many queued flows, grouping no-partition items by auto bucket."""
         if not items:
@@ -183,6 +505,8 @@ class FlowClient:
                 priority=priority,
                 idempotent=idempotent,
                 independent=independent,
+                values=values,
+                value_refs=value_refs,
             )
 
         grouped: dict[str, list[tuple[int, CreateItem]]] = {}
@@ -202,6 +526,8 @@ class FlowClient:
                 priority=priority,
                 idempotent=idempotent,
                 independent=independent,
+                values=values,
+                value_refs=value_refs,
             )
             for (idx, _item), item_result in zip(
                 indexed_items,
@@ -222,6 +548,8 @@ class FlowClient:
         priority: int | None = None,
         idempotent: bool | None = None,
         independent: bool | None = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
     ) -> list[FlowRecord] | Any:
         now_ms = now_ms or _now_ms()
         mixed = partition_key is None and any(item.partition_key is not None for item in items)
@@ -241,14 +569,26 @@ class FlowClient:
         _append(args, "PRIORITY", priority)
         _append_bool(args, "IDEMPOTENT", idempotent)
         _append_bool(args, "INDEPENDENT", independent)
-        args.append("ITEMS")
-        for item in items:
-            if mixed:
-                if item.partition_key is None:
+        if _has_named_item_values(items):
+            args.extend(["ITEMS_EXT", len(items)])
+            for item in items:
+                item_partition = item.partition_key if mixed else None
+                if mixed and item_partition is None:
                     raise ValueError("mixed create_many items require partition_key")
-                args.extend([item.id, item.partition_key, self.codec.encode(item.payload)])
-            else:
-                args.extend([item.id, self.codec.encode(item.payload)])
+                item_values = _merge_named_map(values, item.values)
+                item_refs = _merge_named_map(value_refs, item.value_refs)
+                args.extend([item.id, item_partition or "-", self.codec.encode(item.payload)])
+                _append_named_counts(args, self.codec, item_values, item_refs)
+        else:
+            _append_named_values(args, self.codec, values=values, value_refs=value_refs)
+            args.append("ITEMS")
+            for item in items:
+                if mixed:
+                    if item.partition_key is None:
+                        raise ValueError("mixed create_many items require partition_key")
+                    args.extend([item.id, item.partition_key, self.codec.encode(item.payload)])
+                else:
+                    args.extend([item.id, self.codec.encode(item.payload)])
         return self._records_or_response(self.executor.execute_command(*args))
 
     def value_put(
@@ -257,22 +597,76 @@ class FlowClient:
         *,
         partition_key: str | None = None,
         owner_flow_id: str | None = None,
+        name: str | None = None,
+        override: bool | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
     ) -> Any:
         args: list[Any] = ["FLOW.VALUE.PUT", self.codec.encode(value), "NOW", now_ms or _now_ms()]
         _append(args, "PARTITION", partition_key)
         _append(args, "OWNER_FLOW_ID", owner_flow_id)
+        _append(args, "NAME", name)
+        _append_bool(args, "OVERRIDE", override)
         _append(args, "TTL", ttl_ms)
         return self.executor.execute_command(*args)
+
+    def value_mget(self, refs: list[str]) -> list[Any]:
+        if not refs:
+            return []
+        response = self.executor.execute_command("FLOW.VALUE.MGET", *refs)
+        return [self.codec.decode(value) for value in response]
+
+    def signal(
+        self,
+        id: str,
+        *,
+        signal: str,
+        partition_key: str | None = None,
+        idempotency_key: str | None = None,
+        if_state: str | list[str] | tuple[str, ...] | None = None,
+        transition_to: str | None = None,
+        run_at_ms: int | None = None,
+        now_ms: int | None = None,
+        priority: int | None = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: list[str] | None = None,
+        override_values: list[str] | None = None,
+    ) -> Any:
+        args: list[Any] = ["FLOW.SIGNAL", id, "SIGNAL", signal]
+        _append(args, "PARTITION", partition_key)
+        _append(args, "IDEMPOTENCY", idempotency_key)
+        if isinstance(if_state, (list, tuple)):
+            for state in if_state:
+                _append(args, "IF_STATE", state)
+        else:
+            _append(args, "IF_STATE", if_state)
+        _append(args, "TRANSITION_TO", transition_to)
+        _append(args, "RUN_AT", run_at_ms)
+        _append(args, "NOW", now_ms or _now_ms())
+        _append(args, "PRIORITY", priority)
+        _append_named_values(
+            args,
+            self.codec,
+            values=values,
+            value_refs=value_refs,
+            drop_values=drop_values,
+            override_values=override_values,
+        )
+        return self.executor.execute_command(*args)
+
+    def flow_signal(self, id: str, **kwargs: Any) -> Any:
+        return self.signal(id, **kwargs)
 
     def claim_due(
         self,
         type: str,
         *,
-        state: str = "queued",
+        state: str | None = None,
+        states: list[str] | None = None,
         worker: str,
         partition_key: str | None = None,
+        partition_keys: list[str] | None = None,
         lease_ms: int = 30_000,
         limit: int = 1,
         priority: int | None = None,
@@ -282,27 +676,46 @@ class FlowClient:
         job_only: bool = False,
         payload: bool | None = None,
         payload_max_bytes: int | None = None,
+        values: list[str] | None = None,
+        value_max_bytes: int | None = None,
     ) -> list[FlowRecord] | list[ClaimedItem]:
-        args: list[Any] = [
-            "FLOW.CLAIM_DUE",
-            type,
-            "STATE",
-            state,
-            "WORKER",
-            worker,
-            "LEASE_MS",
-            lease_ms,
-            "LIMIT",
-            limit,
-            "NOW",
-            now_ms or _now_ms(),
-        ]
+        args: list[Any] = ["FLOW.CLAIM_DUE", type]
+        if state is not None and states is not None:
+            raise ValueError("state and states are mutually exclusive")
+        if states is not None:
+            if not states:
+                raise ValueError("states must be non-empty")
+            for item in states:
+                if not isinstance(item, str) or item == "":
+                    raise ValueError("states must contain non-empty strings")
+                _append(args, "STATE", item)
+        else:
+            _append(args, "STATE", state)
+        args.extend(
+            [
+                "WORKER",
+                worker,
+                "LEASE_MS",
+                lease_ms,
+                "LIMIT",
+                limit,
+                "NOW",
+                now_ms or _now_ms(),
+            ]
+        )
+        if partition_key is not None and partition_keys is not None:
+            raise ValueError("partition_key and partition_keys are mutually exclusive")
         _append(args, "PARTITION", partition_key)
+        if partition_keys is not None:
+            if not partition_keys:
+                raise ValueError("partition_keys must be non-empty")
+            args.extend(["PARTITIONS", len(partition_keys), *partition_keys])
         _append(args, "PRIORITY", priority)
         if job_only:
-            _append(args, "RETURN", "JOBS")
+            _append(args, "RETURN", "JOBS_COMPACT")
         _append_bool(args, "PAYLOAD", payload)
         _append(args, "PAYLOAD_MAX_BYTES", payload_max_bytes)
+        _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
         _append_bool(args, "RECLAIM_EXPIRED", reclaim_expired)
         _append(args, "RECLAIM_RATIO", reclaim_ratio)
         response = self.executor.execute_command(*args)
@@ -314,9 +727,11 @@ class FlowClient:
         self,
         type: str,
         *,
-        state: str = "queued",
+        state: str | None = None,
+        states: list[str] | None = None,
         worker: str,
         partition_key: str | None = None,
+        partition_keys: list[str] | None = None,
         lease_ms: int = 30_000,
         limit: int = 100,
         priority: int | None = 0,
@@ -328,8 +743,10 @@ class FlowClient:
         return self.claim_due(
             type,
             state=state,
+            states=states,
             worker=worker,
             partition_key=partition_key,
+            partition_keys=partition_keys,
             lease_ms=lease_ms,
             limit=limit,
             priority=priority,
@@ -402,6 +819,10 @@ class FlowClient:
         fencing_token: int,
         partition_key: str | None = None,
         payload: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: list[str] | None = None,
+        override_values: list[str] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         priority: int | None = None,
@@ -424,6 +845,14 @@ class FlowClient:
         _append_encoded(args, "PAYLOAD", self.codec, payload)
         _append(args, "RUN_AT", run_at_ms if run_at_ms is not None else now_ms)
         _append(args, "PRIORITY", priority)
+        _append_named_values(
+            args,
+            self.codec,
+            values=values,
+            value_refs=value_refs,
+            drop_values=drop_values,
+            override_values=override_values,
+        )
         response = self.executor.execute_command(*args)
         if not return_record:
             return response
@@ -436,6 +865,10 @@ class FlowClient:
         *,
         result: Any = None,
         payload: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: list[str] | None = None,
+        override_values: list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
@@ -446,6 +879,14 @@ class FlowClient:
         _append(args, "TTL", ttl_ms)
         _append(args, "NOW", now_ms or _now_ms())
         _append_bool(args, "INDEPENDENT", independent)
+        _append_named_values(
+            args,
+            self.codec,
+            values=values,
+            value_refs=value_refs,
+            drop_values=drop_values,
+            override_values=override_values,
+        )
         self._append_claimed_items(args, partition_key, items, "FLOW.COMPLETE_MANY")
         return self._records_or_response(self.executor.execute_command(*args))
 
@@ -488,6 +929,10 @@ class FlowClient:
         partition_key: str | None = None,
         result: Any = None,
         payload: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: list[str] | None = None,
+        override_values: list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = True,
@@ -505,6 +950,14 @@ class FlowClient:
         _append_encoded(args, "RESULT", self.codec, result)
         _append_encoded(args, "PAYLOAD", self.codec, payload)
         _append(args, "TTL", ttl_ms)
+        _append_named_values(
+            args,
+            self.codec,
+            values=values,
+            value_refs=value_refs,
+            drop_values=drop_values,
+            override_values=override_values,
+        )
         response = self.executor.execute_command(*args)
         if not return_record:
             return response
@@ -518,6 +971,10 @@ class FlowClient:
         to_state: str,
         items: list[FencedItem],
         payload: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: list[str] | None = None,
+        override_values: list[str] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         priority: int | None = None,
@@ -531,6 +988,14 @@ class FlowClient:
         _append(args, "PRIORITY", priority)
         _append(args, "NOW", now_ms or _now_ms())
         _append_bool(args, "INDEPENDENT", independent)
+        _append_named_values(
+            args,
+            self.codec,
+            values=values,
+            value_refs=value_refs,
+            drop_values=drop_values,
+            override_values=override_values,
+        )
         self._append_fenced_items(
             args,
             partition_key,
@@ -549,6 +1014,10 @@ class FlowClient:
         partition_key: str | None = None,
         error: Any = None,
         payload: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: list[str] | None = None,
+        override_values: list[str] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = True,
@@ -566,6 +1035,14 @@ class FlowClient:
         _append_encoded(args, "ERROR", self.codec, error)
         _append_encoded(args, "PAYLOAD", self.codec, payload)
         _append(args, "RUN_AT", run_at_ms)
+        _append_named_values(
+            args,
+            self.codec,
+            values=values,
+            value_refs=value_refs,
+            drop_values=drop_values,
+            override_values=override_values,
+        )
         response = self.executor.execute_command(*args)
         if not return_record:
             return response
@@ -578,6 +1055,10 @@ class FlowClient:
         *,
         error: Any = None,
         payload: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: list[str] | None = None,
+        override_values: list[str] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
@@ -588,6 +1069,14 @@ class FlowClient:
         _append(args, "RUN_AT", run_at_ms)
         _append(args, "NOW", now_ms or _now_ms())
         _append_bool(args, "INDEPENDENT", independent)
+        _append_named_values(
+            args,
+            self.codec,
+            values=values,
+            value_refs=value_refs,
+            drop_values=drop_values,
+            override_values=override_values,
+        )
         self._append_claimed_items(args, partition_key, items, "FLOW.RETRY_MANY")
         return self._records_or_response(self.executor.execute_command(*args))
 
@@ -600,6 +1089,10 @@ class FlowClient:
         partition_key: str | None = None,
         error: Any = None,
         payload: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: list[str] | None = None,
+        override_values: list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = True,
@@ -617,6 +1110,14 @@ class FlowClient:
         _append_encoded(args, "ERROR", self.codec, error)
         _append_encoded(args, "PAYLOAD", self.codec, payload)
         _append(args, "TTL", ttl_ms)
+        _append_named_values(
+            args,
+            self.codec,
+            values=values,
+            value_refs=value_refs,
+            drop_values=drop_values,
+            override_values=override_values,
+        )
         response = self.executor.execute_command(*args)
         if not return_record:
             return response
@@ -629,6 +1130,10 @@ class FlowClient:
         *,
         error: Any = None,
         payload: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: list[str] | None = None,
+        override_values: list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
@@ -639,6 +1144,14 @@ class FlowClient:
         _append(args, "TTL", ttl_ms)
         _append(args, "NOW", now_ms or _now_ms())
         _append_bool(args, "INDEPENDENT", independent)
+        _append_named_values(
+            args,
+            self.codec,
+            values=values,
+            value_refs=value_refs,
+            drop_values=drop_values,
+            override_values=override_values,
+        )
         self._append_claimed_items(args, partition_key, items, "FLOW.FAIL_MANY")
         return self._records_or_response(self.executor.execute_command(*args))
 
@@ -650,6 +1163,10 @@ class FlowClient:
         lease_token: bytes | None = None,
         partition_key: str | None = None,
         reason: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: list[str] | None = None,
+        override_values: list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = True,
@@ -659,6 +1176,14 @@ class FlowClient:
         _append(args, "PARTITION", partition_key)
         _append(args, "REASON", self.codec.encode(reason) if reason is not None else None)
         _append(args, "TTL", ttl_ms)
+        _append_named_values(
+            args,
+            self.codec,
+            values=values,
+            value_refs=value_refs,
+            drop_values=drop_values,
+            override_values=override_values,
+        )
         response = self.executor.execute_command(*args)
         if not return_record:
             return response
@@ -670,6 +1195,10 @@ class FlowClient:
         items: list[FencedItem],
         *,
         reason: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: list[str] | None = None,
+        override_values: list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
@@ -679,6 +1208,14 @@ class FlowClient:
         _append(args, "TTL", ttl_ms)
         _append(args, "NOW", now_ms or _now_ms())
         _append_bool(args, "INDEPENDENT", independent)
+        _append_named_values(
+            args,
+            self.codec,
+            values=values,
+            value_refs=value_refs,
+            drop_values=drop_values,
+            override_values=override_values,
+        )
         self._append_fenced_items(args, partition_key, items, "FLOW.CANCEL_MANY")
         return self._records_or_response(self.executor.execute_command(*args))
 
@@ -704,9 +1241,17 @@ class FlowClient:
             return response
         return self._record_or_get(response, id, partition_key)
 
-    def get(self, id: str, *, partition_key: str | None = None) -> FlowRecord | None:
+    def get(
+        self,
+        id: str,
+        *,
+        partition_key: str | None = None,
+        values: list[str] | None = None,
+        value_max_bytes: int | None = None,
+    ) -> FlowRecord | None:
         args: list[Any] = ["FLOW.GET", id]
         _append(args, "PARTITION", partition_key)
+        _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
         value = self.executor.execute_command(*args)
         if value is None:
             return None
@@ -871,6 +1416,8 @@ class FlowClient:
         wait_state: str | None = None,
         success: str | None = None,
         failure: str | None = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
         now_ms: int | None = None,
     ) -> Any:
         args: list[Any] = [
@@ -889,17 +1436,28 @@ class FlowClient:
         _append(args, "WAIT_STATE", wait_state)
         _append(args, "SUCCESS", success)
         _append(args, "FAILURE", failure)
-        args.append("ITEMS")
         mixed = any(child.partition_key is not None for child in children)
-        if mixed:
-            args.append("MIXED")
-        for child in children:
-            if mixed:
-                if child.partition_key is None:
+        if _has_named_item_values(children):
+            args.extend(["ITEMS_EXT", len(children)])
+            for child in children:
+                if mixed and child.partition_key is None:
                     raise ValueError("mixed spawn_children items require partition_key")
-                args.extend([child.id, child.partition_key, child.type, child.payload])
-            else:
-                args.extend([child.id, child.type, child.payload])
+                child_values = _merge_named_map(values, child.values)
+                child_refs = _merge_named_map(value_refs, child.value_refs)
+                args.extend([child.id, child.partition_key or "-", child.type, child.payload])
+                _append_named_counts(args, self.codec, child_values, child_refs)
+        else:
+            _append_named_values(args, self.codec, values=values, value_refs=value_refs)
+            args.append("ITEMS")
+            if mixed:
+                args.append("MIXED")
+            for child in children:
+                if mixed:
+                    if child.partition_key is None:
+                        raise ValueError("mixed spawn_children items require partition_key")
+                    args.extend([child.id, child.partition_key, child.type, child.payload])
+                else:
+                    args.extend([child.id, child.type, child.payload])
         return self.executor.execute_command(*args)
 
     def install_policy(
@@ -1001,7 +1559,14 @@ class FlowClient:
 
     def _record(self, value: dict[Any, Any]) -> FlowRecord:
         raw_payload = value.get("payload") if "payload" in value else value.get(b"payload")
-        return FlowRecord.from_resp(value, payload=self.codec.decode(raw_payload))
+        raw_values = value.get("values") if "values" in value else value.get(b"values")
+        values = None
+        if isinstance(raw_values, dict):
+            values = {
+                (key.decode() if isinstance(key, bytes) else str(key)): self.codec.decode(item)
+                for key, item in raw_values.items()
+            }
+        return FlowRecord.from_resp(value, payload=self.codec.decode(raw_payload), values=values)
 
     def _record_or_get(
         self,
@@ -1085,6 +1650,8 @@ class AutobatchFlowClient:
         now_ms: int | None = None,
         priority: int | None = None,
         idempotent: bool | None = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
         return_record: bool = True,
     ) -> Future[Any]:
         future: Future[Any] = Future()
@@ -1109,6 +1676,8 @@ class AutobatchFlowClient:
                         now_ms=now_ms,
                         priority=priority,
                         idempotent=idempotent,
+                        values=values,
+                        value_refs=value_refs,
                         return_record=return_record,
                     )
                 )
@@ -1137,6 +1706,8 @@ class AutobatchFlowClient:
                     "now_ms": now_ms,
                     "priority": priority,
                     "idempotent": idempotent,
+                    "values": values,
+                    "value_refs": value_refs,
                 },
                 future,
             )
@@ -1158,6 +1729,8 @@ class AutobatchFlowClient:
         now_ms: int | None = None,
         priority: int | None = None,
         idempotent: bool | None = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
         return_record: bool = True,
     ) -> FlowRecord | bytes:
         return self.create_async(
@@ -1173,6 +1746,8 @@ class AutobatchFlowClient:
             now_ms=now_ms,
             priority=priority,
             idempotent=idempotent,
+            values=values,
+            value_refs=value_refs,
             return_record=return_record,
         ).result()
 
@@ -1185,6 +1760,10 @@ class AutobatchFlowClient:
         partition_key: str | None = None,
         result: Any = None,
         payload: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: list[str] | None = None,
+        override_values: list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = True,
@@ -1200,6 +1779,10 @@ class AutobatchFlowClient:
                         partition_key=partition_key,
                         result=result,
                         payload=payload,
+                        values=values,
+                        value_refs=value_refs,
+                        drop_values=drop_values,
+                        override_values=override_values,
                         ttl_ms=ttl_ms,
                         now_ms=now_ms,
                         return_record=return_record,
@@ -1212,7 +1795,19 @@ class AutobatchFlowClient:
         self._enqueue(
             _BatchOp(
                 "complete",
-                ("complete", _batch_key_value(result), _batch_key_value(payload), ttl_ms, now_ms),
+                (
+                    "complete",
+                    _batch_key_value(result),
+                    _batch_key_value(payload),
+                    ttl_ms,
+                    now_ms,
+                    _batch_named_key(
+                        values=values,
+                        value_refs=value_refs,
+                        drop_values=drop_values,
+                        override_values=override_values,
+                    ),
+                ),
                 {
                     "id": id,
                     "lease_token": lease_token,
@@ -1220,6 +1815,10 @@ class AutobatchFlowClient:
                     "partition_key": partition_key,
                     "result": result,
                     "payload": payload,
+                    "values": values,
+                    "value_refs": value_refs,
+                    "drop_values": drop_values,
+                    "override_values": override_values,
                     "ttl_ms": ttl_ms,
                     "now_ms": now_ms,
                 },
@@ -1237,6 +1836,10 @@ class AutobatchFlowClient:
         partition_key: str | None = None,
         result: Any = None,
         payload: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: list[str] | None = None,
+        override_values: list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = True,
@@ -1248,6 +1851,10 @@ class AutobatchFlowClient:
             partition_key=partition_key,
             result=result,
             payload=payload,
+            values=values,
+            value_refs=value_refs,
+            drop_values=drop_values,
+            override_values=override_values,
             ttl_ms=ttl_ms,
             now_ms=now_ms,
             return_record=return_record,
@@ -1263,6 +1870,10 @@ class AutobatchFlowClient:
         fencing_token: int,
         partition_key: str | None = None,
         payload: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: list[str] | None = None,
+        override_values: list[str] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         priority: int | None = None,
@@ -1277,6 +1888,10 @@ class AutobatchFlowClient:
                 fencing_token=fencing_token,
                 partition_key=partition_key,
                 payload=payload,
+                values=values,
+                value_refs=value_refs,
+                drop_values=drop_values,
+                override_values=override_values,
                 run_at_ms=run_at_ms,
                 now_ms=now_ms,
                 priority=priority,
@@ -1287,7 +1902,21 @@ class AutobatchFlowClient:
         self._enqueue(
             _BatchOp(
                 "transition",
-                ("transition", from_state, to_state, _batch_key_value(payload), run_at_ms, now_ms, priority),
+                (
+                    "transition",
+                    from_state,
+                    to_state,
+                    _batch_key_value(payload),
+                    run_at_ms,
+                    now_ms,
+                    priority,
+                    _batch_named_key(
+                        values=values,
+                        value_refs=value_refs,
+                        drop_values=drop_values,
+                        override_values=override_values,
+                    ),
+                ),
                 {
                     "id": id,
                     "lease_token": lease_token,
@@ -1296,6 +1925,10 @@ class AutobatchFlowClient:
                     "from_state": from_state,
                     "to_state": to_state,
                     "payload": payload,
+                    "values": values,
+                    "value_refs": value_refs,
+                    "drop_values": drop_values,
+                    "override_values": override_values,
                     "run_at_ms": run_at_ms,
                     "now_ms": now_ms,
                     "priority": priority,
@@ -1314,6 +1947,10 @@ class AutobatchFlowClient:
         partition_key: str | None = None,
         error: Any = None,
         payload: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: list[str] | None = None,
+        override_values: list[str] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = True,
@@ -1326,6 +1963,10 @@ class AutobatchFlowClient:
                 partition_key=partition_key,
                 error=error,
                 payload=payload,
+                values=values,
+                value_refs=value_refs,
+                drop_values=drop_values,
+                override_values=override_values,
                 run_at_ms=run_at_ms,
                 now_ms=now_ms,
                 return_record=return_record,
@@ -1335,7 +1976,19 @@ class AutobatchFlowClient:
         self._enqueue(
             _BatchOp(
                 "retry",
-                ("retry", _batch_key_value(error), _batch_key_value(payload), run_at_ms, now_ms),
+                (
+                    "retry",
+                    _batch_key_value(error),
+                    _batch_key_value(payload),
+                    run_at_ms,
+                    now_ms,
+                    _batch_named_key(
+                        values=values,
+                        value_refs=value_refs,
+                        drop_values=drop_values,
+                        override_values=override_values,
+                    ),
+                ),
                 {
                     "id": id,
                     "lease_token": lease_token,
@@ -1343,6 +1996,10 @@ class AutobatchFlowClient:
                     "partition_key": partition_key,
                     "error": error,
                     "payload": payload,
+                    "values": values,
+                    "value_refs": value_refs,
+                    "drop_values": drop_values,
+                    "override_values": override_values,
                     "run_at_ms": run_at_ms,
                     "now_ms": now_ms,
                 },
@@ -1360,6 +2017,10 @@ class AutobatchFlowClient:
         partition_key: str | None = None,
         error: Any = None,
         payload: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: list[str] | None = None,
+        override_values: list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = True,
@@ -1372,6 +2033,10 @@ class AutobatchFlowClient:
                 partition_key=partition_key,
                 error=error,
                 payload=payload,
+                values=values,
+                value_refs=value_refs,
+                drop_values=drop_values,
+                override_values=override_values,
                 ttl_ms=ttl_ms,
                 now_ms=now_ms,
                 return_record=return_record,
@@ -1381,7 +2046,19 @@ class AutobatchFlowClient:
         self._enqueue(
             _BatchOp(
                 "fail",
-                ("fail", _batch_key_value(error), _batch_key_value(payload), ttl_ms, now_ms),
+                (
+                    "fail",
+                    _batch_key_value(error),
+                    _batch_key_value(payload),
+                    ttl_ms,
+                    now_ms,
+                    _batch_named_key(
+                        values=values,
+                        value_refs=value_refs,
+                        drop_values=drop_values,
+                        override_values=override_values,
+                    ),
+                ),
                 {
                     "id": id,
                     "lease_token": lease_token,
@@ -1389,6 +2066,10 @@ class AutobatchFlowClient:
                     "partition_key": partition_key,
                     "error": error,
                     "payload": payload,
+                    "values": values,
+                    "value_refs": value_refs,
+                    "drop_values": drop_values,
+                    "override_values": override_values,
                     "ttl_ms": ttl_ms,
                     "now_ms": now_ms,
                 },
@@ -1405,6 +2086,10 @@ class AutobatchFlowClient:
         lease_token: bytes | None = None,
         partition_key: str | None = None,
         reason: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: list[str] | None = None,
+        override_values: list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = True,
@@ -1416,6 +2101,10 @@ class AutobatchFlowClient:
                 lease_token=lease_token,
                 partition_key=partition_key,
                 reason=reason,
+                values=values,
+                value_refs=value_refs,
+                drop_values=drop_values,
+                override_values=override_values,
                 ttl_ms=ttl_ms,
                 now_ms=now_ms,
                 return_record=return_record,
@@ -1425,13 +2114,28 @@ class AutobatchFlowClient:
         self._enqueue(
             _BatchOp(
                 "cancel",
-                ("cancel", _batch_key_value(reason), ttl_ms, now_ms),
+                (
+                    "cancel",
+                    _batch_key_value(reason),
+                    ttl_ms,
+                    now_ms,
+                    _batch_named_key(
+                        values=values,
+                        value_refs=value_refs,
+                        drop_values=drop_values,
+                        override_values=override_values,
+                    ),
+                ),
                 {
                     "id": id,
                     "lease_token": lease_token,
                     "fencing_token": fencing_token,
                     "partition_key": partition_key,
                     "reason": reason,
+                    "values": values,
+                    "value_refs": value_refs,
+                    "drop_values": drop_values,
+                    "override_values": override_values,
                     "ttl_ms": ttl_ms,
                     "now_ms": now_ms,
                 },
@@ -1496,6 +2200,8 @@ class AutobatchFlowClient:
                             op.args["id"],
                             op.args["payload"],
                             partition_key=None if partition_key is not None else op.args["partition_key"],
+                            values=op.args.get("values"),
+                            value_refs=op.args.get("value_refs"),
                         )
                         for op in group
                     ],
@@ -1513,6 +2219,10 @@ class AutobatchFlowClient:
                     [self._claimed_item(op) for op in group],
                     result=group[0].args["result"],
                     payload=group[0].args["payload"],
+                    values=group[0].args.get("values"),
+                    value_refs=group[0].args.get("value_refs"),
+                    drop_values=group[0].args.get("drop_values"),
+                    override_values=group[0].args.get("override_values"),
                     ttl_ms=group[0].args["ttl_ms"],
                     now_ms=group[0].args["now_ms"],
                     independent=True,
@@ -1524,6 +2234,10 @@ class AutobatchFlowClient:
                     to_state=group[0].args["to_state"],
                     items=[self._fenced_item(op, include_lease=True) for op in group],
                     payload=group[0].args["payload"],
+                    values=group[0].args.get("values"),
+                    value_refs=group[0].args.get("value_refs"),
+                    drop_values=group[0].args.get("drop_values"),
+                    override_values=group[0].args.get("override_values"),
                     run_at_ms=group[0].args["run_at_ms"],
                     now_ms=group[0].args["now_ms"],
                     priority=group[0].args["priority"],
@@ -1535,6 +2249,10 @@ class AutobatchFlowClient:
                     [self._claimed_item(op) for op in group],
                     error=group[0].args["error"],
                     payload=group[0].args["payload"],
+                    values=group[0].args.get("values"),
+                    value_refs=group[0].args.get("value_refs"),
+                    drop_values=group[0].args.get("drop_values"),
+                    override_values=group[0].args.get("override_values"),
                     run_at_ms=group[0].args["run_at_ms"],
                     now_ms=group[0].args["now_ms"],
                     independent=True,
@@ -1545,6 +2263,10 @@ class AutobatchFlowClient:
                     [self._claimed_item(op) for op in group],
                     error=group[0].args["error"],
                     payload=group[0].args["payload"],
+                    values=group[0].args.get("values"),
+                    value_refs=group[0].args.get("value_refs"),
+                    drop_values=group[0].args.get("drop_values"),
+                    override_values=group[0].args.get("override_values"),
                     ttl_ms=group[0].args["ttl_ms"],
                     now_ms=group[0].args["now_ms"],
                     independent=True,
@@ -1554,6 +2276,10 @@ class AutobatchFlowClient:
                     None,
                     [self._fenced_item(op, include_lease=False) for op in group],
                     reason=group[0].args["reason"],
+                    values=group[0].args.get("values"),
+                    value_refs=group[0].args.get("value_refs"),
+                    drop_values=group[0].args.get("drop_values"),
+                    override_values=group[0].args.get("override_values"),
                     ttl_ms=group[0].args["ttl_ms"],
                     now_ms=group[0].args["now_ms"],
                     independent=True,

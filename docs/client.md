@@ -349,3 +349,77 @@ policy = client.policy_get("order", state="charge")
 ```python
 summary = client.retention_cleanup(limit=1_000)
 ```
+
+## FerricStore-native commands
+
+`FlowClient` also exposes FerricStore commands that are not part of vanilla
+Redis.
+
+```python
+client.cas("k", b"old", b"new", ex=60)
+
+if client.lock("lock:k", "owner", ttl_ms=30_000):
+    try:
+        do_work()
+    finally:
+        client.unlock("lock:k", "owner")
+
+client.extend_lock("lock:k", "owner", ttl_ms=30_000)
+
+limit = client.ratelimit_add("rl:user:42", window_ms=1_000, max=10)
+if limit.allowed:
+    handle_request()
+
+info = client.key_info("k")
+```
+
+Fetch-or-compute gives stampede protection:
+
+```python
+result = client.fetch_or_compute("report:42", ttl_ms=60_000)
+
+if result.hit:
+    report = result.value
+else:
+    try:
+        report = build_report()
+        client.fetch_or_compute_result("report:42", report, ttl_ms=60_000)
+    except Exception as exc:
+        client.fetch_or_compute_error("report:42", str(exc))
+        raise
+```
+
+Cluster/admin helpers:
+
+```python
+client.cluster_health()
+client.cluster_stats()
+client.cluster_keyslot("k")
+client.cluster_slots()
+client.cluster_status()
+client.cluster_role()
+client.cluster_join("node@127.0.0.1", replace=True)
+client.cluster_leave()
+client.cluster_failover(0, "node@127.0.0.1")
+client.cluster_promote("node@127.0.0.1")
+client.cluster_demote("node@127.0.0.1")
+client.ferricstore_config("GET", "max_memory")
+client.ferricstore_hotness()
+client.ferricstore_metrics()
+client.ferricstore_blobgc("RUN")
+```
+
+## Normal Redis command passthrough
+
+Use `command` for any Redis-compatible command that does not need a typed SDK
+wrapper.
+
+```python
+client.command("SET", "k", "v")
+client.command("GET", "k")
+client.command("HSET", "user:1", "name", "Ada")
+client.command("ZADD", "scores", 10, "a")
+```
+
+This is the intended escape hatch. FerricStore-specific APIs are typed; generic
+Redis remains available without turning the SDK into a full Redis client.

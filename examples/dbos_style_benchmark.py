@@ -8,13 +8,20 @@ import zlib
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from ferricstore import ClaimedItem, CreateItem, FlowClient
+from ferricstore import (
+    ClaimedItem,
+    CreateItem,
+    FlowClient,
+    QueueFlowWorker,
+    QueueFlowWorkerResult,
+)
 
 
 FLOW_TYPE = "dbos_python_sdk_bench"
 QUEUE_STATE = "queued"
 AUTO_PARTITION_PREFIX = "__flow_auto__:"
 AUTO_PARTITION_BUCKETS = 256
+SERVER_SLOT_COUNT = 1024
 
 
 def chunks(values: list[int], size: int) -> Iterable[list[int]]:
@@ -36,6 +43,15 @@ def payload_bytes(size: int) -> bytes:
     return b"x" * size
 
 
+def parse_claim_states(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    states = [part.strip() for part in value.split(",") if part.strip()]
+    if not states:
+        raise ValueError("--claim-states must contain at least one state")
+    return states
+
+
 def partition_for(index: int, partitions: int, prefix: str) -> str:
     return f"{prefix}:partition:{index % max(partitions, 1)}"
 
@@ -46,6 +62,23 @@ def auto_partition_index_for_flow_id(id: str) -> int:
 
 def auto_partition_key_for_index(index: int) -> str:
     return f"{AUTO_PARTITION_PREFIX}{index % AUTO_PARTITION_BUCKETS}"
+
+
+def server_shard_for_slot(slot: int, server_shards: int) -> int:
+    server_shards = max(server_shards, 1)
+    slots_per_shard = SERVER_SLOT_COUNT // server_shards
+    remainder = SERVER_SLOT_COUNT % server_shards
+    wide_slots = (slots_per_shard + 1) * remainder
+    slot = slot % SERVER_SLOT_COUNT
+    if slot < wide_slots:
+        return slot // (slots_per_shard + 1)
+    return remainder + ((slot - wide_slots) // slots_per_shard)
+
+
+def auto_partition_server_shard_for_index(index: int, server_shards: int) -> int:
+    tag = f"fa:{index % AUTO_PARTITION_BUCKETS}"
+    slot = zlib.crc32(tag.encode()) & (SERVER_SLOT_COUNT - 1)
+    return server_shard_for_slot(slot, server_shards)
 
 
 def benchmark_partition_key(
@@ -203,8 +236,11 @@ class BenchFlowClient:
         self,
         *,
         flow_type: str,
+        state: str | None,
+        states: list[str] | None,
         worker: str,
         partition_key: str | None,
+        partition_keys: list[str] | None = None,
         limit: int,
         reclaim_expired: bool,
         reclaim_ratio: int,
@@ -212,9 +248,11 @@ class BenchFlowClient:
         claim_job_only: bool,
     ):
         opts = {
-            "state": QUEUE_STATE,
+            "state": state,
+            "states": states,
             "worker": worker,
             "partition_key": partition_key,
+            "partition_keys": partition_keys,
             "limit": limit,
             "reclaim_expired": reclaim_expired,
             "reclaim_ratio": reclaim_ratio,
@@ -352,6 +390,69 @@ class PartitionWakeCoordinator:
             credit = self.credits[worker_index].pop(partition_index, 0)
         return partition_index, credit
 
+    def next_partitions(
+        self,
+        worker_index: int,
+        timeout_s: float,
+        max_partitions: int,
+        max_credit: int,
+        same_group=None,
+    ) -> tuple[list[int], int]:
+        if max_partitions <= 0 or max_credit <= 0:
+            return [], 0
+
+        try:
+            partition_index, credit = self.next_partition(worker_index, timeout_s)
+        except queue.Empty:
+            if timeout_s <= 0:
+                return [], 0
+            raise
+
+        partitions = [partition_index]
+        total_credit = credit
+
+        while len(partitions) < max_partitions and total_credit < max_credit:
+            try:
+                partition_index = self.queues[worker_index].get_nowait()
+            except queue.Empty:
+                break
+
+            with self.locks[worker_index]:
+                self.pending[worker_index].discard(partition_index)
+                credit = self.credits[worker_index].pop(partition_index, 0)
+
+            if credit > 0:
+                if same_group is not None and not same_group(partitions[0], partition_index):
+                    self.return_credit(worker_index, partition_index, credit)
+                    break
+                partitions.append(partition_index)
+                total_credit += credit
+
+        return partitions, total_credit
+
+    def return_credit(self, worker_index: int, partition_index: int, credit: int) -> None:
+        if credit <= 0:
+            return
+
+        should_queue = False
+        with self.locks[worker_index]:
+            self.credits[worker_index][partition_index] = (
+                self.credits[worker_index].get(partition_index, 0) + credit
+            )
+            if partition_index not in self.pending[worker_index]:
+                self.pending[worker_index].add(partition_index)
+                should_queue = True
+
+        if should_queue:
+            self.queues[worker_index].put(partition_index)
+
+    def total_credit(self) -> int:
+        total = 0
+        for worker_index in range(self.workers):
+            with self.locks[worker_index]:
+                total += sum(self.credits[worker_index].values())
+        return total
+
     def take_credit(self, worker_index: int, partition_index: int) -> int:
         with self.locks[worker_index]:
             self.pending[worker_index].discard(partition_index)
@@ -463,6 +564,12 @@ def run_claim_worker(
     reclaim_ratio: int,
     claim_priority: int | None,
     claim_job_only: bool,
+    claim_state: str | None,
+    claim_states: list[str] | None,
+    claim_partition_batch_size: int,
+    claim_drain_batches: int,
+    worker_capacity: int,
+    server_shards: int,
     producers_done: threading.Event,
     claimed_total: list[int],
     completed: list[int],
@@ -481,6 +588,9 @@ def run_claim_worker(
     claimed_items = 0
     local_duplicate_completions = 0
     max_claim_batch = 0
+    fallback_claims = 0
+    fallback_idle_rounds = 0
+    last_claimed_seen = 0
     wake_coalesce_sleeps = 0
     wake_coalesce_seconds = 0.0
     base_idle_sleep_s = max(idle_sleep_ms, 0.0) / 1000.0
@@ -489,7 +599,15 @@ def run_claim_worker(
     wake_coalesce_s = max(wake_coalesce_ms, 0.0) / 1000.0
     partial_claim_delay_s = max(partial_claim_delay_ms, 0.0) / 1000.0
     partial_claim_retries = max(partial_claim_retries, 0)
+    capacity_enabled = worker_capacity > 0
+    worker_capacity = max(worker_capacity, 1) if capacity_enabled else 0
     owned_partitions = [p for p in range(partitions) if p % worker_count == worker_index]
+    same_partition_group = None
+    if partition_mode == "auto":
+        same_partition_group = lambda first, candidate: (
+            auto_partition_server_shard_for_index(first, server_shards)
+            == auto_partition_server_shard_for_index(candidate, server_shards)
+        )
     fallback_round = 0
     complete_executor = (
         ThreadPoolExecutor(max_workers=complete_async_depth) if complete_async_depth > 0 else None
@@ -576,6 +694,8 @@ def run_claim_worker(
             "empty_claims": empty_claims,
             "claimed_items": claimed_items,
             "max_claim_batch": max_claim_batch,
+            "fallback_claims": fallback_claims,
+            "worker_capacity": worker_capacity,
             "wake_coalesce_sleeps": wake_coalesce_sleeps,
             "wake_coalesce_ms": wake_coalesce_seconds * 1000.0,
             **flow.pipeline_stats("process"),
@@ -614,20 +734,53 @@ def run_claim_worker(
                 time.sleep(idle_sleep_s)
             continue
 
+        if capacity_enabled:
+            available_capacity = worker_capacity - (claimed_items - local_completed)
+            if available_capacity <= 0:
+                if pending_completions:
+                    drain_completed_completions(block=True)
+                elif idle_sleep_s > 0:
+                    time.sleep(idle_sleep_s)
+                continue
+            claim_credit_limit = available_capacity
+        else:
+            available_capacity = claim_batch_size
+            claim_credit_limit = claim_batch_size
         partition_index = None
         partition_key = None
+        partition_keys = None
         partition_credit = 0
 
         if wake_coordinator is not None and not claim_any:
             try:
-                partition_index, partition_credit = wake_coordinator.next_partition(
-                    worker_index, idle_sleep_s
+                partition_indices, partition_credit = wake_coordinator.next_partitions(
+                    worker_index,
+                    idle_sleep_s,
+                    max(claim_partition_batch_size, 1),
+                    claim_credit_limit,
+                    same_group=same_partition_group,
                 )
+                partition_index = partition_indices[0]
+                fallback_idle_rounds = 0
             except queue.Empty:
                 if producers_done.is_set() and owned_partitions:
+                    with completed_lock:
+                        observed_claimed = claimed_total[0]
+
+                    if wake_coordinator.total_credit() > 0 or observed_claimed != last_claimed_seen:
+                        last_claimed_seen = observed_claimed
+                        fallback_idle_rounds = 0
+                        continue
+
+                    fallback_idle_rounds += 1
+                    if fallback_idle_rounds < 3:
+                        continue
+
                     partition_index = owned_partitions[fallback_round % len(owned_partitions)]
-                    partition_credit = claim_batch_size
+                    partition_indices = [partition_index]
+                    partition_credit = min(claim_batch_size, available_capacity)
                     fallback_round += 1
+                    fallback_claims += 1
                 else:
                     continue
             if partition_credit <= 0:
@@ -647,24 +800,46 @@ def run_claim_worker(
                     partition_credit += wake_coordinator.take_credit(
                         worker_index, partition_index
                     )
-            partition_key = benchmark_partition_key(
-                partition_mode=partition_mode,
-                partition_index=partition_index,
-                partitions=partitions,
-                run_id=run_id,
-            )
+                    extra_indices, extra_credit = wake_coordinator.next_partitions(
+                        worker_index,
+                        0,
+                        max(claim_partition_batch_size - len(partition_indices), 0),
+                        claim_credit_limit - partition_credit,
+                        same_group=same_partition_group,
+                    ) if len(partition_indices) < claim_partition_batch_size else ([], 0)
+                    partition_indices.extend(extra_indices)
+                    partition_credit += extra_credit
+            partition_keys = [
+                benchmark_partition_key(
+                    partition_mode=partition_mode,
+                    partition_index=index,
+                    partitions=partitions,
+                    run_id=run_id,
+                )
+                for index in partition_indices
+            ]
+            partition_key = partition_keys[0] if len(partition_keys) == 1 else None
 
             remaining_credit = max(partition_credit, 1)
 
             while remaining_credit > 0:
                 if done():
                     return finish()
-                limit = min(claim_batch_size, remaining_credit)
+                if capacity_enabled:
+                    available_capacity = worker_capacity - (claimed_items - local_completed)
+                    if available_capacity <= 0:
+                        break
+                else:
+                    available_capacity = claim_batch_size
+                limit = min(claim_batch_size, remaining_credit, available_capacity)
                 claim_calls += 1
                 jobs = flow.claim_due(
                     flow_type=flow_type,
+                    state=claim_state,
+                    states=claim_states,
                     worker=worker,
                     partition_key=partition_key,
+                    partition_keys=None if partition_key is not None else partition_keys,
                     limit=limit,
                     reclaim_expired=reclaim_expired,
                     reclaim_ratio=reclaim_ratio,
@@ -698,9 +873,11 @@ def run_claim_worker(
         claim_calls += 1
         jobs = flow.claim_due(
             flow_type=flow_type,
+            state=claim_state,
+            states=claim_states,
             worker=worker,
             partition_key=partition_key,
-            limit=claim_batch_size,
+            limit=min(claim_batch_size, available_capacity),
             reclaim_expired=reclaim_expired,
             reclaim_ratio=reclaim_ratio,
             claim_priority=claim_priority,
@@ -715,6 +892,227 @@ def run_claim_worker(
 
         idle_sleep_s = base_idle_sleep_s
         handle_jobs(jobs, partition_key)
+
+
+def run_queue_api_worker(
+    *,
+    url: str,
+    run_id: str,
+    flow_type: str,
+    worker_index: int,
+    worker_count: int,
+    partitions: int,
+    partition_mode: str,
+    claim_any: bool,
+    claim_batch_size: int,
+    complete_batch: bool,
+    complete_async_depth: int,
+    independent_many: bool,
+    transport: str,
+    work_command: str,
+    result: bytes | None,
+    total_flows: int,
+    idle_sleep_ms: float,
+    max_idle_sleep_ms: float,
+    wake_coalesce_ms: float,
+    partial_claim_retries: int,
+    partial_claim_delay_ms: float,
+    reclaim_expired: bool,
+    reclaim_ratio: int,
+    claim_priority: int | None,
+    claim_job_only: bool,
+    claim_state: str | None,
+    claim_states: list[str] | None,
+    claim_partition_batch_size: int,
+    claim_drain_batches: int,
+    worker_capacity: int,
+    server_shards: int,
+    producers_done: threading.Event,
+    claimed_total: list[int],
+    completed: list[int],
+    completed_ids: set[str],
+    duplicate_completions: list[int],
+    completed_lock: threading.Lock,
+    wake_coordinator: PartitionWakeCoordinator | None,
+    track_duplicates: bool,
+) -> dict[str, int]:
+    del (
+        complete_batch,
+        transport,
+        partial_claim_retries,
+        partial_claim_delay_ms,
+        claim_job_only,
+        worker_capacity,
+    )
+
+    client = FlowClient.from_url(url)
+    partition_keys = None
+    owned_partitions = None
+    if not claim_any:
+        owned_partitions = [p for p in range(partitions) if p % worker_count == worker_index]
+        if partition_mode == "auto":
+            owned_partitions.sort(
+                key=lambda partition_index: (
+                    auto_partition_server_shard_for_index(partition_index, server_shards),
+                    partition_index,
+                )
+            )
+        if not owned_partitions:
+            return {
+                "completed": 0,
+                "duplicate_completions": 0,
+                "claim_calls": 0,
+                "empty_claims": 0,
+                "claimed_items": 0,
+                "max_claim_batch": 0,
+                "fallback_claims": 0,
+                "worker_capacity": 0,
+                "wake_coalesce_sleeps": 0,
+                "wake_coalesce_ms": 0.0,
+                "process_pipeline_flushes": 0,
+                "process_pipeline_commands": 0,
+                "process_pipeline_max_depth": 0,
+            }
+        partition_keys = [
+            benchmark_partition_key(
+                partition_mode=partition_mode,
+                partition_index=partition_index,
+                partitions=partitions,
+                run_id=run_id,
+            )
+            for partition_index in owned_partitions
+        ]
+
+    same_partition_group = None
+    if partition_mode == "auto":
+        same_partition_group = lambda first, candidate: (
+            auto_partition_server_shard_for_index(first, server_shards)
+            == auto_partition_server_shard_for_index(candidate, server_shards)
+        )
+
+    completion_clients = (
+        [FlowClient.from_url(url) for _ in range(complete_async_depth)]
+        if complete_async_depth > 0
+        else None
+    )
+
+    worker = QueueFlowWorker(
+        client,
+        type=flow_type,
+        worker=f"{run_id}:worker:{worker_index}",
+        state=claim_state,
+        states=claim_states,
+        concurrency=1,
+        batch_size=claim_batch_size,
+        priority=claim_priority,
+        reclaim_expired=reclaim_expired,
+        reclaim_ratio=reclaim_ratio,
+        idle_sleep_s=max(idle_sleep_ms, 0.0) / 1000.0,
+        max_idle_sleep_s=max(max_idle_sleep_ms, idle_sleep_ms, 0.0) / 1000.0,
+        complete_independent=independent_many,
+        partition_keys=partition_keys,
+        partition_indices=owned_partitions,
+        claim_partition_batch_size=claim_partition_batch_size,
+        claim_drain_batches=claim_drain_batches,
+        complete_async_depth=complete_async_depth,
+        completion_clients=completion_clients,
+        wake_source=wake_coordinator,
+        wake_worker_index=worker_index if wake_coordinator is not None else None,
+        wake_same_group=same_partition_group,
+        wake_producers_done=producers_done.is_set if wake_coordinator is not None else None,
+        wake_coalesce_s=max(wake_coalesce_ms, 0.0) / 1000.0,
+        wake_fallback_after=3,
+    )
+    local_completed = 0
+    local_duplicate_completions = 0
+    claim_calls = 0
+    empty_claims = 0
+    claimed_items = 0
+    max_claim_batch = 0
+    fallback_claims = 0
+    idle_sleep_s = max(idle_sleep_ms, 0.0) / 1000.0
+    max_idle_sleep_s = max(max_idle_sleep_ms, idle_sleep_ms, 0.0) / 1000.0
+
+    def done() -> bool:
+        with completed_lock:
+            return completed[0] >= total_flows
+
+    def all_claimed() -> bool:
+        with completed_lock:
+            return claimed_total[0] >= total_flows
+
+    def handle_batch(jobs):
+        if work_command == "incr":
+            for _job in jobs:
+                client.executor.execute_command("INCR", f"{run_id}:counter")
+        return result
+
+    def record_batch(batch: QueueFlowWorkerResult) -> None:
+        nonlocal claimed_items, max_claim_batch, local_completed
+        if batch.claimed > 0:
+            claimed_items += batch.claimed
+            max_claim_batch = max(max_claim_batch, batch.claimed)
+
+        if batch.claimed == 0 and batch.completed == 0:
+            return
+
+        with completed_lock:
+            claimed_total[0] += batch.claimed
+            if not track_duplicates:
+                completed[0] += batch.completed
+                local_completed += batch.completed
+            else:
+                completed[0] += batch.completed
+                local_completed += batch.completed
+
+    try:
+        while True:
+            if done():
+                break
+            if producers_done.is_set() and all_claimed():
+                break
+
+            batch = worker.run_batch_once(handle_batch)
+            claim_calls += batch.claim_calls
+            if (
+                batch.claimed == 0
+                and batch.completed == 0
+                and batch.retried == 0
+                and batch.failed == 0
+            ):
+                if batch.claim_calls > 0:
+                    empty_claims += 1
+                if producers_done.is_set() and all_claimed():
+                    break
+                if wake_coordinator is not None:
+                    continue
+                if idle_sleep_s > 0:
+                    time.sleep(idle_sleep_s)
+                    idle_sleep_s = min(max_idle_sleep_s, max(idle_sleep_s * 2, idle_sleep_s))
+                continue
+
+            if batch.claimed > 0:
+                idle_sleep_s = max(idle_sleep_ms, 0.0) / 1000.0
+            record_batch(batch)
+
+        record_batch(worker.flush())
+        return {
+            "completed": local_completed,
+            "duplicate_completions": local_duplicate_completions,
+            "claim_calls": claim_calls,
+            "empty_claims": empty_claims,
+            "claimed_items": claimed_items,
+            "max_claim_batch": max_claim_batch,
+            "fallback_claims": fallback_claims,
+            "worker_capacity": 0,
+            "wake_coalesce_sleeps": 0,
+            "wake_coalesce_ms": 0.0,
+            "process_pipeline_flushes": 0,
+            "process_pipeline_commands": 0,
+            "process_pipeline_max_depth": 0,
+        }
+    finally:
+        worker.close()
 
 
 def partition_index_for_claim(
@@ -733,6 +1131,8 @@ def partition_index_for_claim(
 def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | str | bool]:
     run_id = f"py-sdk-bench-{uuid.uuid4().hex}"
     flow_type = f"{FLOW_TYPE}:{run_id}"
+    claim_states = parse_claim_states(args.claim_states)
+    claim_state = None if claim_states is not None or args.claim_state == "omitted" else args.claim_state
     indices = list(range(args.flows))
     payload = payload_bytes(args.payload_bytes)
     result = payload_bytes(args.result_bytes) if args.result_bytes > 0 else None
@@ -742,16 +1142,18 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
     duplicate_completions = [0]
     completed_lock = threading.Lock()
     producers_done = threading.Event()
-    effective_worker_mode = "polling" if args.claim_any else args.worker_mode
+    effective_worker_mode = (
+        "queue-api" if args.worker_api == "queue" else "polling" if args.claim_any else args.worker_mode
+    )
     partition_mode = args.partition_mode
     if args.claim_any and partition_mode == "explicit":
         partition_mode = "auto"
     worker_partitions = AUTO_PARTITION_BUCKETS if partition_mode == "auto" else args.partitions
-    wake_coordinator = (
-        PartitionWakeCoordinator(args.workers, worker_partitions)
-        if effective_worker_mode == "owner-wakeup"
-        else None
-    )
+    worker_capacity = args.worker_capacity
+    wake_coordinator = None
+
+    if args.worker_mode == "owner-wakeup" and args.worker_api != "queue" and not args.claim_any:
+        wake_coordinator = PartitionWakeCoordinator(args.workers, worker_partitions)
 
     if partition_mode == "auto" and args.transport == "many":
         create_ranges = [[] for _ in range(args.producers)]
@@ -789,9 +1191,10 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
         ]
 
     def submit_worker_jobs(executor: ThreadPoolExecutor):
+        worker_fn = run_queue_api_worker if args.worker_api == "queue" else run_claim_worker
         return [
             executor.submit(
-                run_claim_worker,
+                worker_fn,
                 url=args.url,
                 run_id=run_id,
                 flow_type=flow_type,
@@ -817,6 +1220,12 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
                 reclaim_ratio=args.reclaim_ratio,
                 claim_priority=args.claim_priority,
                 claim_job_only=args.claim_job_only,
+                claim_state=claim_state,
+                claim_states=claim_states,
+                claim_partition_batch_size=args.claim_partition_batch_size,
+                claim_drain_batches=args.claim_drain_batches,
+                worker_capacity=worker_capacity,
+                server_shards=args.server_shards,
                 producers_done=producers_done,
                 claimed_total=claimed_total,
                 completed=completed,
@@ -894,6 +1303,11 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
         result["wake_coalesce_sleeps"] for result in worker_results
     )
     process_wake_coalesce_ms = sum(result["wake_coalesce_ms"] for result in worker_results)
+    process_fallback_claims = sum(result["fallback_claims"] for result in worker_results)
+    process_worker_capacity = max(
+        (result["worker_capacity"] for result in worker_results),
+        default=worker_capacity,
+    )
 
     return {
         "mode": "queued",
@@ -910,7 +1324,9 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
         "claim_any": args.claim_any,
         "partition_mode": partition_mode,
         "worker_mode": effective_worker_mode,
+        "worker_api": args.worker_api,
         "claim_batch_size": args.claim_batch_size,
+        "worker_capacity": process_worker_capacity,
         "create_batch_size": args.create_batch_size,
         "complete_batch": args.complete_batch,
         "complete_async_depth": args.complete_async_depth,
@@ -927,14 +1343,20 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
         "reclaim_expired": args.reclaim_expired,
         "reclaim_ratio": args.reclaim_ratio,
         "claim_priority": args.claim_priority,
+        "claim_state": args.claim_state,
+        "claim_states": args.claim_states or "",
         "claim_job_only": args.claim_job_only,
         "track_duplicates": args.track_duplicates,
+        "claim_partition_batch_size": args.claim_partition_batch_size,
+        "claim_drain_batches": args.claim_drain_batches,
+        "server_shards": args.server_shards,
         "wake_notifications": wake_coordinator.notifications if wake_coordinator is not None else 0,
         "wake_credits": wake_coordinator.notified_jobs if wake_coordinator is not None else 0,
         "process_wake_coalesce_sleeps": process_wake_coalesce_sleeps,
         "process_wake_coalesce_ms": process_wake_coalesce_ms,
         "process_claim_calls": process_claim_calls,
         "process_empty_claims": process_empty_claims,
+        "process_fallback_claims": process_fallback_claims,
         "process_avg_claim_batch": process_avg_claim_batch,
         "process_max_claim_batch": process_max_claim_batch,
         "create_pipeline_flushes": create_pipeline_flushes,
@@ -1023,6 +1445,7 @@ def main() -> None:
     parser.add_argument("--producers", type=int, default=4)
     parser.add_argument("--partitions", type=int, default=16)
     parser.add_argument("--claim-batch-size", type=int, default=100)
+    parser.add_argument("--worker-capacity", type=int, default=0)
     parser.add_argument("--create-batch-size", type=int, default=100)
     parser.add_argument("--transport", choices=("many", "pipeline", "autobatch"), default="pipeline")
     parser.add_argument("--partition-mode", choices=("explicit", "auto"), default="explicit")
@@ -1032,18 +1455,24 @@ def main() -> None:
     parser.add_argument("--idle-sleep-ms", type=float, default=10.0)
     parser.add_argument("--max-idle-sleep-ms", type=float, default=50.0)
     parser.add_argument("--worker-mode", choices=("owner-wakeup", "polling"), default="owner-wakeup")
+    parser.add_argument("--worker-api", choices=("lowlevel", "queue"), default="lowlevel")
     parser.add_argument("--wake-coalesce-ms", type=float, default=5.0)
     parser.add_argument("--partial-claim-retries", type=int, default=1)
     parser.add_argument("--partial-claim-delay-ms", type=float, default=1.0)
     parser.add_argument("--reclaim-expired", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--reclaim-ratio", type=int, default=25)
     parser.add_argument("--claim-priority", type=int, default=0)
+    parser.add_argument("--claim-state", choices=("queued", "any", "omitted"), default="queued")
+    parser.add_argument("--claim-states", default=None)
     parser.add_argument("--claim-job-only", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--claim-any", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--complete-batch", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--complete-async-depth", type=int, default=0)
     parser.add_argument("--independent-many", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--track-duplicates", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--claim-partition-batch-size", type=int, default=2)
+    parser.add_argument("--claim-drain-batches", type=int, default=1)
+    parser.add_argument("--server-shards", type=int, default=16)
 
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
@@ -1059,6 +1488,14 @@ def main() -> None:
         parser.error("--partitions must be positive")
     if args.claim_batch_size <= 0:
         parser.error("--claim-batch-size must be positive")
+    if args.worker_capacity < 0:
+        parser.error("--worker-capacity must be non-negative")
+    if args.claim_partition_batch_size <= 0:
+        parser.error("--claim-partition-batch-size must be positive")
+    if args.claim_drain_batches <= 0:
+        parser.error("--claim-drain-batches must be positive")
+    if args.server_shards <= 0:
+        parser.error("--server-shards must be positive")
     if args.create_batch_size <= 0:
         parser.error("--create-batch-size must be positive")
     if args.complete_async_depth < 0:
