@@ -141,7 +141,7 @@ Important options:
 * `--claim-states queued,retry`: explicit multi-state claim selector. The SDK
   sends repeated `STATE` options, preserving the optimized explicit-state
   server path without using the broad `any` selector.
-* `--claim-job-only`: asks `FLOW.CLAIM_DUE RETURN JOBS` for only the fields
+* `--claim-job-only`: asks `FLOW.CLAIM_DUE RETURN JOBS_COMPACT` for only the fields
   needed to complete the job: id, partition, lease token, and fencing token.
   This is the optimized worker path. Use the default full-record claim only
   when the worker needs hydrated payload/state data from the claim response.
@@ -321,6 +321,554 @@ queue live, 4 producers:
 
 workflow live, 4 producers:
   end_to_end_workflows_per_sec: ~65000-68000/s
+```
+
+Azure 4-vCPU server/client results on May 19, 2026:
+
+```text
+Server VM:
+  Azure size: Standard_L4as_v4
+  CPU: 4 vCPU
+  Data disk used: /dev/nvme1n1 mounted at /data
+  Data disk model: Microsoft NVMe Direct Disk v2
+  Filesystem: ext4
+  Mount options: rw,noatime,nodiratime
+  Unused local NVMe: /dev/nvme2n1
+
+Client VM:
+  Azure size: Standard_D4as_v4
+  CPU: 4 vCPU
+
+Server code:
+  ferricstore commit: 037f2bbd Add Flow signal and hot path optimizations
+
+Python SDK/bench code:
+  ferricstore-python commit: 3133f2a Add optimized async Flow SDK and benchmarks
+
+Server env:
+  MIX_ENV=prod
+  FERRICSTORE_PORT=6379
+  FERRICSTORE_DATA_DIR=/data/ferricstore
+  FERRICSTORE_SHARD_COUNT=16
+  FERRICSTORE_PROTECTED_MODE=false
+  FERRICSTORE_BUILD=1
+  ERL_FLAGS="+sbt db +sbwt very_short +swt very_low +K true +A 128 +P 5000000 +Q 65536 +MHas aoffcbf +MBas aoffcbf"
+
+Flow due_any index:
+  disabled by default in server compile config
+```
+
+All Azure Flow runs used:
+
+```text
+url: redis://10.0.1.5:6379/0
+shape: live
+flows: 1000000
+workers: 16
+producers: 8
+partitions: 1024
+partition_mode: auto
+server_shards: 16
+claim_batch_size: 1000
+claim_partition_batch_size: 16
+create_batch_size: 1000
+worker_mode: owner-wakeup
+wake_coalesce_ms: 0
+payload_bytes: 0
+result_bytes: 0
+```
+
+Completed Azure sync queue run:
+
+```bash
+python examples/run_optimized_flow_benchmarks.py \
+  --url redis://10.0.1.5:6379/0 \
+  --runtime sync \
+  --which queue \
+  --flows 1000000 \
+  --server-shards 16
+```
+
+```text
+created: 1000000
+completed: 1000000
+claimed_items: 1000000
+claim_calls: 1039
+empty_claims: 15
+avg_claim_batch: 962.46
+max_claim_batch: 1000
+create_seconds: 62.935866
+process_seconds: 63.046595
+total_seconds: 63.073939
+create_flows_per_sec: 15889/s
+process_flows_per_sec: 15861/s
+end_to_end_flows_per_sec: 15854/s
+```
+
+Completed Azure sync workflow run:
+
+```bash
+python examples/run_optimized_flow_benchmarks.py \
+  --url redis://10.0.1.5:6379/0 \
+  --runtime sync \
+  --which workflow \
+  --flows 1000000 \
+  --server-shards 16
+```
+
+```text
+created: 1000000
+completed: 1000000
+claimed_actions: 1000000
+claim_calls: 1196
+empty_claims: 146
+avg_claim_batch: 836.12
+max_claim_batch: 1000
+create_seconds: 62.056558
+process_seconds: 62.449048
+total_seconds: 62.479110
+create_flows_per_sec: 16114/s
+workflow_completions_per_sec: 16013/s
+end_to_end_workflows_per_sec: 16005/s
+```
+
+Default Azure async profile result:
+
+```text
+queue default async:
+  create_inflight: 32
+  complete_inflight: 4
+  result: failed
+  error: write timeout; outcome unknown
+
+workflow default async:
+  create_inflight: 32
+  apply_inflight: 4
+  result: failed
+  error: write timeout; outcome unknown
+```
+
+This is a saturation/overload result, not a throughput number. During the
+monitored overload run, the server BEAM process hit roughly 398% CPU on the
+4-vCPU server. Client CPU, client memory, and network utilization were not the
+bottleneck. The data disk also showed write-utilization and await spikes during
+the overload window.
+
+Completed Azure throttled async queue run:
+
+```bash
+python examples/run_optimized_flow_benchmarks.py \
+  --url redis://10.0.1.5:6379/0 \
+  --runtime async \
+  --which queue \
+  --flows 1000000 \
+  --server-shards 16 \
+  --async-create-inflight 8 \
+  --complete-async-depth 2
+```
+
+```text
+created: 1000000
+completed: 1000000
+claimed_items: 1000000
+claim_calls: 1053
+empty_claims: 29
+empty_claim_ratio: 0.027540
+avg_claim_batch: 949.67
+max_claim_batch: 1000
+create_seconds: 38.558406
+process_seconds: 70.396745
+total_seconds: 70.396748
+create_flows_per_sec: 25935/s
+process_flows_per_sec: 14205/s
+end_to_end_flows_per_sec: 14205/s
+```
+
+Completed Azure throttled async workflow run:
+
+```bash
+python examples/run_optimized_flow_benchmarks.py \
+  --url redis://10.0.1.5:6379/0 \
+  --runtime async \
+  --which workflow \
+  --flows 1000000 \
+  --server-shards 16 \
+  --async-create-inflight 8 \
+  --workflow-apply-async-depth 2
+```
+
+```text
+created: 1000000
+completed: 1000000
+claimed_actions: 1000000
+claim_calls: 3376
+empty_claims: 2352
+empty_claim_ratio: 0.696682
+avg_claim_batch: 296.21
+max_claim_batch: 1000
+create_seconds: 37.750147
+process_seconds: 70.350906
+total_seconds: 70.350908
+create_flows_per_sec: 26490/s
+workflow_completions_per_sec: 14214/s
+end_to_end_workflows_per_sec: 14214/s
+```
+
+Azure interpretation:
+
+```text
+The completed sync runs are the valid 1M-flow apple-to-apple numbers for the
+default optimized wrapper profile on this 4-vCPU server.
+
+The default async profile can overdrive this 4-vCPU server and fail with
+write-timeout backpressure. Use the throttled async numbers only when comparing
+the lower-inflight async profile, not as an apple-to-apple default async result.
+
+The Azure service config matches the current Terraform cloud-init server tuning
+used for Redis/memtier-style testing: same data dir, shard count, Erlang flags,
+Raft path, and NVMe /data mount. It does not match the older README example that
+shows FERRICSTORE_SHARD_COUNT=8 and a shorter ERL_FLAGS value.
+```
+
+Azure shard-count sweep on the same 4-vCPU server:
+
+```text
+3 shards:
+  queue e2e:    12797/s
+  workflow e2e: 12787/s
+
+4 shards:
+  queue e2e:    14320/s
+  workflow e2e: 14807/s
+
+16 shards:
+  queue e2e:    15854/s
+  workflow e2e: 16005/s
+```
+
+The best completed 4-vCPU Azure result so far is `16` shards with the sync
+wrapper. The default async wrapper was also tested at 16 shards, but it
+overdrove the 4-vCPU server and failed with `write timeout; outcome unknown`.
+The completed throttled async profile reached about `14205/s` queue e2e and
+`14214/s` workflow e2e, with create throughput around `26k/s` but process
+throughput capped around `14.2k/s`.
+
+Azure 8-vCPU server results on May 20, 2026:
+
+```text
+Server VM:
+  Azure size: Standard_L8as_v4
+  CPU: 8 vCPU
+  Data disk used: /dev/nvme1n1 mounted at /data
+  Data disk model: Microsoft NVMe Direct Disk v2
+  Filesystem: ext4
+  Mount options: rw,noatime,nodiratime
+  Other local NVMe devices available but unused: /dev/nvme2n1, /dev/nvme3n1, /dev/nvme4n1
+
+Client VM:
+  Azure size: Standard_D2as_v4
+  CPU: 2 vCPU
+  Note: the original 4-vCPU client plus 8-vCPU server shape requires 12 regional
+  cores, but the Azure regional quota was 10. The client was not the bottleneck
+  in the 4-vCPU-server runs, so the client was reduced to 2 vCPU to fit quota.
+
+Server env:
+  MIX_ENV=prod
+  FERRICSTORE_PORT=6379
+  FERRICSTORE_DATA_DIR=/data/ferricstore
+  FERRICSTORE_SHARD_COUNT=16
+  FERRICSTORE_PROTECTED_MODE=false
+  FERRICSTORE_BUILD=1
+  ERL_FLAGS="+sbt db +sbwt very_short +swt very_low +K true +A 128 +P 5000000 +Q 65536 +MHas aoffcbf +MBas aoffcbf"
+```
+
+Completed Azure 8-vCPU sync queue run:
+
+```text
+created: 1000000
+completed: 1000000
+claimed_items: 1000000
+claim_calls: 1024
+empty_claims: 0
+avg_claim_batch: 976.56
+max_claim_batch: 1000
+create_seconds: 33.095759
+process_seconds: 33.185270
+total_seconds: 33.207910
+create_flows_per_sec: 30215/s
+process_flows_per_sec: 30134/s
+end_to_end_flows_per_sec: 30113/s
+```
+
+Completed Azure 8-vCPU sync workflow run:
+
+```text
+created: 1000000
+completed: 1000000
+claimed_actions: 1000000
+claim_calls: 1077
+empty_claims: 53
+avg_claim_batch: 928.51
+max_claim_batch: 1000
+create_seconds: 33.977231
+process_seconds: 36.109253
+total_seconds: 36.135159
+create_flows_per_sec: 29431/s
+workflow_completions_per_sec: 27694/s
+end_to_end_workflows_per_sec: 27674/s
+```
+
+Completed Azure 8-vCPU default async queue run:
+
+```text
+create_inflight: 32
+complete_inflight: 4
+created: 1000000
+completed: 1000000
+claimed_items: 1000000
+claim_calls: 1110
+empty_claims: 86
+empty_claim_ratio: 0.077477
+avg_claim_batch: 900.90
+max_claim_batch: 1000
+create_seconds: 18.365799
+process_seconds: 41.872213
+total_seconds: 41.872215
+create_flows_per_sec: 54449/s
+process_flows_per_sec: 23882/s
+end_to_end_flows_per_sec: 23882/s
+```
+
+Completed Azure 8-vCPU default async workflow run:
+
+```text
+create_inflight: 32
+apply_inflight: 4
+created: 1000000
+completed: 1000000
+claimed_actions: 1000000
+claim_calls: 2599
+empty_claims: 1575
+empty_claim_ratio: 0.606002
+avg_claim_batch: 384.76
+max_claim_batch: 1000
+create_seconds: 17.548224
+process_seconds: 40.466861
+total_seconds: 40.466864
+create_flows_per_sec: 56986/s
+workflow_completions_per_sec: 24712/s
+end_to_end_workflows_per_sec: 24712/s
+```
+
+Azure 4-vCPU vs 8-vCPU summary:
+
+```text
+4-vCPU server, 16 shards:
+  sync queue e2e:       15854/s
+  sync workflow e2e:    16005/s
+  default async queue:  failed with write timeout
+  default async workflow: failed with write timeout
+
+8-vCPU server, 16 shards:
+  sync queue e2e:       30113/s
+  sync workflow e2e:    27674/s
+  async queue e2e:      23882/s
+  async workflow e2e:   24712/s
+```
+
+On this Azure shape, the sync wrapper gives the best completed end-to-end
+numbers. Default async now completes on the 8-vCPU server, but it overproduces
+creates and makes the process side the limiting phase.
+
+Azure 16-vCPU server results on May 20, 2026:
+
+```text
+Server VM:
+  Azure size: Standard_L16as_v4
+  CPU: 16 vCPU
+  Data disk used: /dev/nvme3n1 mounted at /data
+  Data disk model: Microsoft NVMe Direct Disk v2
+  Filesystem: ext4
+  Mount options: rw,noatime,nodiratime
+  Other local NVMe devices available but unused: /dev/nvme1n1, /dev/nvme2n1, /dev/nvme4n1
+
+Client VM:
+  Azure size: Standard_D2as_v4
+  CPU: 2 vCPU
+
+Server env:
+  MIX_ENV=prod
+  FERRICSTORE_PORT=6379
+  FERRICSTORE_DATA_DIR=/data/ferricstore
+  FERRICSTORE_SHARD_COUNT=16
+  FERRICSTORE_PROTECTED_MODE=false
+  FERRICSTORE_BUILD=1
+  ERL_FLAGS="+sbt db +sbwt very_short +swt very_low +K true +A 128 +P 5000000 +Q 65536 +MHas aoffcbf +MBas aoffcbf"
+```
+
+Completed Azure 16-vCPU sync queue run:
+
+```text
+created: 1000000
+completed: 1000000
+claimed_items: 1000000
+claim_calls: 1024
+empty_claims: 0
+avg_claim_batch: 976.56
+max_claim_batch: 1000
+create_seconds: 21.183025
+process_seconds: 21.267518
+total_seconds: 21.292836
+create_flows_per_sec: 47208/s
+process_flows_per_sec: 47020/s
+end_to_end_flows_per_sec: 46964/s
+```
+
+Completed Azure 16-vCPU sync workflow run:
+
+```text
+created: 1000000
+completed: 1000000
+claimed_actions: 1000000
+claim_calls: 1167
+empty_claims: 135
+avg_claim_batch: 856.90
+max_claim_batch: 1000
+create_seconds: 21.811884
+process_seconds: 22.010885
+total_seconds: 22.038564
+create_flows_per_sec: 45847/s
+workflow_completions_per_sec: 45432/s
+end_to_end_workflows_per_sec: 45375/s
+```
+
+Completed Azure 16-vCPU default async queue run:
+
+```text
+create_inflight: 32
+complete_inflight: 4
+created: 1000000
+completed: 1000000
+claimed_items: 1000000
+claim_calls: 1054
+empty_claims: 30
+empty_claim_ratio: 0.028463
+avg_claim_batch: 948.77
+max_claim_batch: 1000
+create_seconds: 11.508486
+process_seconds: 24.312494
+total_seconds: 24.312496
+create_flows_per_sec: 86892/s
+process_flows_per_sec: 41131/s
+end_to_end_flows_per_sec: 41131/s
+```
+
+Completed Azure 16-vCPU default async workflow run:
+
+```text
+create_inflight: 32
+apply_inflight: 4
+created: 1000000
+completed: 1000000
+claimed_actions: 1000000
+claim_calls: 3055
+empty_claims: 2031
+empty_claim_ratio: 0.664812
+avg_claim_batch: 327.33
+max_claim_batch: 1000
+create_seconds: 11.049294
+process_seconds: 24.318434
+total_seconds: 24.318437
+create_flows_per_sec: 90504/s
+workflow_completions_per_sec: 41121/s
+end_to_end_workflows_per_sec: 41121/s
+```
+
+Azure 4-vCPU vs 8-vCPU vs 16-vCPU summary:
+
+```text
+4-vCPU server, 16 shards:
+  sync queue e2e:       15854/s
+  sync workflow e2e:    16005/s
+  default async queue:  failed with write timeout
+  default async workflow: failed with write timeout
+
+8-vCPU server, 16 shards:
+  sync queue e2e:       30113/s
+  sync workflow e2e:    27674/s
+  async queue e2e:      23882/s
+  async workflow e2e:   24712/s
+
+16-vCPU server, 16 shards:
+  sync queue e2e:       46964/s
+  sync workflow e2e:    45375/s
+  async queue e2e:      41131/s
+  async workflow e2e:   41121/s
+```
+
+The 16-vCPU server continues to scale the sync wrapper, but not linearly from
+8 vCPU. With the current 16-shard setting, the next useful sweep is likely
+`24` or `32` server shards on the 16-vCPU server, plus an async process-side
+tuning pass to reduce workflow empty claims.
+
+Azure 16-vCPU server shard-count sweep:
+
+```text
+16 shards:
+  sync queue e2e:       46964/s
+  sync workflow e2e:    45375/s
+
+24 shards:
+  sync queue e2e:       51644/s
+  sync workflow e2e:    51977/s
+
+32 shards:
+  sync queue e2e:       53790/s
+  sync workflow e2e:    54060/s
+
+48 shards:
+  sync queue e2e:       54287/s
+  sync workflow e2e:    53736/s
+```
+
+On this VM, `32` shards is the best balanced setting observed so far. `48`
+shards is slightly better for queue-only throughput, but worse for workflow.
+The next useful checks would be repeat runs at `32` and `48` to measure
+variance, then an async worker/claim tuning pass if we want async e2e to match
+or beat sync.
+
+Azure 16-vCPU server async shard-count sweep:
+
+```text
+16 shards:
+  async queue e2e:      41131/s
+  async workflow e2e:   41121/s
+  async queue create:   86892/s
+  async workflow create: 90504/s
+
+32 shards:
+  async queue e2e:      45608/s
+  async workflow e2e:   47888/s
+  async queue create:   95896/s
+  async workflow create: 97196/s
+
+48 shards:
+  async queue e2e:      43997/s
+  async workflow e2e:   45137/s
+  async queue create:   96219/s
+  async workflow create: 95195/s
+```
+
+Async also peaks at `32` shards in this sweep. It can create around
+`96k-97k/s`, but e2e remains process-side limited. Sync at `32` shards remains
+the best observed e2e result:
+
+```text
+32 shards sync queue e2e:      53790/s
+32 shards async queue e2e:     45608/s
+
+32 shards sync workflow e2e:   54060/s
+32 shards async workflow e2e:  47888/s
 ```
 
 Preloaded reference numbers isolate create and process phases. They are not the

@@ -67,7 +67,7 @@ class RetryPolicy:
 class ChildSpec:
     id: str
     type: str
-    payload: bytes = b""
+    payload: Any = None
     partition_key: str | None = None
     values: dict[str, Any] | None = None
     value_refs: dict[str, str] | None = None
@@ -108,6 +108,10 @@ class ClaimedItem:
             lease_token=_bytes(_get(value, "lease_token")),
             fencing_token=_int(_get(value, "fencing_token")),
             partition_key=_optional_str(_get(value, "partition_key")),
+            type=_str(_get(value, "type")),
+            state=_optional_str(_get(value, "state")) or "running",
+            run_state=_optional_str(_get(value, "run_state")),
+            payload=_get(value, "payload"),
         )
 
 
@@ -200,6 +204,9 @@ class FlowRecord:
     correlation_id: str | None = None
     value_refs: dict[str, Any] | None = None
     values: dict[str, Any] | None = None
+    value_sizes: dict[str, Any] | None = None
+    value_omitted: dict[str, Any] | None = None
+    value_missing: dict[str, Any] | None = None
     raw: dict[Any, Any] | None = None
 
     @classmethod
@@ -224,6 +231,9 @@ class FlowRecord:
             correlation_id=_optional_str(_get(value, "correlation_id")),
             value_refs=_str_key_map(_get(value, "value_refs")),
             values=values,
+            value_sizes=_str_key_map(_get(value, "value_sizes")),
+            value_omitted=_str_key_map(_get(value, "value_omitted")),
+            value_missing=_str_key_map(_get(value, "value_missing")),
             raw=value,
         )
 

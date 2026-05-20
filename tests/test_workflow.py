@@ -1,4 +1,7 @@
-from ferricstore import ChildSpec, Complete, FlowClient, Workflow, WorkflowContext, WorkflowWorker, complete, state, transition
+import pytest
+
+from ferricstore import ChildSpec, Complete, FlowClient, Worker, Workflow, WorkflowContext, WorkflowWorker, complete, fail, state, transition
+from ferricstore.types import FlowRecord
 
 
 class FakeRedis:
@@ -153,6 +156,15 @@ class BatchValueWorkflow(Workflow):
         return complete(values={"receipt": b"receipt"}, override_values=["receipt"])
 
 
+class PlainReturnWorkflow(Workflow):
+    type = "plain-return"
+    initial_state = "created"
+
+    @state("created", claim_payload=False, return_record=False)
+    def created(self, _job):
+        return b"plain-result"
+
+
 def test_workflow_create_uses_partition_by():
     redis = FakeRedis()
     workflow = OrderWorkflow(FlowClient(redis))
@@ -160,6 +172,15 @@ def test_workflow_create_uses_partition_by():
     workflow.create("f1", tenant_id="tenant", order_id="order", payload=b"p", now_ms=100)
 
     assert "tenant:order" in redis.calls[0]
+
+
+def test_workflow_create_allows_custom_initial_state():
+    redis = FakeRedis()
+    workflow = OrderWorkflow(FlowClient(redis))
+
+    workflow.create("f1", tenant_id="tenant", order_id="order", state="review", payload=b"p", now_ms=100)
+
+    assert redis.calls[0][redis.calls[0].index("STATE") + 1] == "review"
 
 
 def test_workflow_enqueue_uses_ack_only_create_with_partition_by():
@@ -251,6 +272,71 @@ def test_workflow_can_claim_compact_metadata_without_full_record():
     assert redis.calls[0][-2:] == ("RETURN", "JOBS_COMPACT")
     assert redis.calls[1][0] == "FLOW.TRANSITION_MANY"
     assert redis.calls[1][2:4] == ("running", "next")
+
+
+def test_workflow_context_value_many_preserves_present_none_values():
+    workflow = OrderWorkflow(FlowClient(FakeRedis()))
+    job = FlowRecord(
+        id="f1",
+        type="order",
+        state="created",
+        partition_key="tenant:order",
+        lease_token=b"lease",
+        fencing_token=1,
+        values={"optional": None},
+    )
+    ctx = workflow.context(job, "created")
+
+    assert ctx.value_many(["optional", "missing"]) == {"optional": None}
+
+
+def test_workflow_context_value_many_batches_value_refs():
+    class ValueRefRedis(FakeRedis):
+        def execute_command(self, *args):
+            self.calls.append(args)
+            if args[0] == "FLOW.VALUE.MGET":
+                return [b"one", b"two"]
+            return super().execute_command(*args)
+
+    redis = ValueRefRedis()
+    workflow = ValueWorkflow(FlowClient(redis))
+    job = FlowRecord(
+        id="f1",
+        type="value-order",
+        state="created",
+        partition_key="tenant:order",
+        value_refs={"a": {"ref": "ref-a"}, "b": {"ref": "ref-b"}},
+    )
+    ctx = WorkflowContext(workflow, job, "created")
+
+    assert ctx.value_many(["a", "b"], local_cache=True) == {"a": b"one", "b": b"two"}
+
+    mget_calls = [call for call in redis.calls if call[0] == "FLOW.VALUE.MGET"]
+    assert mget_calls == [("FLOW.VALUE.MGET", "ref-a", "ref-b", "MAX_BYTES", 1024)]
+
+
+def test_workflow_outcomes_propagate_priority_and_terminal_ttl_options():
+    redis = FakeRedis()
+    workflow = OrderWorkflow(FlowClient(redis))
+    job = FlowRecord(
+        id="f1",
+        type="order",
+        state="created",
+        partition_key="tenant:order",
+        lease_token=b"lease",
+        fencing_token=1,
+    )
+
+    workflow.apply(job, transition("next", priority=7), state_name="created")
+    workflow.apply(job, complete(result=b"done", ttl_ms=123), state_name="done")
+    workflow.apply(job, fail(error=b"bad", ttl_ms=456), state_name="done")
+
+    assert redis.calls[0][0] == "FLOW.TRANSITION"
+    assert redis.calls[0][redis.calls[0].index("PRIORITY") + 1] == 7
+    assert redis.calls[1][0] == "FLOW.COMPLETE"
+    assert redis.calls[1][redis.calls[1].index("TTL") + 1] == 123
+    assert redis.calls[2][0] == "FLOW.FAIL"
+    assert redis.calls[2][redis.calls[2].index("TTL") + 1] == 456
 
 
 def test_handle_claimed_batch_count_uses_many_without_materializing_results():
@@ -352,6 +438,16 @@ def test_workflow_worker_cycles_configured_states():
     assert redis.calls[1][second_state_idx + 1] == "done"
 
 
+def test_polling_worker_rejects_invalid_limit_and_empty_states():
+    workflow = OrderWorkflow(FlowClient(FakeRedis()))
+
+    with pytest.raises(ValueError, match="limit"):
+        Worker(workflow, worker="w1", limit=0)
+
+    with pytest.raises(ValueError, match="states"):
+        Worker(workflow, worker="w1", states=[])
+
+
 def test_workflow_worker_rotates_partition_keys():
     redis = FakeRedis()
     redis.claim_ids = []
@@ -372,6 +468,36 @@ def test_workflow_worker_rotates_partition_keys():
     second_partition_idx = redis.calls[1].index("PARTITION")
     assert redis.calls[0][first_partition_idx + 1] == "p1"
     assert redis.calls[1][second_partition_idx + 1] == "p2"
+
+
+def test_workflow_worker_cycles_all_state_partition_pairs():
+    redis = FakeRedis()
+    redis.claim_ids = []
+    workflow = OrderWorkflow(FlowClient(redis))
+    worker = WorkflowWorker(
+        workflow,
+        states=["created", "done"],
+        worker="w1",
+        partition_keys=["p1", "p2"],
+        claim_partition_batch_size=1,
+        apply_async_depth=0,
+    )
+
+    for _ in range(4):
+        worker.run_once()
+
+    pairs = []
+    for call in redis.calls:
+        state_idx = call.index("STATE")
+        partition_idx = call.index("PARTITION")
+        pairs.append((call[state_idx + 1], call[partition_idx + 1]))
+
+    assert pairs == [
+        ("created", "p1"),
+        ("created", "p2"),
+        ("done", "p1"),
+        ("done", "p2"),
+    ]
 
 
 def test_state_config_controls_claim_payload_and_mutation_return():
@@ -514,6 +640,21 @@ def test_workflow_batch_outcomes_forward_named_values_to_many_command():
     )
 
 
+def test_workflow_batch_plain_return_completes_with_result():
+    redis = FakeRedis()
+    redis.claim_state = b"running"
+    redis.claim_run_state = b"created"
+    redis.claim_ids = [b"f1", b"f2"]
+    workflow = PlainReturnWorkflow(FlowClient(redis))
+
+    results = workflow.run_batch_once("created", worker="w1", partition_key="tenant:order", limit=2)
+
+    assert len(results) == 2
+    complete_call = redis.calls[1]
+    assert complete_call[0] == "FLOW.COMPLETE_MANY"
+    assert complete_call[complete_call.index("RESULT") + 1] == b"plain-result"
+
+
 def test_workflow_worker_start_stop_join_tracks_stats():
     worker_ref = {}
 
@@ -542,4 +683,46 @@ def test_workflow_worker_start_stop_join_tracks_stats():
 
     assert stats.claimed == 1
     assert stats.applied == 1
+    assert worker.is_running is False
+
+
+def test_workflow_on_error_raise_propagates():
+    class RaisingWorkflow(Workflow):
+        type = "order"
+        initial_state = "created"
+
+        @state("created", on_error="raise", claim_payload=False, return_record=False)
+        def created(self, _job):
+            raise RuntimeError("boom")
+
+    redis = FakeRedis()
+    workflow = RaisingWorkflow(FlowClient(redis))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        workflow.run_once("created", worker="w1", partition_key="tenant:order")
+
+    assert len(redis.calls) == 1
+
+
+def test_workflow_worker_resets_running_after_loop_exception():
+    class RaisingWorkflow(Workflow):
+        type = "order"
+        initial_state = "created"
+
+        @state("created", on_error="raise", claim_payload=False, return_record=False)
+        def created(self, _job):
+            raise RuntimeError("boom")
+
+    worker = WorkflowWorker(
+        RaisingWorkflow(FlowClient(FakeRedis())),
+        state="created",
+        worker="w1",
+        partition_key="tenant:order",
+        idle_sleep_s=0,
+        apply_async_depth=0,
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        worker._run_loop()
+
     assert worker.is_running is False

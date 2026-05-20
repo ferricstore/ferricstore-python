@@ -19,9 +19,12 @@ from ferricstore.types import (
 class FakeRedis:
     def __init__(self):
         self.calls = []
+        self.responses = []
 
     def execute_command(self, *args):
         self.calls.append(args)
+        if self.responses:
+            return self.responses.pop(0)
         command = args[0]
         record = {
             b"id": b"f1",
@@ -73,6 +76,15 @@ class FakeRedis:
         return record
 
 
+class CloseRedis(FakeRedis):
+    def __init__(self):
+        super().__init__()
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
 class AckRedis(FakeRedis):
     def execute_command(self, *args):
         self.calls.append(args)
@@ -98,6 +110,25 @@ class PerItemAckRedis(FakeRedis):
             count = (len(args) - args.index("ITEMS") - 1) // width
             return [b"OK"] * count
         if command == "FLOW.CANCEL_MANY":
+            width = 3 if args[1] == "MIXED" else 2
+            count = (len(args) - args.index("ITEMS") - 1) // width
+            return [b"OK"] * count
+        return b"OK"
+
+
+class BlockingRedis(PerItemAckRedis):
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def execute_command(self, *args):
+        self.calls.append(args)
+        if args[0] == "FLOW.CREATE_MANY":
+            self.entered.set()
+            self.release.wait()
+            if "ITEMS_EXT" in args:
+                return [b"OK"] * int(args[args.index("ITEMS_EXT") + 1])
             width = 3 if args[1] == "MIXED" else 2
             count = (len(args) - args.index("ITEMS") - 1) // width
             return [b"OK"] * count
@@ -135,6 +166,22 @@ class ClaimThenAckRedis(FakeRedis):
             count = (len(args) - args.index("ITEMS") - 1) // width
             return [b"OK"] * count
         return b"OK"
+
+
+class CreateAckThenGetRedis(FakeRedis):
+    def execute_command(self, *args):
+        self.calls.append(args)
+        if args[0] == "FLOW.CREATE":
+            return b"OK"
+        if args[0] == "FLOW.GET":
+            return {
+                b"id": args[1].encode() if isinstance(args[1], str) else args[1],
+                b"type": b"order",
+                b"state": b"queued",
+                b"partition_key": args[args.index("PARTITION") + 1].encode(),
+                b"version": 1,
+            }
+        return super().execute_command(*args)
 
 
 def test_create_builds_flow_create_command():
@@ -185,6 +232,38 @@ def test_create_can_return_ack_without_followup_get():
 
     assert result == b"OK"
     assert len(redis.calls) == 1
+
+
+def test_create_honors_zero_now_ms():
+    redis = AckRedis()
+    client = FlowClient(redis)
+
+    client.create("f-zero", type="order", now_ms=0, return_record=False)
+
+    call = redis.calls[0]
+    assert call[call.index("NOW") + 1] == 0
+    assert call[call.index("RUN_AT") + 1] == 0
+
+
+def test_flow_client_close_forwards_to_executor():
+    redis = CloseRedis()
+    client = FlowClient(redis)
+
+    client.close()
+
+    assert redis.closed is True
+
+
+def test_create_ack_followup_get_uses_auto_partition_when_partition_omitted():
+    redis = CreateAckThenGetRedis()
+    client = FlowClient(redis)
+    expected_partition = f"__flow_auto__:{zlib.crc32(b'f-auto') % 256}"
+
+    record = client.create("f-auto", type="order", payload=b"hello", now_ms=100)
+
+    assert record.id == "f-auto"
+    assert redis.calls[1][:2] == ("FLOW.GET", "f-auto")
+    assert redis.calls[1][redis.calls[1].index("PARTITION") + 1] == expected_partition
 
 
 def test_create_can_attach_named_values_and_refs():
@@ -330,6 +409,24 @@ def test_enqueue_many_groups_no_partition_items_by_auto_bucket():
         ids = item_args[0::2]
         for id in ids:
             assert bucket == f"__flow_auto__:{zlib.crc32(id.encode()) % 256}"
+
+
+def test_direct_many_methods_noop_on_empty_inputs():
+    redis = PerItemAckRedis()
+    client = FlowClient(redis)
+
+    assert client.create_many("tenant:1", [], type="order") == []
+    assert client.complete_many("tenant:1", []) == []
+    assert client.transition_many(
+        "tenant:1",
+        from_state="running",
+        to_state="next",
+        items=[],
+    ) == []
+    assert client.retry_many("tenant:1", []) == []
+    assert client.fail_many("tenant:1", []) == []
+    assert client.cancel_many("tenant:1", []) == []
+    assert redis.calls == []
 
 
 def test_autobatch_groups_no_partition_creates_by_auto_bucket():
@@ -603,6 +700,17 @@ def test_value_put_named_options_and_value_mget_decode_values():
     assert redis.calls[1] == ("FLOW.VALUE.MGET", "ref-a", "ref-b")
 
 
+def test_value_mget_normalizes_omission_metadata_recursively():
+    redis = FakeRedis()
+    client = FlowClient(redis)
+    redis.responses = [[{b"ref": b"ref-a", b"omitted": True, b"size": 123, b"nested": {b"k": b"v"}}]]
+
+    values = client.value_mget(["ref-a"], max_bytes=10)
+
+    assert values == [{"ref": "ref-a", "omitted": True, "size": 123, "nested": {"k": "v"}}]
+    assert redis.calls[-1] == ("FLOW.VALUE.MGET", "ref-a", "MAX_BYTES", 10)
+
+
 def test_get_can_request_selected_named_values():
     redis = FakeRedis()
     client = FlowClient(redis)
@@ -799,6 +907,23 @@ def test_claim_jobs_can_scan_multiple_partitions():
         0,
         "RETURN",
         "JOBS_COMPACT",
+    )
+
+
+def test_claim_jobs_only_sends_reclaim_expired_when_explicit():
+    redis = FakeRedis()
+    client = FlowClient(redis)
+
+    client.claim_jobs(
+        "order",
+        state="queued",
+        worker="worker-1",
+        partition_key="tenant:1",
+        reclaim_expired=False,
+    )
+
+    call = redis.calls[0]
+    assert call[call.index("RECLAIM_EXPIRED") : call.index("RECLAIM_EXPIRED") + 2] == (
         "RECLAIM_EXPIRED",
         "false",
     )
@@ -839,8 +964,6 @@ def test_claim_jobs_and_complete_jobs_hide_hot_path_options():
         0,
         "RETURN",
         "JOBS_COMPACT",
-        "RECLAIM_EXPIRED",
-        "false",
     )
     assert redis.calls[1] == (
         "FLOW.COMPLETE_MANY",
@@ -854,6 +977,62 @@ def test_claim_jobs_and_complete_jobs_hide_hot_path_options():
         b"lease",
         7,
     )
+
+
+def test_reclaim_exposes_claim_due_response_options_and_partitions():
+    redis = FakeRedis()
+    client = FlowClient(redis)
+
+    result = client.reclaim(
+        "order",
+        worker="worker-1",
+        partition_keys=["p1", "p2"],
+        priority=5,
+        limit=10,
+        now_ms=100,
+        job_only=True,
+        payload=False,
+        values=["order"],
+        value_max_bytes=128,
+    )
+
+    assert isinstance(result[0], ClaimedItem)
+    assert redis.calls[0] == (
+        "FLOW.RECLAIM",
+        "order",
+        "WORKER",
+        "worker-1",
+        "LEASE_MS",
+        30000,
+        "LIMIT",
+        10,
+        "NOW",
+        100,
+        "PARTITIONS",
+        2,
+        "p1",
+        "p2",
+        "PRIORITY",
+        5,
+        "RETURN",
+        "JOBS_COMPACT",
+        "PAYLOAD",
+        "false",
+        "VALUE",
+        "order",
+        "VALUE_MAX_BYTES",
+        128,
+    )
+
+
+def test_reclaim_rejects_non_running_state_alias():
+    redis = FakeRedis()
+    client = FlowClient(redis)
+
+    with pytest.raises(ValueError, match="FLOW.RECLAIM only supports running"):
+        client.reclaim("order", state="queued", worker="worker-1")
+
+    assert redis.calls == []
 
 
 def test_flow_worker_runs_hot_path_with_minimal_developer_code():
@@ -1051,6 +1230,47 @@ def test_create_many_mixed_builds_items():
     )
 
 
+def test_create_many_mixed_allows_auto_partition_items():
+    redis = FakeRedis()
+    client = FlowClient(redis)
+
+    client.create_many(
+        None,
+        [
+            CreateItem("f1", b"p1"),
+            CreateItem("f2", b"p2", partition_key="tenant:2"),
+        ],
+        type="order",
+        state="queued",
+        now_ms=100,
+    )
+
+    assert redis.calls[0] == (
+        "FLOW.CREATE_MANY",
+        "MIXED",
+        "TYPE",
+        "order",
+        "STATE",
+        "queued",
+        "NOW",
+        100,
+        "RUN_AT",
+        100,
+        "ITEMS_EXT",
+        2,
+        "f1",
+        "-",
+        b"p1",
+        0,
+        0,
+        "f2",
+        "tenant:2",
+        b"p2",
+        0,
+        0,
+    )
+
+
 def test_create_many_without_partition_uses_auto_wire_shape():
     redis = FakeRedis()
     client = FlowClient(redis)
@@ -1190,6 +1410,32 @@ def test_spawn_children_uses_extended_items_for_per_child_named_values():
     )
 
 
+def test_spawn_children_exposes_parent_guards_and_child_policies():
+    redis = FakeRedis()
+    client = FlowClient(redis)
+
+    client.spawn_children(
+        "parent-1",
+        [ChildSpec("c1", "email", b"p1")],
+        partition_key="parent-p",
+        group_id="g1",
+        from_state="running",
+        wait_state="waiting_children",
+        on_child_failed="ignore",
+        on_parent_closed="abandon_children",
+        success="done",
+        failure="failed",
+    )
+
+    call = redis.calls[0]
+    assert call[call.index("FROM_STATE") + 1] == "running"
+    assert call[call.index("WAIT_STATE") + 1] == "waiting_children"
+    assert call[call.index("ON_CHILD_FAILED") + 1] == "ignore"
+    assert call[call.index("ON_PARENT_CLOSED") + 1] == "abandon_children"
+    assert call[call.index("SUCCESS") + 1] == "done"
+    assert call[call.index("FAILURE") + 1] == "failed"
+
+
 def test_create_many_allows_ok_response():
     redis = AckRedis()
     client = FlowClient(redis)
@@ -1203,6 +1449,22 @@ def test_create_many_allows_ok_response():
     )
 
     assert result == b"OK"
+
+
+def test_many_commands_reject_items_from_different_explicit_partition():
+    redis = FakeRedis()
+    client = FlowClient(redis)
+
+    with pytest.raises(ValueError, match="partition_key"):
+        client.create_many("p1", [CreateItem("f1", b"p", partition_key="p2")], type="order")
+
+    with pytest.raises(ValueError, match="partition_key"):
+        client.complete_many("p1", [ClaimedItem("f1", b"lease", 3, partition_key="p2")])
+
+    with pytest.raises(ValueError, match="partition_key"):
+        client.cancel_many("p1", [FencedItem("f1", 3, partition_key="p2")])
+
+    assert redis.calls == []
 
 
 def test_many_commands_support_independent_option():
@@ -1278,6 +1540,27 @@ def test_autobatch_create_uses_create_many_independent_for_ack_calls():
     assert redis.calls[0][0] == "FLOW.CREATE_MANY"
     assert redis.calls[0][1] == "MIXED"
     assert "INDEPENDENT" in redis.calls[0]
+
+
+def test_autobatch_close_timeout_does_not_hang():
+    redis = BlockingRedis()
+    client = FlowClient(redis).autobatch(max_batch=10, max_delay_ms=0)
+
+    future = client.create_async(
+        "f1",
+        type="order",
+        payload=b"p",
+        partition_key="p1",
+        return_record=False,
+    )
+    assert redis.entered.wait(1)
+
+    with pytest.raises(TimeoutError):
+        client.close(timeout=0.01)
+
+    redis.release.set()
+    assert future.result(timeout=1) == b"OK"
+    client.close(timeout=1)
 
 
 def test_autobatch_complete_uses_complete_many_independent_for_ack_calls():
@@ -1711,6 +1994,30 @@ def test_command_pipeline_context_executes_on_success():
 
     assert pipe.results is not None
     assert redis.calls[-2:] == [("GET", "k"), ("HSET", "h", "f", "v")]
+
+
+def test_command_pipeline_maps_native_redis_pipeline_errors():
+    class ErrorPipe:
+        def execute_command(self, *args):
+            return self
+
+        def execute(self):
+            raise RuntimeError("ERR flow already exists")
+
+    class NativeRedis:
+        def pipeline(self, transaction=False):
+            return ErrorPipe()
+
+    class RedisExecutor:
+        client = NativeRedis()
+
+        def execute_command(self, *args):
+            return b"OK"
+
+    client = FlowClient(RedisExecutor())
+
+    with pytest.raises(FlowAlreadyExistsError):
+        client.pipeline().command("FLOW.CREATE", "f1").execute()
 
 
 def test_server_errors_are_typed():

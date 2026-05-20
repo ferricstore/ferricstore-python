@@ -58,9 +58,9 @@ class FlowReadyCoordinator:
 
     def __init__(self) -> None:
         self._condition = threading.Condition()
-        self._credits: dict[tuple[str, str, int | None, str], int] = {}
-        self._meta: dict[tuple[str, str, int | None, str], FlowReadySignal] = {}
-        self._queued: set[tuple[str, str, int | None, str]] = set()
+        self._credits: dict[tuple[str, str, int | None, str, int | None], int] = {}
+        self._meta: dict[tuple[str, str, int | None, str, int | None], FlowReadySignal] = {}
+        self._queued: set[tuple[str, str, int | None, str, int | None]] = set()
         self._ready = deque()
         self.notifications = 0
         self.notified_jobs = 0
@@ -69,7 +69,7 @@ class FlowReadyCoordinator:
         if signal.count <= 0:
             return
 
-        key = (signal.type, signal.state, signal.priority, signal.partition_key)
+        key = (signal.type, signal.state, signal.priority, signal.partition_key, signal.due_at_ms)
         with self._condition:
             self.notifications += 1
             self.notified_jobs += signal.count
@@ -89,6 +89,39 @@ class FlowReadyCoordinator:
     def total_credit(self) -> int:
         with self._condition:
             return sum(self._credits.values())
+
+    def matching_credit(
+        self,
+        *,
+        type: str,
+        state: str | None,
+        states: Sequence[str] | None,
+        priority: int | None,
+        partition_keys: Sequence[str] | None,
+    ) -> int:
+        allowed_states = set(states) if states is not None else ({state} if state is not None else None)
+        allowed_partitions = set(partition_keys) if partition_keys is not None else None
+
+        with self._condition:
+            total = 0
+            for key in self._ready:
+                credit = self._credits.get(key, 0)
+                meta = self._meta.get(key)
+                if credit <= 0 or meta is None:
+                    continue
+                if not self._signal_due_ready(meta):
+                    continue
+                if self._ready_key_matches(
+                    key,
+                    meta,
+                    type=type,
+                    allowed_states=allowed_states,
+                    priority=priority,
+                    allowed_partitions=allowed_partitions,
+                    selected_shard=False,
+                ):
+                    total += credit
+            return total
 
     def next_ready(
         self,
@@ -122,7 +155,15 @@ class FlowReadyCoordinator:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise queue.Empty
-                self._condition.wait(remaining)
+                self._condition.wait(
+                    self._wait_until_next_due_locked(
+                        remaining,
+                        type=type,
+                        allowed_states=allowed_states,
+                        priority=priority,
+                        allowed_partitions=allowed_partitions,
+                    )
+                )
 
     def _select_ready_locked(
         self,
@@ -134,7 +175,7 @@ class FlowReadyCoordinator:
         max_partitions: int,
         max_credit: int,
     ) -> tuple[list[str], int]:
-        selected: list[tuple[str, str, int | None, str]] = []
+        selected: list[tuple[str, str, int | None, str, int | None]] = []
         selected_partitions: list[str] = []
         selected_credit = 0
         selected_shard: int | None | bool = False
@@ -159,6 +200,11 @@ class FlowReadyCoordinator:
                 allowed_partitions=allowed_partitions,
                 selected_shard=selected_shard,
             ):
+                self._queued.add(key)
+                self._ready.append(key)
+                continue
+
+            if not self._signal_due_ready(meta):
                 self._queued.add(key)
                 self._ready.append(key)
                 continue
@@ -189,9 +235,50 @@ class FlowReadyCoordinator:
 
         return selected_partitions, min(selected_credit, max_credit)
 
+    def _wait_until_next_due_locked(
+        self,
+        remaining: float,
+        *,
+        type: str,
+        allowed_states: set[str] | None,
+        priority: int | None,
+        allowed_partitions: set[str] | None,
+    ) -> float:
+        now_ms = int(time.time() * 1000)
+        next_due_ms: int | None = None
+
+        for key in self._ready:
+            meta = self._meta.get(key)
+            credit = self._credits.get(key, 0)
+            if credit <= 0 or meta is None:
+                continue
+            if not self._ready_key_matches(
+                key,
+                meta,
+                type=type,
+                allowed_states=allowed_states,
+                priority=priority,
+                allowed_partitions=allowed_partitions,
+                selected_shard=False,
+            ):
+                continue
+            if meta.due_at_ms is None or meta.due_at_ms <= now_ms:
+                return 0.0
+            if next_due_ms is None or meta.due_at_ms < next_due_ms:
+                next_due_ms = meta.due_at_ms
+
+        if next_due_ms is None:
+            return remaining
+
+        return min(remaining, max((next_due_ms - now_ms) / 1000.0, 0.0))
+
+    @staticmethod
+    def _signal_due_ready(meta: FlowReadySignal) -> bool:
+        return meta.due_at_ms is None or meta.due_at_ms <= int(time.time() * 1000)
+
     @staticmethod
     def _ready_key_matches(
-        key: tuple[str, str, int | None, str],
+        key: tuple[str, str, int | None, str, int | None],
         meta: FlowReadySignal,
         *,
         type: str,
@@ -200,7 +287,7 @@ class FlowReadyCoordinator:
         allowed_partitions: set[str] | None,
         selected_shard: int | None | bool,
     ) -> bool:
-        key_type, key_state, key_priority, key_partition = key
+        key_type, key_state, key_priority, key_partition, _key_due_at_ms = key
         if key_type != type:
             return False
         if allowed_states is not None and key_state not in allowed_states:
@@ -229,7 +316,7 @@ class QueueFlowWorker:
         batch_size: int = 100,
         lease_ms: int = 30_000,
         priority: int | None = 0,
-        reclaim_expired: bool | None = False,
+        reclaim_expired: bool | None = None,
         reclaim_ratio: int | None = None,
         claim_values: Sequence[str] | None = None,
         value_max_bytes: int | None = None,
@@ -406,21 +493,24 @@ class QueueFlowWorker:
     ) -> None:
         self._running = True
         idle_sleep_s = self.idle_sleep_s
-        while self._running:
-            result = (
-                self.run_batch_once(handler)
-                if batch_handler
-                else self.run_once(handler)
-            )
-            self._totals = self._merge_results(self._totals, result)
-            if result.claimed == 0:
-                time.sleep(idle_sleep_s)
-                idle_sleep_s = min(
-                    self.max_idle_sleep_s,
-                    max(idle_sleep_s * 2, self.idle_sleep_s),
+        try:
+            while self._running:
+                result = (
+                    self.run_batch_once(handler)
+                    if batch_handler
+                    else self.run_once(handler)
                 )
-            else:
-                idle_sleep_s = self.idle_sleep_s
+                self._totals = self._merge_results(self._totals, result)
+                if result.claimed == 0:
+                    time.sleep(idle_sleep_s)
+                    idle_sleep_s = min(
+                        self.max_idle_sleep_s,
+                        max(idle_sleep_s * 2, self.idle_sleep_s),
+                    )
+                else:
+                    idle_sleep_s = self.idle_sleep_s
+        finally:
+            self._running = False
 
     def stop(self) -> None:
         self._running = False
@@ -429,7 +519,8 @@ class QueueFlowWorker:
         self.stop()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join()
-        self.flush()
+        result = self.flush()
+        self._totals = self._merge_results(self._totals, result)
         if self._executor is not None:
             self._executor.shutdown(wait=True)
         if self._completion_executor is not None:
@@ -464,9 +555,6 @@ class QueueFlowWorker:
                     claim_credit,
                     batch_handler=batch_handler,
                 )
-
-            if self._wake_should_wait_for_signal():
-                return result
 
             self._wake_idle_rounds += 1
             if self._wake_idle_rounds < self.wake_fallback_after:
@@ -606,12 +694,15 @@ class QueueFlowWorker:
         next_ready = getattr(self.wake_source, "next_ready", None)
         if callable(next_ready):
             try:
+                wake_partition_keys = (
+                    [self.partition_key] if self.partition_key is not None else self.partition_keys
+                )
                 partition_keys, partition_credit = next_ready(
                     type=self.type,
                     state=self.state,
                     states=self.states,
                     priority=self.priority,
-                    partition_keys=self.partition_keys,
+                    partition_keys=wake_partition_keys,
                     timeout_s=self.idle_sleep_s,
                     max_partitions=self.claim_partition_batch_size,
                     max_credit=self.batch_size,
@@ -636,7 +727,7 @@ class QueueFlowWorker:
                             state=self.state,
                             states=self.states,
                             priority=self.priority,
-                            partition_keys=self.partition_keys,
+                            partition_keys=wake_partition_keys,
                             timeout_s=0,
                             max_partitions=remaining_partitions,
                             max_credit=remaining_credit,
@@ -711,6 +802,25 @@ class QueueFlowWorker:
         producers_done = self.wake_producers_done
         if producers_done is not None and not producers_done():
             return True
+
+        matching_credit = getattr(self.wake_source, "matching_credit", None)
+        if callable(matching_credit):
+            try:
+                wake_partition_keys = (
+                    [self.partition_key] if self.partition_key is not None else self.partition_keys
+                )
+                return (
+                    matching_credit(
+                        type=self.type,
+                        state=self.state,
+                        states=self.states,
+                        priority=self.priority,
+                        partition_keys=wake_partition_keys,
+                    )
+                    > 0
+                )
+            except Exception:
+                return False
 
         total_credit = getattr(self.wake_source, "total_credit", None)
         if callable(total_credit):
@@ -938,26 +1048,83 @@ class QueueFlowWorker:
             return 0, 0
 
         jobs = [job for job, _exc in failures]
-        message = str(failures[0][1])
-
         if self.on_error == "raise":
             raise failures[0][1]
+
+        grouped: dict[str, list[FlowJob]] = {}
+        for job, exc in failures:
+            grouped.setdefault(str(exc), []).append(job)
+
         if self.on_error == "fail":
-            client.fail_many(
+            for message, group_jobs in grouped.items():
+                client.fail_many(
+                    None,
+                    group_jobs,
+                    error=message,
+                    independent=self.complete_independent,
+                )
+            return 0, len(jobs)
+
+        for message, group_jobs in grouped.items():
+            client.retry_many(
                 None,
-                jobs,
+                group_jobs,
                 error=message,
                 independent=self.complete_independent,
             )
-            return 0, len(jobs)
-
-        client.retry_many(
-            None,
-            jobs,
-            error=message,
-            independent=self.complete_independent,
-        )
+        self._notify_retried_jobs(jobs)
         return len(jobs), 0
+
+    def _notify_retried_jobs(self, jobs: list[FlowJob]) -> None:
+        if self.wake_source is None or not jobs:
+            return
+
+        signals: list[FlowReadySignal] = []
+        for job in jobs:
+            partition_key = (
+                getattr(job, "partition_key", None)
+                or self.partition_key
+                or (self.partition_keys[0] if self.partition_keys else None)
+            )
+            if partition_key is None:
+                continue
+            for state in self._retry_wake_states(job):
+                signals.append(
+                    FlowReadySignal(
+                        type=self.type,
+                        state=state,
+                        partition_key=partition_key,
+                        priority=self.priority,
+                    )
+                )
+
+        if not signals:
+            return
+
+        notify_many = getattr(self.wake_source, "notify_many", None)
+        if callable(notify_many):
+            notify_many(signals)
+            return
+
+        notify = getattr(self.wake_source, "notify", None)
+        if callable(notify):
+            for signal in signals:
+                notify(signal)
+
+    def _retry_wake_states(self, job: FlowJob) -> list[str]:
+        run_state = getattr(job, "run_state", None)
+        if run_state:
+            return [run_state]
+
+        job_state = getattr(job, "state", None)
+        if job_state not in (None, "running"):
+            return [job_state]
+
+        if self.state is not None:
+            return [self.state]
+        if self.states:
+            return list(dict.fromkeys(self.states))
+        return ["queued"]
 
 
 class Worker:
@@ -979,9 +1146,14 @@ class Worker:
         reclaim_expired: bool | None = None,
         reclaim_ratio: int | None = None,
     ) -> None:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        if states == []:
+            raise ValueError("states must be non-empty")
+
         self.workflow = workflow
         self.worker = worker
-        self.states = states or list(workflow._states.keys())
+        self.states = list(workflow._states.keys()) if states is None else states
         self.partition_key = partition_key
         self.limit = limit
         self.idle_sleep_s = idle_sleep_s

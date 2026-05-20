@@ -166,10 +166,10 @@ FLOW.TRANSITION / FLOW.COMPLETE / FLOW.RETRY / FLOW.FAIL
 ## Handler outcomes
 
 ```python
-return transition("next_state", payload=b"new payload")
-return complete(result=b"ok")
+return transition("next_state", payload=b"new payload", priority=10)
+return complete(result=b"ok", ttl_ms=86_400_000)
 return retry(error=b"temporary", run_at_ms=next_attempt_ms)
-return fail(error=b"permanent")
+return fail(error=b"permanent", ttl_ms=86_400_000)
 ```
 
 Outcome helpers also support named value mutations:
@@ -216,6 +216,10 @@ If handler raises:
 | `fail` | SDK sends `FLOW.FAIL`. |
 
 Default is retry.
+
+`AsyncWorkflow` has the same error policy surface. Set a workflow default with
+`AsyncWorkflow(..., on_error="fail")` or override one state with
+`@workflow.on("state", on_error="retry")`.
 
 ## Performance switches
 

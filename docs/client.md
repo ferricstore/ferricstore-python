@@ -15,7 +15,7 @@ client = FlowClient.from_url("redis://127.0.0.1:6379/0")
 | Area | Methods |
 | --- | --- |
 | Create | `create`, `create_many` |
-| Value refs | `value_put` |
+| Value refs | `value_put`, `value_mget` |
 | Claim/lease | `claim_due`, `reclaim`, `extend_lease` |
 | Mutate | `transition`, `transition_many`, `complete`, `complete_many`, `retry`, `retry_many`, `fail`, `fail_many`, `cancel`, `cancel_many`, `rewind` |
 | Children | `spawn_children` |
@@ -96,9 +96,9 @@ records = client.create_many(
 Same-partition batches are atomic as one shard group. Mixed batches are grouped by
 shard; each shard group is atomic.
 
-Batch commands may return either RESP3 maps or `OK`, depending on the server
-command. The SDK decodes list-of-map responses into `FlowRecord` values and
-passes `OK` through unchanged.
+Batch commands normally return `OK`. With `independent=True`, the server returns
+per-item outcomes such as `OK` or an error for each item; the SDK preserves that
+shape so callers can see which items succeeded.
 
 ## `value_put`
 
@@ -106,6 +106,21 @@ Stores a reusable value and returns server metadata/reference.
 
 ```python
 ref = client.value_put(b"large payload", partition_key="tenant-a", owner_flow_id="flow-1")
+```
+
+Named values are unique per owner flow and name. Use `override=True` when an
+idempotent writer intentionally replaces the existing value.
+
+```python
+ref = client.value_put(
+    b"fraud-report",
+    partition_key="tenant-a",
+    owner_flow_id="flow-1",
+    name="fraud_report",
+    override=False,
+)
+
+values = client.value_mget([ref["ref"]], max_bytes=64 * 1024)
 ```
 
 ## `claim_due`
@@ -134,6 +149,10 @@ Claims expired leases, typically for recovery workers.
 jobs = client.reclaim("order", worker="reaper-1", limit=100)
 ```
 
+`reclaim` supports the same partition and response controls as `claim_due`:
+`partition_key`, `partition_keys`, `priority`, `job_only`, `payload`,
+`payload_max_bytes`, `values`, and `value_max_bytes`.
+
 ## `extend_lease`
 
 Extends a running lease.
@@ -161,6 +180,7 @@ client.transition(
     fencing_token=job.fencing_token,
     partition_key=job.partition_key,
     payload=b"next payload",
+    priority=10,
 )
 ```
 
@@ -178,6 +198,7 @@ client.complete(
     fencing_token=job.fencing_token,
     partition_key=job.partition_key,
     result=b"ok",
+    ttl_ms=86_400_000,
 )
 ```
 
@@ -216,6 +237,32 @@ client.cancel_many(
     None,
     items=[FencedItem(job.id, job.fencing_token, partition_key=job.partition_key)],
     reason=b"user cancelled",
+)
+```
+
+## `spawn_children`
+
+Creates child flows and optionally moves the parent into a wait state.
+
+```python
+from ferricstore import ChildSpec
+
+client.spawn_children(
+    parent.id,
+    [
+        ChildSpec("child-1", type="order.child", payload=b"one"),
+        ChildSpec("child-2", type="order.child", payload=b"two"),
+    ],
+    partition_key=parent.partition_key,
+    lease_token=parent.lease_token,
+    fencing_token=parent.fencing_token,
+    wait="all",
+    wait_state="waiting_children",
+    success="children_done",
+    failure="child_failed",
+    from_state=parent.state,
+    on_child_failed="fail_parent",
+    on_parent_closed="cancel_children",
 )
 ```
 

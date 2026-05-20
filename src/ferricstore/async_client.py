@@ -33,6 +33,7 @@ from ferricstore.types import (
     KeyInfo,
     RateLimitResult,
     RetryPolicy,
+    _normalize_ref_meta,
 )
 
 
@@ -84,7 +85,13 @@ class AsyncCommandPipeline:
             pipe = pipeline_factory(transaction=False)
             for command in self.commands:
                 pipe.execute_command(*command)
-            self.results = list(await pipe.execute())
+            try:
+                self.results = list(await pipe.execute())
+            except Exception as exc:
+                mapped = map_exception(exc)
+                if mapped is exc:
+                    raise
+                raise mapped from exc
             return self.results
 
         self.results = [await self.client.command(*command) for command in self.commands]
@@ -254,7 +261,7 @@ class AsyncFlowClient:
         value_refs: dict[str, str] | None = None,
         return_record: bool = True,
     ) -> FlowRecord | bytes:
-        now_ms = now_ms or _now_ms()
+        now_ms = now_ms if now_ms is not None else _now_ms()
         args: list[Any] = ["FLOW.CREATE", id, "TYPE", type, "STATE", state, "NOW", now_ms]
         _append(args, "PARTITION", partition_key)
         _append_encoded(args, "PAYLOAD", self.codec, payload)
@@ -376,7 +383,14 @@ class AsyncFlowClient:
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
     ) -> list[FlowRecord] | Any:
-        now_ms = now_ms or _now_ms()
+        if not items:
+            return []
+
+        now_ms = now_ms if now_ms is not None else _now_ms()
+        if partition_key is not None:
+            for item in items:
+                if item.partition_key is not None and item.partition_key != partition_key:
+                    raise ValueError("create_many item partition_key does not match batch partition_key")
         mixed = partition_key is None and any(item.partition_key is not None for item in items)
         auto = partition_key is None and not mixed
         wire_partition = "MIXED" if mixed else "AUTO" if auto else partition_key
@@ -394,12 +408,14 @@ class AsyncFlowClient:
         _append(args, "PRIORITY", priority)
         _append_bool(args, "IDEMPOTENT", idempotent)
         _append_bool(args, "INDEPENDENT", independent)
-        if _has_named_item_values(items):
+        extended_items = _has_named_item_values(items) or (
+            mixed and any(item.partition_key is None for item in items)
+        )
+
+        if extended_items:
             args.extend(["ITEMS_EXT", len(items)])
             for item in items:
                 item_partition = item.partition_key if mixed else None
-                if mixed and item_partition is None:
-                    raise ValueError("mixed create_many items require partition_key")
                 item_values = _merge_named_map(values, item.values)
                 item_refs = _merge_named_map(value_refs, item.value_refs)
                 args.extend([item.id, item_partition or "-", self.codec.encode(item.payload)])
@@ -427,7 +443,7 @@ class AsyncFlowClient:
         ttl_ms: int | None = None,
         now_ms: int | None = None,
     ) -> Any:
-        args: list[Any] = ["FLOW.VALUE.PUT", self.codec.encode(value), "NOW", now_ms or _now_ms()]
+        args: list[Any] = ["FLOW.VALUE.PUT", self.codec.encode(value), "NOW", now_ms if now_ms is not None else _now_ms()]
         _append(args, "PARTITION", partition_key)
         _append(args, "OWNER_FLOW_ID", owner_flow_id)
         _append(args, "NAME", name)
@@ -435,11 +451,20 @@ class AsyncFlowClient:
         _append(args, "TTL", ttl_ms)
         return await self.executor.execute_command(*args)
 
-    async def value_mget(self, refs: list[str]) -> list[Any]:
+    async def value_mget(self, refs: list[str], *, max_bytes: int | None = None) -> list[Any]:
         if not refs:
             return []
-        response = await self.executor.execute_command("FLOW.VALUE.MGET", *refs)
-        return [self.codec.decode(value) for value in response]
+        args: list[Any] = ["FLOW.VALUE.MGET", *refs]
+        _append(args, "MAX_BYTES", max_bytes)
+        response = await self.executor.execute_command(*args)
+        return [
+            _normalize_ref_meta(value)
+            if isinstance(value, dict)
+            else value
+            if value is None
+            else self.codec.decode(value)
+            for value in response
+        ]
 
     async def signal(
         self,
@@ -468,7 +493,7 @@ class AsyncFlowClient:
             _append(args, "IF_STATE", if_state)
         _append(args, "TRANSITION_TO", transition_to)
         _append(args, "RUN_AT", run_at_ms)
-        _append(args, "NOW", now_ms or _now_ms())
+        _append(args, "NOW", now_ms if now_ms is not None else _now_ms())
         _append(args, "PRIORITY", priority)
         _append_named_values(
             args,
@@ -525,7 +550,7 @@ class AsyncFlowClient:
                 "LIMIT",
                 limit,
                 "NOW",
-                now_ms or _now_ms(),
+                now_ms if now_ms is not None else _now_ms(),
             ]
         )
         if partition_key is not None and partition_keys is not None:
@@ -561,7 +586,7 @@ class AsyncFlowClient:
         limit: int = 100,
         priority: int | None = 0,
         now_ms: int | None = None,
-        reclaim_expired: bool | None = False,
+        reclaim_expired: bool | None = None,
         reclaim_ratio: int | None = None,
     ) -> list[ClaimedItem]:
         return await self.claim_due(
@@ -584,18 +609,26 @@ class AsyncFlowClient:
         self,
         type: str,
         *,
-        state: str = "running",
+        state: str | None = None,
         worker: str,
         partition_key: str | None = None,
+        partition_keys: list[str] | None = None,
         lease_ms: int = 30_000,
         limit: int = 1,
+        priority: int | None = None,
         now_ms: int | None = None,
-    ) -> list[FlowRecord]:
+        job_only: bool = False,
+        payload: bool | None = None,
+        payload_max_bytes: int | None = None,
+        values: list[str] | None = None,
+        value_max_bytes: int | None = None,
+    ) -> list[FlowRecord] | list[ClaimedItem]:
+        if state not in (None, "running"):
+            raise ValueError("FLOW.RECLAIM only supports running state")
+
         args: list[Any] = [
             "FLOW.RECLAIM",
             type,
-            "STATE",
-            state,
             "WORKER",
             worker,
             "LEASE_MS",
@@ -603,10 +636,25 @@ class AsyncFlowClient:
             "LIMIT",
             limit,
             "NOW",
-            now_ms or _now_ms(),
+            now_ms if now_ms is not None else _now_ms(),
         ]
+        if partition_key is not None and partition_keys is not None:
+            raise ValueError("partition_key and partition_keys are mutually exclusive")
         _append(args, "PARTITION", partition_key)
-        return self._records(await self.executor.execute_command(*args))
+        if partition_keys is not None:
+            if not partition_keys:
+                raise ValueError("partition_keys must be non-empty")
+            args.extend(["PARTITIONS", len(partition_keys), *partition_keys])
+        _append(args, "PRIORITY", priority)
+        if job_only:
+            _append(args, "RETURN", "JOBS_COMPACT")
+        _append_bool(args, "PAYLOAD", payload)
+        _append(args, "PAYLOAD_MAX_BYTES", payload_max_bytes)
+        _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
+        response = await self.executor.execute_command(*args)
+        if job_only:
+            return [ClaimedItem.from_resp(value) for value in response]
+        return self._records(response)
 
     async def extend_lease(
         self,
@@ -627,7 +675,7 @@ class AsyncFlowClient:
             "LEASE_MS",
             lease_ms,
             "NOW",
-            now_ms or _now_ms(),
+            now_ms if now_ms is not None else _now_ms(),
         ]
         _append(args, "PARTITION", partition_key)
         response = await self.executor.execute_command(*args)
@@ -652,7 +700,7 @@ class AsyncFlowClient:
         priority: int | None = None,
         return_record: bool = True,
     ) -> FlowRecord | bytes:
-        now_ms = now_ms or _now_ms()
+        now_ms = now_ms if now_ms is not None else _now_ms()
         args: list[Any] = [
             "FLOW.TRANSITION",
             id,
@@ -697,11 +745,14 @@ class AsyncFlowClient:
         now_ms: int | None = None,
         independent: bool | None = None,
     ) -> list[FlowRecord] | Any:
+        if not items:
+            return []
+
         args: list[Any] = ["FLOW.COMPLETE_MANY", "MIXED" if partition_key is None else partition_key]
         _append_encoded(args, "RESULT", self.codec, result)
         _append_encoded(args, "PAYLOAD", self.codec, payload)
         _append(args, "TTL", ttl_ms)
-        _append(args, "NOW", now_ms or _now_ms())
+        _append(args, "NOW", now_ms if now_ms is not None else _now_ms())
         _append_bool(args, "INDEPENDENT", independent)
         _append_named_values(
             args,
@@ -767,7 +818,7 @@ class AsyncFlowClient:
             "FENCING",
             fencing_token,
             "NOW",
-            now_ms or _now_ms(),
+            now_ms if now_ms is not None else _now_ms(),
         ]
         _append(args, "PARTITION", partition_key)
         _append_encoded(args, "RESULT", self.codec, result)
@@ -803,13 +854,16 @@ class AsyncFlowClient:
         priority: int | None = None,
         independent: bool | None = None,
     ) -> list[FlowRecord] | Any:
+        if not items:
+            return []
+
         mixed = partition_key is None
         wire_partition = "MIXED" if mixed else partition_key
         args: list[Any] = ["FLOW.TRANSITION_MANY", wire_partition, from_state, to_state]
         _append(args, "PAYLOAD", self.codec.encode(payload) if payload is not None else None)
         _append(args, "RUN_AT", run_at_ms)
         _append(args, "PRIORITY", priority)
-        _append(args, "NOW", now_ms or _now_ms())
+        _append(args, "NOW", now_ms if now_ms is not None else _now_ms())
         _append_bool(args, "INDEPENDENT", independent)
         _append_named_values(
             args,
@@ -852,7 +906,7 @@ class AsyncFlowClient:
             "FENCING",
             fencing_token,
             "NOW",
-            now_ms or _now_ms(),
+            now_ms if now_ms is not None else _now_ms(),
         ]
         _append(args, "PARTITION", partition_key)
         _append_encoded(args, "ERROR", self.codec, error)
@@ -886,11 +940,14 @@ class AsyncFlowClient:
         now_ms: int | None = None,
         independent: bool | None = None,
     ) -> list[FlowRecord] | Any:
+        if not items:
+            return []
+
         args: list[Any] = ["FLOW.RETRY_MANY", "MIXED" if partition_key is None else partition_key]
         _append(args, "ERROR", self.codec.encode(error) if error is not None else None)
         _append(args, "PAYLOAD", self.codec.encode(payload) if payload is not None else None)
         _append(args, "RUN_AT", run_at_ms)
-        _append(args, "NOW", now_ms or _now_ms())
+        _append(args, "NOW", now_ms if now_ms is not None else _now_ms())
         _append_bool(args, "INDEPENDENT", independent)
         _append_named_values(
             args,
@@ -927,7 +984,7 @@ class AsyncFlowClient:
             "FENCING",
             fencing_token,
             "NOW",
-            now_ms or _now_ms(),
+            now_ms if now_ms is not None else _now_ms(),
         ]
         _append(args, "PARTITION", partition_key)
         _append_encoded(args, "ERROR", self.codec, error)
@@ -961,11 +1018,14 @@ class AsyncFlowClient:
         now_ms: int | None = None,
         independent: bool | None = None,
     ) -> list[FlowRecord] | Any:
+        if not items:
+            return []
+
         args: list[Any] = ["FLOW.FAIL_MANY", "MIXED" if partition_key is None else partition_key]
         _append(args, "ERROR", self.codec.encode(error) if error is not None else None)
         _append(args, "PAYLOAD", self.codec.encode(payload) if payload is not None else None)
         _append(args, "TTL", ttl_ms)
-        _append(args, "NOW", now_ms or _now_ms())
+        _append(args, "NOW", now_ms if now_ms is not None else _now_ms())
         _append_bool(args, "INDEPENDENT", independent)
         _append_named_values(
             args,
@@ -994,7 +1054,7 @@ class AsyncFlowClient:
         now_ms: int | None = None,
         return_record: bool = True,
     ) -> FlowRecord | bytes:
-        args: list[Any] = ["FLOW.CANCEL", id, "FENCING", fencing_token, "NOW", now_ms or _now_ms()]
+        args: list[Any] = ["FLOW.CANCEL", id, "FENCING", fencing_token, "NOW", now_ms if now_ms is not None else _now_ms()]
         _append(args, "LEASE_TOKEN", lease_token)
         _append(args, "PARTITION", partition_key)
         _append(args, "REASON", self.codec.encode(reason) if reason is not None else None)
@@ -1026,10 +1086,13 @@ class AsyncFlowClient:
         now_ms: int | None = None,
         independent: bool | None = None,
     ) -> list[FlowRecord] | Any:
+        if not items:
+            return []
+
         args: list[Any] = ["FLOW.CANCEL_MANY", "MIXED" if partition_key is None else partition_key]
         _append(args, "REASON", self.codec.encode(reason) if reason is not None else None)
         _append(args, "TTL", ttl_ms)
-        _append(args, "NOW", now_ms or _now_ms())
+        _append(args, "NOW", now_ms if now_ms is not None else _now_ms())
         _append_bool(args, "INDEPENDENT", independent)
         _append_named_values(
             args,
@@ -1054,7 +1117,7 @@ class AsyncFlowClient:
         now_ms: int | None = None,
         return_record: bool = True,
     ) -> FlowRecord | bytes:
-        args: list[Any] = ["FLOW.REWIND", id, "TO_EVENT", to_event, "NOW", now_ms or _now_ms()]
+        args: list[Any] = ["FLOW.REWIND", id, "TO_EVENT", to_event, "NOW", now_ms if now_ms is not None else _now_ms()]
         _append(args, "PARTITION", partition_key)
         _append(args, "EXPECT_STATE", expect_state)
         _append(args, "RUN_AT", run_at_ms)
@@ -1239,6 +1302,9 @@ class AsyncFlowClient:
         wait_state: str | None = None,
         success: str | None = None,
         failure: str | None = None,
+        from_state: str | None = None,
+        on_child_failed: str | None = None,
+        on_parent_closed: str | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         now_ms: int | None = None,
@@ -1251,7 +1317,7 @@ class AsyncFlowClient:
             "WAIT",
             wait,
             "NOW",
-            now_ms or _now_ms(),
+            now_ms if now_ms is not None else _now_ms(),
         ]
         _append(args, "PARTITION", partition_key)
         _append(args, "LEASE_TOKEN", lease_token)
@@ -1259,6 +1325,9 @@ class AsyncFlowClient:
         _append(args, "WAIT_STATE", wait_state)
         _append(args, "SUCCESS", success)
         _append(args, "FAILURE", failure)
+        _append(args, "FROM_STATE", from_state)
+        _append(args, "ON_CHILD_FAILED", on_child_failed)
+        _append(args, "ON_PARENT_CLOSED", on_parent_closed)
         mixed = any(child.partition_key is not None for child in children)
         if _has_named_item_values(children):
             args.extend(["ITEMS_EXT", len(children)])
@@ -1267,7 +1336,7 @@ class AsyncFlowClient:
                     raise ValueError("mixed spawn_children items require partition_key")
                 child_values = _merge_named_map(values, child.values)
                 child_refs = _merge_named_map(value_refs, child.value_refs)
-                args.extend([child.id, child.partition_key or "-", child.type, child.payload])
+                args.extend([child.id, child.partition_key or "-", child.type, self.codec.encode(child.payload)])
                 _append_named_counts(args, self.codec, child_values, child_refs)
         else:
             _append_named_values(args, self.codec, values=values, value_refs=value_refs)
@@ -1278,9 +1347,9 @@ class AsyncFlowClient:
                 if mixed:
                     if child.partition_key is None:
                         raise ValueError("mixed spawn_children items require partition_key")
-                    args.extend([child.id, child.partition_key, child.type, child.payload])
+                    args.extend([child.id, child.partition_key, child.type, self.codec.encode(child.payload)])
                 else:
-                    args.extend([child.id, child.type, child.payload])
+                    args.extend([child.id, child.type, self.codec.encode(child.payload)])
         return await self.executor.execute_command(*args)
 
     async def install_policy(
@@ -1334,6 +1403,8 @@ class AsyncFlowClient:
                     raise ValueError(f"mixed {command} items require partition_key")
                 args.extend([item.id, item.partition_key, item.lease_token, item.fencing_token])
             else:
+                if item.partition_key is not None and item.partition_key != partition_key:
+                    raise ValueError(f"{command} item partition_key does not match batch partition_key")
                 args.extend([item.id, item.lease_token, item.fencing_token])
         return args
 
@@ -1357,6 +1428,8 @@ class AsyncFlowClient:
                 if include_lease:
                     args.append(lease)
             else:
+                if item.partition_key is not None and item.partition_key != partition_key:
+                    raise ValueError(f"{command} item partition_key does not match batch partition_key")
                 args.extend([item.id, item.fencing_token])
                 if include_lease:
                     args.append(lease)
@@ -1399,7 +1472,8 @@ class AsyncFlowClient:
     ) -> FlowRecord:
         if isinstance(value, dict):
             return self._record(value)
-        record = await self.get(id, partition_key=partition_key)
+        lookup_partition = _auto_partition_key_for_id(id) if partition_key is None else partition_key
+        record = await self.get(id, partition_key=lookup_partition)
         if record is None:
             raise RuntimeError(f"FLOW command succeeded but record {id!r} was not found")
         return record

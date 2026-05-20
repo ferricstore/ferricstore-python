@@ -48,14 +48,26 @@ def wait_for_port(url: str, timeout_s: float = 60.0) -> None:
     raise RuntimeError(f"server did not listen on {host}:{port}: {last_error}")
 
 
+def port_is_open(url: str) -> bool:
+    host, port = server_address(url)
+    try:
+        with socket.create_connection((host, port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
 def start_server(args: argparse.Namespace) -> tuple[subprocess.Popen, str, object]:
-    data_dir = tempfile.mkdtemp(prefix="ferricstore-flow-bench.")
-    log_path = Path(args.server_log)
-    log_file = log_path.open("ab")
     server_repo = Path(args.server_repo)
     host, port = server_address(args.url)
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError("--start-server only supports local benchmark URLs")
+    if port_is_open(args.url):
+        raise RuntimeError(f"--start-server refused to reuse already-listening server at {host}:{port}")
+
+    data_dir = tempfile.mkdtemp(prefix="ferricstore-flow-bench.")
+    log_path = Path(args.server_log)
+    log_file = log_path.open("ab")
 
     env = os.environ.copy()
     env.setdefault("FERRICSTORE_BUILD", "1")

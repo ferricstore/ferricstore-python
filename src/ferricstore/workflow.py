@@ -39,6 +39,7 @@ class Transition:
     to_state: str
     payload: Any = None
     run_at_ms: int | None = None
+    priority: int | None = None
     values: dict[str, Any] | None = None
     value_refs: dict[str, str] | None = None
     drop_values: list[str] | None = None
@@ -49,6 +50,7 @@ class Transition:
 class Complete:
     result: Any = None
     payload: Any = None
+    ttl_ms: int | None = None
     values: dict[str, Any] | None = None
     value_refs: dict[str, str] | None = None
     drop_values: list[str] | None = None
@@ -70,6 +72,7 @@ class Retry:
 class Fail:
     error: Any = None
     payload: Any = None
+    ttl_ms: int | None = None
     values: dict[str, Any] | None = None
     value_refs: dict[str, str] | None = None
     drop_values: list[str] | None = None
@@ -391,8 +394,8 @@ class WorkflowFlowCommands:
         kwargs.setdefault("owner_flow_id", self._ctx.id)
         return self.client.value_put(value, **kwargs)
 
-    def value_mget(self, refs: list[str]) -> list[Any]:
-        return self.client.value_mget(refs)
+    def value_mget(self, refs: list[str], *, max_bytes: int | None = None) -> list[Any]:
+        return self.client.value_mget(refs, max_bytes=max_bytes)
 
     def value(self, name: str, default: Any = None, *, local_cache: bool = False) -> Any:
         return self._ctx.value(name, default, local_cache=local_cache)
@@ -505,18 +508,54 @@ class WorkflowContext:
         if not ref:
             return default
 
-        values = self.client.value_mget([ref])
+        values = self.client.value_mget([ref], max_bytes=self._value_max_bytes())
         value = values[0] if values else default
         if local_cache and values:
             self._value_cache[name] = value
         return value
 
     def value_many(self, names: list[str], *, local_cache: bool = False) -> dict[str, Any]:
-        return {
-            name: value
-            for name in names
-            if (value := self.value(name, local_cache=local_cache)) is not None
-        }
+        values: dict[str, Any] = {}
+        pending_names: list[str] = []
+        pending_refs: list[str] = []
+
+        for name in names:
+            if local_cache and name in self._value_cache:
+                values[name] = self._value_cache[name]
+                continue
+
+            if name in self.values:
+                value = self.values[name]
+                values[name] = value
+                if local_cache:
+                    self._value_cache[name] = value
+                continue
+
+            meta = self.value_refs.get(name)
+            ref = None
+            if isinstance(meta, dict):
+                ref = meta.get("ref") or meta.get(b"ref")
+            elif isinstance(meta, str):
+                ref = meta
+            elif isinstance(meta, bytes):
+                ref = meta.decode()
+
+            if ref:
+                pending_names.append(name)
+                pending_refs.append(ref)
+
+        if pending_refs:
+            fetched = self.client.value_mget(pending_refs, max_bytes=self._value_max_bytes())
+            for name, value in zip(pending_names, fetched):
+                values[name] = value
+                if local_cache:
+                    self._value_cache[name] = value
+
+        return values
+
+    def _value_max_bytes(self) -> int | None:
+        config = self.workflow._states.get(self.state_name)
+        return None if config is None else config.value_max_bytes
 
     @property
     def lease_token(self) -> bytes:
@@ -552,6 +591,7 @@ def transition(
     *,
     payload: Any = None,
     run_at_ms: int | None = None,
+    priority: int | None = None,
     values: dict[str, Any] | None = None,
     value_refs: dict[str, str] | None = None,
     drop_values: list[str] | None = None,
@@ -561,6 +601,7 @@ def transition(
         to_state=to_state,
         payload=payload,
         run_at_ms=run_at_ms,
+        priority=priority,
         values=values,
         value_refs=value_refs,
         drop_values=drop_values,
@@ -572,6 +613,7 @@ def complete(
     *,
     result: Any = None,
     payload: Any = None,
+    ttl_ms: int | None = None,
     values: dict[str, Any] | None = None,
     value_refs: dict[str, str] | None = None,
     drop_values: list[str] | None = None,
@@ -580,6 +622,7 @@ def complete(
     return Complete(
         result=result,
         payload=payload,
+        ttl_ms=ttl_ms,
         values=values,
         value_refs=value_refs,
         drop_values=drop_values,
@@ -612,6 +655,7 @@ def fail(
     *,
     error: Any = None,
     payload: Any = None,
+    ttl_ms: int | None = None,
     values: dict[str, Any] | None = None,
     value_refs: dict[str, str] | None = None,
     drop_values: list[str] | None = None,
@@ -620,6 +664,7 @@ def fail(
     return Fail(
         error=error,
         payload=payload,
+        ttl_ms=ttl_ms,
         values=values,
         value_refs=value_refs,
         drop_values=drop_values,
@@ -639,6 +684,9 @@ def state(
     retry: RetryPolicy | None = None,
     return_record: bool = True,
 ) -> Callable[[Handler], Handler]:
+    if on_error not in {"retry", "fail", "raise"}:
+        raise ValueError("on_error must be 'retry', 'fail', or 'raise'")
+
     def decorate(fn: Handler) -> Handler:
         setattr(
             fn,
@@ -678,7 +726,7 @@ class Workflow:
         return self.client.create(
             id,
             type=self.type,
-            state=self.initial_state,
+            state=attrs.pop("state", self.initial_state),
             payload=payload,
             partition_key=partition_key,
             **attrs,
@@ -907,7 +955,7 @@ class Workflow:
         self,
         id: str,
         *,
-        payload: bytes = b"",
+        payload: Any = None,
         partition_key: str | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
@@ -1022,6 +1070,9 @@ class Workflow:
             "partition_key": job.partition_key,
             "return_record": self._states[logical_state].return_record,
         }
+        if not isinstance(outcome, (Transition, Complete, Retry, Fail)):
+            outcome = complete(result=outcome)
+
         if isinstance(outcome, Transition):
             return self.client.transition(
                 job.id,
@@ -1029,6 +1080,7 @@ class Workflow:
                 to_state=outcome.to_state,
                 payload=outcome.payload,
                 run_at_ms=outcome.run_at_ms,
+                priority=outcome.priority,
                 values=outcome.values,
                 value_refs=outcome.value_refs,
                 drop_values=outcome.drop_values,
@@ -1040,6 +1092,7 @@ class Workflow:
                 job.id,
                 result=outcome.result,
                 payload=outcome.payload,
+                ttl_ms=outcome.ttl_ms,
                 values=outcome.values,
                 value_refs=outcome.value_refs,
                 drop_values=outcome.drop_values,
@@ -1063,6 +1116,7 @@ class Workflow:
                 job.id,
                 error=outcome.error,
                 payload=outcome.payload,
+                ttl_ms=outcome.ttl_ms,
                 values=outcome.values,
                 value_refs=outcome.value_refs,
                 drop_values=outcome.drop_values,
@@ -1107,6 +1161,9 @@ class Workflow:
 
         partition_key = self._uniform_partition_key(jobs)
 
+        if not isinstance(outcome, (Transition, Complete, Retry, Fail)):
+            outcome = complete(result=outcome)
+
         if isinstance(outcome, Transition):
             from_state = self._uniform_current_state(jobs)
             if from_state is None:
@@ -1122,6 +1179,7 @@ class Workflow:
                 items=jobs,
                 payload=outcome.payload,
                 run_at_ms=outcome.run_at_ms,
+                priority=outcome.priority,
                 values=outcome.values,
                 value_refs=outcome.value_refs,
                 drop_values=outcome.drop_values,
@@ -1138,6 +1196,7 @@ class Workflow:
                 jobs,
                 result=outcome.result,
                 payload=outcome.payload,
+                ttl_ms=outcome.ttl_ms,
                 values=outcome.values,
                 value_refs=outcome.value_refs,
                 drop_values=outcome.drop_values,
@@ -1171,6 +1230,7 @@ class Workflow:
                 jobs,
                 error=outcome.error,
                 payload=outcome.payload,
+                ttl_ms=outcome.ttl_ms,
                 values=outcome.values,
                 value_refs=outcome.value_refs,
                 drop_values=outcome.drop_values,
@@ -1191,6 +1251,8 @@ class Workflow:
         state_name: str,
     ) -> Outcome:
         config = self._states[state_name]
+        if config.on_error == "raise":
+            raise exc
         if config.on_error == "fail":
             return Fail(error=str(exc))
         return Retry(error=str(exc))
@@ -1277,7 +1339,7 @@ class WorkflowWorker:
         states: Sequence[str] | None = None,
         batch_size: int = 1000,
         priority: int | None = 0,
-        reclaim_expired: bool | None = False,
+        reclaim_expired: bool | None = None,
         reclaim_ratio: int | None = None,
         partition_key: str | None = None,
         partition_keys: Sequence[str] | None = None,
@@ -1371,17 +1433,20 @@ class WorkflowWorker:
     def _run_loop(self) -> None:
         self._running = True
         idle_sleep_s = self.idle_sleep_s
-        while self._running:
-            result = self.run_once()
-            self._totals = self._merge_results(self._totals, result)
-            if result.claimed == 0:
-                time.sleep(idle_sleep_s)
-                idle_sleep_s = min(
-                    self.max_idle_sleep_s,
-                    max(idle_sleep_s * 2, self.idle_sleep_s),
-                )
-            else:
-                idle_sleep_s = self.idle_sleep_s
+        try:
+            while self._running:
+                result = self.run_once()
+                self._totals = self._merge_results(self._totals, result)
+                if result.claimed == 0:
+                    time.sleep(idle_sleep_s)
+                    idle_sleep_s = min(
+                        self.max_idle_sleep_s,
+                        max(idle_sleep_s * 2, self.idle_sleep_s),
+                    )
+                else:
+                    idle_sleep_s = self.idle_sleep_s
+        finally:
+            self._running = False
 
     def stop(self) -> None:
         self._running = False
@@ -1402,8 +1467,7 @@ class WorkflowWorker:
 
     def run_once(self) -> WorkflowWorkerResult:
         result = self._drain_pending_applies(block=False)
-        state_name = self._next_state()
-        partition_key, partition_keys = self._next_claim_partition()
+        state_name, partition_key, partition_keys = self._next_claim_target()
         jobs = self.workflow.claim_due(
             state_name,
             worker=self.worker,
@@ -1442,6 +1506,26 @@ class WorkflowWorker:
         state_name = self.states[self._state_cursor]
         self._state_cursor = (self._state_cursor + 1) % len(self.states)
         return state_name
+
+    def _next_claim_target(self) -> tuple[str, str | None, list[str] | None]:
+        if self.partition_key is not None:
+            return self._next_state(), self.partition_key, None
+        if not self.partition_keys:
+            return self._next_state(), None, None
+
+        state_name = self.states[self._state_cursor]
+        count = min(
+            self.claim_partition_batch_size,
+            len(self.partition_keys) - self._partition_cursor,
+        )
+        keys = self.partition_keys[self._partition_cursor : self._partition_cursor + count]
+        self._partition_cursor += count
+        if self._partition_cursor >= len(self.partition_keys):
+            self._partition_cursor = 0
+            self._state_cursor = (self._state_cursor + 1) % len(self.states)
+        if len(keys) == 1:
+            return state_name, keys[0], None
+        return state_name, None, keys
 
     def _next_claim_partition(self) -> tuple[str | None, list[str] | None]:
         if self.partition_key is not None:
