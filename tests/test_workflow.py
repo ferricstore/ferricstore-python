@@ -1,6 +1,24 @@
 import pytest
 
-from ferricstore import ChildSpec, Complete, FlowClient, Worker, Workflow, WorkflowContext, WorkflowWorker, complete, fail, state, transition
+from ferricstore import (
+    ChildSpec,
+    Complete,
+    ExceptionPolicy,
+    FlowClient,
+    FlowWorkflow,
+    RetryPolicy,
+    ValueConfig,
+    Worker,
+    WorkerConfig,
+    Workflow,
+    WorkflowClient,
+    WorkflowContext,
+    WorkflowWorker,
+    complete,
+    fail,
+    state,
+    transition,
+)
 from ferricstore.types import FlowRecord
 
 
@@ -10,6 +28,7 @@ class FakeRedis:
         self.claim_state = b"created"
         self.claim_run_state = None
         self.claim_ids = [b"f1"]
+        self.closed = False
 
     def execute_command(self, *args):
         self.calls.append(args)
@@ -37,6 +56,9 @@ class FakeRedis:
             b"state": b"next",
             b"partition_key": b"tenant:order",
         }
+
+    def close(self):
+        self.closed = True
 
 
 class OrderWorkflow(Workflow):
@@ -122,7 +144,9 @@ class ContextChildrenWorkflow(Workflow):
 
     @state("created", return_record=False)
     def created(self, ctx: WorkflowContext):
-        ctx.flow.spawn_children([ChildSpec(id="child-1", type="child", payload=b"payload")], wait_state="done")
+        ctx.flow.spawn_children(
+            [ChildSpec(id="child-1", type="child", payload=b"payload")], wait_state="done"
+        )
         return transition("waiting")
 
 
@@ -134,7 +158,13 @@ class ValueWorkflow(Workflow):
         super().__init__(client)
         self.seen_values = []
 
-    @state("created", claim_payload=False, claim_values=["order"], value_max_bytes=1024, return_record=False)
+    @state(
+        "created",
+        claim_payload=False,
+        claim_values=["order"],
+        value_max_bytes=1024,
+        return_record=False,
+    )
     def created(self, ctx: WorkflowContext):
         self.seen_values.append(ctx.value("order", local_cache=True))
         self.seen_values.append(ctx.value("order", local_cache=True))
@@ -178,7 +208,9 @@ def test_workflow_create_allows_custom_initial_state():
     redis = FakeRedis()
     workflow = OrderWorkflow(FlowClient(redis))
 
-    workflow.create("f1", tenant_id="tenant", order_id="order", state="review", payload=b"p", now_ms=100)
+    workflow.create(
+        "f1", tenant_id="tenant", order_id="order", state="review", payload=b"p", now_ms=100
+    )
 
     assert redis.calls[0][redis.calls[0].index("STATE") + 1] == "review"
 
@@ -272,6 +304,49 @@ def test_workflow_can_claim_compact_metadata_without_full_record():
     assert redis.calls[0][-2:] == ("RETURN", "JOBS_COMPACT")
     assert redis.calls[1][0] == "FLOW.TRANSITION_MANY"
     assert redis.calls[1][2:4] == ("running", "next")
+
+
+def test_blocking_workflow_worker_claims_all_states_with_compact_state_return():
+    class ClaimAnyRedis(FakeRedis):
+        def execute_command(self, *args):
+            self.calls.append(args)
+            if args[0] == "FLOW.CLAIM_DUE":
+                return [
+                    [b"f1", b"tenant:order", b"lease-1", 1, b"created"],
+                    [b"f2", b"tenant:order", b"lease-2", 2, b"done"],
+                ]
+            if args[0] in {"FLOW.TRANSITION_MANY", "FLOW.COMPLETE_MANY"}:
+                return [b"OK"]
+            return super().execute_command(*args)
+
+    class AnyStateWorkflow(Workflow):
+        type = "order"
+        initial_state = "created"
+
+        @state("created", claim_payload=False, claim_record=False, return_record=False)
+        def created(self, _job):
+            return transition("done")
+
+        @state("done", claim_payload=False, claim_record=False, return_record=False)
+        def done(self, _job):
+            return complete(result=b"ok")
+
+    redis = ClaimAnyRedis()
+    workflow = AnyStateWorkflow(FlowClient(redis))
+    worker = WorkflowWorker(workflow, batch_size=2, block_ms=5000, apply_async_depth=0)
+
+    result = worker.run_once()
+
+    assert result.claimed == 2
+    assert result.applied == 2
+    claim = redis.calls[0]
+    assert "STATE" not in claim
+    assert claim[claim.index("RETURN") : claim.index("RETURN") + 2] == (
+        "RETURN",
+        "JOBS_COMPACT_STATE",
+    )
+    assert redis.calls[1][0] == "FLOW.TRANSITION_MANY"
+    assert redis.calls[2][0] == "FLOW.COMPLETE_MANY"
 
 
 def test_workflow_context_value_many_preserves_present_none_values():
@@ -470,6 +545,31 @@ def test_workflow_worker_rotates_partition_keys():
     assert redis.calls[1][second_partition_idx + 1] == "p2"
 
 
+def test_workflow_worker_batches_partition_keys_by_default():
+    redis = FakeRedis()
+    redis.claim_ids = []
+    workflow = CompactWorkflow(FlowClient(redis))
+    worker = WorkflowWorker(
+        workflow,
+        state="created",
+        worker="w1",
+        partition_keys=["p1", "p2", "p3"],
+        apply_async_depth=0,
+    )
+
+    worker.run_once()
+
+    assert "PARTITION" not in redis.calls[0]
+    partitions_idx = redis.calls[0].index("PARTITIONS")
+    assert redis.calls[0][partitions_idx : partitions_idx + 5] == (
+        "PARTITIONS",
+        3,
+        "p1",
+        "p2",
+        "p3",
+    )
+
+
 def test_workflow_worker_cycles_all_state_partition_pairs():
     redis = FakeRedis()
     redis.claim_ids = []
@@ -508,7 +608,7 @@ def test_state_config_controls_claim_payload_and_mutation_return():
 
     assert len(results) == 1
     claim = redis.calls[0]
-    assert claim[:11] == (
+    assert claim[:10] == (
         "FLOW.CLAIM_DUE",
         "lean",
         "STATE",
@@ -519,9 +619,9 @@ def test_state_config_controls_claim_payload_and_mutation_return():
         30000,
         "LIMIT",
         1,
-        "NOW",
     )
-    assert claim[12:] == ("PARTITION", "tenant:order", "PRIORITY", 0, "PAYLOAD", "false")
+    assert "NOW" not in claim
+    assert claim[10:] == ("PARTITION", "tenant:order", "PRIORITY", 0, "PAYLOAD", "false")
     assert redis.calls[1][0] == "FLOW.TRANSITION"
     assert "PAYLOAD" not in redis.calls[1]
     assert len(redis.calls) == 2
@@ -726,3 +826,245 @@ def test_workflow_worker_resets_running_after_loop_exception():
         worker._run_loop()
 
     assert worker.is_running is False
+
+
+def test_state_defaults_to_ack_only_and_retry_exception_policy():
+    class DefaultWorkflow(Workflow):
+        type = "default"
+        initial_state = "created"
+
+        @state("created")
+        def created(self, job):
+            return transition("done")
+
+    workflow = DefaultWorkflow(FlowClient(FakeRedis()))
+    config = workflow._states["created"]
+
+    assert config.return_record is False
+    assert config.on_error == "retry"
+
+
+def test_state_accepts_exception_policy_enum():
+    class EnumPolicyWorkflow(Workflow):
+        type = "default"
+        initial_state = "created"
+
+        @state("created", exception_policy=ExceptionPolicy.RAISE)
+        def created(self, job):
+            return transition("done")
+
+    workflow = EnumPolicyWorkflow(FlowClient(FakeRedis()))
+
+    assert workflow._states["created"].on_error == "raise"
+
+
+def test_state_rejects_exception_policy_and_on_error_together():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+
+        class BadWorkflow(Workflow):
+            type = "bad"
+            initial_state = "created"
+
+            @state("created", exception_policy=ExceptionPolicy.RETRY, on_error="fail")
+            def created(self, job):
+                return transition("done")
+
+
+def test_flow_workflow_constructor_registers_state_handlers_and_partition_by():
+    redis = FakeRedis()
+    workflow = FlowWorkflow(
+        FlowClient(redis),
+        type="order",
+        initial_state="created",
+        partition_by=("tenant_id", "order_id"),
+    )
+
+    @workflow.state("created", exception_policy=ExceptionPolicy.FAIL)
+    def created(job):
+        return transition("done")
+
+    workflow.create("f1", tenant_id="tenant-a", order_id="order-1", payload=b"p", now_ms=100)
+
+    assert workflow._states["created"].on_error == "fail"
+    assert redis.calls[0][redis.calls[0].index("PARTITION") + 1] == "tenant-a:order-1"
+
+
+def test_flow_workflow_on_alias_registers_state_handler():
+    workflow = FlowWorkflow(FlowClient(FakeRedis()), type="order", initial_state="created")
+
+    @workflow.on("created")
+    def created(job):
+        return transition("done")
+
+    assert "created" in workflow._states
+    assert "created" in workflow._handlers
+
+
+def test_workflow_client_creates_workflow_and_delegates_flow_commands():
+    redis = FakeRedis()
+    client = WorkflowClient(FlowClient(redis))
+    workflow = client.workflow(
+        type="order",
+        initial_state="created",
+        partition_by=("tenant_id", "order_id"),
+    )
+
+    @workflow.state("created")
+    def created(job):
+        return transition("done")
+
+    workflow.start("f1", tenant_id="tenant-a", order_id="order-1", payload=b"p", now_ms=100)
+    client.command("PING")
+
+    assert redis.calls[0][0] == "FLOW.CREATE"
+    assert redis.calls[0][redis.calls[0].index("PARTITION") + 1] == "tenant-a:order-1"
+    assert redis.calls[1] == ("PING",)
+
+
+def test_workflow_client_retry_policy_is_inherited_and_state_can_override():
+    redis = FakeRedis()
+    default_policy = RetryPolicy(max_retries=5, backoff="exponential", base_ms=200)
+    state_policy = RetryPolicy(max_retries=2, backoff="fixed", base_ms=50)
+    client = WorkflowClient(FlowClient(redis), retry_policy=default_policy)
+    workflow = client.workflow(type="order", initial_state="created")
+
+    @workflow.state("created", retry_policy=state_policy)
+    def created(job):
+        return transition("done")
+
+    workflow.install_policy()
+
+    call = redis.calls[-1]
+    assert call[:2] == ("FLOW.POLICY.SET", "order")
+    assert "STATE" in call
+    assert "created" in call
+    assert default_policy.max_retries in call
+    assert state_policy.max_retries in call
+
+
+def test_state_rejects_retry_policy_and_retry_alias_together():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        state(
+            "created",
+            retry_policy=RetryPolicy(max_retries=1),
+            retry=RetryPolicy(max_retries=2),
+        )(lambda job: transition("done"))
+
+
+def test_workflow_client_worker_and_value_config_are_inherited_and_overridable():
+    client = WorkflowClient(
+        FlowClient(FakeRedis()),
+        worker_config=WorkerConfig(
+            batch_size=50,
+            idle_sleep_s=0.01,
+            apply_async_depth=0,
+            exception_policy=ExceptionPolicy.FAIL,
+        ),
+        value_config=ValueConfig(value_max_bytes=64_000, local_cache=True),
+    )
+    workflow = client.workflow(type="order", initial_state="created")
+
+    @workflow.state("created", claim_values=["order"])
+    def created(job):
+        return transition("done")
+
+    worker = workflow.worker(batch_size=10)
+
+    assert worker.batch_size == 10
+    assert worker.idle_sleep_s == 0.01
+    assert worker.apply_async_depth == 0
+    assert workflow._states["created"].on_error == "fail"
+    assert workflow._states["created"].value_max_bytes == 64_000
+    assert workflow.value_config.local_cache is True
+
+
+def test_workflow_client_from_url_creates_separate_claim_pool(monkeypatch):
+    calls = []
+
+    def from_url(url, **kwargs):
+        client = FlowClient(FakeRedis())
+        client.url = url
+        client.kwargs = kwargs
+        calls.append((url, kwargs, client))
+        return client
+
+    monkeypatch.setattr("ferricstore.workflow.FlowClient.from_url", staticmethod(from_url))
+
+    client = WorkflowClient.from_url(
+        "redis://example/0",
+        worker_config=WorkerConfig(workers=4),
+    )
+    workflow = client.workflow(type="order", initial_state="created")
+
+    @workflow.state("created")
+    def created(job):
+        return transition("done")
+
+    jobs = workflow.claim_due("created", worker="w1", block_ms=5000)
+
+    assert [(url, kwargs) for url, kwargs, _client in calls] == [
+        ("redis://example/0", {"max_connections": 4}),
+        ("redis://example/0", {"max_connections": 4}),
+    ]
+    assert jobs
+    assert workflow.client is client.flow
+    assert workflow.claim_client is client.claim_flow
+    assert client.flow.executor._executor.calls == []
+    assert client.claim_flow.executor._executor.calls[0][0] == "FLOW.CLAIM_DUE"
+
+
+def test_workflow_worker_config_at_workflow_time_resizes_claim_pool(monkeypatch):
+    calls = []
+
+    def from_url(url, **kwargs):
+        client = FlowClient(FakeRedis())
+        client.url = url
+        client.kwargs = kwargs
+        calls.append((url, kwargs, client))
+        return client
+
+    monkeypatch.setattr("ferricstore.workflow.FlowClient.from_url", staticmethod(from_url))
+
+    client = WorkflowClient.from_url("redis://example/0")
+    workflow = client.workflow(
+        type="order",
+        initial_state="created",
+        worker_config=WorkerConfig(workers=16),
+    )
+
+    assert calls[0][1]["max_connections"] == 2
+    assert calls[1][1]["max_connections"] == 1
+    assert calls[2][1]["max_connections"] == 16
+    assert workflow.client is client.flow
+    assert workflow.claim_client is calls[2][2]
+
+
+def test_workflow_client_close_does_not_close_externally_owned_clients():
+    flow_redis = FakeRedis()
+    claim_redis = FakeRedis()
+    client = WorkflowClient(
+        FlowClient(flow_redis),
+        claim_client=FlowClient(claim_redis),
+    )
+
+    client.close()
+
+    assert flow_redis.closed is False
+    assert claim_redis.closed is False
+
+
+def test_class_workflow_worker_config_exception_policy_is_inherited():
+    class ConfiguredWorkflow(Workflow):
+        type = "configured"
+        initial_state = "created"
+
+        @state("created")
+        def created(self, job):
+            return transition("done")
+
+    workflow = ConfiguredWorkflow(
+        FlowClient(FakeRedis()),
+        worker_config=WorkerConfig(exception_policy=ExceptionPolicy.FAIL),
+    )
+
+    assert workflow._states["created"].on_error == "fail"

@@ -1,7 +1,6 @@
 import argparse
 import asyncio
 import math
-import threading
 import time
 import uuid
 import zlib
@@ -10,7 +9,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from ferricstore import AsyncFlowClient, ClaimedItem, CreateItem
-
 
 FLOW_TYPE = "dbos_python_sdk_async_bench"
 QUEUE_STATE = "queued"
@@ -147,232 +145,6 @@ class AsyncCounters:
             return self.claimed >= self.flows
 
 
-class AsyncPartitionWakeCoordinator:
-    def __init__(self, workers: int, owner_fn=None) -> None:
-        self.workers = max(workers, 1)
-        self.owner_fn = owner_fn
-        self.queues = [asyncio.Queue() for _ in range(self.workers)]
-        self.pending = [set() for _ in range(self.workers)]
-        self.credits = [dict() for _ in range(self.workers)]
-        self.locks = [asyncio.Lock() for _ in range(self.workers)]
-        self.notifications = 0
-        self.notified_jobs = 0
-
-    def owner_for(self, partition_index: int) -> int:
-        if self.owner_fn is not None:
-            return self.owner_fn(partition_index) % self.workers
-        return partition_index % self.workers
-
-    async def notify_partition(self, partition_index: int, count: int = 1) -> None:
-        count = max(int(count), 0)
-        if count == 0:
-            return
-
-        owner = self.owner_for(partition_index)
-        should_queue = False
-        async with self.locks[owner]:
-            self.credits[owner][partition_index] = self.credits[owner].get(partition_index, 0) + count
-            self.notified_jobs += count
-            if partition_index not in self.pending[owner]:
-                self.pending[owner].add(partition_index)
-                self.notifications += 1
-                should_queue = True
-
-        if should_queue:
-            self.queues[owner].put_nowait(partition_index)
-
-    async def next_partitions(
-        self,
-        worker_index: int,
-        *,
-        timeout_s: float,
-        max_partitions: int,
-        max_credit: int,
-        same_group=None,
-    ) -> tuple[list[int], int]:
-        if max_partitions <= 0 or max_credit <= 0:
-            return [], 0
-
-        if timeout_s <= 0:
-            try:
-                partition_index = self.queues[worker_index].get_nowait()
-            except asyncio.QueueEmpty:
-                return [], 0
-        else:
-            try:
-                partition_index = await asyncio.wait_for(
-                    self.queues[worker_index].get(),
-                    timeout=timeout_s,
-                )
-            except asyncio.TimeoutError:
-                return [], 0
-
-        async with self.locks[worker_index]:
-            self.pending[worker_index].discard(partition_index)
-            credit = self.credits[worker_index].pop(partition_index, 0)
-
-        partitions = [partition_index]
-        total_credit = credit
-
-        while len(partitions) < max_partitions and total_credit < max_credit:
-            try:
-                partition_index = self.queues[worker_index].get_nowait()
-            except asyncio.QueueEmpty:
-                break
-
-            async with self.locks[worker_index]:
-                self.pending[worker_index].discard(partition_index)
-                credit = self.credits[worker_index].pop(partition_index, 0)
-
-            if credit <= 0:
-                continue
-            if same_group is not None and not same_group(partitions[0], partition_index):
-                await self.return_credit(worker_index, partition_index, credit)
-                break
-            partitions.append(partition_index)
-            total_credit += credit
-
-        return partitions, total_credit
-
-    async def return_credit(self, worker_index: int, partition_index: int, credit: int) -> None:
-        if credit <= 0:
-            return
-        should_queue = False
-        async with self.locks[worker_index]:
-            self.credits[worker_index][partition_index] = self.credits[worker_index].get(partition_index, 0) + credit
-            if partition_index not in self.pending[worker_index]:
-                self.pending[worker_index].add(partition_index)
-                should_queue = True
-        if should_queue:
-            self.queues[worker_index].put_nowait(partition_index)
-
-    async def total_credit(self) -> int:
-        total = 0
-        for worker_index in range(self.workers):
-            async with self.locks[worker_index]:
-                total += sum(self.credits[worker_index].values())
-        return total
-
-
-class CrossLoopPartitionWakeCoordinator:
-    def __init__(self, workers: int, loop: asyncio.AbstractEventLoop, owner_fn=None) -> None:
-        self.workers = max(workers, 1)
-        self.loop = loop
-        self.owner_fn = owner_fn
-        self.queues = [asyncio.Queue() for _ in range(self.workers)]
-        self.pending = [set() for _ in range(self.workers)]
-        self.credits = [dict() for _ in range(self.workers)]
-        self.locks = [threading.Lock() for _ in range(self.workers)]
-        self.notifications = 0
-        self.notified_jobs = 0
-
-    def owner_for(self, partition_index: int) -> int:
-        if self.owner_fn is not None:
-            return self.owner_fn(partition_index) % self.workers
-        return partition_index % self.workers
-
-    async def notify_partition(self, partition_index: int, count: int = 1) -> None:
-        count = max(int(count), 0)
-        if count == 0:
-            return
-
-        owner = self.owner_for(partition_index)
-        should_queue = False
-        with self.locks[owner]:
-            self.credits[owner][partition_index] = self.credits[owner].get(partition_index, 0) + count
-            self.notified_jobs += count
-            if partition_index not in self.pending[owner]:
-                self.pending[owner].add(partition_index)
-                self.notifications += 1
-                should_queue = True
-
-        if should_queue:
-            self.loop.call_soon_threadsafe(
-                self.queues[owner].put_nowait,
-                partition_index,
-            )
-
-    async def next_partitions(
-        self,
-        worker_index: int,
-        *,
-        timeout_s: float,
-        max_partitions: int,
-        max_credit: int,
-        same_group=None,
-    ) -> tuple[list[int], int]:
-        if max_partitions <= 0 or max_credit <= 0:
-            return [], 0
-
-        if timeout_s <= 0:
-            try:
-                partition_index = self.queues[worker_index].get_nowait()
-            except asyncio.QueueEmpty:
-                return [], 0
-        else:
-            try:
-                partition_index = await asyncio.wait_for(
-                    self.queues[worker_index].get(),
-                    timeout=timeout_s,
-                )
-            except asyncio.TimeoutError:
-                return [], 0
-
-        with self.locks[worker_index]:
-            self.pending[worker_index].discard(partition_index)
-            credit = self.credits[worker_index].pop(partition_index, 0)
-
-        partitions = [partition_index]
-        total_credit = credit
-
-        while len(partitions) < max_partitions and total_credit < max_credit:
-            try:
-                partition_index = self.queues[worker_index].get_nowait()
-            except asyncio.QueueEmpty:
-                break
-
-            with self.locks[worker_index]:
-                self.pending[worker_index].discard(partition_index)
-                credit = self.credits[worker_index].pop(partition_index, 0)
-
-            if credit <= 0:
-                continue
-            if same_group is not None and not same_group(partitions[0], partition_index):
-                await self.return_credit(worker_index, partition_index, credit)
-                break
-            partitions.append(partition_index)
-            total_credit += credit
-
-        return partitions, total_credit
-
-    async def return_credit(self, worker_index: int, partition_index: int, credit: int) -> None:
-        if credit <= 0:
-            return
-
-        should_queue = False
-        with self.locks[worker_index]:
-            self.credits[worker_index][partition_index] = self.credits[worker_index].get(partition_index, 0) + credit
-            if partition_index not in self.pending[worker_index]:
-                self.pending[worker_index].add(partition_index)
-                should_queue = True
-
-        if should_queue:
-            self.loop.call_soon_threadsafe(
-                self.queues[worker_index].put_nowait,
-                partition_index,
-            )
-
-    async def total_credit(self) -> int:
-        total = 0
-        for worker_index in range(self.workers):
-            with self.locks[worker_index]:
-                total += sum(self.credits[worker_index].values())
-        return total
-
-
-QueueWakeCoordinator = AsyncPartitionWakeCoordinator | CrossLoopPartitionWakeCoordinator
-
-
 async def create_flows(
     *,
     url: str,
@@ -387,7 +159,7 @@ async def create_flows(
     create_backpressure_credit: int,
     payload: bytes,
     independent_many: bool,
-    wake_coordinator: QueueWakeCoordinator | None,
+    wake_coordinator: object | None,
 ) -> dict[str, int]:
     client = AsyncFlowClient.from_url(url)
     created = 0
@@ -411,10 +183,7 @@ async def create_flows(
             await wake_coordinator.notify_partition(partition_index, count)
 
     async def apply_backpressure() -> None:
-        if (
-            create_backpressure_credit <= 0
-            or wake_coordinator is None
-        ):
+        if create_backpressure_credit <= 0 or wake_coordinator is None:
             return
         while await wake_coordinator.total_credit() > create_backpressure_credit:
             await asyncio.sleep(0.001)
@@ -582,8 +351,9 @@ async def run_worker(
     complete_inflight: int,
     counters: AsyncCounters,
     producers_done: asyncio.Event,
-    wake_coordinator: AsyncPartitionWakeCoordinator | None,
+    wake_coordinator: object | None,
     wake_coalesce_ms: float,
+    claim_block_ms: int | None,
     server_shards: int,
 ) -> dict[str, int | float]:
     client = AsyncFlowClient.from_url(url)
@@ -607,14 +377,13 @@ async def run_worker(
     claim_partition_batch_size = max(claim_partition_batch_size, 1)
 
     partition_count = AUTO_PARTITION_BUCKETS if partition_mode == "auto" else partitions
+
     def owner_for_partition(partition_index: int) -> int:
         if partition_mode == "auto":
             return auto_partition_server_shard_for_index(partition_index, server_shards) % workers
         return partition_index % workers
 
-    owned_partitions = [
-        p for p in range(partition_count) if owner_for_partition(p) == worker_index
-    ]
+    owned_partitions = [p for p in range(partition_count) if owner_for_partition(p) == worker_index]
     if partition_mode == "auto":
         owned_partitions.sort(
             key=lambda idx: (auto_partition_server_shard_for_index(idx, server_shards), idx)
@@ -633,10 +402,11 @@ async def run_worker(
 
     same_group = None
     if partition_mode == "auto":
-        same_group = lambda first, candidate: (
-            auto_partition_server_shard_for_index(first, server_shards)
-            == auto_partition_server_shard_for_index(candidate, server_shards)
-        )
+
+        def same_group(first: int, candidate: int) -> bool:
+            return auto_partition_server_shard_for_index(
+                first, server_shards
+            ) == auto_partition_server_shard_for_index(candidate, server_shards)
 
     async def drain_completions(*, block: bool = False, limit: int | None = None) -> int:
         drained_count = 0
@@ -694,6 +464,7 @@ async def run_worker(
             priority=claim_priority,
             reclaim_expired=reclaim_expired,
             reclaim_ratio=reclaim_ratio,
+            block_ms=claim_block_ms,
         )
         if not jobs:
             empty_claims += 1
@@ -725,7 +496,6 @@ async def run_worker(
                 continue
 
             partition_indices: list[int]
-            limit = claim_batch_size
             claim_credit = claim_batch_size
             if claim_any:
                 partition_indices = []
@@ -748,14 +518,19 @@ async def run_worker(
                             else:
                                 await asyncio.sleep(current_sleep)
                             continue
-                        if await wake_coordinator.total_credit() > 0 or claimed != last_claimed_seen:
+                        if (
+                            await wake_coordinator.total_credit() > 0
+                            or claimed != last_claimed_seen
+                        ):
                             last_claimed_seen = claimed
                             fallback_idle_rounds = 0
                             continue
                         fallback_idle_rounds += 1
                         if fallback_idle_rounds < 3:
                             continue
-                        partition_indices = [owned_partitions[fallback_round % len(owned_partitions)]]
+                        partition_indices = [
+                            owned_partitions[fallback_round % len(owned_partitions)]
+                        ]
                         fallback_round += 1
                         fallback_claims += 1
                     else:
@@ -763,8 +538,11 @@ async def run_worker(
                 else:
                     fallback_idle_rounds = 0
                     claim_credit = max(credit, 1)
-                    limit = min(claim_batch_size, claim_credit)
-                    if wake_coalesce_s > 0 and credit < claim_batch_size and not producers_done.is_set():
+                    if (
+                        wake_coalesce_s > 0
+                        and credit < claim_batch_size
+                        and not producers_done.is_set()
+                    ):
                         sleep_s = min(wake_coalesce_s, 0.002)
                         await asyncio.sleep(sleep_s)
                         wake_coalesce_sleeps += 1
@@ -782,11 +560,12 @@ async def run_worker(
                         partition_indices.extend(extra_partitions)
                         credit += extra_credit
                         claim_credit = max(credit, 1)
-                        limit = min(claim_batch_size, claim_credit)
             else:
                 partition_indices = []
                 for _ in range(min(claim_partition_batch_size, len(owned_partitions))):
-                    partition_indices.append(owned_partitions[fallback_round % len(owned_partitions)])
+                    partition_indices.append(
+                        owned_partitions[fallback_round % len(owned_partitions)]
+                    )
                     fallback_round += 1
 
             remaining_credit = max(claim_credit, 1)
@@ -833,42 +612,19 @@ async def run_worker(
 async def run_queued_throughput(args: argparse.Namespace) -> dict[str, Any]:
     run_id = f"py-async-queue-bench-{uuid.uuid4().hex}"
     flow_type = f"{FLOW_TYPE}:{run_id}"
-    partition_mode = "auto" if args.claim_any and args.partition_mode == "explicit" else args.partition_mode
+    partition_mode = (
+        "auto" if args.claim_any and args.partition_mode == "explicit" else args.partition_mode
+    )
     worker_partitions = AUTO_PARTITION_BUCKETS if partition_mode == "auto" else args.partitions
     payload = payload_bytes(args.payload_bytes)
     result = payload_bytes(args.result_bytes) if args.result_bytes > 0 else None
     claim_states = parse_claim_states(args.claim_states)
-    claim_state = None if claim_states is not None or args.claim_state == "omitted" else args.claim_state
+    claim_state = (
+        None if claim_states is not None or args.claim_state == "omitted" else args.claim_state
+    )
     counters = AsyncCounters(args.flows)
     producers_done = asyncio.Event()
-    wake_coordinator = (
-        CrossLoopPartitionWakeCoordinator(
-            args.workers,
-            asyncio.get_running_loop(),
-            owner_fn=(
-                lambda partition_index: auto_partition_server_shard_for_index(
-                    partition_index,
-                    args.server_shards,
-                )
-                if partition_mode == "auto"
-                else partition_index
-            ),
-        )
-        if args.worker_mode == "owner-wakeup" and not args.claim_any and args.producer_loop_thread
-        else AsyncPartitionWakeCoordinator(
-            args.workers,
-            owner_fn=(
-                lambda partition_index: auto_partition_server_shard_for_index(
-                    partition_index,
-                    args.server_shards,
-                )
-                if partition_mode == "auto"
-                else partition_index
-            ),
-        )
-        if args.worker_mode == "owner-wakeup" and not args.claim_any
-        else None
-    )
+    wake_coordinator = None
 
     indices = list(range(args.flows))
     if partition_mode == "auto" and args.create_mode == "many":
@@ -881,7 +637,7 @@ async def run_queued_throughput(args: argparse.Namespace) -> dict[str, Any]:
 
     async def create_task(
         batch: list[int],
-        wake_source: QueueWakeCoordinator | None,
+        wake_source: object | None,
     ) -> dict[str, int]:
         return await create_flows(
             url=args.url,
@@ -925,6 +681,7 @@ async def run_queued_throughput(args: argparse.Namespace) -> dict[str, Any]:
             producers_done=producers_done,
             wake_coordinator=wake_coordinator,
             wake_coalesce_ms=args.wake_coalesce_ms,
+            claim_block_ms=args.claim_block_ms,
             server_shards=args.server_shards,
         )
 
@@ -949,6 +706,7 @@ async def run_queued_throughput(args: argparse.Namespace) -> dict[str, Any]:
         worker_tasks = [asyncio.create_task(worker_task(idx)) for idx in range(args.workers)]
         create_started = time.perf_counter()
         if args.producer_loop_thread:
+
             def run_create_thread() -> list[dict[str, int]]:
                 async def run_all() -> list[dict[str, int]]:
                     return await asyncio.gather(
@@ -975,9 +733,15 @@ async def run_queued_throughput(args: argparse.Namespace) -> dict[str, Any]:
     fallback_claims = sum(int(result["fallback_claims"]) for result in worker_results)
     wake_coalesce_sleeps = sum(int(result["wake_coalesce_sleeps"]) for result in worker_results)
     wake_coalesce_ms = sum(float(result["wake_coalesce_ms"]) for result in worker_results)
-    create_pipeline_flushes = sum(int(result.get("create_pipeline_flushes", 0)) for result in create_results)
-    create_pipeline_commands = sum(int(result.get("create_pipeline_commands", 0)) for result in create_results)
-    create_pipeline_max_depth = max((int(result.get("create_pipeline_max_depth", 0)) for result in create_results), default=0)
+    create_pipeline_flushes = sum(
+        int(result.get("create_pipeline_flushes", 0)) for result in create_results
+    )
+    create_pipeline_commands = sum(
+        int(result.get("create_pipeline_commands", 0)) for result in create_results
+    )
+    create_pipeline_max_depth = max(
+        (int(result.get("create_pipeline_max_depth", 0)) for result in create_results), default=0
+    )
     create_seconds = create_finished - create_started
     process_seconds = process_finished - process_started
     total_seconds = process_finished - started
@@ -1058,8 +822,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--claim-priority", type=int, default=0)
     parser.add_argument("--reclaim-expired", action="store_true")
     parser.add_argument("--reclaim-ratio", type=int, default=4)
-    parser.add_argument("--worker-mode", choices=("owner-wakeup", "polling"), default="owner-wakeup")
+    parser.add_argument("--worker-mode", choices=("blocking", "polling"), default="blocking")
     parser.add_argument("--wake-coalesce-ms", type=float, default=1.0)
+    parser.add_argument("--claim-block-ms", type=int, default=-1)
     parser.add_argument("--idle-sleep-ms", type=float, default=1.0)
     parser.add_argument("--max-idle-sleep-ms", type=float, default=10.0)
     parser.add_argument("--payload-bytes", type=int, default=0)
@@ -1079,6 +844,8 @@ def print_metrics(metrics: dict[str, Any]) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.claim_block_ms < 0:
+        args.claim_block_ms = None
     metrics = asyncio.run(run_queued_throughput(args))
     print_metrics(metrics)
 

@@ -1,29 +1,18 @@
-from __future__ import annotations
-
-from ferricstore import CreateItem, FlowClient, QueueFlowWorker
+from ferricstore import CreateItem, QueueClient
 
 
 def main() -> None:
-    client = FlowClient.from_url("redis://127.0.0.1:6379/0")
+    client = QueueClient.from_url("redis://127.0.0.1:6379/0")
+    emails = client.queue(type="email")
 
-    client.enqueue_many(
-        [CreateItem(f"email-{idx}", f"user-{idx}".encode()) for idx in range(100)],
-        type="email",
+    emails.enqueue_many(
+        [CreateItem(f"email-{idx}", f"payload-{idx}".encode()) for idx in range(10)]
     )
 
-    worker = QueueFlowWorker(
-        client,
-        type="email",
-        state="queued",
-        concurrency=16,
-        batch_size=100,
-        idle_sleep_s=0.05,
-    )
+    def handler(job):
+        print("send", job.id)
 
-    def handle(job):
-        print("send email", job.id)
-
-    worker.run_once(handle)
+    emails.worker(concurrency=4, batch_size=10).run_once(handler)
 
 
 if __name__ == "__main__":

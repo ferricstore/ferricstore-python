@@ -1,24 +1,56 @@
 from __future__ import annotations
 
+import threading
 import time
 import uuid
-import queue
-import threading
-from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, cast
 
 from ferricstore.client import FlowClient
-from ferricstore.types import ClaimedItem, FlowRecord
+from ferricstore.types import (
+    ClaimedItem,
+    ExceptionPolicy,
+    FlowRecord,
+    RetryPolicy,
+    ValueConfig,
+    WorkerConfig,
+    normalize_exception_policy,
+    resolve_worker_connection_counts,
+)
 from ferricstore.workflow import Workflow
-
 
 FlowJob = ClaimedItem | FlowRecord
 FlowHandler = Callable[[FlowJob], Any]
 FlowBatchHandler = Callable[[list[FlowJob]], Any]
-ErrorMode = Literal["retry", "fail", "raise"]
+ErrorMode = ExceptionPolicy | str
+QUEUE_WORKER_CONFIG_KEYS = frozenset(
+    {
+        "concurrency",
+        "command_connections",
+        "claim_connections",
+        "batch_size",
+        "lease_ms",
+        "priority",
+        "reclaim_expired",
+        "reclaim_ratio",
+        "claim_values",
+        "value_max_bytes",
+        "block_ms",
+        "claim_scan_block_ms",
+        "idle_sleep_s",
+        "max_idle_sleep_s",
+        "exception_policy",
+        "complete_independent",
+        "claim_partition_batch_size",
+        "claim_drain_batches",
+        "scan_before_blocking",
+        "complete_async_depth",
+        "empty_claim_cooldown_s",
+        "partial_claim_cooldown_s",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -38,269 +70,6 @@ class _HandledBatch:
     failures: list[tuple[FlowJob, Exception]] | None = None
 
 
-@dataclass(frozen=True)
-class FlowReadySignal:
-    type: str
-    state: str
-    partition_key: str
-    count: int = 1
-    priority: int | None = 0
-    server_shard: int | None = None
-    epoch: int = 0
-    due_at_ms: int | None = None
-
-
-class FlowReadyCoordinator:
-    """In-process ready-signal coordinator for QueueFlowWorker.
-
-    Signals are advisory. CLAIM_DUE remains the correctness boundary.
-    """
-
-    def __init__(self) -> None:
-        self._condition = threading.Condition()
-        self._credits: dict[tuple[str, str, int | None, str, int | None], int] = {}
-        self._meta: dict[tuple[str, str, int | None, str, int | None], FlowReadySignal] = {}
-        self._queued: set[tuple[str, str, int | None, str, int | None]] = set()
-        self._ready = deque()
-        self.notifications = 0
-        self.notified_jobs = 0
-
-    def notify(self, signal: FlowReadySignal) -> None:
-        if signal.count <= 0:
-            return
-
-        key = (signal.type, signal.state, signal.priority, signal.partition_key, signal.due_at_ms)
-        with self._condition:
-            self.notifications += 1
-            self.notified_jobs += signal.count
-            self._credits[key] = self._credits.get(key, 0) + signal.count
-            current = self._meta.get(key)
-            if current is None or signal.epoch >= current.epoch:
-                self._meta[key] = signal
-            if key not in self._queued:
-                self._queued.add(key)
-                self._ready.append(key)
-            self._condition.notify()
-
-    def notify_many(self, signals: Sequence[FlowReadySignal]) -> None:
-        for signal in signals:
-            self.notify(signal)
-
-    def total_credit(self) -> int:
-        with self._condition:
-            return sum(self._credits.values())
-
-    def matching_credit(
-        self,
-        *,
-        type: str,
-        state: str | None,
-        states: Sequence[str] | None,
-        priority: int | None,
-        partition_keys: Sequence[str] | None,
-    ) -> int:
-        allowed_states = set(states) if states is not None else ({state} if state is not None else None)
-        allowed_partitions = set(partition_keys) if partition_keys is not None else None
-
-        with self._condition:
-            total = 0
-            for key in self._ready:
-                credit = self._credits.get(key, 0)
-                meta = self._meta.get(key)
-                if credit <= 0 or meta is None:
-                    continue
-                if not self._signal_due_ready(meta):
-                    continue
-                if self._ready_key_matches(
-                    key,
-                    meta,
-                    type=type,
-                    allowed_states=allowed_states,
-                    priority=priority,
-                    allowed_partitions=allowed_partitions,
-                    selected_shard=False,
-                ):
-                    total += credit
-            return total
-
-    def next_ready(
-        self,
-        *,
-        type: str,
-        state: str | None,
-        states: Sequence[str] | None,
-        priority: int | None,
-        partition_keys: Sequence[str] | None,
-        timeout_s: float,
-        max_partitions: int,
-        max_credit: int,
-    ) -> tuple[list[str], int]:
-        deadline = time.monotonic() + max(timeout_s, 0.0)
-        allowed_states = set(states) if states is not None else ({state} if state is not None else None)
-        allowed_partitions = set(partition_keys) if partition_keys is not None else None
-
-        with self._condition:
-            while True:
-                selected, credit = self._select_ready_locked(
-                    type=type,
-                    allowed_states=allowed_states,
-                    priority=priority,
-                    allowed_partitions=allowed_partitions,
-                    max_partitions=max(max_partitions, 1),
-                    max_credit=max(max_credit, 1),
-                )
-                if selected:
-                    return selected, credit
-
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise queue.Empty
-                self._condition.wait(
-                    self._wait_until_next_due_locked(
-                        remaining,
-                        type=type,
-                        allowed_states=allowed_states,
-                        priority=priority,
-                        allowed_partitions=allowed_partitions,
-                    )
-                )
-
-    def _select_ready_locked(
-        self,
-        *,
-        type: str,
-        allowed_states: set[str] | None,
-        priority: int | None,
-        allowed_partitions: set[str] | None,
-        max_partitions: int,
-        max_credit: int,
-    ) -> tuple[list[str], int]:
-        selected: list[tuple[str, str, int | None, str, int | None]] = []
-        selected_partitions: list[str] = []
-        selected_credit = 0
-        selected_shard: int | None | bool = False
-        scan_count = len(self._ready)
-
-        for _ in range(scan_count):
-            key = self._ready.popleft()
-            self._queued.discard(key)
-            credit = self._credits.get(key, 0)
-            meta = self._meta.get(key)
-            if credit <= 0 or meta is None:
-                self._credits.pop(key, None)
-                self._meta.pop(key, None)
-                continue
-
-            if not self._ready_key_matches(
-                key,
-                meta,
-                type=type,
-                allowed_states=allowed_states,
-                priority=priority,
-                allowed_partitions=allowed_partitions,
-                selected_shard=selected_shard,
-            ):
-                self._queued.add(key)
-                self._ready.append(key)
-                continue
-
-            if not self._signal_due_ready(meta):
-                self._queued.add(key)
-                self._ready.append(key)
-                continue
-
-            take = min(credit, max_credit - selected_credit)
-            selected.append(key)
-            selected_partitions.append(meta.partition_key)
-            selected_credit += take
-            selected_shard = meta.server_shard
-
-            if len(selected) >= max_partitions or selected_credit >= max_credit:
-                break
-
-        remaining_budget = max_credit
-        for key in selected:
-            credit = self._credits.get(key, 0)
-            taken = min(credit, remaining_budget)
-            remaining_budget -= taken
-            remaining = credit - taken
-            if remaining > 0:
-                self._credits[key] = remaining
-                if key not in self._queued:
-                    self._queued.add(key)
-                    self._ready.append(key)
-            else:
-                self._credits.pop(key, None)
-                self._meta.pop(key, None)
-
-        return selected_partitions, min(selected_credit, max_credit)
-
-    def _wait_until_next_due_locked(
-        self,
-        remaining: float,
-        *,
-        type: str,
-        allowed_states: set[str] | None,
-        priority: int | None,
-        allowed_partitions: set[str] | None,
-    ) -> float:
-        now_ms = int(time.time() * 1000)
-        next_due_ms: int | None = None
-
-        for key in self._ready:
-            meta = self._meta.get(key)
-            credit = self._credits.get(key, 0)
-            if credit <= 0 or meta is None:
-                continue
-            if not self._ready_key_matches(
-                key,
-                meta,
-                type=type,
-                allowed_states=allowed_states,
-                priority=priority,
-                allowed_partitions=allowed_partitions,
-                selected_shard=False,
-            ):
-                continue
-            if meta.due_at_ms is None or meta.due_at_ms <= now_ms:
-                return 0.0
-            if next_due_ms is None or meta.due_at_ms < next_due_ms:
-                next_due_ms = meta.due_at_ms
-
-        if next_due_ms is None:
-            return remaining
-
-        return min(remaining, max((next_due_ms - now_ms) / 1000.0, 0.0))
-
-    @staticmethod
-    def _signal_due_ready(meta: FlowReadySignal) -> bool:
-        return meta.due_at_ms is None or meta.due_at_ms <= int(time.time() * 1000)
-
-    @staticmethod
-    def _ready_key_matches(
-        key: tuple[str, str, int | None, str, int | None],
-        meta: FlowReadySignal,
-        *,
-        type: str,
-        allowed_states: set[str] | None,
-        priority: int | None,
-        allowed_partitions: set[str] | None,
-        selected_shard: int | None | bool,
-    ) -> bool:
-        key_type, key_state, key_priority, key_partition, _key_due_at_ms = key
-        if key_type != type:
-            return False
-        if allowed_states is not None and key_state not in allowed_states:
-            return False
-        if priority is not None and key_priority != priority:
-            return False
-        if allowed_partitions is not None and key_partition not in allowed_partitions:
-            return False
-        if selected_shard is not False and meta.server_shard != selected_shard:
-            return False
-        return True
-
-
 class QueueFlowWorker:
     """High-level queue worker for the optimized FerricFlow hot path."""
 
@@ -313,30 +82,30 @@ class QueueFlowWorker:
         state: str | None = None,
         states: Sequence[str] | None = None,
         concurrency: int = 1,
-        batch_size: int = 100,
+        batch_size: int = 10,
         lease_ms: int = 30_000,
         priority: int | None = 0,
         reclaim_expired: bool | None = None,
         reclaim_ratio: int | None = None,
         claim_values: Sequence[str] | None = None,
         value_max_bytes: int | None = None,
+        block_ms: int | None = None,
+        claim_scan_block_ms: int | None = None,
         idle_sleep_s: float = 0.1,
         max_idle_sleep_s: float | None = None,
-        on_error: ErrorMode = "retry",
+        exception_policy: ErrorMode | None = None,
+        on_error: ErrorMode | None = None,
         complete_independent: bool = True,
         partition_key: str | None = None,
         partition_keys: Sequence[str] | None = None,
-        partition_indices: Sequence[int] | None = None,
-        claim_partition_batch_size: int = 1,
+        claim_partition_batch_size: int | None = None,
         claim_drain_batches: int = 1,
+        scan_before_blocking: bool = False,
         complete_async_depth: int = 0,
         completion_clients: Sequence[FlowClient] | None = None,
-        wake_source: Any | None = None,
-        wake_worker_index: int | None = None,
-        wake_same_group: Callable[[int, int], bool] | None = None,
-        wake_producers_done: Callable[[], bool] | None = None,
-        wake_coalesce_s: float = 0.0,
-        wake_fallback_after: int = 3,
+        claim_client: FlowClient | str | None = None,
+        command_connections: int | None = None,
+        claim_connections: int | None = None,
         empty_claim_cooldown_s: float | None = None,
         partial_claim_cooldown_s: float | None = None,
     ) -> None:
@@ -348,34 +117,56 @@ class QueueFlowWorker:
             raise ValueError("states must be non-empty")
         if partition_keys is not None and not partition_keys:
             raise ValueError("partition_keys must be non-empty")
-        if partition_indices is not None and partition_keys is None:
-            raise ValueError("partition_indices requires partition_keys")
-        if partition_indices is not None and len(partition_indices) != len(partition_keys or []):
-            raise ValueError("partition_indices must match partition_keys length")
         if concurrency <= 0:
             raise ValueError("concurrency must be positive")
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        if claim_partition_batch_size <= 0:
+        if claim_partition_batch_size is not None and claim_partition_batch_size <= 0:
             raise ValueError("claim_partition_batch_size must be positive")
         if claim_drain_batches <= 0:
             raise ValueError("claim_drain_batches must be positive")
         if complete_async_depth < 0:
             raise ValueError("complete_async_depth must be non-negative")
-        if wake_source is not None and wake_worker_index is None:
-            raise ValueError("wake_worker_index is required when wake_source is set")
-        if wake_coalesce_s < 0:
-            raise ValueError("wake_coalesce_s must be non-negative")
-        if wake_fallback_after <= 0:
-            raise ValueError("wake_fallback_after must be positive")
+        if block_ms is not None and block_ms < 0:
+            raise ValueError("block_ms must be non-negative")
+        if claim_scan_block_ms is not None and claim_scan_block_ms < 0:
+            raise ValueError("claim_scan_block_ms must be non-negative")
         if empty_claim_cooldown_s is not None and empty_claim_cooldown_s < 0:
             raise ValueError("empty_claim_cooldown_s must be non-negative")
         if partial_claim_cooldown_s is not None and partial_claim_cooldown_s < 0:
             raise ValueError("partial_claim_cooldown_s must be non-negative")
-        if on_error not in {"retry", "fail", "raise"}:
-            raise ValueError("on_error must be 'retry', 'fail', or 'raise'")
+        if exception_policy is not None and on_error is not None:
+            raise ValueError("exception_policy and on_error are mutually exclusive")
+        resolved_on_error = normalize_exception_policy(
+            exception_policy if exception_policy is not None else on_error,
+            argument="exception_policy" if exception_policy is not None else "on_error",
+        )
 
-        self.client = FlowClient.from_url(client) if isinstance(client, str) else client
+        command_pool_size, claim_pool_size = resolve_worker_connection_counts(
+            workers=1,
+            concurrency=concurrency,
+            command_connections=command_connections,
+            claim_connections=claim_connections,
+        )
+        if isinstance(client, str):
+            self.client = FlowClient.from_url(client, max_connections=command_pool_size)
+            self._owns_client = True
+        else:
+            self.client = client
+            self._owns_client = False
+        if claim_client is None:
+            if isinstance(client, str):
+                self.claim_client = FlowClient.from_url(client, max_connections=claim_pool_size)
+                self._owns_claim_client = True
+            else:
+                self.claim_client = self.client
+                self._owns_claim_client = False
+        elif isinstance(claim_client, str):
+            self.claim_client = FlowClient.from_url(claim_client, max_connections=claim_pool_size)
+            self._owns_claim_client = True
+        else:
+            self.claim_client = claim_client
+            self._owns_claim_client = False
         self.type = type
         self.worker = worker or f"{type}:worker:{uuid.uuid4().hex}"
         self.state = state
@@ -388,45 +179,36 @@ class QueueFlowWorker:
         self.reclaim_ratio = reclaim_ratio
         self.claim_values = list(claim_values) if claim_values is not None else None
         self.value_max_bytes = value_max_bytes
+        self.block_ms = block_ms
+        self.claim_scan_block_ms = claim_scan_block_ms
         self.partition_key = partition_key
         self.partition_keys = list(partition_keys) if partition_keys is not None else None
-        self.partition_indices = list(partition_indices) if partition_indices is not None else None
-        self._partition_key_by_index = (
-            dict(zip(self.partition_indices, self.partition_keys))
-            if self.partition_indices is not None and self.partition_keys is not None
-            else None
+        self.claim_partition_batch_size = (
+            claim_partition_batch_size
+            if claim_partition_batch_size is not None
+            else len(self.partition_keys or []) or 1
         )
-        self.claim_partition_batch_size = claim_partition_batch_size
         self.claim_drain_batches = claim_drain_batches
-        self.wake_source = wake_source
-        self.wake_worker_index = wake_worker_index
-        self.wake_same_group = wake_same_group
-        self.wake_producers_done = wake_producers_done
-        self.wake_coalesce_s = wake_coalesce_s
-        self.wake_fallback_after = wake_fallback_after
+        self.scan_before_blocking = scan_before_blocking
         self.idle_sleep_s = max(idle_sleep_s, 0.0)
         self.max_idle_sleep_s = (
             max(max_idle_sleep_s, self.idle_sleep_s)
             if max_idle_sleep_s is not None
             else self.idle_sleep_s
         )
-        self.on_error = on_error
+        self.on_error = resolved_on_error
         self.complete_independent = complete_independent
         self._running = False
         self._thread: threading.Thread | None = None
         self._totals = QueueFlowWorkerResult()
-        self._executor = (
-            ThreadPoolExecutor(max_workers=concurrency) if concurrency > 1 else None
-        )
+        self._executor = ThreadPoolExecutor(max_workers=concurrency) if concurrency > 1 else None
         self._completion_executor = (
             ThreadPoolExecutor(max_workers=complete_async_depth)
             if complete_async_depth > 0
             else None
         )
         self._completion_clients = (
-            list(completion_clients)
-            if completion_clients is not None
-            else [self.client]
+            list(completion_clients) if completion_clients is not None else [self.client]
         )
         if not self._completion_clients:
             raise ValueError("completion_clients must be non-empty")
@@ -434,14 +216,15 @@ class QueueFlowWorker:
         self._complete_async_depth = complete_async_depth
         self._pending_completions: list[Future[QueueFlowWorkerResult]] = []
         self._partition_cursor = 0
-        self._wake_idle_rounds = 0
-        self._wake_fallback_round = 0
         self._claim_cooldown_until: dict[str, float] = {}
+        default_claim_cooldown_s = min(self.idle_sleep_s, 0.001)
         self.empty_claim_cooldown_s = (
-            0.0 if empty_claim_cooldown_s is None else empty_claim_cooldown_s
+            default_claim_cooldown_s if empty_claim_cooldown_s is None else empty_claim_cooldown_s
         )
         self.partial_claim_cooldown_s = (
-            0.0 if partial_claim_cooldown_s is None else partial_claim_cooldown_s
+            default_claim_cooldown_s
+            if partial_claim_cooldown_s is None
+            else partial_claim_cooldown_s
         )
 
     def run(self, handler: FlowHandler) -> None:
@@ -459,7 +242,7 @@ class QueueFlowWorker:
         *,
         batch_handler: bool = False,
         daemon: bool = True,
-    ) -> "QueueFlowWorker":
+    ) -> QueueFlowWorker:
         if self._thread is not None and self._thread.is_alive():
             raise RuntimeError("worker already started")
 
@@ -496,9 +279,9 @@ class QueueFlowWorker:
         try:
             while self._running:
                 result = (
-                    self.run_batch_once(handler)
+                    self.run_batch_once(cast(FlowBatchHandler, handler))
                     if batch_handler
-                    else self.run_once(handler)
+                    else self.run_once(cast(FlowHandler, handler))
                 )
                 self._totals = self._merge_results(self._totals, result)
                 if result.claimed == 0:
@@ -525,6 +308,10 @@ class QueueFlowWorker:
             self._executor.shutdown(wait=True)
         if self._completion_executor is not None:
             self._completion_executor.shutdown(wait=True)
+        if self._owns_claim_client and self.claim_client is not self.client:
+            self.claim_client.close()
+        if self._owns_client:
+            self.client.close()
 
     def flush(self) -> QueueFlowWorkerResult:
         return self._drain_pending_completions(block=True)
@@ -535,6 +322,35 @@ class QueueFlowWorker:
     def run_batch_once(self, handler: FlowBatchHandler) -> QueueFlowWorkerResult:
         return self._run_once(handler, batch_handler=True)
 
+    def run_batch_once_for_partition_keys(
+        self,
+        handler: FlowBatchHandler,
+        partition_keys: Sequence[str],
+        *,
+        claim_credit: int | None = None,
+        block_ms: int | None = None,
+    ) -> QueueFlowWorkerResult:
+        keys = list(partition_keys)
+        if not keys:
+            return self._drain_pending_completions(block=False)
+
+        result = self._drain_pending_completions(block=False)
+        partition_key = keys[0] if len(keys) == 1 else None
+        partition_key_list = None if partition_key is not None else keys
+        return self._drain_claim_plan(
+            handler,
+            result,
+            partition_key,
+            partition_key_list,
+            (
+                claim_credit
+                if claim_credit is not None
+                else self.batch_size * self.claim_drain_batches
+            ),
+            block_ms=block_ms,
+            batch_handler=True,
+        )
+
     def _run_once(
         self,
         handler: FlowHandler | FlowBatchHandler,
@@ -542,31 +358,45 @@ class QueueFlowWorker:
         batch_handler: bool,
     ) -> QueueFlowWorkerResult:
         result = self._drain_pending_completions(block=False)
-        if self.wake_source is not None:
-            wake_plan = self._next_wake_claim()
-            if wake_plan is not None:
-                self._wake_idle_rounds = 0
-                claim_partition_key, claim_partition_keys, claim_credit = wake_plan
-                return self._drain_claim_plan(
+
+        if self._should_scan_owned_partitions_before_blocking():
+            pages = self._owned_partition_scan_pages()
+
+            for _ in range(pages):
+                before_claimed = result.claimed
+                claim_partition_key, claim_partition_keys = self._next_claim_partition()
+                result = self._drain_claim_plan(
                     handler,
                     result,
                     claim_partition_key,
                     claim_partition_keys,
-                    claim_credit,
+                    self.batch_size * self.claim_drain_batches,
+                    block_ms=None,
                     batch_handler=batch_handler,
                 )
+                if result.claimed > before_claimed:
+                    return result
 
-            self._wake_idle_rounds += 1
-            if self._wake_idle_rounds < self.wake_fallback_after:
-                return result
-            self._wake_idle_rounds = 0
-            claim_partition_key, claim_partition_keys = self._fallback_claim_partition()
+            claim_partition_key, claim_partition_keys = self._owned_partition_block_claim()
             return self._drain_claim_plan(
                 handler,
                 result,
                 claim_partition_key,
                 claim_partition_keys,
-                self.batch_size,
+                self.batch_size * self.claim_drain_batches,
+                block_ms=self._post_scan_block_ms(),
+                batch_handler=batch_handler,
+            )
+
+        if self._should_block_on_owned_partitions():
+            claim_partition_key, claim_partition_keys = self._owned_partition_block_claim()
+            return self._drain_claim_plan(
+                handler,
+                result,
+                claim_partition_key,
+                claim_partition_keys,
+                self.batch_size * self.claim_drain_batches,
+                block_ms=self.block_ms,
                 batch_handler=batch_handler,
             )
 
@@ -578,6 +408,7 @@ class QueueFlowWorker:
             claim_partition_key,
             claim_partition_keys,
             max_credit,
+            block_ms=self.block_ms,
             batch_handler=batch_handler,
         )
 
@@ -589,6 +420,7 @@ class QueueFlowWorker:
         claim_partition_keys: list[str] | None,
         claim_credit: int,
         *,
+        block_ms: int | None,
         batch_handler: bool,
     ) -> QueueFlowWorkerResult:
         remaining_credit = max(claim_credit, 1)
@@ -600,16 +432,19 @@ class QueueFlowWorker:
                 claim_partition_key=claim_partition_key,
                 claim_partition_keys=claim_partition_keys,
                 limit=limit,
+                block_ms=block_ms,
             )
             result = self._merge_results(result, QueueFlowWorkerResult(claim_calls=1))
             if not jobs:
-                self._cool_claim_keys(claim_partition_key, claim_partition_keys, self.empty_claim_cooldown_s)
+                self._cool_claim_keys(
+                    claim_partition_key, claim_partition_keys, self.empty_claim_cooldown_s
+                )
                 break
 
             handled = (
-                self._run_batch_handler(jobs, handler)
+                self._run_batch_handler(jobs, cast(FlowBatchHandler, handler))
                 if batch_handler
-                else self._run_handlers(jobs, handler)
+                else self._run_handlers(jobs, cast(FlowHandler, handler))
             )
             result = self._merge_results(
                 result,
@@ -655,9 +490,33 @@ class QueueFlowWorker:
         claim_partition_key: str | None,
         claim_partition_keys: list[str] | None,
         limit: int,
+        block_ms: int | None,
     ) -> list[FlowJob]:
         if self.claim_values:
-            return self.client.claim_due(
+            return cast(
+                list[FlowJob],
+                self.claim_client.claim_due(
+                    self.type,
+                    state=self.state,
+                    states=self.states,
+                    worker=self.worker,
+                    partition_key=claim_partition_key,
+                    partition_keys=claim_partition_keys,
+                    lease_ms=self.lease_ms,
+                    limit=limit,
+                    priority=self.priority,
+                    reclaim_expired=self.reclaim_expired,
+                    reclaim_ratio=self.reclaim_ratio,
+                    block_ms=block_ms,
+                    payload=False,
+                    values=self.claim_values,
+                    value_max_bytes=self.value_max_bytes,
+                ),
+            )
+
+        return cast(
+            list[FlowJob],
+            self.claim_client.claim_jobs(
                 self.type,
                 state=self.state,
                 states=self.states,
@@ -669,173 +528,46 @@ class QueueFlowWorker:
                 priority=self.priority,
                 reclaim_expired=self.reclaim_expired,
                 reclaim_ratio=self.reclaim_ratio,
-                payload=False,
-                values=self.claim_values,
-                value_max_bytes=self.value_max_bytes,
-            )
-
-        return self.client.claim_jobs(
-            self.type,
-            state=self.state,
-            states=self.states,
-            worker=self.worker,
-            partition_key=claim_partition_key,
-            partition_keys=claim_partition_keys,
-            lease_ms=self.lease_ms,
-            limit=limit,
-            priority=self.priority,
-            reclaim_expired=self.reclaim_expired,
-            reclaim_ratio=self.reclaim_ratio,
+                block_ms=block_ms,
+            ),
         )
 
-    def _next_wake_claim(self) -> tuple[str | None, list[str] | None, int] | None:
-        if self.wake_source is None or self.wake_worker_index is None:
-            return None
-        next_ready = getattr(self.wake_source, "next_ready", None)
-        if callable(next_ready):
-            try:
-                wake_partition_keys = (
-                    [self.partition_key] if self.partition_key is not None else self.partition_keys
-                )
-                partition_keys, partition_credit = next_ready(
-                    type=self.type,
-                    state=self.state,
-                    states=self.states,
-                    priority=self.priority,
-                    partition_keys=wake_partition_keys,
-                    timeout_s=self.idle_sleep_s,
-                    max_partitions=self.claim_partition_batch_size,
-                    max_credit=self.batch_size,
-                )
-            except queue.Empty:
-                return None
+    def _should_scan_owned_partitions_before_blocking(self) -> bool:
+        return (
+            self.scan_before_blocking
+            and self.block_ms is not None
+            and self.block_ms > 0
+            and self.partition_key is None
+            and bool(self.partition_keys)
+        )
 
-            if not partition_keys or partition_credit <= 0:
-                return None
-            if (
-                self.wake_coalesce_s > 0
-                and partition_credit < self.batch_size
-                and not self._wake_producers_are_done()
-            ):
-                time.sleep(min(self.wake_coalesce_s, 0.002))
-                remaining_partitions = max(self.claim_partition_batch_size - len(partition_keys), 0)
-                remaining_credit = max(self.batch_size - partition_credit, 0)
-                if remaining_partitions > 0 and remaining_credit > 0:
-                    try:
-                        extra_keys, extra_credit = next_ready(
-                            type=self.type,
-                            state=self.state,
-                            states=self.states,
-                            priority=self.priority,
-                            partition_keys=wake_partition_keys,
-                            timeout_s=0,
-                            max_partitions=remaining_partitions,
-                            max_credit=remaining_credit,
-                        )
-                    except queue.Empty:
-                        extra_keys = []
-                        extra_credit = 0
-                    partition_keys.extend(extra_keys)
-                    partition_credit += extra_credit
-            if len(partition_keys) == 1:
-                return partition_keys[0], None, partition_credit
-            return None, partition_keys, partition_credit
+    def _should_block_on_owned_partitions(self) -> bool:
+        return (
+            not self.scan_before_blocking
+            and self.block_ms is not None
+            and self.block_ms > 0
+            and self.partition_key is None
+            and bool(self.partition_keys)
+        )
 
-        if self._partition_key_by_index is None:
-            return None
+    def _post_scan_block_ms(self) -> int | None:
+        return self.block_ms if self.claim_scan_block_ms is None else self.claim_scan_block_ms
 
-        try:
-            partition_indices, partition_credit = self.wake_source.next_partitions(
-                self.wake_worker_index,
-                self.idle_sleep_s,
-                self.claim_partition_batch_size,
-                self.batch_size,
-                same_group=self.wake_same_group,
-            )
-        except queue.Empty:
-            return None
+    def _owned_partition_scan_pages(self) -> int:
+        if not self.partition_keys:
+            return 1
+        return max(
+            1,
+            (len(self.partition_keys) + self.claim_partition_batch_size - 1)
+            // self.claim_partition_batch_size,
+        )
 
-        if not partition_indices or partition_credit <= 0:
-            return None
-
-        if (
-            self.wake_coalesce_s > 0
-            and partition_credit < self.batch_size
-            and not self._wake_producers_are_done()
-        ):
-            time.sleep(min(self.wake_coalesce_s, 0.002))
-            partition_credit += self.wake_source.take_credit(
-                self.wake_worker_index,
-                partition_indices[0],
-            )
-            remaining_credit = max(
-                self.batch_size - partition_credit,
-                0,
-            )
-            if len(partition_indices) < self.claim_partition_batch_size and remaining_credit > 0:
-                try:
-                    extra_indices, extra_credit = self.wake_source.next_partitions(
-                        self.wake_worker_index,
-                        0,
-                        self.claim_partition_batch_size - len(partition_indices),
-                        remaining_credit,
-                        same_group=self.wake_same_group,
-                    )
-                except queue.Empty:
-                    extra_indices = []
-                    extra_credit = 0
-                partition_indices.extend(extra_indices)
-                partition_credit += extra_credit
-
-        partition_keys = [
-            self._partition_key_by_index[index]
-            for index in partition_indices
-            if index in self._partition_key_by_index
-        ]
-        if not partition_keys:
-            return None
-        if len(partition_keys) == 1:
-            return partition_keys[0], None, partition_credit
-        return None, partition_keys, partition_credit
-
-    def _wake_should_wait_for_signal(self) -> bool:
-        producers_done = self.wake_producers_done
-        if producers_done is not None and not producers_done():
-            return True
-
-        matching_credit = getattr(self.wake_source, "matching_credit", None)
-        if callable(matching_credit):
-            try:
-                wake_partition_keys = (
-                    [self.partition_key] if self.partition_key is not None else self.partition_keys
-                )
-                return (
-                    matching_credit(
-                        type=self.type,
-                        state=self.state,
-                        states=self.states,
-                        priority=self.priority,
-                        partition_keys=wake_partition_keys,
-                    )
-                    > 0
-                )
-            except Exception:
-                return False
-
-        total_credit = getattr(self.wake_source, "total_credit", None)
-        if callable(total_credit):
-            try:
-                return total_credit() > 0
-            except Exception:
-                return False
-
-        return False
-
-    def _wake_producers_are_done(self) -> bool:
-        producers_done = self.wake_producers_done
-        if producers_done is None:
-            return False
-        return producers_done()
+    def _owned_partition_block_claim(self) -> tuple[str | None, list[str] | None]:
+        if not self.partition_keys:
+            return None, None
+        if len(self.partition_keys) == 1:
+            return self.partition_keys[0], None
+        return None, list(self.partition_keys)
 
     def _run_handlers(
         self,
@@ -846,7 +578,7 @@ class QueueFlowWorker:
         failures: list[tuple[FlowJob, Exception]] = []
         first_result: Any = None
         first_result_set = False
-        mixed_results: list[tuple[ClaimedItem, Any]] | None = None
+        mixed_results: list[tuple[FlowJob, Any]] | None = None
 
         def record_success(job: FlowJob, result: Any) -> None:
             nonlocal first_result, first_result_set, mixed_results
@@ -913,10 +645,7 @@ class QueueFlowWorker:
         selected_start = self._partition_cursor
         for step in range(key_count):
             start = (self._partition_cursor + step * count) % key_count
-            keys = [
-                self.partition_keys[(start + offset) % key_count]
-                for offset in range(count)
-            ]
+            keys = [self.partition_keys[(start + offset) % key_count] for offset in range(count)]
             if any(self._claim_cooldown_until.get(key, 0.0) <= now for key in keys):
                 selected_start = start
                 break
@@ -930,13 +659,6 @@ class QueueFlowWorker:
         if len(keys) == 1:
             return keys[0], None
         return None, keys
-
-    def _fallback_claim_partition(self) -> tuple[str | None, list[str] | None]:
-        if self.partition_key is not None:
-            return self.partition_key, None
-        if self.partition_keys:
-            return None, self.partition_keys
-        return None, None
 
     def _cool_claim_keys(
         self,
@@ -984,7 +706,11 @@ class QueueFlowWorker:
 
         drained = QueueFlowWorkerResult()
         if block:
-            remaining = len(self._pending_completions) if limit is None else min(limit, len(self._pending_completions))
+            remaining = (
+                len(self._pending_completions)
+                if limit is None
+                else min(limit, len(self._pending_completions))
+            )
             for _ in range(remaining):
                 future = self._pending_completions.pop(0)
                 drained = self._merge_results(drained, future.result())
@@ -1003,7 +729,9 @@ class QueueFlowWorker:
         return drained
 
     @staticmethod
-    def _merge_results(left: QueueFlowWorkerResult, right: QueueFlowWorkerResult) -> QueueFlowWorkerResult:
+    def _merge_results(
+        left: QueueFlowWorkerResult, right: QueueFlowWorkerResult
+    ) -> QueueFlowWorkerResult:
         return QueueFlowWorkerResult(
             claimed=left.claimed + right.claimed,
             completed=left.completed + right.completed,
@@ -1022,7 +750,7 @@ class QueueFlowWorker:
 
         if handled.mixed_results is None:
             client.complete_jobs(
-                handled.jobs,
+                cast(list[ClaimedItem], handled.jobs),
                 result=handled.first_result,
                 independent=self.complete_independent,
             )
@@ -1059,7 +787,7 @@ class QueueFlowWorker:
             for message, group_jobs in grouped.items():
                 client.fail_many(
                     None,
-                    group_jobs,
+                    cast(list[ClaimedItem], group_jobs),
                     error=message,
                     independent=self.complete_independent,
                 )
@@ -1068,63 +796,11 @@ class QueueFlowWorker:
         for message, group_jobs in grouped.items():
             client.retry_many(
                 None,
-                group_jobs,
+                cast(list[ClaimedItem], group_jobs),
                 error=message,
                 independent=self.complete_independent,
             )
-        self._notify_retried_jobs(jobs)
         return len(jobs), 0
-
-    def _notify_retried_jobs(self, jobs: list[FlowJob]) -> None:
-        if self.wake_source is None or not jobs:
-            return
-
-        signals: list[FlowReadySignal] = []
-        for job in jobs:
-            partition_key = (
-                getattr(job, "partition_key", None)
-                or self.partition_key
-                or (self.partition_keys[0] if self.partition_keys else None)
-            )
-            if partition_key is None:
-                continue
-            for state in self._retry_wake_states(job):
-                signals.append(
-                    FlowReadySignal(
-                        type=self.type,
-                        state=state,
-                        partition_key=partition_key,
-                        priority=self.priority,
-                    )
-                )
-
-        if not signals:
-            return
-
-        notify_many = getattr(self.wake_source, "notify_many", None)
-        if callable(notify_many):
-            notify_many(signals)
-            return
-
-        notify = getattr(self.wake_source, "notify", None)
-        if callable(notify):
-            for signal in signals:
-                notify(signal)
-
-    def _retry_wake_states(self, job: FlowJob) -> list[str]:
-        run_state = getattr(job, "run_state", None)
-        if run_state:
-            return [run_state]
-
-        job_state = getattr(job, "state", None)
-        if job_state not in (None, "running"):
-            return [job_state]
-
-        if self.state is not None:
-            return [self.state]
-        if self.states:
-            return list(dict.fromkeys(self.states))
-        return ["queued"]
 
 
 class Worker:
@@ -1205,3 +881,229 @@ class Worker:
                 if self.partial_retry_delay_s > 0:
                     time.sleep(self.partial_retry_delay_s)
         return processed
+
+
+class Queue:
+    """High-level durable queue bound to one FerricFlow type/state."""
+
+    def __init__(
+        self,
+        client: FlowClient,
+        *,
+        claim_client: FlowClient | None = None,
+        type: str,
+        state: str = "queued",
+        retry_policy: RetryPolicy | None = None,
+        worker_config: WorkerConfig | None = None,
+        value_config: ValueConfig | None = None,
+    ) -> None:
+        self.client = client
+        self.claim_client = claim_client if claim_client is not None else client
+        self.type = type
+        self.state = state
+        self.retry_policy = retry_policy
+        self.worker_config = worker_config
+        self.value_config = value_config or ValueConfig()
+
+    def enqueue(self, id: str, *, payload: Any = None, **attrs: Any) -> FlowRecord | bytes:
+        return self.client.enqueue(
+            id,
+            type=self.type,
+            state=attrs.pop("state", self.state),
+            payload=payload,
+            **attrs,
+        )
+
+    def enqueue_many(self, items: list[Any], **attrs: Any) -> list[Any] | Any:
+        return self.client.enqueue_many(
+            items,
+            type=self.type,
+            state=attrs.pop("state", self.state),
+            **attrs,
+        )
+
+    def worker(self, **kwargs: Any) -> QueueFlowWorker:
+        worker_kwargs = (
+            self.worker_config.to_kwargs(QUEUE_WORKER_CONFIG_KEYS)
+            if self.worker_config is not None
+            else {}
+        )
+        if self.value_config.value_max_bytes is not None and "value_max_bytes" not in worker_kwargs:
+            worker_kwargs["value_max_bytes"] = self.value_config.value_max_bytes
+        worker_kwargs.update(kwargs)
+        if "state" not in worker_kwargs and "states" not in worker_kwargs:
+            worker_kwargs["state"] = self.state
+        return QueueFlowWorker(
+            self.client,
+            claim_client=self.claim_client,
+            type=self.type,
+            **worker_kwargs,
+        )
+
+    def install_policy(
+        self,
+        *,
+        retry_policy: RetryPolicy | None = None,
+        retry: RetryPolicy | None = None,
+    ) -> Any:
+        if retry_policy is not None and retry is not None:
+            raise ValueError("retry_policy and retry are mutually exclusive")
+        resolved_retry_policy = (
+            retry_policy
+            if retry_policy is not None
+            else retry
+            if retry is not None
+            else self.retry_policy
+        )
+        return self.client.install_policy(self.type, retry=resolved_retry_policy)
+
+
+class QueueClient:
+    """High-level client for durable queue workloads."""
+
+    def __init__(
+        self,
+        client: FlowClient | str,
+        *,
+        claim_client: FlowClient | str | None = None,
+        retry_policy: RetryPolicy | None = None,
+        worker_config: WorkerConfig | None = None,
+        value_config: ValueConfig | None = None,
+        _owns_clients: bool = False,
+    ) -> None:
+        command_pool_size, claim_pool_size = resolve_worker_connection_counts(
+            worker_config=worker_config,
+            default_workers=1,
+        )
+        self._url = client if isinstance(client, str) else None
+        self._base_url_kwargs: dict[str, Any] = {}
+        self._claim_client_explicit = claim_client is not None
+        self._owned_extra_claim_flows: list[FlowClient] = []
+        self._claim_pool_size = claim_pool_size
+        self.flow = (
+            FlowClient.from_url(client, max_connections=command_pool_size)
+            if isinstance(client, str)
+            else client
+        )
+        if claim_client is None:
+            self.claim_flow = (
+                FlowClient.from_url(client, max_connections=claim_pool_size)
+                if isinstance(client, str)
+                else self.flow
+            )
+        else:
+            self.claim_flow = (
+                FlowClient.from_url(claim_client, max_connections=claim_pool_size)
+                if isinstance(claim_client, str)
+                else claim_client
+            )
+        self.retry_policy = retry_policy
+        self.worker_config = worker_config
+        self.value_config = value_config or ValueConfig()
+        self._owns_flow = _owns_clients or isinstance(client, str)
+        self._owns_claim_flow = (
+            _owns_clients
+            or isinstance(claim_client, str)
+            or (claim_client is None and isinstance(client, str))
+        )
+
+    @classmethod
+    def from_url(
+        cls,
+        url: str,
+        *,
+        retry_policy: RetryPolicy | None = None,
+        worker_config: WorkerConfig | None = None,
+        value_config: ValueConfig | None = None,
+        **kwargs: Any,
+    ) -> QueueClient:
+        command_pool_size, claim_pool_size = resolve_worker_connection_counts(
+            worker_config=worker_config,
+            default_workers=1,
+        )
+        command_kwargs = dict(kwargs)
+        command_kwargs.setdefault("max_connections", command_pool_size)
+        claim_kwargs = dict(kwargs)
+        claim_kwargs["max_connections"] = claim_pool_size
+        instance = cls(
+            FlowClient.from_url(url, **command_kwargs),
+            claim_client=FlowClient.from_url(url, **claim_kwargs),
+            retry_policy=retry_policy,
+            worker_config=worker_config,
+            value_config=value_config,
+            _owns_clients=True,
+        )
+        instance._url = url
+        instance._base_url_kwargs = dict(kwargs)
+        instance._claim_client_explicit = False
+        instance._claim_pool_size = claim_pool_size
+        return instance
+
+    def _claim_flow_for_worker_config(
+        self,
+        worker_config: WorkerConfig | None,
+    ) -> FlowClient:
+        if self._claim_client_explicit or self._url is None or worker_config is None:
+            return self.claim_flow
+        _, claim_pool_size = resolve_worker_connection_counts(
+            worker_config=worker_config,
+            default_workers=1,
+        )
+        if claim_pool_size == self._claim_pool_size:
+            return self.claim_flow
+        claim_kwargs = dict(self._base_url_kwargs)
+        claim_kwargs["max_connections"] = claim_pool_size
+        claim_flow = FlowClient.from_url(self._url, **claim_kwargs)
+        self._owned_extra_claim_flows.append(claim_flow)
+        return claim_flow
+
+    def queue(
+        self,
+        *,
+        type: str,
+        state: str = "queued",
+        retry_policy: RetryPolicy | None = None,
+        worker_config: WorkerConfig | None = None,
+        value_config: ValueConfig | None = None,
+    ) -> Queue:
+        resolved_worker_config = worker_config if worker_config is not None else self.worker_config
+        return Queue(
+            self.flow,
+            claim_client=self._claim_flow_for_worker_config(resolved_worker_config),
+            type=type,
+            state=state,
+            retry_policy=retry_policy if retry_policy is not None else self.retry_policy,
+            worker_config=resolved_worker_config,
+            value_config=value_config if value_config is not None else self.value_config,
+        )
+
+    def install_policy(
+        self,
+        type: str,
+        *,
+        retry_policy: RetryPolicy | None = None,
+        retry: RetryPolicy | None = None,
+        states: dict[str, RetryPolicy] | None = None,
+    ) -> Any:
+        if retry_policy is not None and retry is not None:
+            raise ValueError("retry_policy and retry are mutually exclusive")
+        resolved_retry_policy = (
+            retry_policy
+            if retry_policy is not None
+            else retry
+            if retry is not None
+            else self.retry_policy
+        )
+        return self.flow.install_policy(type, retry=resolved_retry_policy, states=states)
+
+    def close(self) -> None:
+        for claim_flow in self._owned_extra_claim_flows:
+            claim_flow.close()
+        self._owned_extra_claim_flows.clear()
+        if self._owns_claim_flow and self.claim_flow is not self.flow:
+            self.claim_flow.close()
+        if self._owns_flow:
+            self.flow.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.flow, name)

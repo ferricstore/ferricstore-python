@@ -28,6 +28,44 @@ Typical state transition:
    * fail
 6. SDK sends `FLOW.TRANSITION`, `FLOW.COMPLETE`, `FLOW.RETRY`, or `FLOW.FAIL`.
 
+Queue lifecycle:
+
+```text
+enqueue
+  -> claim_due
+  -> handler
+  -> complete | retry | fail
+```
+
+Workflow lifecycle:
+
+```text
+start
+  -> state handler
+  -> transition(next state)
+  -> next state handler
+  -> complete | retry | fail
+```
+
+Lease lifecycle:
+
+```text
+claim_due returns lease_token + fencing_token
+  -> worker owns the job until lease expiry
+  -> complete/transition/retry/fail must use current tokens
+  -> stale tokens are rejected
+  -> expired leases can be reclaimed
+```
+
+Named value lifecycle:
+
+```text
+write value or value_ref
+  -> claim handler with claim_values=[...]
+  -> hydrate only requested names
+  -> cap large reads with value_max_bytes
+```
+
 ## Why Explicit State Pipeline
 
 Temporal and DBOS let user code look like one sequential function. FerricFlow
@@ -71,3 +109,5 @@ partition_key = "tenant-a:device-123"
 Payloads are raw bytes by default. The SDK does not JSON encode unless `JsonCodec`
 is used. This keeps large payload handling predictable and avoids accidental copies.
 
+Use [Data in Workflows](data.md) for concrete rules on `payload`, named values,
+value refs, `value_max_bytes`, and local caching.

@@ -5,9 +5,9 @@ The SDK defaults to raw bytes. This is fastest and avoids accidental JSON work.
 ## RawCodec
 
 ```python
-from ferricstore import FlowClient, RawCodec
+from ferricstore import RawCodec, WorkflowClient
 
-client = FlowClient.from_url("redis://127.0.0.1:6379/0", codec=RawCodec())
+client = WorkflowClient.from_url("redis://127.0.0.1:6379/0", codec=RawCodec())
 ```
 
 Accepts:
@@ -22,13 +22,13 @@ Returns `bytes | None` on decode.
 ## JsonCodec
 
 ```python
-from ferricstore import FlowClient, JsonCodec
+from ferricstore import JsonCodec, WorkflowClient
 
-client = FlowClient.from_url("redis://127.0.0.1:6379/0", codec=JsonCodec())
+client = WorkflowClient.from_url("redis://127.0.0.1:6379/0", codec=JsonCodec())
+orders = client.workflow(type="order")
 
-client.create(
+orders.start(
     "flow-1",
-    type="order",
     payload={"amount": 123},
 )
 ```
@@ -59,4 +59,3 @@ better than JSON.
 
 Payload should stay raw. Indexes, lineage, and counters should not duplicate it.
 Only request payload when handler needs it.
-

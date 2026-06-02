@@ -10,9 +10,7 @@ from typing import Any
 
 from ferricstore.client import FlowClient
 from ferricstore.types import CreateItem
-from ferricstore.worker import FlowReadyCoordinator, FlowReadySignal
 from ferricstore.workflow import Workflow, complete, state, transition
-
 
 AUTO_PARTITION_PREFIX = "__flow_auto__:"
 AUTO_PARTITION_BUCKETS = 256
@@ -96,9 +94,9 @@ def build_workflow_class(
     for idx, state_name in enumerate(states):
         next_state = states[idx + 1] if idx + 1 < len(states) else None
 
-        def make_handler(target_state: str | None):
+        def make_handler(source_state: str, target_state: str | None):
             @state(
-                state_name,
+                source_state,
                 claim_payload=claim_payload,
                 claim_record=claim_record,
                 return_record=return_record,
@@ -110,7 +108,7 @@ def build_workflow_class(
 
             return handle
 
-        attrs[f"handle_{idx}_{state_name}"] = make_handler(next_state)
+        attrs[f"handle_{idx}_{state_name}"] = make_handler(state_name, next_state)
 
     return type("BenchmarkWorkflow", (Workflow,), attrs)
 
@@ -150,31 +148,14 @@ def worker_partition_keys(
 
 
 def notify_ready_counts(
-    wake_coordinator: FlowReadyCoordinator | None,
+    wake_coordinator: object | None,
     *,
     flow_type: str,
     state_name: str,
     partition_counts: dict[str, int],
     server_shards: int,
 ) -> None:
-    if wake_coordinator is None:
-        return
-    for partition_key, count in partition_counts.items():
-        partition_index = auto_partition_index_from_key(partition_key)
-        wake_coordinator.notify(
-            FlowReadySignal(
-                type=flow_type,
-                state=state_name,
-                partition_key=partition_key,
-                count=count,
-                priority=0,
-                server_shard=(
-                    auto_partition_server_shard_for_index(partition_index, server_shards)
-                    if partition_index is not None
-                    else None
-                ),
-            )
-        )
+    return
 
 
 def created_partition_counts(
@@ -216,7 +197,7 @@ def create_workflows(
     create_batch_size: int,
     create_mode: str,
     independent_many: bool,
-    wake_coordinator: FlowReadyCoordinator | None,
+    wake_coordinator: object | None,
     server_shards: int,
 ) -> dict[str, int]:
     client = FlowClient.from_url(url)
@@ -361,7 +342,7 @@ def run_workflow_worker(
     completed: list[int],
     completed_lock: threading.Lock,
     producers_done: threading.Event,
-    wake_coordinator: FlowReadyCoordinator | None,
+    wake_coordinator: object | None,
     wake_coalesce_ms: float,
     server_shards: int,
 ) -> dict[str, int]:
@@ -396,13 +377,14 @@ def run_workflow_worker(
     current_sleep = idle_sleep_s
     final_state = states[-1]
     next_state_by_state = {
-        state_name: states[idx + 1]
-        for idx, state_name in enumerate(states[:-1])
+        state_name: states[idx + 1] for idx, state_name in enumerate(states[:-1])
     }
     allowed_partition_keys = [key for key in partitions_to_scan if key is not None]
     wake_idle_rounds = 0
     wake_coalesce_s = max(wake_coalesce_ms, 0.0) / 1000.0
-    apply_executor = ThreadPoolExecutor(max_workers=apply_async_depth) if apply_async_depth > 0 else None
+    apply_executor = (
+        ThreadPoolExecutor(max_workers=apply_async_depth) if apply_async_depth > 0 else None
+    )
     pending_applies = []
 
     def record_completed(count: int) -> None:
@@ -483,7 +465,9 @@ def run_workflow_worker(
                                 extra_credit = 0
                             selected_partitions.extend(extra_partitions)
                             partition_credit += extra_credit
-                    partition_key = selected_partitions[0] if len(selected_partitions) == 1 else None
+                    partition_key = (
+                        selected_partitions[0] if len(selected_partitions) == 1 else None
+                    )
                     partition_keys = selected_partitions if len(selected_partitions) > 1 else None
                     claim_limit = min(claim_batch_size, max(partition_credit, 1))
                 elif claim_partition_batch_size == 1:
@@ -495,7 +479,9 @@ def run_workflow_worker(
                     for _ in range(min(claim_partition_batch_size, len(partitions_to_scan))):
                         selected_partitions.append(partitions_to_scan[partition_cursor])
                         partition_cursor = (partition_cursor + 1) % len(partitions_to_scan)
-                    partition_key = selected_partitions[0] if len(selected_partitions) == 1 else None
+                    partition_key = (
+                        selected_partitions[0] if len(selected_partitions) == 1 else None
+                    )
                     partition_keys = selected_partitions if len(selected_partitions) > 1 else None
             elif claim_partition_batch_size == 1:
                 partition_key = partitions_to_scan[partition_cursor]
@@ -589,14 +575,8 @@ def run_state_machine_throughput(args: argparse.Namespace) -> dict[str, float | 
     completed = [0]
     completed_lock = threading.Lock()
     producers_done = threading.Event()
-    worker_mode = (
-        "owner-wakeup"
-        if args.worker_mode == "auto" and args.steps > 1
-        else "polling"
-        if args.worker_mode == "auto"
-        else args.worker_mode
-    )
-    wake_coordinator = FlowReadyCoordinator() if worker_mode == "owner-wakeup" else None
+    worker_mode = "blocking"
+    wake_coordinator = None
 
     if args.partition_mode == "auto" and args.create_mode == "many":
         create_ranges = [[] for _ in range(args.producers)]
@@ -643,7 +623,9 @@ def run_state_machine_throughput(args: argparse.Namespace) -> dict[str, float | 
                 flow_type=flow_type,
                 worker_index=worker_index,
                 workers=args.workers,
-                partitions=AUTO_PARTITION_BUCKETS if args.partition_mode == "auto" else args.partitions,
+                partitions=AUTO_PARTITION_BUCKETS
+                if args.partition_mode == "auto"
+                else args.partitions,
                 partition_mode=args.partition_mode,
                 states=states,
                 flows=args.flows,
@@ -742,9 +724,13 @@ def run_state_machine_throughput(args: argparse.Namespace) -> dict[str, float | 
         "process_seconds": process_seconds,
         "total_seconds": total_seconds,
         "create_flows_per_sec": created / create_seconds if create_seconds > 0 else 0.0,
-        "workflow_completions_per_sec": completed_count / process_seconds if process_seconds > 0 else 0.0,
+        "workflow_completions_per_sec": completed_count / process_seconds
+        if process_seconds > 0
+        else 0.0,
         "state_actions_per_sec": claimed_actions / process_seconds if process_seconds > 0 else 0.0,
-        "end_to_end_workflows_per_sec": completed_count / total_seconds if total_seconds > 0 else 0.0,
+        "end_to_end_workflows_per_sec": completed_count / total_seconds
+        if total_seconds > 0
+        else 0.0,
     }
 
 
@@ -762,7 +748,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--create-batch-size", type=int, default=5000)
     parser.add_argument("--claim-batch-size", type=int, default=1000)
     parser.add_argument("--claim-partition-batch-size", type=int, default=1)
-    parser.add_argument("--worker-mode", choices=("auto", "owner-wakeup", "polling"), default="auto")
+    parser.add_argument(
+        "--worker-mode", choices=("blocking", "polling"), default="blocking"
+    )
     parser.add_argument("--wake-coalesce-ms", type=float, default=2.0)
     parser.add_argument("--apply-async-depth", type=int, default=4)
     parser.add_argument("--server-shards", type=int, default=16)

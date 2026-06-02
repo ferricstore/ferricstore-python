@@ -3,7 +3,17 @@ import zlib
 
 import pytest
 
-from ferricstore import FlowAlreadyExistsError, FlowClient, QueueFlowWorker, JsonCodec, StaleLeaseError
+from ferricstore import (
+    BackpressurePolicy,
+    FlowAlreadyExistsError,
+    FlowClient,
+    JsonCodec,
+    OverloadedError,
+    QueueFlowWorker,
+    StaleLeaseError,
+)
+from ferricstore.backpressure import BackpressureController
+from ferricstore.errors import classify_server_error
 from ferricstore.types import (
     ChildSpec,
     ClaimedItem,
@@ -88,6 +98,19 @@ class CloseRedis(FakeRedis):
 class AckRedis(FakeRedis):
     def execute_command(self, *args):
         self.calls.append(args)
+        return b"OK"
+
+
+class OverloadThenAckRedis(FakeRedis):
+    def __init__(self, overloads: int):
+        super().__init__()
+        self.overloads = overloads
+
+    def execute_command(self, *args):
+        self.calls.append(args)
+        if self.overloads > 0:
+            self.overloads -= 1
+            raise OverloadedError("ERR overloaded")
         return b"OK"
 
 
@@ -195,6 +218,7 @@ def test_create_builds_flow_create_command():
         partition_key="tenant:1",
         payload=b"hello",
         now_ms=100,
+        return_record=True,
     )
 
     assert record.id == "f1"
@@ -227,7 +251,6 @@ def test_create_can_return_ack_without_followup_get():
         partition_key="tenant:1",
         payload=b"hello",
         now_ms=100,
-        return_record=False,
     )
 
     assert result == b"OK"
@@ -259,7 +282,7 @@ def test_create_ack_followup_get_uses_auto_partition_when_partition_omitted():
     client = FlowClient(redis)
     expected_partition = f"__flow_auto__:{zlib.crc32(b'f-auto') % 256}"
 
-    record = client.create("f-auto", type="order", payload=b"hello", now_ms=100)
+    record = client.create("f-auto", type="order", payload=b"hello", now_ms=100, return_record=True)
 
     assert record.id == "f-auto"
     assert redis.calls[1][:2] == ("FLOW.GET", "f-auto")
@@ -391,6 +414,95 @@ def test_enqueue_uses_ack_only_create_by_default():
     )
 
 
+def test_enqueue_passes_retention_ttl_ms():
+    redis = AckRedis()
+    client = FlowClient(redis)
+
+    result = client.enqueue(
+        "f1",
+        type="order",
+        payload=b"hello",
+        now_ms=100,
+        retention_ttl_ms=300_000,
+    )
+
+    assert result == b"OK"
+    assert "RETENTION_TTL_MS" in redis.calls[0]
+    assert redis.calls[0][redis.calls[0].index("RETENTION_TTL_MS") + 1] == 300_000
+
+
+def test_enqueue_retries_server_overload_with_backpressure():
+    redis = OverloadThenAckRedis(overloads=2)
+    client = FlowClient(
+        redis,
+        backpressure=BackpressurePolicy(base_delay_ms=0, max_delay_ms=0, jitter=0),
+    )
+
+    result = client.enqueue("f1", type="order", payload=b"hello", now_ms=100)
+
+    assert result == b"OK"
+    assert len(redis.calls) == 3
+
+
+def test_enqueue_default_backpressure_retries_until_server_recovers():
+    redis = OverloadThenAckRedis(overloads=12)
+    client = FlowClient(
+        redis,
+        backpressure=BackpressurePolicy(base_delay_ms=0, max_delay_ms=0, jitter=0),
+    )
+
+    result = client.enqueue("f1", type="order", payload=b"hello", now_ms=100)
+
+    assert result == b"OK"
+    assert len(redis.calls) == 13
+
+
+def test_backpressure_delay_saturates_without_overflow():
+    controller = BackpressureController(
+        BackpressurePolicy(base_delay_ms=5, max_delay_ms=500, jitter=0, shared=False)
+    )
+
+    assert controller._delay_for_attempt(10_000) == 0.5
+
+
+def test_overload_error_parses_retry_after_hint():
+    error = classify_server_error(
+        "BUSY FerricStore overloaded: new Flow creates paused; "
+        "retry_after_ms=2000 reason=rss_pressure"
+    )
+
+    assert isinstance(error, OverloadedError)
+    assert error.retry_after_ms == 2000
+    assert error.reason == "rss_pressure"
+
+
+def test_backpressure_uses_retry_after_hint_and_shares_block():
+    policy = BackpressurePolicy(
+        base_delay_ms=0,
+        max_delay_ms=0,
+        jitter=0,
+        shared=True,
+    )
+    producer_a = BackpressureController(policy)
+    producer_b = BackpressureController(policy)
+
+    assert producer_a._record_overload_delay(0, retry_after_ms=1) == 0.001
+    assert producer_b._wait_delay() > 0
+
+
+def test_enqueue_stops_after_backpressure_retry_budget():
+    redis = OverloadThenAckRedis(overloads=2)
+    client = FlowClient(
+        redis,
+        backpressure=BackpressurePolicy(max_retries=1, base_delay_ms=0, max_delay_ms=0, jitter=0),
+    )
+
+    with pytest.raises(OverloadedError):
+        client.enqueue("f1", type="order", payload=b"hello", now_ms=100)
+
+    assert len(redis.calls) == 2
+
+
 def test_enqueue_many_groups_no_partition_items_by_auto_bucket():
     redis = PerItemAckRedis()
     client = FlowClient(redis)
@@ -405,10 +517,29 @@ def test_enqueue_many_groups_no_partition_items_by_auto_bucket():
         bucket = call[1]
         assert isinstance(bucket, str)
         assert bucket.startswith("__flow_auto__:")
+        assert "RETENTION_TTL_MS" not in call
         item_args = call[call.index("ITEMS") + 1 :]
         ids = item_args[0::2]
         for id in ids:
             assert bucket == f"__flow_auto__:{zlib.crc32(id.encode()) % 256}"
+
+
+def test_enqueue_many_passes_retention_ttl_ms_to_auto_bucket_batches():
+    redis = PerItemAckRedis()
+    client = FlowClient(redis)
+
+    results = client.enqueue_many(
+        [CreateItem(f"flow-{idx}", b"payload") for idx in range(16)],
+        type="order",
+        now_ms=100,
+        retention_ttl_ms=300_000,
+    )
+
+    assert results == [b"OK"] * 16
+    assert redis.calls
+    for call in redis.calls:
+        assert "RETENTION_TTL_MS" in call
+        assert call[call.index("RETENTION_TTL_MS") + 1] == 300_000
 
 
 def test_direct_many_methods_noop_on_empty_inputs():
@@ -417,12 +548,15 @@ def test_direct_many_methods_noop_on_empty_inputs():
 
     assert client.create_many("tenant:1", [], type="order") == []
     assert client.complete_many("tenant:1", []) == []
-    assert client.transition_many(
-        "tenant:1",
-        from_state="running",
-        to_state="next",
-        items=[],
-    ) == []
+    assert (
+        client.transition_many(
+            "tenant:1",
+            from_state="running",
+            to_state="next",
+            items=[],
+        )
+        == []
+    )
     assert client.retry_many("tenant:1", []) == []
     assert client.fail_many("tenant:1", []) == []
     assert client.cancel_many("tenant:1", []) == []
@@ -513,6 +647,38 @@ def test_claim_due_can_target_priority():
         "RECLAIM_EXPIRED",
         "false",
     )
+
+
+def test_claim_due_omits_now_when_not_supplied():
+    redis = FakeRedis()
+    client = FlowClient(redis)
+
+    client.claim_due(
+        "order",
+        state="queued",
+        worker="worker-1",
+        partition_key="tenant:1",
+        limit=10,
+    )
+
+    assert "NOW" not in redis.calls[0]
+
+
+def test_claim_due_sends_block_when_supplied():
+    redis = FakeRedis()
+    client = FlowClient(redis)
+
+    client.claim_jobs(
+        "order",
+        state="queued",
+        worker="worker-1",
+        partition_key="tenant:1",
+        limit=10,
+        block_ms=5000,
+    )
+
+    assert "BLOCK" in redis.calls[0]
+    assert redis.calls[0][redis.calls[0].index("BLOCK") + 1] == 5000
 
 
 def test_claim_due_omits_state_when_none():
@@ -703,7 +869,9 @@ def test_value_put_named_options_and_value_mget_decode_values():
 def test_value_mget_normalizes_omission_metadata_recursively():
     redis = FakeRedis()
     client = FlowClient(redis)
-    redis.responses = [[{b"ref": b"ref-a", b"omitted": True, b"size": 123, b"nested": {b"k": b"v"}}]]
+    redis.responses = [
+        [{b"ref": b"ref-a", b"omitted": True, b"size": 123, b"nested": {b"k": b"v"}}]
+    ]
 
     values = client.value_mget(["ref-a"], max_bytes=10)
 
@@ -834,6 +1002,49 @@ def test_claim_due_can_return_job_only_items():
         0,
         "RETURN",
         "JOBS_COMPACT",
+    )
+
+
+def test_claim_jobs_can_request_compact_state_items():
+    redis = FakeRedis()
+    redis.responses.append([[b"f1", b"tenant:1", b"lease", 7, b"ready"]])
+    client = FlowClient(redis)
+
+    jobs = client.claim_jobs(
+        "order",
+        worker="worker-1",
+        partition_key="tenant:1",
+        limit=10,
+        block_ms=5000,
+        include_state=True,
+    )
+
+    assert jobs == [
+        ClaimedItem(
+            id="f1",
+            partition_key="tenant:1",
+            lease_token=b"lease",
+            fencing_token=7,
+            run_state="ready",
+        )
+    ]
+    assert redis.calls[0] == (
+        "FLOW.CLAIM_DUE",
+        "order",
+        "WORKER",
+        "worker-1",
+        "LEASE_MS",
+        30000,
+        "LIMIT",
+        10,
+        "PARTITION",
+        "tenant:1",
+        "PRIORITY",
+        0,
+        "RETURN",
+        "JOBS_COMPACT_STATE",
+        "BLOCK",
+        5000,
     )
 
 
@@ -1366,7 +1577,9 @@ def test_spawn_children_uses_extended_items_for_per_child_named_values():
         "parent-1",
         [
             ChildSpec("c1", "email", b"p1", partition_key="p1", values={"order": b"o1"}),
-            ChildSpec("c2", "audit", b"p2", partition_key="p2", value_refs={"profile": "profile-ref"}),
+            ChildSpec(
+                "c2", "audit", b"p2", partition_key="p2", value_refs={"profile": "profile-ref"}
+            ),
         ],
         partition_key="parent-p",
         group_id="g1",
@@ -1804,10 +2017,14 @@ def test_single_extra_mutation_commands():
     redis = FakeRedis()
     client = FlowClient(redis)
 
-    client.extend_lease("f1", b"lease", fencing_token=3, lease_ms=10_000, partition_key="p1", now_ms=100)
+    client.extend_lease(
+        "f1", b"lease", fencing_token=3, lease_ms=10_000, partition_key="p1", now_ms=100
+    )
     assert redis.calls[-1][0] == "FLOW.EXTEND_LEASE"
 
-    client.cancel("f1", fencing_token=3, lease_token=b"lease", partition_key="p1", reason=b"stop", now_ms=101)
+    client.cancel(
+        "f1", fencing_token=3, lease_token=b"lease", partition_key="p1", reason=b"stop", now_ms=101
+    )
     assert redis.calls[-1][0] == "FLOW.CANCEL"
 
     client.rewind("f1", to_event="e1", partition_key="p1", expect_state="failed", now_ms=102)
@@ -1973,11 +2190,7 @@ def test_command_pipeline_batches_mixed_commands_with_sequential_fallback():
     client = FlowClient(redis)
 
     pipe = client.pipeline()
-    result = (
-        pipe.command("SET", "k", "v")
-        .command("FLOW.CREATE", "f1", "TYPE", "order")
-        .execute()
-    )
+    result = pipe.command("SET", "k", "v").command("FLOW.CREATE", "f1", "TYPE", "order").execute()
 
     assert len(result) == 2
     assert redis.calls[0] == ("SET", "k", "v")

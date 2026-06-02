@@ -3,7 +3,15 @@ import zlib
 
 import pytest
 
-from ferricstore import AsyncFlowClient, FlowAlreadyExistsError, FlowClient, JsonCodec, StaleLeaseError
+from ferricstore import (
+    AsyncFlowClient,
+    BackpressurePolicy,
+    FlowAlreadyExistsError,
+    FlowClient,
+    JsonCodec,
+    OverloadedError,
+    StaleLeaseError,
+)
 from ferricstore.types import ChildSpec, ClaimedItem, CreateItem, FencedItem
 
 
@@ -18,9 +26,38 @@ class FakeAsyncRedis:
         if self.responses:
             return self.responses.pop(0)
         command = args[0]
+        record = {
+            b"id": b"f1",
+            b"type": b"order",
+            b"state": b"created",
+            b"partition_key": b"tenant:1",
+            b"version": 1,
+            b"lease_token": b"lease",
+            b"fencing_token": 7,
+            b"payload": b'{"ok":true}',
+        }
         if command in {"FLOW.CLAIM_DUE", "FLOW.RECLAIM"}:
             return [[b"f1", b"tenant:1", b"lease", 7]]
-        if command in {"FLOW.CREATE_MANY", "FLOW.COMPLETE_MANY", "FLOW.RETRY_MANY", "FLOW.FAIL_MANY"}:
+        if command in {
+            "FLOW.LIST",
+            "FLOW.TERMINALS",
+            "FLOW.FAILURES",
+            "FLOW.BY_PARENT",
+            "FLOW.BY_ROOT",
+            "FLOW.BY_CORRELATION",
+            "FLOW.STUCK",
+        }:
+            return [record]
+        if command in {"FLOW.INFO", "FLOW.POLICY.GET", "FLOW.RETENTION_CLEANUP"}:
+            return {b"ok": 1}
+        if command == "FLOW.HISTORY":
+            return [[b"event-1", {b"event": b"created"}]]
+        if command in {
+            "FLOW.CREATE_MANY",
+            "FLOW.COMPLETE_MANY",
+            "FLOW.RETRY_MANY",
+            "FLOW.FAIL_MANY",
+        }:
             return [b"OK"]
         if command == "FLOW.VALUE.MGET":
             return [b'{"ok": true}']
@@ -30,6 +67,19 @@ class FakeAsyncRedis:
 
     async def close(self):
         self.closed = True
+
+
+class OverloadThenAckAsyncRedis(FakeAsyncRedis):
+    def __init__(self, overloads: int):
+        super().__init__()
+        self.overloads = overloads
+
+    async def execute_command(self, *args):
+        self.calls.append(args)
+        if self.overloads > 0:
+            self.overloads -= 1
+            raise OverloadedError("ERR overloaded")
+        return b"OK"
 
 
 class CreateAckThenGetAsyncRedis(FakeAsyncRedis):
@@ -69,7 +119,6 @@ def test_async_create_uses_real_async_executor_without_thread_fallback(monkeypat
             partition_key="tenant:1",
             payload=b"hello",
             now_ms=100,
-            return_record=False,
         )
 
         assert result == b"OK"
@@ -168,12 +217,15 @@ def test_async_direct_many_methods_noop_on_empty_inputs():
 
         assert await client.create_many("tenant:1", [], type="order") == []
         assert await client.complete_many("tenant:1", []) == []
-        assert await client.transition_many(
-            "tenant:1",
-            from_state="running",
-            to_state="next",
-            items=[],
-        ) == []
+        assert (
+            await client.transition_many(
+                "tenant:1",
+                from_state="running",
+                to_state="next",
+                items=[],
+            )
+            == []
+        )
         assert await client.retry_many("tenant:1", []) == []
         assert await client.fail_many("tenant:1", []) == []
         assert await client.cancel_many("tenant:1", []) == []
@@ -188,7 +240,13 @@ def test_async_create_ack_followup_get_uses_auto_partition_when_partition_omitte
         client = AsyncFlowClient(redis)
         expected_partition = f"__flow_auto__:{zlib.crc32(b'f-auto') % 256}"
 
-        record = await client.create("f-auto", type="order", payload=b"hello", now_ms=100)
+        record = await client.create(
+            "f-auto",
+            type="order",
+            payload=b"hello",
+            now_ms=100,
+            return_record=True,
+        )
 
         assert record.id == "f-auto"
         assert redis.calls[1][:2] == ("FLOW.GET", "f-auto")
@@ -255,6 +313,90 @@ def test_async_claim_jobs_and_complete_jobs_use_hot_compact_paths():
             b"lease",
             7,
         )
+
+    run(main())
+
+
+def test_async_claim_jobs_can_request_compact_state_items():
+    async def main():
+        redis = FakeAsyncRedis()
+        redis.responses.append([[b"f1", b"tenant:1", b"lease", 7, b"ready"]])
+        client = AsyncFlowClient(redis)
+
+        jobs = await client.claim_jobs(
+            "order",
+            worker="worker-1",
+            partition_key="tenant:1",
+            limit=10,
+            block_ms=5000,
+            include_state=True,
+        )
+
+        assert jobs == [
+            ClaimedItem(
+                id="f1",
+                partition_key="tenant:1",
+                lease_token=b"lease",
+                fencing_token=7,
+                run_state="ready",
+            )
+        ]
+        assert redis.calls[0] == (
+            "FLOW.CLAIM_DUE",
+            "order",
+            "WORKER",
+            "worker-1",
+            "LEASE_MS",
+            30000,
+            "LIMIT",
+            10,
+            "PARTITION",
+            "tenant:1",
+            "PRIORITY",
+            0,
+            "RETURN",
+            "JOBS_COMPACT_STATE",
+            "BLOCK",
+            5000,
+        )
+
+    run(main())
+
+
+def test_async_claim_due_omits_now_when_not_supplied():
+    async def main():
+        redis = FakeAsyncRedis()
+        client = AsyncFlowClient(redis)
+
+        await client.claim_jobs(
+            "order",
+            state="queued",
+            worker="worker-1",
+            partition_key="tenant:1",
+            limit=10,
+        )
+
+        assert "NOW" not in redis.calls[0]
+
+    run(main())
+
+
+def test_async_claim_due_sends_block_when_supplied():
+    async def main():
+        redis = FakeAsyncRedis()
+        client = AsyncFlowClient(redis)
+
+        await client.claim_jobs(
+            "order",
+            state="queued",
+            worker="worker-1",
+            partition_key="tenant:1",
+            limit=10,
+            block_ms=5000,
+        )
+
+        assert "BLOCK" in redis.calls[0]
+        assert redis.calls[0][redis.calls[0].index("BLOCK") + 1] == 5000
 
     run(main())
 
@@ -361,6 +503,100 @@ def test_async_enqueue_many_keeps_auto_bucket_grouping():
     run(main())
 
 
+def test_async_enqueue_passes_retention_ttl_ms():
+    async def main():
+        redis = FakeAsyncRedis()
+        client = AsyncFlowClient(redis)
+
+        result = await client.enqueue(
+            "f1",
+            type="order",
+            payload=b"hello",
+            now_ms=100,
+            retention_ttl_ms=300_000,
+        )
+
+        assert result == b"OK"
+        assert "RETENTION_TTL_MS" in redis.calls[0]
+        assert redis.calls[0][redis.calls[0].index("RETENTION_TTL_MS") + 1] == 300_000
+
+    run(main())
+
+
+def test_async_enqueue_retries_server_overload_with_backpressure():
+    async def main():
+        redis = OverloadThenAckAsyncRedis(overloads=2)
+        client = AsyncFlowClient(
+            redis,
+            backpressure=BackpressurePolicy(base_delay_ms=0, max_delay_ms=0, jitter=0),
+        )
+
+        result = await client.enqueue("f1", type="order", payload=b"hello", now_ms=100)
+
+        assert result == b"OK"
+        assert len(redis.calls) == 3
+
+    run(main())
+
+
+def test_async_enqueue_default_backpressure_retries_until_server_recovers():
+    async def main():
+        redis = OverloadThenAckAsyncRedis(overloads=12)
+        client = AsyncFlowClient(
+            redis,
+            backpressure=BackpressurePolicy(base_delay_ms=0, max_delay_ms=0, jitter=0),
+        )
+
+        result = await client.enqueue("f1", type="order", payload=b"hello", now_ms=100)
+
+        assert result == b"OK"
+        assert len(redis.calls) == 13
+
+    run(main())
+
+
+def test_async_enqueue_stops_after_backpressure_retry_budget():
+    async def main():
+        redis = OverloadThenAckAsyncRedis(overloads=2)
+        client = AsyncFlowClient(
+            redis,
+            backpressure=BackpressurePolicy(
+                max_retries=1,
+                base_delay_ms=0,
+                max_delay_ms=0,
+                jitter=0,
+            ),
+        )
+
+        with pytest.raises(OverloadedError):
+            await client.enqueue("f1", type="order", payload=b"hello", now_ms=100)
+
+        assert len(redis.calls) == 2
+
+    run(main())
+
+
+def test_async_enqueue_many_passes_retention_ttl_ms_to_auto_bucket_batches():
+    async def main():
+        redis = FakeAsyncRedis()
+        client = AsyncFlowClient(redis)
+
+        result = await client.enqueue_many(
+            [CreateItem("flow-1", b"a"), CreateItem("flow-2", b"b")],
+            type="order",
+            now_ms=100,
+            retention_ttl_ms=300_000,
+        )
+
+        assert result == [b"OK", b"OK"]
+        assert redis.calls
+        for call in redis.calls:
+            assert "RETENTION_TTL_MS" in call
+            assert call[call.index("RETENTION_TTL_MS") + 1] == 300_000
+
+    run(main())
+
+
 def test_async_create_many_mixed_allows_auto_partition_items():
     async def main():
         redis = FakeAsyncRedis()
@@ -442,7 +678,9 @@ def test_async_many_commands_reject_items_from_different_explicit_partition():
         client = AsyncFlowClient(redis)
 
         with pytest.raises(ValueError, match="partition_key"):
-            await client.create_many("p1", [CreateItem("f1", b"p", partition_key="p2")], type="order")
+            await client.create_many(
+                "p1", [CreateItem("f1", b"p", partition_key="p2")], type="order"
+            )
 
         with pytest.raises(ValueError, match="partition_key"):
             await client.complete_many("p1", [ClaimedItem("f1", b"lease", 3, partition_key="p2")])
@@ -517,13 +755,63 @@ def test_async_value_mget_decodes_with_codec_and_close_awaits_executor():
 def test_async_value_mget_normalizes_omission_metadata_recursively():
     async def main():
         redis = FakeAsyncRedis()
-        redis.responses = [[{b"ref": b"ref-a", b"omitted": True, b"size": 123, b"nested": {b"k": b"v"}}]]
+        redis.responses = [
+            [{b"ref": b"ref-a", b"omitted": True, b"size": 123, b"nested": {b"k": b"v"}}]
+        ]
         client = AsyncFlowClient(redis)
 
         values = await client.value_mget(["ref-a"], max_bytes=10)
 
         assert values == [{"ref": "ref-a", "omitted": True, "size": 123, "nested": {"k": "v"}}]
         assert redis.calls[-1] == ("FLOW.VALUE.MGET", "ref-a", "MAX_BYTES", 10)
+
+    run(main())
+
+
+def test_async_query_policy_and_cleanup_commands():
+    async def main():
+        redis = FakeAsyncRedis()
+        client = AsyncFlowClient(redis)
+
+        assert (await client.list("order", state="queued", count=10))[0].id == "f1"
+        assert redis.calls[-1] == ("FLOW.LIST", "order", "STATE", "queued", "COUNT", 10)
+
+        assert (await client.terminals("order", state="completed", rev=True, count=5))[0].id == "f1"
+        assert redis.calls[-1] == (
+            "FLOW.TERMINALS",
+            "order",
+            "COUNT",
+            5,
+            "REV",
+            "true",
+            "STATE",
+            "completed",
+        )
+
+        assert (await client.failures("order", from_ms=10, to_ms=20))[0].id == "f1"
+        assert redis.calls[-1] == ("FLOW.FAILURES", "order", "FROM_MS", 10, "TO_MS", 20)
+
+        assert (await client.by_parent("p", count=1, terminal_only=True))[0].id == "f1"
+        assert redis.calls[-1] == (
+            "FLOW.BY_PARENT",
+            "p",
+            "COUNT",
+            1,
+            "TERMINAL_ONLY",
+            "true",
+        )
+
+        assert (await client.by_root("root", count=1))[0].id == "f1"
+        assert redis.calls[-1] == ("FLOW.BY_ROOT", "root", "COUNT", 1)
+
+        assert (await client.by_correlation("checkout-1", include_cold=True))[0].id == "f1"
+        assert redis.calls[-1] == ("FLOW.BY_CORRELATION", "checkout-1", "INCLUDE_COLD", "true")
+
+        assert await client.info("order") == {b"ok": 1}
+        assert (await client.stuck("order", older_than_ms=100, now_ms=200))[0].id == "f1"
+        assert await client.history("f1", count=10, from_version=2, values=True)
+        assert await client.policy_get("order", state="queued") == {b"ok": 1}
+        assert await client.retention_cleanup(limit=100, now_ms=123) == {b"ok": 1}
 
     run(main())
 

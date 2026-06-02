@@ -1,31 +1,19 @@
-from __future__ import annotations
-
 import asyncio
 
-from ferricstore import AsyncFlowClient, AsyncQueueFlowWorker, CreateItem
+from ferricstore import AsyncQueueClient
+
+
+async def send_email(job) -> bytes:
+    print(f"send email: {job.id} payload={job.payload!r}")
+    return b"sent"
 
 
 async def main() -> None:
-    client = AsyncFlowClient.from_url("redis://127.0.0.1:6379/0")
+    client = AsyncQueueClient.from_url("redis://127.0.0.1:6379/0")
+    emails = client.queue(type="email")
 
-    await client.enqueue_many(
-        [CreateItem(f"async-email-{idx}", f"user-{idx}".encode()) for idx in range(100)],
-        type="email",
-    )
-
-    worker = AsyncQueueFlowWorker(
-        client,
-        type="email",
-        state="queued",
-        concurrency=100,
-        batch_size=100,
-    )
-
-    async def handle(job):
-        print("send async email", job.id)
-
-    await worker.run_once(handle)
-    await worker.close()
+    await emails.enqueue("email-1", payload=b"welcome:user-1", idempotent=True)
+    await emails.worker(concurrency=10, batch_size=100).run(send_email)
 
 
 if __name__ == "__main__":

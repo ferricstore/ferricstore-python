@@ -6,18 +6,28 @@ FerricStore speaks Redis-compatible RESP. The SDK gives typed helpers for
 FerricFlow and FerricStore-native commands, while still letting you call any
 normal Redis command through one passthrough method.
 
+If you are new, start with [Quickstart](quickstart.md). If you need
+production-style examples for sagas, IoT fanout, AI orchestration, human
+approval, webhooks, or batch fanout, read [Use Case Examples](use-cases.md).
+
 ## What the SDK includes
 
 | Area | API |
 | --- | --- |
+| High-level workflows | `WorkflowClient`, `@workflow.state`, `transition`, `complete`, `retry`, `fail` |
+| High-level queues | `QueueClient` |
+| Async high-level workflows | `AsyncWorkflowClient` |
+| Async high-level queues | `AsyncQueueClient` |
 | Low-level Flow commands | `FlowClient` |
-| Queue-style workers | `QueueFlowWorker` |
-| Explicit state-machine workflows | `Workflow`, `@state`, `transition`, `complete`, `retry`, `fail` |
-| Queue/workflow support types | `CreateItem`, `ClaimedItem`, `FencedItem`, `ChildSpec`, `RetryPolicy`, `FlowRecord` |
+| Queue/workflow support types | `CreateItem`, `ClaimedItem`, `FencedItem`, `ChildSpec`, `RetryPolicy`, `WorkerConfig`, `ValueConfig`, `ExceptionPolicy`, `FlowRecord` |
 | Native FerricStore commands | `cas`, `lock`, `ratelimit_add`, `fetch_or_compute`, `key_info`, cluster/admin helpers |
 | Normal Redis commands | `client.command(...)` |
 | Payload codecs | `RawCodec`, `JsonCodec` |
 | Transport adapter | `RedisAdapter`, `RedisCommandExecutor` |
+
+For production deployment defaults, worker sizing, lease/reclaim policy,
+observability, graceful shutdown, and security guidance, read
+[Production Readiness](production.md).
 
 ## Install and connect
 
@@ -37,9 +47,9 @@ pip install -e ".[dev]"
 Create a client:
 
 ```python
-from ferricstore import FlowClient
+from ferricstore import WorkflowClient
 
-client = FlowClient.from_url("redis://127.0.0.1:6379/0")
+client = WorkflowClient.from_url("redis://127.0.0.1:6379/0")
 ```
 
 `from_url` uses `redis-py` with RESP3 and raw byte responses:
@@ -51,9 +61,9 @@ redis.Redis.from_url(url, protocol=3, decode_responses=False)
 Use JSON payloads when you want language-neutral structured values:
 
 ```python
-from ferricstore import FlowClient, JsonCodec
+from ferricstore import JsonCodec, WorkflowClient
 
-client = FlowClient.from_url("redis://127.0.0.1:6379/0", codec=JsonCodec())
+client = WorkflowClient.from_url("redis://127.0.0.1:6379/0", codec=JsonCodec())
 ```
 
 The default `RawCodec` accepts `bytes`, `bytearray`, `str`, or `None` and returns
@@ -63,15 +73,38 @@ raw bytes on decode.
 
 | Use case | Recommended API |
 | --- | --- |
-| DBOS-style queue workload | `client.enqueue(...)` plus `QueueFlowWorker` |
-| Explicit durable state machine | `Workflow` plus `@state` handlers |
+| DBOS-style queue workload | `QueueClient` |
+| Explicit durable state machine | `WorkflowClient` plus `@workflow.state` handlers |
+| Async queue or workflow service | `AsyncQueueClient` / `AsyncWorkflowClient` |
 | Advanced batching, fanout, custom routing | `FlowClient` directly |
 | Normal Redis data structures | `client.command("SET", ...)`, `client.command("HSET", ...)` |
 | Locks, CAS, rate limits, fetch stampede protection | First-class native helpers on `FlowClient` |
 | Cluster/admin operations | Cluster/admin helpers or `client.command(...)` |
 
-Rule of thumb: start with `QueueFlowWorker` for queues, start with `Workflow` for
-state machines, and drop to `FlowClient` when you need exact command control.
+Rule of thumb: start with `QueueClient` for queues, start with `WorkflowClient`
+for state machines, use the async equivalents in `asyncio` services, and drop to
+`FlowClient` only when you need exact command control.
+
+## Client-level defaults
+
+Put normal production defaults on the high-level client. Queues and workflows
+inherit them, and explicit `.queue(...)`, `.workflow(...)`, `.worker(...)`, or
+`@workflow.state(...)` arguments override them.
+
+```python
+from ferricstore import ExceptionPolicy, RetryPolicy, ValueConfig, WorkerConfig, WorkflowClient
+
+client = WorkflowClient.from_url(
+    "redis://127.0.0.1:6379/0",
+    retry_policy=RetryPolicy(max_retries=10, backoff="exponential"),
+    worker_config=WorkerConfig(
+        batch_size=100,
+        idle_sleep_s=0.01,
+        exception_policy=ExceptionPolicy.RETRY,
+    ),
+    value_config=ValueConfig(value_max_bytes=64 * 1024),
+)
+```
 
 ## Normal Redis commands
 
@@ -204,7 +237,7 @@ operator code, not normal request handlers.
 ### Create one flow
 
 ```python
-record = client.create(
+client.create(
     "order-1",
     type="order",
     state="created",
@@ -227,7 +260,7 @@ Important create options:
 | `priority` | Priority used by due indexes. |
 | `idempotent` | Let duplicate creates resolve safely when server supports it. |
 | `values`, `value_refs` | Named per-flow values. |
-| `return_record` | If `False`, return raw ack and skip follow-up `FLOW.GET`. |
+| `return_record` | Default `False`. Set `True` only when the caller needs the updated `FlowRecord`. |
 
 Use `enqueue` when you only need acknowledgement:
 
@@ -245,7 +278,7 @@ client.enqueue(
 ```python
 from ferricstore import CreateItem
 
-records = client.create_many(
+client.create_many(
     "tenant-a",
     [
         CreateItem("order-1", b"payload-1"),
@@ -303,6 +336,10 @@ ids and tokens:
 jobs = client.claim_jobs("order", state="queued", worker="worker-1", limit=100)
 ```
 
+Long timers use the same claim path. FerricStore may hibernate far-future
+`run_at_ms` flows to keep hot RAM/indexes small; `claim_due`, `claim_jobs`, and
+the worker APIs still promote and claim those flows normally once they are due.
+
 ### Complete, retry, fail, cancel
 
 ```python
@@ -314,7 +351,6 @@ client.complete(
     fencing_token=job.fencing_token,
     partition_key=job.partition_key,
     result=b"ok",
-    return_record=False,
 )
 ```
 
@@ -326,7 +362,6 @@ client.retry(
     partition_key=job.partition_key,
     error=b"temporary failure",
     run_at_ms=next_attempt_ms,
-    return_record=False,
 )
 ```
 
@@ -337,7 +372,6 @@ client.fail(
     fencing_token=job.fencing_token,
     partition_key=job.partition_key,
     error=b"permanent failure",
-    return_record=False,
 )
 ```
 
@@ -348,7 +382,6 @@ client.cancel(
     lease_token=job.lease_token,
     partition_key=job.partition_key,
     reason=b"user cancelled",
-    return_record=False,
 )
 ```
 
@@ -363,7 +396,6 @@ client.transition(
     fencing_token=job.fencing_token,
     partition_key=job.partition_key,
     payload=b"charged payload",
-    return_record=False,
 )
 ```
 
@@ -433,16 +465,16 @@ stuck = client.stuck("order", older_than_ms=300_000, count=100)
 ### Policy and cleanup
 
 ```python
-from ferricstore import RetryPolicy
+from ferricstore import RetryPolicy, WorkflowClient
 
-client.install_policy(
-    "order",
-    states={
-        "queued": RetryPolicy(max_retries=5, backoff="exponential", base_ms=100, max_ms=5_000),
-    },
+client = WorkflowClient.from_url(
+    "redis://127.0.0.1:6379/0",
+    retry_policy=RetryPolicy(max_retries=5, backoff="exponential", base_ms=100, max_ms=5_000),
 )
+workflow = client.workflow(type="order", initial_state="queued")
+workflow.install_policy()
 
-policy = client.policy_get("order", state="queued")
+policy = client.policy_get("order")
 client.retention_cleanup(limit=10_000)
 ```
 
@@ -478,22 +510,23 @@ client.transition(
     partition_key=job.partition_key,
     values={"charge": b"charge response"},
     drop_values=["customer"],
-    override_values=["charge"],
-    return_record=False,
 )
 ```
+
+Use `override_values=[...]` only when the state intentionally replaces a named
+value. For normal step outputs, prefer first-write semantics so duplicate
+side effects or unexpected retries are visible.
 
 Fetch only the values needed by this read or claim:
 
 ```python
-record = client.get("order-1", values=["order"], value_max_bytes=64 * 1024)
+record = client.get("order-1", values=["order"])
 
 jobs = client.claim_due(
     "order",
     state="queued",
     worker="worker-1",
     values=["order", "customer"],
-    value_max_bytes=64 * 1024,
 )
 ```
 
@@ -512,124 +545,55 @@ values on claim without an extra `get`.
 
 ## Queue API
 
-Use `QueueFlowWorker` when the flow is acting as a durable queue: create jobs,
-claim jobs, run a handler, complete/retry/fail behind the scenes.
+Use `QueueClient` when each item is one durable unit of work.
 
 ```python
-from ferricstore import FlowClient, QueueFlowWorker
+from ferricstore import QueueClient
 
-client = FlowClient.from_url("redis://127.0.0.1:6379/0")
+client = QueueClient.from_url("redis://127.0.0.1:6379/0")
+emails = client.queue(type="email")
 
-worker = QueueFlowWorker(
-    client,
-    type="email",
-    state="queued",
-    concurrency=500,
-    batch_size=100,
-    lease_ms=30_000,
-    claim_values=["template"],
-    value_max_bytes=64 * 1024,
-)
-
+emails.enqueue("email-1", payload=b"welcome:user-1")
 
 def send_email(job):
-    template = None
-    if getattr(job, "values", None):
-        template = job.values.get("template")
-    deliver(job.id, template)
+    deliver(job.id)
 
-
-worker.run(send_email)
+emails.worker(concurrency=500, batch_size=1000).run(send_email)
 ```
 
-Common queue producer:
-
-```python
-client.enqueue(
-    "email-1",
-    type="email",
-    payload=b"small routing payload",
-    values={"template": b"welcome"},
-)
-```
-
-High-throughput producer:
-
-```python
-from ferricstore import CreateItem
-
-client.enqueue_many(
-    [CreateItem(f"email-{i}", b"payload") for i in range(10_000)],
-    type="email",
-)
-```
-
-Important `QueueFlowWorker` options:
-
-| Option | Meaning |
-| --- | --- |
-| `type` | Flow type to claim. |
-| `state` | One state to claim. Omit only when you intentionally want any state. |
-| `states` | Multiple states to claim. Mutually exclusive with `state`. |
-| `concurrency` | Handler concurrency. |
-| `batch_size` | Max jobs per claim. |
-| `lease_ms` | Lease duration for claimed jobs. |
-| `claim_values` | Named values to hydrate with each claim. |
-| `value_max_bytes` | Per-value hydration cap. |
-| `on_error` | `retry`, `fail`, or `raise`. |
-| `partition_key`, `partition_keys` | Restrict claims to specific partitions. |
-| `claim_partition_batch_size` | Claim from multiple partitions per loop when supplied. |
-| `complete_async_depth` | Async completion batching depth. |
-| `wake_source` | Optional ready-signal coordinator/source. |
-
-Error behavior:
-
-| `on_error` | Behavior |
-| --- | --- |
-| `retry` | Failed handler sends `FLOW.RETRY`. |
-| `fail` | Failed handler sends `FLOW.FAIL`. |
-| `raise` | Exception escapes to caller. |
-
-`QueueFlowWorker` is the API to sell for queue workloads. It hides the optimized
-claim/complete batching while keeping handler code simple.
+Queue workers hide claim/complete batching while keeping handler code simple.
 
 ## Workflow/state-machine API
 
-Use `Workflow` when the app is an explicit durable state machine.
+Use `WorkflowClient` when the app is an explicit durable state machine.
 
 ```python
-from ferricstore import FlowClient, Workflow, complete, fail, retry, state, transition
+from ferricstore import WorkflowClient, complete, fail, retry, transition
 
+client = WorkflowClient.from_url("redis://127.0.0.1:6379/0")
+order = client.workflow(
+    type="order",
+    initial_state="created",
+    partition_by=("tenant_id", "order_id"),
+)
 
-class OrderWorkflow(Workflow):
-    type = "order"
-    initial_state = "created"
-    partition_by = ("tenant_id", "order_id")
+@order.state("created", lease_ms=30_000, claim_payload=True)
+def created(job):
+    charge_card(job.payload)
+    return transition("charged", payload=b"charge result")
 
-    @state("created", lease_ms=30_000, claim_payload=True, on_error="retry", return_record=False)
-    def created(self, job):
-        charge_card(job.payload)
-        return transition("charged", payload=b"charge result")
+@order.state("charged", lease_ms=30_000, claim_values=["invoice"])
+def charged(job):
+    send_receipt(job.values.get("invoice"))
+    return complete(result=b"ok")
 
-    @state("charged", lease_ms=30_000, claim_values=["invoice"], on_error="fail", return_record=False)
-    def charged(self, job):
-        send_receipt(job.values.get("invoice"))
-        return complete(result=b"ok")
-
-
-client = FlowClient.from_url("redis://127.0.0.1:6379/0")
-workflow = OrderWorkflow(client)
-
-record = workflow.create(
+order.start(
     "order-1",
     tenant_id="tenant-a",
     order_id="order-1",
     payload=b"order payload",
     values={"invoice": b"invoice payload"},
 )
-
-workflow.run_once("created", worker="worker-1", partition_key=record.partition_key)
-workflow.run_once("charged", worker="worker-1", partition_key=record.partition_key)
 ```
 
 What a state handler does:
@@ -653,22 +617,27 @@ A handler can also call other Flow or Redis commands through the context/client
 helpers exposed by the workflow layer:
 
 ```python
-@state("created", return_record=False)
-def created(self, job):
+@order.state("created")
+def created(job):
     job.flow.create(
         "child-1",
         type="child",
         payload=b"child payload",
-        return_record=False,
     )
 
     job.flow.command("SET", "last-order", job.id)
     return transition("child_created")
 ```
 
-Use `return_record=False` when the handler does not need the post-mutation record.
+Workflow state decorators default to ack-only mutation responses. Set
+`return_record=True` only when the handler needs the post-mutation record.
 Use `claim_payload=False` when the handler does not need the current payload. Use
 `claim_values=[...]` when it needs only selected named values.
+
+Advanced: `job.value("name", local_cache=True)` caches a named value only inside
+the current handler invocation. The default is `False`; enable it only when the
+same handler reads the same value repeatedly and the value is safe to hold in
+memory briefly.
 
 This workflow DSL does not replay Python code. Each handler is one durable state
 boundary. That is the design: explicit states, explicit retries, explicit side
@@ -682,7 +651,7 @@ server batch commands when possible.
 ```python
 auto = client.autobatch(max_batch=100, max_delay_ms=1.0)
 
-future = auto.create_async("order-1", type="order", payload=b"payload", return_record=False)
+future = auto.create_async("order-1", type="order", payload=b"payload")
 result = future.result()
 ```
 
@@ -696,9 +665,8 @@ Use these defaults for production hot paths:
 
 | Workload | Recommendation |
 | --- | --- |
-| Queue producer | `enqueue_many` or `enqueue(..., return_record=False)` |
-| Queue worker | `QueueFlowWorker` with `batch_size` near handler capacity |
-| State machine | `Workflow` with `return_record=False` on hot states |
+| Queue workload | `QueueClient.queue(...).enqueue(...)` plus `.worker(...)` |
+| State machine | `WorkflowClient.workflow(...)` plus `@workflow.state(...)` |
 | Payload-heavy flows | Use named values and request only needed values |
 | Normal Redis operations | Use `client.command(...)` |
 | Reused expensive values | Use `value_put`, `value_refs`, and `value_mget` |
@@ -707,6 +675,10 @@ Use these defaults for production hot paths:
 Avoid hydrating payloads or named values unless the handler needs them. Avoid
 post-mutation reads in hot paths unless the next line of user code actually uses
 the new record.
+
+For production services, also set explicit Redis timeouts, size connection pools,
+wire graceful shutdown, cap value hydration with `value_max_bytes`, and verify
+crash/reclaim behavior in integration tests. See [Production Readiness](production.md).
 
 ## Correctness guidelines
 
@@ -729,39 +701,32 @@ Use these tools:
 ### Queue workload
 
 ```python
-from ferricstore import FlowClient, QueueFlowWorker
+from ferricstore import QueueClient
 
-client = FlowClient.from_url("redis://127.0.0.1:6379/0")
-client.enqueue("email-1", type="email", payload=b"welcome")
+client = QueueClient.from_url("redis://127.0.0.1:6379/0")
+emails = client.queue(type="email")
 
-worker = QueueFlowWorker(client, type="email", state="queued", concurrency=100, batch_size=100)
-worker.run(lambda job: send_email(job.id))
+emails.enqueue("email-1", payload=b"welcome")
+emails.worker(concurrency=100, batch_size=1000).run(lambda job: send_email(job.id))
 ```
 
 ### State machine workload
 
 ```python
-from ferricstore import FlowClient, Workflow, complete, state, transition
+from ferricstore import WorkflowClient, complete, transition
 
+client = WorkflowClient.from_url("redis://127.0.0.1:6379/0")
+signup = client.workflow(type="signup", initial_state="created")
 
-class Signup(Workflow):
-    type = "signup"
-    initial_state = "created"
+@signup.state("created")
+def created(job):
+    return transition("email_sent")
 
-    @state("created", return_record=False)
-    def created(self, job):
-        return transition("email_sent")
+@signup.state("email_sent")
+def email_sent(job):
+    return complete(result=b"ok")
 
-    @state("email_sent", return_record=False)
-    def email_sent(self, job):
-        return complete(result=b"ok")
-
-
-client = FlowClient.from_url("redis://127.0.0.1:6379/0")
-workflow = Signup(client)
-workflow.enqueue("signup-1", payload=b"user")
-workflow.run_once("created", worker="worker-1")
-workflow.run_once("email_sent", worker="worker-1")
+signup.start("signup-1", payload=b"user")
 ```
 
 ### Native command plus Redis passthrough

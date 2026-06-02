@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -42,9 +43,32 @@ class InvalidCommandError(FerricStoreError):
     code = "invalid_command"
 
 
+class OverloadedError(FerricStoreError):
+    code = "overloaded"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw: Any = None,
+        retry_after_ms: int | None = None,
+        reason: str | None = None,
+    ) -> None:
+        super().__init__(message, raw=raw)
+        self.retry_after_ms = retry_after_ms
+        self.reason = reason
+
+
 def classify_server_error(message: str, *, raw: Any = None) -> FerricStoreError:
     lower = message.lower()
 
+    if "overloaded" in lower or "busy" in lower:
+        return OverloadedError(
+            message,
+            raw=raw,
+            retry_after_ms=_int_field(lower, "retry_after_ms"),
+            reason=_str_field(lower, "reason"),
+        )
     if "already exists" in lower:
         return FlowAlreadyExistsError(message, raw=raw)
     if "wrong state" in lower:
@@ -61,6 +85,20 @@ def classify_server_error(message: str, *, raw: Any = None) -> FerricStoreError:
         return InvalidCommandError(message, raw=raw)
 
     return FerricStoreError(message, raw=raw)
+
+
+def _int_field(message: str, name: str) -> int | None:
+    match = re.search(rf"\b{name}=([0-9]+)\b", message)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _str_field(message: str, name: str) -> str | None:
+    match = re.search(rf"\b{name}=([a-z0-9_:-]+)\b", message)
+    if not match:
+        return None
+    return match.group(1)
 
 
 def map_exception(exc: Exception) -> Exception:

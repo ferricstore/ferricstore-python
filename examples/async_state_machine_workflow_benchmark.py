@@ -1,7 +1,6 @@
 import argparse
 import asyncio
-import math
-import threading
+import contextlib
 import time
 import uuid
 import zlib
@@ -11,11 +10,11 @@ from typing import Any
 
 from ferricstore import AsyncFlowClient, ClaimedItem, CreateItem, FencedItem
 
-
 AUTO_PARTITION_PREFIX = "__flow_auto__:"
 AUTO_PARTITION_BUCKETS = 256
 SERVER_SLOT_COUNT = 1024
 DEFAULT_STATE = "queued"
+ANY_STATE_WAKE_BUCKET = "__any__"
 
 
 def chunks(values: list[int], size: int) -> Iterable[list[int]]:
@@ -125,7 +124,9 @@ def claimed_partition_counts(jobs: list[ClaimedItem]) -> dict[str, int]:
     return counts
 
 
-def partition_index_from_claimed_key(partition_key: str, partition_mode: str, partitions: int) -> int | None:
+def partition_index_from_claimed_key(
+    partition_key: str, partition_mode: str, partitions: int
+) -> int | None:
     if partition_mode == "auto":
         return auto_partition_index_from_key(partition_key)
     marker = ":partition:"
@@ -135,6 +136,10 @@ def partition_index_from_claimed_key(partition_key: str, partition_mode: str, pa
         return int(partition_key.rsplit(marker, 1)[1]) % max(partitions, 1)
     except ValueError:
         return None
+
+
+def claim_states_for_mode(claim_states_mode: str, states: list[str]) -> list[str] | None:
+    return states if claim_states_mode == "all" else None
 
 
 @dataclass
@@ -164,285 +169,60 @@ class AsyncCounters:
             return self.claimed_actions >= expected_actions
 
 
-class AsyncFlowReadyCoordinator:
-    def __init__(self, workers: int, owner_fn=None) -> None:
-        self.workers = max(workers, 1)
-        self.owner_fn = owner_fn
-        self.queues: dict[tuple[int, str], asyncio.Queue[int]] = {}
-        self.pending: dict[tuple[int, str], set[int]] = {}
-        self.credits: dict[tuple[int, str], dict[int, int]] = {}
-        self.locks: dict[tuple[int, str], asyncio.Lock] = {}
-        self.notifications = 0
-        self.notified_jobs = 0
+class ProgressCounters:
+    def __init__(self) -> None:
+        self.created = 0
+        self.claim_calls = 0
+        self.empty_claims = 0
+        self.max_claim_batch = 0
+        self.lock = asyncio.Lock()
 
-    def owner_for(self, partition_index: int) -> int:
-        if self.owner_fn is not None:
-            return self.owner_fn(partition_index) % self.workers
-        return partition_index % self.workers
+    async def add_created(self, count: int) -> None:
+        async with self.lock:
+            self.created += count
 
-    def _bucket(self, worker_index: int, state_name: str) -> tuple[int, str]:
-        key = (worker_index, state_name)
-        if key not in self.queues:
-            self.queues[key] = asyncio.Queue()
-            self.pending[key] = set()
-            self.credits[key] = {}
-            self.locks[key] = asyncio.Lock()
-        return key
+    async def add_claim_result(self, claimed: int) -> None:
+        async with self.lock:
+            self.claim_calls += 1
+            if claimed == 0:
+                self.empty_claims += 1
+            else:
+                self.max_claim_batch = max(self.max_claim_batch, claimed)
 
-    async def notify(self, *, state_name: str, partition_index: int, count: int) -> None:
-        count = max(int(count), 0)
-        if count == 0:
-            return
-        worker_index = self.owner_for(partition_index)
-        key = self._bucket(worker_index, state_name)
-        should_queue = False
-        async with self.locks[key]:
-            self.credits[key][partition_index] = self.credits[key].get(partition_index, 0) + count
-            self.notified_jobs += count
-            if partition_index not in self.pending[key]:
-                self.pending[key].add(partition_index)
-                self.notifications += 1
-                should_queue = True
-        if should_queue:
-            self.queues[key].put_nowait(partition_index)
-
-    async def notify_partition_counts(
-        self,
-        *,
-        state_name: str,
-        partition_counts: dict[str, int],
-        partition_mode: str,
-        partitions: int,
-    ) -> None:
-        for partition_key, count in partition_counts.items():
-            partition_index = partition_index_from_claimed_key(partition_key, partition_mode, partitions)
-            if partition_index is not None:
-                await self.notify(state_name=state_name, partition_index=partition_index, count=count)
-
-    async def next_ready(
-        self,
-        *,
-        worker_index: int,
-        state_name: str,
-        timeout_s: float,
-        max_partitions: int,
-        max_credit: int,
-        same_group=None,
-    ) -> tuple[list[int], int]:
-        key = self._bucket(worker_index, state_name)
-        if max_partitions <= 0 or max_credit <= 0:
-            return [], 0
-        if timeout_s <= 0:
-            try:
-                partition_index = self.queues[key].get_nowait()
-            except asyncio.QueueEmpty:
-                return [], 0
-        else:
-            try:
-                partition_index = await asyncio.wait_for(
-                    self.queues[key].get(),
-                    timeout=timeout_s,
-                )
-            except asyncio.TimeoutError:
-                return [], 0
-        async with self.locks[key]:
-            self.pending[key].discard(partition_index)
-            credit = self.credits[key].pop(partition_index, 0)
-
-        partitions = [partition_index]
-        total_credit = credit
-        while len(partitions) < max_partitions and total_credit < max_credit:
-            try:
-                partition_index = self.queues[key].get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            async with self.locks[key]:
-                self.pending[key].discard(partition_index)
-                credit = self.credits[key].pop(partition_index, 0)
-            if credit <= 0:
-                continue
-            if same_group is not None and not same_group(partitions[0], partition_index):
-                await self.return_credit(
-                    worker_index=worker_index,
-                    state_name=state_name,
-                    partition_index=partition_index,
-                    count=credit,
-                )
-                break
-            partitions.append(partition_index)
-            total_credit += credit
-        return partitions, total_credit
-
-    async def return_credit(
-        self,
-        *,
-        worker_index: int,
-        state_name: str,
-        partition_index: int,
-        count: int,
-    ) -> None:
-        count = max(int(count), 0)
-        if count == 0:
-            return
-        key = self._bucket(worker_index, state_name)
-        should_queue = False
-        async with self.locks[key]:
-            self.credits[key][partition_index] = self.credits[key].get(partition_index, 0) + count
-            if partition_index not in self.pending[key]:
-                self.pending[key].add(partition_index)
-                should_queue = True
-        if should_queue:
-            self.queues[key].put_nowait(partition_index)
-
-
-class CrossLoopFlowReadyCoordinator:
-    def __init__(
-        self,
-        workers: int,
-        states: list[str],
-        loop: asyncio.AbstractEventLoop,
-        owner_fn=None,
-    ) -> None:
-        self.workers = max(workers, 1)
-        self.owner_fn = owner_fn
-        self.loop = loop
-        self.queues: dict[tuple[int, str], asyncio.Queue[int]] = {}
-        self.pending: dict[tuple[int, str], set[int]] = {}
-        self.credits: dict[tuple[int, str], dict[int, int]] = {}
-        self.locks: dict[tuple[int, str], threading.Lock] = {}
-        self.notifications = 0
-        self.notified_jobs = 0
-        for worker_index in range(self.workers):
-            for state_name in states:
-                self._bucket(worker_index, state_name)
-
-    def owner_for(self, partition_index: int) -> int:
-        if self.owner_fn is not None:
-            return self.owner_fn(partition_index) % self.workers
-        return partition_index % self.workers
-
-    def _bucket(self, worker_index: int, state_name: str) -> tuple[int, str]:
-        key = (worker_index, state_name)
-        if key not in self.queues:
-            self.queues[key] = asyncio.Queue()
-            self.pending[key] = set()
-            self.credits[key] = {}
-            self.locks[key] = threading.Lock()
-        return key
-
-    async def notify(self, *, state_name: str, partition_index: int, count: int) -> None:
-        count = max(int(count), 0)
-        if count == 0:
-            return
-        worker_index = self.owner_for(partition_index)
-        key = self._bucket(worker_index, state_name)
-        should_queue = False
-        with self.locks[key]:
-            self.credits[key][partition_index] = self.credits[key].get(partition_index, 0) + count
-            self.notified_jobs += count
-            if partition_index not in self.pending[key]:
-                self.pending[key].add(partition_index)
-                self.notifications += 1
-                should_queue = True
-        if should_queue:
-            self.loop.call_soon_threadsafe(
-                self.queues[key].put_nowait,
-                partition_index,
-            )
-
-    async def notify_partition_counts(
-        self,
-        *,
-        state_name: str,
-        partition_counts: dict[str, int],
-        partition_mode: str,
-        partitions: int,
-    ) -> None:
-        for partition_key, count in partition_counts.items():
-            partition_index = partition_index_from_claimed_key(partition_key, partition_mode, partitions)
-            if partition_index is not None:
-                await self.notify(state_name=state_name, partition_index=partition_index, count=count)
-
-    async def next_ready(
-        self,
-        *,
-        worker_index: int,
-        state_name: str,
-        timeout_s: float,
-        max_partitions: int,
-        max_credit: int,
-        same_group=None,
-    ) -> tuple[list[int], int]:
-        key = self._bucket(worker_index, state_name)
-        if max_partitions <= 0 or max_credit <= 0:
-            return [], 0
-        if timeout_s <= 0:
-            try:
-                partition_index = self.queues[key].get_nowait()
-            except asyncio.QueueEmpty:
-                return [], 0
-        else:
-            try:
-                partition_index = await asyncio.wait_for(
-                    self.queues[key].get(),
-                    timeout=timeout_s,
-                )
-            except asyncio.TimeoutError:
-                return [], 0
-        with self.locks[key]:
-            self.pending[key].discard(partition_index)
-            credit = self.credits[key].pop(partition_index, 0)
-
-        partitions = [partition_index]
-        total_credit = credit
-        while len(partitions) < max_partitions and total_credit < max_credit:
-            try:
-                partition_index = self.queues[key].get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            with self.locks[key]:
-                self.pending[key].discard(partition_index)
-                credit = self.credits[key].pop(partition_index, 0)
-            if credit <= 0:
-                continue
-            if same_group is not None and not same_group(partitions[0], partition_index):
-                await self.return_credit(
-                    worker_index=worker_index,
-                    state_name=state_name,
-                    partition_index=partition_index,
-                    count=credit,
-                )
-                break
-            partitions.append(partition_index)
-            total_credit += credit
-        return partitions, total_credit
-
-    async def return_credit(
-        self,
-        *,
-        worker_index: int,
-        state_name: str,
-        partition_index: int,
-        count: int,
-    ) -> None:
-        count = max(int(count), 0)
-        if count == 0:
-            return
-        key = self._bucket(worker_index, state_name)
-        should_queue = False
-        with self.locks[key]:
-            self.credits[key][partition_index] = self.credits[key].get(partition_index, 0) + count
-            if partition_index not in self.pending[key]:
-                self.pending[key].add(partition_index)
-                should_queue = True
-        if should_queue:
-            self.loop.call_soon_threadsafe(
-                self.queues[key].put_nowait,
-                partition_index,
+    async def snapshot(self) -> tuple[int, int, int, int]:
+        async with self.lock:
+            return (
+                self.created,
+                self.claim_calls,
+                self.empty_claims,
+                self.max_claim_batch,
             )
 
 
-FlowReadyWakeCoordinator = AsyncFlowReadyCoordinator | CrossLoopFlowReadyCoordinator
+async def progress_logger(
+    *,
+    interval_s: float,
+    progress: ProgressCounters,
+    counters: AsyncCounters,
+    stop: asyncio.Event,
+    started: float,
+) -> None:
+    interval_s = max(interval_s, 0.1)
+    while not stop.is_set():
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=interval_s)
+        created, claim_calls, empty_claims, max_claim_batch = await progress.snapshot()
+        completed, claimed_actions = await counters.snapshot()
+        elapsed_s = time.perf_counter() - started
+        avg_claim_batch = claimed_actions / claim_calls if claim_calls > 0 else 0.0
+        print(
+            "progress "
+            f"elapsed_s={elapsed_s:.1f} created={created} completed={completed} "
+            f"claimed_actions={claimed_actions} claim_calls={claim_calls} "
+            f"empty_claims={empty_claims} avg_claim_batch={avg_claim_batch:.2f} "
+            f"max_claim_batch={max_claim_batch}",
+            flush=True,
+        )
 
 
 async def create_workflows(
@@ -456,12 +236,29 @@ async def create_workflows(
     payload: bytes,
     create_batch_size: int,
     create_inflight: int,
+    create_rate_per_sec: float,
     create_mode: str,
     independent_many: bool,
-    wake_coordinator: FlowReadyWakeCoordinator | None,
+    retention_ttl_ms: int,
+    run_at_delay_ms: int,
+    create_now_ms: int | None,
+    wake_coordinator: object | None,
+    progress: ProgressCounters | None,
 ) -> dict[str, int]:
-    client = AsyncFlowClient.from_url(url)
+    client = AsyncFlowClient.from_url(url, max_connections=max(create_inflight, 1))
     created = 0
+    scheduled = 0
+    started = time.perf_counter()
+
+    async def throttle(count: int) -> None:
+        nonlocal scheduled
+        if create_rate_per_sec <= 0:
+            return
+        scheduled += count
+        target_elapsed = scheduled / create_rate_per_sec
+        actual_elapsed = time.perf_counter() - started
+        if target_elapsed > actual_elapsed:
+            await asyncio.sleep(target_elapsed - actual_elapsed)
 
     async def notify(batch: list[int]) -> None:
         if wake_coordinator is None:
@@ -482,9 +279,17 @@ async def create_workflows(
                 count=count,
             )
 
+    def create_command_now_ms() -> int:
+        return create_now_ms if create_now_ms is not None else now_ms()
+
+    def create_run_at_ms(command_now_ms: int | None = None) -> int:
+        base_now_ms = command_now_ms if command_now_ms is not None else create_command_now_ms()
+        return base_now_ms + max(run_at_delay_ms, 0)
+
     try:
         if create_mode == "single":
             for index in indices:
+                command_now_ms = create_command_now_ms()
                 await client.enqueue(
                     flow_id(run_id, index),
                     type=flow_type,
@@ -494,18 +299,28 @@ async def create_workflows(
                         partition_mode=partition_mode,
                         index=index,
                         partitions=partitions,
-                        run_id=run_id,
+                    run_id=run_id,
                     ),
+                    run_at_ms=create_run_at_ms(command_now_ms),
+                    now_ms=command_now_ms,
                     return_record=False,
+                    retention_ttl_ms=retention_ttl_ms if retention_ttl_ms > 0 else None,
                 )
                 created += 1
+                if progress is not None:
+                    await progress.add_created(1)
                 await notify([index])
+                await throttle(1)
             return {"created": created}
 
         if create_mode == "pipeline":
-            for batch in chunks(indices, max(create_batch_size, 1)):
+            pending: list[asyncio.Task[tuple[int, list[int]]]] = []
+            create_inflight = max(create_inflight, 1)
+
+            async def send_pipeline_batch(batch: list[int]) -> tuple[int, list[int]]:
                 pipe = client.pipeline()
-                ts = now_ms()
+                ts = create_command_now_ms()
+                run_at_ms = create_run_at_ms(ts)
                 for index in batch:
                     args: list[Any] = [
                         "FLOW.CREATE",
@@ -527,11 +342,31 @@ async def create_workflows(
                         args.extend(["PARTITION", partition_key])
                     if payload:
                         args.extend(["PAYLOAD", payload])
-                    args.extend(["RUN_AT", ts, "PRIORITY", 0])
+                    if retention_ttl_ms > 0:
+                        args.extend(["RETENTION_TTL_MS", retention_ttl_ms])
+                    args.extend(["RUN_AT", run_at_ms, "PRIORITY", 0])
                     pipe.command(*args)
                 await pipe.execute()
-                created += len(batch)
-                await notify(batch)
+                return len(batch), batch
+
+            async def drain_one() -> None:
+                nonlocal created
+                done, pending_set = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                pending[:] = list(pending_set)
+                for task in done:
+                    count, batch = task.result()
+                    created += count
+                    if progress is not None:
+                        await progress.add_created(count)
+                    await notify(batch)
+
+            for batch in chunks(indices, max(create_batch_size, 1)):
+                await throttle(len(batch))
+                pending.append(asyncio.create_task(send_pipeline_batch(batch)))
+                if len(pending) >= create_inflight:
+                    await drain_one()
+            while pending:
+                await drain_one()
             return {"created": created}
 
         if partition_mode == "auto":
@@ -541,11 +376,15 @@ async def create_workflows(
 
             async def send_auto_batch(batch: list[int]) -> tuple[int, list[int]]:
                 items = [CreateItem(flow_id(run_id, index), payload) for index in batch]
+                command_now_ms = create_command_now_ms()
                 await client.enqueue_many(
                     items,
                     type=flow_type,
                     state=DEFAULT_STATE,
+                    run_at_ms=create_run_at_ms(command_now_ms),
+                    now_ms=command_now_ms,
                     independent=independent_many,
+                    retention_ttl_ms=retention_ttl_ms if retention_ttl_ms > 0 else None,
                 )
                 return len(items), batch
 
@@ -556,12 +395,15 @@ async def create_workflows(
                 for task in done:
                     count, batch = task.result()
                     created += count
+                    if progress is not None:
+                        await progress.add_created(count)
                     await notify(batch)
 
             async def flush_auto_bucket(partition_index: int) -> None:
                 batch = auto_buffers.get(partition_index)
                 if not batch:
                     return
+                await throttle(len(batch))
                 pending.append(asyncio.create_task(send_auto_batch(batch)))
                 auto_buffers[partition_index] = []
                 if len(pending) >= create_inflight:
@@ -581,6 +423,8 @@ async def create_workflows(
             return {"created": created}
 
         for batch in chunks(indices, max(create_batch_size, 1)):
+            await throttle(len(batch))
+            command_now_ms = create_command_now_ms()
             items = [
                 CreateItem(
                     flow_id(run_id, index),
@@ -593,9 +437,14 @@ async def create_workflows(
                 items,
                 type=flow_type,
                 state=DEFAULT_STATE,
+                run_at_ms=create_run_at_ms(command_now_ms),
+                now_ms=command_now_ms,
                 independent=independent_many,
+                retention_ttl_ms=retention_ttl_ms if retention_ttl_ms > 0 else None,
             )
             created += len(items)
+            if progress is not None:
+                await progress.add_created(len(items))
             await notify(batch)
         return {"created": created}
     finally:
@@ -617,24 +466,32 @@ async def run_workflow_worker(
     apply_inflight: int,
     idle_sleep_ms: float,
     max_idle_sleep_ms: float,
+    transition_payload: bytes | None,
+    terminal_payload: bytes | None,
+    terminal_mode: str,
     result_payload: bytes | None,
+    claim_states_mode: str,
+    reclaim_expired: bool,
     independent_many: bool,
     counters: AsyncCounters,
     producers_done: asyncio.Event,
-    wake_coordinator: FlowReadyWakeCoordinator | None,
+    wake_coordinator: object | None,
     wake_coalesce_ms: float,
+    claim_block_ms: int | None,
     server_shards: int,
+    claim_now_ms: int | None,
+    progress: ProgressCounters | None,
 ) -> dict[str, int | float]:
-    client = AsyncFlowClient.from_url(url)
+    client = AsyncFlowClient.from_url(url, max_connections=max(apply_inflight + 1, 2))
+    claim_client = AsyncFlowClient.from_url(url, max_connections=1)
     partition_count = AUTO_PARTITION_BUCKETS if partition_mode == "auto" else partitions
+
     def owner_for_partition(partition_index: int) -> int:
         if partition_mode == "auto":
             return auto_partition_server_shard_for_index(partition_index, server_shards) % workers
         return partition_index % workers
 
-    owned_partitions = [
-        p for p in range(partition_count) if owner_for_partition(p) == worker_index
-    ]
+    owned_partitions = [p for p in range(partition_count) if owner_for_partition(p) == worker_index]
     if partition_mode == "auto":
         owned_partitions.sort(
             key=lambda idx: (auto_partition_server_shard_for_index(idx, server_shards), idx)
@@ -652,8 +509,7 @@ async def run_workflow_worker(
 
     final_state = states[-1]
     next_state_by_state = {
-        state_name: states[idx + 1]
-        for idx, state_name in enumerate(states[:-1])
+        state_name: states[idx + 1] for idx, state_name in enumerate(states[:-1])
     }
     state_cursor = 0
     partition_cursor = 0
@@ -677,10 +533,11 @@ async def run_workflow_worker(
 
     same_group = None
     if partition_mode == "auto":
-        same_group = lambda first, candidate: (
-            auto_partition_server_shard_for_index(first, server_shards)
-            == auto_partition_server_shard_for_index(candidate, server_shards)
-        )
+
+        def same_group(first: int, candidate: int) -> bool:
+            return auto_partition_server_shard_for_index(
+                first, server_shards
+            ) == auto_partition_server_shard_for_index(candidate, server_shards)
 
     def partition_keys_from_indices(indices: list[int]) -> tuple[str | None, list[str] | None]:
         keys = [
@@ -712,11 +569,21 @@ async def run_workflow_worker(
     ) -> tuple[int, int, str | None, list[ClaimedItem]]:
         batch_size = len(jobs)
         if state_name == final_state:
-            await client.complete_jobs(
-                jobs,
-                result=result_payload,
-                independent=independent_many,
-            )
+            if terminal_mode == "fail":
+                await client.fail_many(
+                    None,
+                    jobs,
+                    error=result_payload,
+                    payload=terminal_payload,
+                    independent=independent_many,
+                )
+            else:
+                await client.complete_jobs(
+                    jobs,
+                    result=result_payload,
+                    payload=terminal_payload,
+                    independent=independent_many,
+                )
             return batch_size, batch_size, None, []
 
         next_state = next_state_by_state[state_name]
@@ -734,9 +601,38 @@ async def run_workflow_worker(
             from_state="running",
             to_state=next_state,
             items=fenced_items,
+            payload=transition_payload,
             independent=independent_many,
         )
         return 0, batch_size, next_state, jobs
+
+    async def apply_claimed_jobs(
+        state_name: str,
+        jobs: list[ClaimedItem],
+    ) -> tuple[int, int, str | None, list[ClaimedItem]]:
+        if claim_states_mode == "cursor":
+            return await apply_jobs(state_name, jobs)
+
+        completed_count = 0
+        claimed_count = 0
+        next_jobs: list[ClaimedItem] = []
+        next_state: str | None = None
+        grouped: dict[str, list[ClaimedItem]] = {}
+        for job in jobs:
+            grouped.setdefault(job.run_state or job.state, []).append(job)
+
+        for claimed_state, claimed_jobs in grouped.items():
+            group_completed, group_claimed, group_next_state, group_jobs = await apply_jobs(
+                claimed_state,
+                claimed_jobs,
+            )
+            completed_count += group_completed
+            claimed_count += group_claimed
+            if group_next_state is not None:
+                next_state = group_next_state
+                next_jobs.extend(group_jobs)
+
+        return completed_count, claimed_count, next_state, next_jobs
 
     async def drain_applies(*, block: bool = False, limit: int | None = None) -> int:
         nonlocal completed_workflows
@@ -775,18 +671,27 @@ async def run_workflow_worker(
                 continue
 
             state_name = states[state_cursor]
-            state_cursor = (state_cursor + 1) % len(states)
-            limit = claim_batch_size
+            if claim_states_mode == "cursor":
+                state_cursor = (state_cursor + 1) % len(states)
             claim_credit = claim_batch_size
             if wake_coordinator is not None:
-                selected_partitions, credit = await wake_coordinator.next_ready(
-                    worker_index=worker_index,
-                    state_name=state_name,
-                    timeout_s=current_sleep,
-                    max_partitions=claim_partition_batch_size,
-                    max_credit=claim_batch_size,
-                    same_group=same_group,
-                )
+                if claim_states_mode in ("all", "any"):
+                    selected_partitions, credit = await wake_coordinator.next_ready_any(
+                        worker_index=worker_index,
+                        timeout_s=current_sleep,
+                        max_partitions=claim_partition_batch_size,
+                        max_credit=claim_batch_size,
+                        same_group=same_group,
+                    )
+                else:
+                    selected_partitions, credit = await wake_coordinator.next_ready(
+                        worker_index=worker_index,
+                        state_name=state_name,
+                        timeout_s=current_sleep,
+                        max_partitions=claim_partition_batch_size,
+                        max_credit=claim_batch_size,
+                        same_group=same_group,
+                    )
                 if not selected_partitions:
                     if producers_done.is_set():
                         if await counters.done():
@@ -805,38 +710,56 @@ async def run_workflow_worker(
                         wake_idle_rounds += 1
                         if wake_idle_rounds < 3:
                             continue
-                        selected_partitions = [owned_partitions[partition_cursor % len(owned_partitions)]]
+                        selected_partitions = [
+                            owned_partitions[partition_cursor % len(owned_partitions)]
+                        ]
                         partition_cursor += 1
                     else:
                         continue
                 else:
                     wake_idle_rounds = 0
                     claim_credit = max(credit, 1)
-                    limit = min(claim_batch_size, claim_credit)
-                    if wake_coalesce_s > 0 and credit < claim_batch_size and not producers_done.is_set():
+                    if (
+                        wake_coalesce_s > 0
+                        and credit < claim_batch_size
+                        and not producers_done.is_set()
+                    ):
                         sleep_s = min(wake_coalesce_s, 0.002)
                         await asyncio.sleep(sleep_s)
                         wake_coalesce_sleeps += 1
                         wake_coalesce_seconds += sleep_s
-                        extra_partitions, extra_credit = await wake_coordinator.next_ready(
-                            worker_index=worker_index,
-                            state_name=state_name,
-                            timeout_s=0,
-                            max_partitions=max(
-                                claim_partition_batch_size - len(selected_partitions),
-                                0,
-                            ),
-                            max_credit=max(claim_batch_size - credit, 0),
-                            same_group=same_group,
-                        )
+                        if claim_states_mode == "cursor":
+                            extra_partitions, extra_credit = await wake_coordinator.next_ready(
+                                worker_index=worker_index,
+                                state_name=state_name,
+                                timeout_s=0,
+                                max_partitions=max(
+                                    claim_partition_batch_size - len(selected_partitions),
+                                    0,
+                                ),
+                                max_credit=max(claim_batch_size - credit, 0),
+                                same_group=same_group,
+                            )
+                        else:
+                            extra_partitions, extra_credit = await wake_coordinator.next_ready_any(
+                                worker_index=worker_index,
+                                timeout_s=0,
+                                max_partitions=max(
+                                    claim_partition_batch_size - len(selected_partitions),
+                                    0,
+                                ),
+                                max_credit=max(claim_batch_size - credit, 0),
+                                same_group=same_group,
+                            )
                         selected_partitions.extend(extra_partitions)
                         credit += extra_credit
                         claim_credit = max(credit, 1)
-                        limit = min(claim_batch_size, claim_credit)
             else:
                 selected_partitions = []
                 for _ in range(min(claim_partition_batch_size, len(owned_partitions))):
-                    selected_partitions.append(owned_partitions[partition_cursor % len(owned_partitions)])
+                    selected_partitions.append(
+                        owned_partitions[partition_cursor % len(owned_partitions)]
+                    )
                     partition_cursor += 1
 
             partition_key, partition_keys = partition_keys_from_indices(selected_partitions)
@@ -844,17 +767,37 @@ async def run_workflow_worker(
             total_claimed_this_round = 0
             while remaining_credit > 0 and not await counters.done():
                 claim_limit = min(claim_batch_size, remaining_credit)
+                command_now_ms = claim_now_ms
                 claim_calls += 1
-                jobs = await client.claim_jobs(
-                    flow_type,
-                    state=state_name,
-                    worker=f"{run_id}:worker:{worker_index}",
-                    partition_key=partition_key,
-                    partition_keys=partition_keys,
-                    limit=claim_limit,
-                    priority=0,
-                    reclaim_expired=False,
-                )
+                if claim_states_mode in ("all", "any"):
+                    jobs = await claim_client.claim_jobs(
+                        flow_type,
+                        states=claim_states_for_mode(claim_states_mode, states),
+                        worker=f"{run_id}:worker:{worker_index}",
+                        partition_key=partition_key,
+                        partition_keys=partition_keys,
+                        limit=claim_limit,
+                        priority=0,
+                        now_ms=command_now_ms,
+                        reclaim_expired=reclaim_expired,
+                        block_ms=claim_block_ms,
+                        include_state=True,
+                    )
+                else:
+                    jobs = await claim_client.claim_jobs(
+                        flow_type,
+                        state=state_name,
+                        worker=f"{run_id}:worker:{worker_index}",
+                        partition_key=partition_key,
+                        partition_keys=partition_keys,
+                        limit=claim_limit,
+                        priority=0,
+                        now_ms=command_now_ms,
+                        reclaim_expired=reclaim_expired,
+                        block_ms=claim_block_ms,
+                    )
+                if progress is not None:
+                    await progress.add_claim_result(len(jobs))
                 if not jobs:
                     empty_claims += 1
                     break
@@ -865,15 +808,20 @@ async def run_workflow_worker(
                 claimed_actions += batch_size
                 max_claim_batch = max(max_claim_batch, batch_size)
                 await counters.add(completed=0, claimed_actions=batch_size)
+                all_actions_claimed = await counters.all_actions_claimed(expected_actions)
 
                 if apply_inflight > 0:
-                    pending_applies.append(asyncio.create_task(apply_jobs(state_name, jobs)))
+                    pending_applies.append(
+                        asyncio.create_task(apply_claimed_jobs(state_name, jobs))
+                    )
                     while len(pending_applies) >= apply_inflight:
                         await drain_applies(block=True, limit=1)
                 else:
-                    completed_count, claimed_count, next_state, applied_jobs = await apply_jobs(
-                        state_name,
-                        jobs,
+                    completed_count, claimed_count, next_state, applied_jobs = (
+                        await apply_claimed_jobs(
+                            state_name,
+                            jobs,
+                        )
                     )
                     completed_workflows += completed_count
                     await counters.add(completed=completed_count, claimed_actions=0)
@@ -881,7 +829,7 @@ async def run_workflow_worker(
                         await notify_next_state(next_state, applied_jobs)
 
                 remaining_credit -= batch_size
-                if batch_size < claim_limit:
+                if all_actions_claimed or batch_size < claim_limit:
                     break
 
             if total_claimed_this_round == 0:
@@ -904,6 +852,7 @@ async def run_workflow_worker(
             "wake_coalesce_ms": wake_coalesce_seconds * 1000.0,
         }
     finally:
+        await claim_client.close()
         await client.close()
 
 
@@ -913,39 +862,24 @@ async def run_state_machine_throughput(args: argparse.Namespace) -> dict[str, An
     states = workflow_states(args.steps)
     indices = list(range(args.flows))
     payload = payload_bytes(args.payload_bytes)
+    transition_payload = (
+        payload_bytes(args.transition_payload_bytes)
+        if args.transition_payload_bytes > 0
+        else None
+    )
+    terminal_payload = (
+        payload_bytes(args.terminal_payload_bytes)
+        if args.terminal_payload_bytes > 0
+        else None
+    )
     result_payload = payload_bytes(args.result_bytes) if args.result_bytes > 0 else None
     counters = AsyncCounters(args.flows)
     producers_done = asyncio.Event()
-    worker_mode = "polling" if args.worker_mode == "auto" else args.worker_mode
-    wake_coordinator = (
-        CrossLoopFlowReadyCoordinator(
-            args.workers,
-            states,
-            asyncio.get_running_loop(),
-            owner_fn=(
-                lambda partition_index: auto_partition_server_shard_for_index(
-                    partition_index,
-                    args.server_shards,
-                )
-                if args.partition_mode == "auto"
-                else partition_index
-            ),
-        )
-        if worker_mode == "owner-wakeup" and args.producer_loop_thread
-        else AsyncFlowReadyCoordinator(
-            args.workers,
-            owner_fn=(
-                lambda partition_index: auto_partition_server_shard_for_index(
-                    partition_index,
-                    args.server_shards,
-                )
-                if args.partition_mode == "auto"
-                else partition_index
-            ),
-        )
-        if worker_mode == "owner-wakeup"
-        else None
-    )
+    worker_mode = "blocking" if args.worker_mode == "auto" else args.worker_mode
+    claim_block_ms = effective_claim_block_ms(worker_mode, args.claim_block_ms)
+    wake_coordinator = None
+    progress = ProgressCounters() if args.progress_interval_s > 0 else None
+    progress_stop = asyncio.Event()
 
     if args.partition_mode == "auto" and args.create_mode == "many":
         create_ranges = [[] for _ in range(args.producers)]
@@ -956,6 +890,8 @@ async def run_state_machine_throughput(args: argparse.Namespace) -> dict[str, An
         create_ranges = [indices[offset :: args.producers] for offset in range(args.producers)]
 
     async def create_task(batch: list[int]) -> dict[str, int]:
+        create_task_count = max(len(create_ranges), 1)
+
         return await create_workflows(
             url=args.url,
             run_id=run_id,
@@ -964,11 +900,16 @@ async def run_state_machine_throughput(args: argparse.Namespace) -> dict[str, An
             partitions=args.partitions,
             partition_mode=args.partition_mode,
             payload=payload,
-                create_batch_size=args.create_batch_size,
-                create_inflight=args.create_inflight,
+            create_batch_size=args.create_batch_size,
+            create_inflight=args.create_inflight,
+            create_rate_per_sec=args.create_rate_per_sec / create_task_count,
             create_mode=args.create_mode,
             independent_many=args.independent_many,
+            retention_ttl_ms=args.retention_ttl_ms,
+            run_at_delay_ms=args.run_at_delay_ms,
+            create_now_ms=args.create_now_ms,
             wake_coordinator=wake_coordinator,
+            progress=progress,
         )
 
     async def worker_task(worker_index: int) -> dict[str, int | float]:
@@ -986,13 +927,21 @@ async def run_state_machine_throughput(args: argparse.Namespace) -> dict[str, An
             apply_inflight=args.apply_inflight,
             idle_sleep_ms=args.idle_sleep_ms,
             max_idle_sleep_ms=args.max_idle_sleep_ms,
+            transition_payload=transition_payload,
+            terminal_payload=terminal_payload,
+            terminal_mode=args.terminal_mode,
             result_payload=result_payload,
+            claim_states_mode=args.claim_states_mode,
+            reclaim_expired=args.reclaim_expired,
             independent_many=args.independent_many,
             counters=counters,
             producers_done=producers_done,
             wake_coordinator=wake_coordinator,
             wake_coalesce_ms=args.wake_coalesce_ms,
+            claim_block_ms=claim_block_ms,
             server_shards=args.server_shards,
+            claim_now_ms=args.claim_now_ms,
+            progress=progress,
         )
 
     started = time.perf_counter()
@@ -1001,32 +950,67 @@ async def run_state_machine_throughput(args: argparse.Namespace) -> dict[str, An
     process_started = started
     process_finished = started
 
-    if args.shape == "preloaded":
-        create_started = time.perf_counter()
-        create_results = await asyncio.gather(*(create_task(batch) for batch in create_ranges))
-        create_finished = time.perf_counter()
-        producers_done.set()
-        process_started = time.perf_counter()
-        worker_results = await asyncio.gather(*(worker_task(idx) for idx in range(args.workers)))
-        process_finished = time.perf_counter()
-    else:
-        process_started = time.perf_counter()
-        worker_tasks = [asyncio.create_task(worker_task(idx)) for idx in range(args.workers)]
-        create_started = time.perf_counter()
-        if args.producer_loop_thread:
-            def run_create_thread() -> list[dict[str, int]]:
-                async def run_all() -> list[dict[str, int]]:
-                    return await asyncio.gather(*(create_task(batch) for batch in create_ranges))
+    progress_task = (
+        asyncio.create_task(
+            progress_logger(
+                interval_s=args.progress_interval_s,
+                progress=progress,
+                counters=counters,
+                stop=progress_stop,
+                started=started,
+            )
+        )
+        if progress is not None
+        else None
+    )
+    if progress is not None:
+        print(
+            "benchmark_run "
+            f"run_id={run_id} flow_type={flow_type} shape={args.shape} "
+            f"partition_mode={args.partition_mode} create_mode={args.create_mode} "
+            f"claim_states_mode={args.claim_states_mode} worker_mode={worker_mode} "
+            f"run_at_delay_ms={args.run_at_delay_ms}",
+            flush=True,
+        )
 
-                return asyncio.run(run_all())
-
-            create_results = await asyncio.to_thread(run_create_thread)
-        else:
+    try:
+        if args.shape == "preloaded":
+            create_started = time.perf_counter()
             create_results = await asyncio.gather(*(create_task(batch) for batch in create_ranges))
-        create_finished = time.perf_counter()
-        producers_done.set()
-        worker_results = await asyncio.gather(*worker_tasks)
-        process_finished = time.perf_counter()
+            create_finished = time.perf_counter()
+            producers_done.set()
+            process_started = time.perf_counter()
+            worker_results = await asyncio.gather(
+                *(worker_task(idx) for idx in range(args.workers))
+            )
+            process_finished = time.perf_counter()
+        else:
+            process_started = time.perf_counter()
+            worker_tasks = [asyncio.create_task(worker_task(idx)) for idx in range(args.workers)]
+            create_started = time.perf_counter()
+            if args.producer_loop_thread:
+
+                def run_create_thread() -> list[dict[str, int]]:
+                    async def run_all() -> list[dict[str, int]]:
+                        return await asyncio.gather(
+                            *(create_task(batch) for batch in create_ranges)
+                        )
+
+                    return asyncio.run(run_all())
+
+                create_results = await asyncio.to_thread(run_create_thread)
+            else:
+                create_results = await asyncio.gather(
+                    *(create_task(batch) for batch in create_ranges)
+                )
+            create_finished = time.perf_counter()
+            producers_done.set()
+            worker_results = await asyncio.gather(*worker_tasks)
+            process_finished = time.perf_counter()
+    finally:
+        if progress_task is not None:
+            progress_stop.set()
+            await progress_task
 
     created = sum(result["created"] for result in create_results)
     completed, claimed_actions = await counters.snapshot()
@@ -1056,11 +1040,15 @@ async def run_state_machine_throughput(args: argparse.Namespace) -> dict[str, An
         "create_mode": args.create_mode,
         "create_batch_size": args.create_batch_size,
         "create_inflight": args.create_inflight,
+        "create_rate_per_sec": args.create_rate_per_sec,
         "producer_loop_thread": args.producer_loop_thread,
         "claim_batch_size": args.claim_batch_size,
         "claim_partition_batch_size": args.claim_partition_batch_size,
         "apply_inflight": args.apply_inflight,
         "worker_mode": worker_mode,
+        "claim_block_ms": claim_block_ms,
+        "claim_states_mode": args.claim_states_mode,
+        "reclaim_expired": args.reclaim_expired,
         "wake_coalesce_ms": args.wake_coalesce_ms,
         "wake_notifications": wake_coordinator.notifications if wake_coordinator is not None else 0,
         "wake_credits": wake_coordinator.notified_jobs if wake_coordinator is not None else 0,
@@ -1068,6 +1056,13 @@ async def run_state_machine_throughput(args: argparse.Namespace) -> dict[str, An
         "wake_coalesce_sleep_ms": wake_coalesce_ms,
         "independent_many": args.independent_many,
         "payload_bytes": args.payload_bytes,
+        "transition_payload_bytes": args.transition_payload_bytes,
+        "terminal_payload_bytes": args.terminal_payload_bytes,
+        "retention_ttl_ms": args.retention_ttl_ms,
+        "run_at_delay_ms": args.run_at_delay_ms,
+        "create_now_ms": args.create_now_ms,
+        "claim_now_ms": args.claim_now_ms,
+        "terminal_mode": args.terminal_mode,
         "result_bytes": args.result_bytes,
         "claim_calls": claim_calls,
         "empty_claims": empty_claims,
@@ -1084,8 +1079,18 @@ async def run_state_machine_throughput(args: argparse.Namespace) -> dict[str, An
     }
 
 
+def effective_claim_block_ms(worker_mode: str, configured_block_ms: int | None) -> int | None:
+    if worker_mode != "blocking":
+        return None
+    if configured_block_ms is None or configured_block_ms < 0:
+        return None
+    return configured_block_ms
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="FerricFlow true-async state-machine workflow benchmark")
+    parser = argparse.ArgumentParser(
+        description="FerricFlow true-async state-machine workflow benchmark"
+    )
     parser.add_argument("--url", default="redis://127.0.0.1:7379")
     parser.add_argument("--shape", choices=("live", "preloaded"), default="live")
     parser.add_argument("--flows", type=int, default=10_000)
@@ -1097,18 +1102,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--create-mode", choices=("many", "pipeline", "single"), default="pipeline")
     parser.add_argument("--create-batch-size", type=int, default=500)
     parser.add_argument("--create-inflight", type=int, default=32)
+    parser.add_argument("--create-rate-per-sec", type=float, default=0.0)
     parser.add_argument("--producer-loop-thread", action="store_true")
     parser.add_argument("--claim-batch-size", type=int, default=500)
     parser.add_argument("--claim-partition-batch-size", type=int, default=32)
     parser.add_argument("--apply-inflight", type=int, default=0)
-    parser.add_argument("--worker-mode", choices=("auto", "owner-wakeup", "polling"), default="auto")
+    parser.add_argument(
+        "--worker-mode", choices=("auto", "blocking", "polling"), default="auto"
+    )
     parser.add_argument("--wake-coalesce-ms", type=float, default=1.0)
+    parser.add_argument("--claim-block-ms", type=int, default=-1)
     parser.add_argument("--idle-sleep-ms", type=float, default=1.0)
     parser.add_argument("--max-idle-sleep-ms", type=float, default=10.0)
     parser.add_argument("--payload-bytes", type=int, default=0)
+    parser.add_argument("--transition-payload-bytes", type=int, default=0)
+    parser.add_argument("--terminal-payload-bytes", type=int, default=0)
+    parser.add_argument("--retention-ttl-ms", type=int, default=0)
+    parser.add_argument("--run-at-delay-ms", type=int, default=0)
+    parser.add_argument("--create-now-ms", type=int, default=None)
+    parser.add_argument("--claim-now-ms", type=int, default=None)
+    parser.add_argument("--terminal-mode", choices=("complete", "fail"), default="complete")
+    parser.add_argument("--claim-states-mode", choices=("cursor", "all", "any"), default="cursor")
+    parser.add_argument("--reclaim-expired", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--result-bytes", type=int, default=0)
     parser.add_argument("--server-shards", type=int, default=16)
     parser.add_argument("--independent-many", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--progress-interval-s", type=float, default=0.0)
     return parser.parse_args()
 
 

@@ -1,5 +1,24 @@
 # DBOS-Style Benchmark
 
+Benchmarks are workload-specific and should be treated as reproducibility notes,
+not universal product claims. Always record:
+
+```text
+SDK commit/version
+FerricStore server commit/version
+server instance type
+client instance type
+storage device and mount options
+server shard count
+Flow due_any setting
+benchmark command
+flow count
+payload size
+worker/producers/connections
+```
+
+Use fresh data directories for apples-to-apples comparisons.
+
 `examples/dbos_style_benchmark.py` has two modes:
 
 * `queued`: throughput benchmark, closer to DBOS queued workflow numbers.
@@ -19,13 +38,12 @@ producers and workers run concurrently
 producers:
   FLOW.CREATE pipelined, or FLOW.CREATE_MANY
 workers:
-  owner-wakeup mode assigns partitions to workers
-  producer wake for partition P goes only to owner(P)
-  FLOW.CLAIM_DUE limit=N
+  FLOW.CLAIM_DUE LIMIT N BLOCK ms
+  server wakes blocked workers when matching work is durable
   FLOW.COMPLETE pipelined, or FLOW.COMPLETE_MANY
 ```
 
-Default run:
+Simple pipeline smoke run:
 
 ```bash
 python examples/dbos_style_benchmark.py \
@@ -51,7 +69,7 @@ python examples/dbos_style_benchmark.py \
   --producers 16 \
   --partitions 16 \
   --partition-mode explicit \
-  --worker-mode owner-wakeup \
+  --worker-mode blocking \
   --claim-batch-size 500 \
   --create-batch-size 500 \
   --no-reclaim-expired \
@@ -73,7 +91,7 @@ python examples/dbos_style_benchmark.py \
   --producers 32 \
   --partitions 16 \
   --partition-mode auto \
-  --worker-mode owner-wakeup \
+  --worker-mode blocking \
   --claim-batch-size 500 \
   --create-batch-size 500 \
   --no-reclaim-expired \
@@ -99,8 +117,8 @@ Output:
 Important options:
 
 * `--claim-batch-size`: `FLOW.CLAIM_DUE LIMIT`, default `100`.
-  For explicit partition owner-wakeup, `500` currently gives the best local
-  throughput. `1000` was slower because it increased empty/partial claim work.
+  Leave `--claim-block-ms` disabled for hot throughput; empty polling is cheaper
+  than putting hot workers into server-side long polling.
 * `--create-batch-size`: create flush size. With `--transport pipeline`, this is Redis pipeline depth for singular `FLOW.CREATE`. With `--transport many`, this is `FLOW.CREATE_MANY` size.
 * `--queued-shape live`: producers and workers run concurrently. This is the
   DBOS-style queued benchmark shape.
@@ -124,9 +142,8 @@ Important options:
   group no-partition creates by hidden bucket before flushing `FLOW.CREATE_MANY`,
   so the server receives shard-local batches while application code stays
   partition-free.
-* `--partition-mode explicit --worker-mode owner-wakeup`: fastest current
-  DBOS-style throughput path. It avoids broad `claim_any` polling and lets each
-  partition owner form large claim/complete batches.
+* `--partition-mode explicit --worker-mode blocking`: opt-in partition-aware
+  server-side blocked `FLOW.CLAIM_DUE` waiters for low-volume/idle queues.
 * `--no-complete-batch`: use single `FLOW.COMPLETE` instead of `FLOW.COMPLETE_MANY`.
 * `--no-reclaim-expired`: disables the extra expired-running reclaim pass before
   normal queued claims. This benchmark defaults to disabled because DBOS-style
@@ -150,9 +167,12 @@ Important options:
   lowered throughput.
 * `--payload-bytes`: raw payload bytes per flow.
 * `--work-command incr`: add one `INCR` per claimed flow.
-* `--worker-mode owner-wakeup`: default live worker policy. Producers notify the owner of each partition after a durable create flush. Only that worker drains the partition, avoiding broadcast/herd polling.
-* `--worker-mode polling`: old blind polling mode. Useful as a stress/diagnostic path, but it can destroy batching.
-* `--wake-coalesce-ms`: small delay after a partition wake before claiming, default `5ms`, to let live producers form useful claim batches.
+* `--worker-mode blocking`: opt-in server wait policy. Use it for low-volume
+  queues where idle polling cost matters more than peak throughput.
+* `--worker-mode polling`: default hot path. It avoids long-poll tail effects
+  and relies on batching, wake credits, and short idle backoff.
+* `--claim-block-ms`: max server-side wait for a blocked claim before returning
+  an empty result. Default is disabled.
 * `--idle-sleep-ms` / `--max-idle-sleep-ms`: fallback worker wait/backoff. Defaults to `10ms` with exponential backoff up to `50ms`.
 
 Each queued benchmark run uses a unique Flow type suffix, so dirty servers with
@@ -180,9 +200,9 @@ For `N = 10`, one workflow execution sends:
 
 Total: 31 FerricStore commands.
 
-The benchmark uses ack-only mutators (`return_record=False`) for create,
-transition, and complete. That matches the command count above and avoids
-measuring extra post-mutation `FLOW.GET` calls.
+The benchmark uses ack-only mutators for create, transition, and complete. That
+matches the command count above and avoids measuring extra post-mutation
+`FLOW.GET` calls.
 
 ```bash
 python examples/dbos_style_benchmark.py --mode serial-latency --steps 10 --iterations 100
@@ -218,17 +238,25 @@ For each benchmark it creates a fresh prod-mode server with a temporary data dir
 then stops it after the run. This avoids stale Ra/Bitcask/index state and avoids
 manual server config drift.
 
-Server env used by the wrapper:
+Server env used by the wrapper by default:
 
 ```text
 MIX_ENV=prod
 FERRICSTORE_PORT=6379
 FERRICSTORE_DATA_DIR=<temp dir>
-FERRICSTORE_SHARD_COUNT=16
-FERRICSTORE_MAX_MEMORY=100000000000
-FERRICSTORE_LOG_LEVEL=error
-FERRICSTORE_PROTECTED_MODE=false
-FERRICSTORE_FLOW_DUE_ANY_ENABLED=false
+FERRICSTORE_LOG_LEVEL=warning
+```
+
+The wrapper does not override server resource/Flow defaults unless you pass an
+explicit override. Production server defaults are:
+
+```text
+FERRICSTORE_SHARD_COUNT=0 -> schedulers online
+FERRICSTORE_MAX_MEMORY=auto -> 80% detected memory/cgroup limit
+FERRICSTORE_KEYDIR_MAX_RAM=auto -> derived from max memory
+FERRICSTORE_FLOW_LMDB_MODE=lagged
+FERRICSTORE_FLOW_HIBERNATION_ENABLED=true
+FERRICSTORE_PROTECTED_MODE=true
 ```
 
 Current optimized wrapper defaults:
@@ -236,15 +264,13 @@ Current optimized wrapper defaults:
 ```text
 flows: 1000000
 workers: 16
-producers: 8
-partitions: 1024
-server_shards: 16
-claim_batch_size: 1000
-claim_partition_batch_size: 16
-queue_create_batch_size: 1000
+producers: 32
+partitions: 16
+server_shards: auto-detected local CPU count for client-side shard planning
+claim_batch_size: 500
+claim_partition_batch_size: 2
+queue_create_batch_size: 500
 workflow_create_batch_size: 1000
-queue_wake_coalesce_ms: 0
-workflow_wake_coalesce_ms: 0
 complete_async_depth: 4
 workflow_apply_async_depth: 4
 ```
@@ -258,19 +284,32 @@ python examples/dbos_style_benchmark.py \
   --queued-shape live \
   --transport many \
   --worker-api lowlevel \
-  --worker-mode owner-wakeup \
+  --worker-mode polling \
   --partition-mode auto \
   --flows 1000000 \
   --workers 16 \
-  --producers 8 \
-  --partitions 1024 \
-  --claim-batch-size 1000 \
-  --claim-partition-batch-size 16 \
-  --create-batch-size 1000 \
+  --producers 32 \
+  --partitions 16 \
+  --claim-batch-size 500 \
+  --claim-partition-batch-size 2 \
+  --create-batch-size 500 \
   --complete-async-depth 4 \
-  --server-shards 16 \
-  --wake-coalesce-ms 0 \
+  --server-shards <auto-detected> \
   --claim-job-only
+```
+
+Latest local validation on June 2, 2026 with a fresh prod server and no
+server-side resource overrides:
+
+```text
+flows: 1000000
+created: 1000000
+completed: 1000000
+duplicates: 0
+total_seconds: 13.233
+create_flows_per_sec: 90077/s
+process_flows_per_sec: 75574/s
+end_to_end_flows_per_sec: 75567/s
 ```
 
 Workflow benchmark command generated by the wrapper:
@@ -282,17 +321,16 @@ python examples/state_machine_workflow_benchmark.py \
   --flows 1000000 \
   --steps 1 \
   --workers 16 \
-  --producers 8 \
-  --partitions 1024 \
+  --producers 32 \
+  --partitions 16 \
   --partition-mode auto \
   --create-mode many \
   --create-batch-size 1000 \
-  --claim-batch-size 1000 \
-  --claim-partition-batch-size 16 \
+  --claim-batch-size 500 \
+  --claim-partition-batch-size 2 \
   --apply-async-depth 4 \
-  --worker-mode owner-wakeup \
-  --wake-coalesce-ms 0 \
-  --server-shards 16
+  --worker-mode blocking \
+  --server-shards <auto-detected>
 ```
 
 Recovered local 1M baselines on May 18, 2026:
@@ -351,7 +389,6 @@ Server env:
   FERRICSTORE_DATA_DIR=/data/ferricstore
   FERRICSTORE_SHARD_COUNT=16
   FERRICSTORE_PROTECTED_MODE=false
-  FERRICSTORE_BUILD=1
   ERL_FLAGS="+sbt db +sbwt very_short +swt very_low +K true +A 128 +P 5000000 +Q 65536 +MHas aoffcbf +MBas aoffcbf"
 
 Flow due_any index:
@@ -372,8 +409,7 @@ server_shards: 16
 claim_batch_size: 1000
 claim_partition_batch_size: 16
 create_batch_size: 1000
-worker_mode: owner-wakeup
-wake_coalesce_ms: 0
+worker_mode: blocking
 payload_bytes: 0
 result_bytes: 0
 ```
@@ -578,7 +614,6 @@ Server env:
   FERRICSTORE_DATA_DIR=/data/ferricstore
   FERRICSTORE_SHARD_COUNT=16
   FERRICSTORE_PROTECTED_MODE=false
-  FERRICSTORE_BUILD=1
   ERL_FLAGS="+sbt db +sbwt very_short +swt very_low +K true +A 128 +P 5000000 +Q 65536 +MHas aoffcbf +MBas aoffcbf"
 ```
 
@@ -702,7 +737,6 @@ Server env:
   FERRICSTORE_DATA_DIR=/data/ferricstore
   FERRICSTORE_SHARD_COUNT=16
   FERRICSTORE_PROTECTED_MODE=false
-  FERRICSTORE_BUILD=1
   ERL_FLAGS="+sbt db +sbwt very_short +swt very_low +K true +A 128 +P 5000000 +Q 65536 +MHas aoffcbf +MBas aoffcbf"
 ```
 

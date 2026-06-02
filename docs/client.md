@@ -1,6 +1,8 @@
 # Client API
 
 `FlowClient` is the low-level typed wrapper around FerricStore Flow commands.
+Most applications should start with `WorkflowClient` or `QueueClient`; use this
+page when you need exact command-level control.
 
 ```python
 from ferricstore import FlowClient
@@ -33,7 +35,7 @@ redis.Redis.from_url(url, protocol=3, decode_responses=False)
 Creates one flow.
 
 ```python
-record = client.create(
+ack = client.create(
     "flow-1",
     type="order",
     state="created",
@@ -59,8 +61,8 @@ Important options:
 * `run_at_ms`: due time.
 * `priority`: lower/higher depends on server ordering policy.
 * `idempotent`: let duplicate create by id return existing result when supported.
-* `return_record`: default `True`. When `False`, return the raw server response
-  and skip the SDK follow-up `FLOW.GET` used when the server returns `OK`.
+* `return_record`: default `False`. When `True`, fetch and return the updated
+  `FlowRecord` after the mutation.
 
 ## `create_many`
 
@@ -69,7 +71,7 @@ Creates a batch.
 ```python
 from ferricstore import CreateItem
 
-records = client.create_many(
+client.create_many(
     "tenant-a",
     [
         CreateItem("flow-1", b"payload-1"),
@@ -83,7 +85,7 @@ records = client.create_many(
 Use `partition_key=None` for mixed partitions:
 
 ```python
-records = client.create_many(
+client.create_many(
     None,
     [
         CreateItem("flow-1", b"payload-1", partition_key="tenant-a:1"),
@@ -108,8 +110,9 @@ Stores a reusable value and returns server metadata/reference.
 ref = client.value_put(b"large payload", partition_key="tenant-a", owner_flow_id="flow-1")
 ```
 
-Named values are unique per owner flow and name. Use `override=True` when an
-idempotent writer intentionally replaces the existing value.
+Named values are unique per owner flow and name. Keep `override=False` for normal
+first-write values. Use `override=True` only when the caller intentionally
+replaces an existing value, such as regenerating a draft/report.
 
 ```python
 ref = client.value_put(
@@ -140,6 +143,15 @@ jobs = client.claim_due(
 
 Returns `list[FlowRecord]`. Each record includes `lease_token` and
 `fencing_token`; pass both into mutation commands.
+
+Default behavior:
+
+| Concern | Default |
+| --- | --- |
+| Long timers | Delayed flows may be hibernated in FerricStore cold-due storage, but `claim_due` claims them normally once due. |
+| Payload | Payload is not hydrated unless `payload=True` or named `values=[...]` are requested. |
+| Blocking | `block_ms=None` means one immediate claim attempt. Set `block_ms` to wait server-side. |
+| Lease recovery | `reclaim_expired=True` by default for `claim_due`; `claim_jobs` only sends it when explicit. |
 
 ## `reclaim`
 
@@ -184,8 +196,8 @@ client.transition(
 )
 ```
 
-Set `return_record=False` when the caller only needs acknowledgement and not the
-new record. This removes one `FLOW.GET` from the hot path.
+Mutators are ack-only by default. Set `return_record=True` only when the caller
+needs the new record immediately.
 
 ## `complete`
 
@@ -202,8 +214,8 @@ client.complete(
 )
 ```
 
-`complete`, `retry`, `fail`, and `cancel` support the same `return_record=False`
-ack-only option.
+`complete`, `retry`, `fail`, and `cancel` support the same `return_record=True`
+option when the caller needs the post-mutation record.
 
 ## Batch Mutations
 

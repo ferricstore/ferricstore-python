@@ -41,4 +41,3 @@ class JsonCodec:
         if value is None:
             return None
         return json.loads(value.decode())
-

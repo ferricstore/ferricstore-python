@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import atexit
+import builtins
+import contextlib
 import threading
 import time
 import zlib
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from ferricstore.adapters import RedisAdapter, RedisCommandExecutor
+from ferricstore.backpressure import BackpressureController, BackpressurePolicy
 from ferricstore.codecs import Codec, RawCodec
-from ferricstore.errors import map_exception
+from ferricstore.errors import OverloadedError, map_exception
 from ferricstore.types import (
     ChildSpec,
     ClaimedItem,
@@ -24,38 +27,41 @@ from ferricstore.types import (
     _normalize_ref_meta,
 )
 
-
 _AUTO_PARTITION_PREFIX = "__flow_auto__:"
 _AUTO_PARTITION_BUCKETS = 256
+
+
+def _flow_return(value: Any) -> FlowRecord | bytes:
+    return cast(FlowRecord | bytes, value)
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _append(args: list[Any], name: str, value: Any) -> None:
+def _append(args: builtins.list[Any], name: str, value: Any) -> None:
     if value is not None:
         args.extend([name, value])
 
 
-def _append_bool(args: list[Any], name: str, value: bool | None) -> None:
+def _append_bool(args: builtins.list[Any], name: str, value: bool | None) -> None:
     if value is not None:
         args.extend([name, "true" if value else "false"])
 
 
-def _append_encoded(args: list[Any], name: str, codec: Codec, value: Any) -> None:
+def _append_encoded(args: builtins.list[Any], name: str, codec: Codec, value: Any) -> None:
     if value is not None:
         args.extend([name, codec.encode(value)])
 
 
 def _append_named_values(
-    args: list[Any],
+    args: builtins.list[Any],
     codec: Codec,
     *,
     values: dict[str, Any] | None = None,
     value_refs: dict[str, str] | None = None,
-    drop_values: list[str] | None = None,
-    override_values: list[str] | None = None,
+    drop_values: builtins.list[str] | None = None,
+    override_values: builtins.list[str] | None = None,
 ) -> None:
     for name, value in (values or {}).items():
         args.extend(["VALUE", name, codec.encode(value)])
@@ -76,12 +82,12 @@ def _merge_named_map(base: dict[str, Any] | None, item: dict[str, Any] | None) -
     return merged
 
 
-def _has_named_item_values(items: list[Any]) -> bool:
+def _has_named_item_values(items: builtins.list[Any]) -> bool:
     return any(getattr(item, "values", None) or getattr(item, "value_refs", None) for item in items)
 
 
 def _append_named_counts(
-    args: list[Any],
+    args: builtins.list[Any],
     codec: Codec,
     values: dict[str, Any],
     value_refs: dict[str, str],
@@ -95,9 +101,9 @@ def _append_named_counts(
 
 
 def _append_value_return(
-    args: list[Any],
+    args: builtins.list[Any],
     *,
-    values: list[str] | None = None,
+    values: builtins.list[str] | None = None,
     value_max_bytes: int | None = None,
 ) -> None:
     for name in values or []:
@@ -115,8 +121,8 @@ def _batch_named_key(
     *,
     values: dict[str, Any] | None = None,
     value_refs: dict[str, str] | None = None,
-    drop_values: list[str] | None = None,
-    override_values: list[str] | None = None,
+    drop_values: builtins.list[str] | None = None,
+    override_values: builtins.list[str] | None = None,
 ) -> tuple[Any, Any, tuple[str, ...], tuple[str, ...]]:
     value_items = tuple(
         sorted((name, _batch_key_value(value)) for name, value in (values or {}).items())
@@ -134,14 +140,14 @@ def _auto_partition_key_for_id(id: str) -> str:
     return f"{_AUTO_PARTITION_PREFIX}{zlib.crc32(id.encode()) % _AUTO_PARTITION_BUCKETS}"
 
 
-def _expand_many_response(value: Any, count: int) -> list[Any]:
+def _expand_many_response(value: Any, count: int) -> builtins.list[Any]:
     if isinstance(value, list) and len(value) == count:
         return value
     return [value] * count
 
 
 def _append_read_options(
-    args: list[Any],
+    args: builtins.list[Any],
     *,
     partition_key: str | None = None,
     count: int | None = None,
@@ -246,8 +252,8 @@ class CommandPipeline:
 
     def __init__(self, client: FlowClient) -> None:
         self.client = client
-        self.commands: list[tuple[Any, ...]] = []
-        self.results: list[Any] | None = None
+        self.commands: builtins.list[tuple[Any, ...]] = []
+        self.results: builtins.list[Any] | None = None
 
     def __enter__(self) -> CommandPipeline:
         return self
@@ -260,7 +266,7 @@ class CommandPipeline:
         self.commands.append(args)
         return self
 
-    def execute(self) -> list[Any]:
+    def execute(self) -> builtins.list[Any]:
         raw_executor = getattr(self.client.executor, "_executor", self.client.executor)
         redis_client = getattr(raw_executor, "client", None)
         pipeline_factory = getattr(redis_client, "pipeline", None)
@@ -285,13 +291,27 @@ class CommandPipeline:
 class FlowClient:
     """FerricFlow client over Redis/FerricStore commands."""
 
-    def __init__(self, executor: RedisCommandExecutor, codec: Codec | None = None) -> None:
+    def __init__(
+        self,
+        executor: RedisCommandExecutor,
+        codec: Codec | None = None,
+        *,
+        backpressure: BackpressurePolicy | None = None,
+    ) -> None:
         self.executor = _ErrorMappingExecutor(executor)
         self.codec = codec or RawCodec()
+        self.backpressure = BackpressureController(backpressure)
 
     @classmethod
-    def from_url(cls, url: str, *, codec: Codec | None = None, **kwargs: Any) -> FlowClient:
-        return cls(RedisAdapter.from_url(url, **kwargs), codec=codec)
+    def from_url(
+        cls,
+        url: str,
+        *,
+        codec: Codec | None = None,
+        backpressure: BackpressurePolicy | None = None,
+        **kwargs: Any,
+    ) -> FlowClient:
+        return cls(RedisAdapter.from_url(url, **kwargs), codec=codec, backpressure=backpressure)
 
     def autobatch(
         self,
@@ -313,7 +333,12 @@ class FlowClient:
             close()
 
     def cas(self, key: str, expected: Any, value: Any, *, ex: int | None = None) -> bool:
-        args: list[Any] = ["CAS", key, self.codec.encode(expected), self.codec.encode(value)]
+        args: builtins.list[Any] = [
+            "CAS",
+            key,
+            self.codec.encode(expected),
+            self.codec.encode(value),
+        ]
         _append(args, "EX", ex)
         return bool(self.executor.execute_command(*args))
 
@@ -348,7 +373,7 @@ class FlowClient:
         ttl_ms: int,
         hint: str | None = None,
     ) -> FetchOrComputeResult:
-        args: list[Any] = ["FETCH_OR_COMPUTE", key, ttl_ms]
+        args: builtins.list[Any] = ["FETCH_OR_COMPUTE", key, ttl_ms]
         if hint is not None:
             args.append(hint)
         response = self.executor.execute_command(*args)
@@ -389,7 +414,7 @@ class FlowClient:
         return self.executor.execute_command("CLUSTER.ROLE")
 
     def cluster_join(self, node: str, *, replace: bool = False) -> bool:
-        args: list[Any] = ["CLUSTER.JOIN", node]
+        args: builtins.list[Any] = ["CLUSTER.JOIN", node]
         if replace:
             args.append("REPLACE")
         return _ok_response(self.executor.execute_command(*args))
@@ -435,12 +460,13 @@ class FlowClient:
         now_ms: int | None = None,
         priority: int | None = None,
         idempotent: bool | None = None,
+        retention_ttl_ms: int | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        return_record: bool = True,
+        return_record: bool = False,
     ) -> FlowRecord | bytes:
         now_ms = now_ms if now_ms is not None else _now_ms()
-        args: list[Any] = ["FLOW.CREATE", id, "TYPE", type, "STATE", state, "NOW", now_ms]
+        args: builtins.list[Any] = ["FLOW.CREATE", id, "TYPE", type, "STATE", state, "NOW", now_ms]
         _append(args, "PARTITION", partition_key)
         _append_encoded(args, "PAYLOAD", self.codec, payload)
         _append(args, "PARENT_FLOW_ID", parent_flow_id)
@@ -449,10 +475,11 @@ class FlowClient:
         _append(args, "RUN_AT", run_at_ms if run_at_ms is not None else now_ms)
         _append(args, "PRIORITY", priority)
         _append_bool(args, "IDEMPOTENT", idempotent)
+        _append(args, "RETENTION_TTL_MS", retention_ttl_ms)
         _append_named_values(args, self.codec, values=values, value_refs=value_refs)
-        response = self.executor.execute_command(*args)
+        response = self._execute_producer_write(*args)
         if not return_record:
-            return response
+            return _flow_return(response)
         return self._record_or_get(response, id, partition_key)
 
     def enqueue(
@@ -467,6 +494,7 @@ class FlowClient:
         now_ms: int | None = None,
         priority: int | None = 0,
         idempotent: bool | None = None,
+        retention_ttl_ms: int | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         return_record: bool = False,
@@ -482,6 +510,7 @@ class FlowClient:
             now_ms=now_ms,
             priority=priority,
             idempotent=idempotent,
+            retention_ttl_ms=retention_ttl_ms,
             values=values,
             value_refs=value_refs,
             return_record=return_record,
@@ -489,7 +518,7 @@ class FlowClient:
 
     def enqueue_many(
         self,
-        items: list[CreateItem],
+        items: builtins.list[CreateItem],
         *,
         type: str,
         state: str = "queued",
@@ -499,9 +528,10 @@ class FlowClient:
         priority: int | None = 0,
         idempotent: bool | None = None,
         independent: bool | None = True,
+        retention_ttl_ms: int | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-    ) -> list[Any] | Any:
+    ) -> builtins.list[Any] | Any:
         """Create many queued flows, grouping no-partition items by auto bucket."""
         if not items:
             return []
@@ -517,15 +547,16 @@ class FlowClient:
                 priority=priority,
                 idempotent=idempotent,
                 independent=independent,
+                retention_ttl_ms=retention_ttl_ms,
                 values=values,
                 value_refs=value_refs,
             )
 
-        grouped: dict[str, list[tuple[int, CreateItem]]] = {}
+        grouped: dict[str, builtins.list[tuple[int, CreateItem]]] = {}
         for idx, item in enumerate(items):
             grouped.setdefault(_auto_partition_key_for_id(item.id), []).append((idx, item))
 
-        results: list[Any] = [None] * len(items)
+        results: builtins.list[Any] = [None] * len(items)
         for bucket, indexed_items in grouped.items():
             group_items = [item for _idx, item in indexed_items]
             response = self.create_many(
@@ -538,12 +569,14 @@ class FlowClient:
                 priority=priority,
                 idempotent=idempotent,
                 independent=independent,
+                retention_ttl_ms=retention_ttl_ms,
                 values=values,
                 value_refs=value_refs,
             )
             for (idx, _item), item_result in zip(
                 indexed_items,
                 _expand_many_response(response, len(indexed_items)),
+                strict=False,
             ):
                 results[idx] = item_result
         return results
@@ -551,7 +584,7 @@ class FlowClient:
     def create_many(
         self,
         partition_key: str | None,
-        items: list[CreateItem],
+        items: builtins.list[CreateItem],
         *,
         type: str,
         state: str = "queued",
@@ -560,9 +593,10 @@ class FlowClient:
         priority: int | None = None,
         idempotent: bool | None = None,
         independent: bool | None = None,
+        retention_ttl_ms: int | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-    ) -> list[FlowRecord] | Any:
+    ) -> builtins.list[FlowRecord] | Any:
         if not items:
             return []
 
@@ -570,11 +604,13 @@ class FlowClient:
         if partition_key is not None:
             for item in items:
                 if item.partition_key is not None and item.partition_key != partition_key:
-                    raise ValueError("create_many item partition_key does not match batch partition_key")
+                    raise ValueError(
+                        "create_many item partition_key does not match batch partition_key"
+                    )
         mixed = partition_key is None and any(item.partition_key is not None for item in items)
         auto = partition_key is None and not mixed
         wire_partition = "MIXED" if mixed else "AUTO" if auto else partition_key
-        args: list[Any] = [
+        args: builtins.list[Any] = [
             "FLOW.CREATE_MANY",
             wire_partition,
             "TYPE",
@@ -588,6 +624,7 @@ class FlowClient:
         _append(args, "PRIORITY", priority)
         _append_bool(args, "IDEMPOTENT", idempotent)
         _append_bool(args, "INDEPENDENT", independent)
+        _append(args, "RETENTION_TTL_MS", retention_ttl_ms)
         extended_items = _has_named_item_values(items) or (
             mixed and any(item.partition_key is None for item in items)
         )
@@ -610,7 +647,7 @@ class FlowClient:
                     args.extend([item.id, item.partition_key, self.codec.encode(item.payload)])
                 else:
                     args.extend([item.id, self.codec.encode(item.payload)])
-        return self._records_or_response(self.executor.execute_command(*args))
+        return self._records_or_response(self._execute_producer_write(*args))
 
     def value_put(
         self,
@@ -623,7 +660,12 @@ class FlowClient:
         ttl_ms: int | None = None,
         now_ms: int | None = None,
     ) -> Any:
-        args: list[Any] = ["FLOW.VALUE.PUT", self.codec.encode(value), "NOW", now_ms if now_ms is not None else _now_ms()]
+        args: builtins.list[Any] = [
+            "FLOW.VALUE.PUT",
+            self.codec.encode(value),
+            "NOW",
+            now_ms if now_ms is not None else _now_ms(),
+        ]
         _append(args, "PARTITION", partition_key)
         _append(args, "OWNER_FLOW_ID", owner_flow_id)
         _append(args, "NAME", name)
@@ -631,10 +673,12 @@ class FlowClient:
         _append(args, "TTL", ttl_ms)
         return self.executor.execute_command(*args)
 
-    def value_mget(self, refs: list[str], *, max_bytes: int | None = None) -> list[Any]:
+    def value_mget(
+        self, refs: builtins.list[str], *, max_bytes: int | None = None
+    ) -> builtins.list[Any]:
         if not refs:
             return []
-        args: list[Any] = ["FLOW.VALUE.MGET", *refs]
+        args: builtins.list[Any] = ["FLOW.VALUE.MGET", *refs]
         _append(args, "MAX_BYTES", max_bytes)
         response = self.executor.execute_command(*args)
         return [
@@ -653,17 +697,17 @@ class FlowClient:
         signal: str,
         partition_key: str | None = None,
         idempotency_key: str | None = None,
-        if_state: str | list[str] | tuple[str, ...] | None = None,
+        if_state: str | builtins.list[str] | tuple[str, ...] | None = None,
         transition_to: str | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         priority: int | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        drop_values: list[str] | None = None,
-        override_values: list[str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
     ) -> Any:
-        args: list[Any] = ["FLOW.SIGNAL", id, "SIGNAL", signal]
+        args: builtins.list[Any] = ["FLOW.SIGNAL", id, "SIGNAL", signal]
         _append(args, "PARTITION", partition_key)
         _append(args, "IDEMPOTENCY", idempotency_key)
         if isinstance(if_state, (list, tuple)):
@@ -693,23 +737,25 @@ class FlowClient:
         type: str,
         *,
         state: str | None = None,
-        states: list[str] | None = None,
+        states: builtins.list[str] | None = None,
         worker: str,
         partition_key: str | None = None,
-        partition_keys: list[str] | None = None,
+        partition_keys: builtins.list[str] | None = None,
         lease_ms: int = 30_000,
         limit: int = 1,
         priority: int | None = None,
         now_ms: int | None = None,
+        block_ms: int | None = None,
         reclaim_expired: bool | None = None,
         reclaim_ratio: int | None = None,
         job_only: bool = False,
         payload: bool | None = None,
         payload_max_bytes: int | None = None,
-        values: list[str] | None = None,
+        values: builtins.list[str] | None = None,
         value_max_bytes: int | None = None,
-    ) -> list[FlowRecord] | list[ClaimedItem]:
-        args: list[Any] = ["FLOW.CLAIM_DUE", type]
+        include_state: bool = False,
+    ) -> builtins.list[FlowRecord] | builtins.list[ClaimedItem]:
+        args: builtins.list[Any] = ["FLOW.CLAIM_DUE", type]
         if state is not None and states is not None:
             raise ValueError("state and states are mutually exclusive")
         if states is not None:
@@ -729,10 +775,9 @@ class FlowClient:
                 lease_ms,
                 "LIMIT",
                 limit,
-                "NOW",
-                now_ms if now_ms is not None else _now_ms(),
             ]
         )
+        _append(args, "NOW", now_ms)
         if partition_key is not None and partition_keys is not None:
             raise ValueError("partition_key and partition_keys are mutually exclusive")
         _append(args, "PARTITION", partition_key)
@@ -741,8 +786,11 @@ class FlowClient:
                 raise ValueError("partition_keys must be non-empty")
             args.extend(["PARTITIONS", len(partition_keys), *partition_keys])
         _append(args, "PRIORITY", priority)
+        if include_state and not job_only:
+            raise ValueError("include_state requires job_only=True")
         if job_only:
-            _append(args, "RETURN", "JOBS_COMPACT")
+            _append(args, "RETURN", "JOBS_COMPACT_STATE" if include_state else "JOBS_COMPACT")
+        _append(args, "BLOCK", block_ms)
         _append_bool(args, "PAYLOAD", payload)
         _append(args, "PAYLOAD_MAX_BYTES", payload_max_bytes)
         _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
@@ -758,32 +806,39 @@ class FlowClient:
         type: str,
         *,
         state: str | None = None,
-        states: list[str] | None = None,
+        states: builtins.list[str] | None = None,
         worker: str,
         partition_key: str | None = None,
-        partition_keys: list[str] | None = None,
+        partition_keys: builtins.list[str] | None = None,
         lease_ms: int = 30_000,
         limit: int = 100,
         priority: int | None = 0,
         now_ms: int | None = None,
+        block_ms: int | None = None,
         reclaim_expired: bool | None = None,
         reclaim_ratio: int | None = None,
-    ) -> list[ClaimedItem]:
+        include_state: bool = False,
+    ) -> builtins.list[ClaimedItem]:
         """Claim jobs with the optimized minimal response shape."""
-        return self.claim_due(
-            type,
-            state=state,
-            states=states,
-            worker=worker,
-            partition_key=partition_key,
-            partition_keys=partition_keys,
-            lease_ms=lease_ms,
-            limit=limit,
-            priority=priority,
-            now_ms=now_ms,
-            reclaim_expired=reclaim_expired,
-            reclaim_ratio=reclaim_ratio,
-            job_only=True,
+        return cast(
+            builtins.list[ClaimedItem],
+            self.claim_due(
+                type,
+                state=state,
+                states=states,
+                worker=worker,
+                partition_key=partition_key,
+                partition_keys=partition_keys,
+                lease_ms=lease_ms,
+                limit=limit,
+                priority=priority,
+                now_ms=now_ms,
+                block_ms=block_ms,
+                reclaim_expired=reclaim_expired,
+                reclaim_ratio=reclaim_ratio,
+                job_only=True,
+                include_state=include_state,
+            ),
         )
 
     def reclaim(
@@ -793,7 +848,7 @@ class FlowClient:
         state: str | None = None,
         worker: str,
         partition_key: str | None = None,
-        partition_keys: list[str] | None = None,
+        partition_keys: builtins.list[str] | None = None,
         lease_ms: int = 30_000,
         limit: int = 1,
         priority: int | None = None,
@@ -801,13 +856,13 @@ class FlowClient:
         job_only: bool = False,
         payload: bool | None = None,
         payload_max_bytes: int | None = None,
-        values: list[str] | None = None,
+        values: builtins.list[str] | None = None,
         value_max_bytes: int | None = None,
-    ) -> list[FlowRecord] | list[ClaimedItem]:
+    ) -> builtins.list[FlowRecord] | builtins.list[ClaimedItem]:
         if state not in (None, "running"):
             raise ValueError("FLOW.RECLAIM only supports running state")
 
-        args: list[Any] = [
+        args: builtins.list[Any] = [
             "FLOW.RECLAIM",
             type,
             "WORKER",
@@ -847,7 +902,7 @@ class FlowClient:
         partition_key: str | None = None,
         now_ms: int | None = None,
     ) -> FlowRecord:
-        args: list[Any] = [
+        args: builtins.list[Any] = [
             "FLOW.EXTEND_LEASE",
             id,
             lease_token,
@@ -874,15 +929,15 @@ class FlowClient:
         payload: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        drop_values: list[str] | None = None,
-        override_values: list[str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         priority: int | None = None,
-        return_record: bool = True,
+        return_record: bool = False,
     ) -> FlowRecord | bytes:
         now_ms = now_ms if now_ms is not None else _now_ms()
-        args: list[Any] = [
+        args: builtins.list[Any] = [
             "FLOW.TRANSITION",
             id,
             from_state,
@@ -908,28 +963,31 @@ class FlowClient:
         )
         response = self.executor.execute_command(*args)
         if not return_record:
-            return response
+            return _flow_return(response)
         return self._record_or_get(response, id, partition_key)
 
     def complete_many(
         self,
         partition_key: str | None,
-        items: list[ClaimedItem],
+        items: builtins.list[ClaimedItem],
         *,
         result: Any = None,
         payload: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        drop_values: list[str] | None = None,
-        override_values: list[str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
-    ) -> list[FlowRecord] | Any:
+    ) -> builtins.list[FlowRecord] | Any:
         if not items:
             return []
 
-        args: list[Any] = ["FLOW.COMPLETE_MANY", "MIXED" if partition_key is None else partition_key]
+        args: builtins.list[Any] = [
+            "FLOW.COMPLETE_MANY",
+            "MIXED" if partition_key is None else partition_key,
+        ]
         _append_encoded(args, "RESULT", self.codec, result)
         _append_encoded(args, "PAYLOAD", self.codec, payload)
         _append(args, "TTL", ttl_ms)
@@ -948,14 +1006,14 @@ class FlowClient:
 
     def complete_jobs(
         self,
-        jobs: list[ClaimedItem],
+        jobs: builtins.list[ClaimedItem],
         *,
         result: Any = None,
         payload: Any = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = True,
-    ) -> list[FlowRecord] | Any:
+    ) -> builtins.list[FlowRecord] | Any:
         """Complete claimed jobs, choosing single-partition or mixed batch wire format."""
         if not jobs:
             return []
@@ -963,7 +1021,8 @@ class FlowClient:
         first_partition = jobs[0].partition_key
         partition_key = (
             first_partition
-            if first_partition is not None and all(job.partition_key == first_partition for job in jobs)
+            if first_partition is not None
+            and all(job.partition_key == first_partition for job in jobs)
             else None
         )
         return self.complete_many(
@@ -987,13 +1046,13 @@ class FlowClient:
         payload: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        drop_values: list[str] | None = None,
-        override_values: list[str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
-        return_record: bool = True,
+        return_record: bool = False,
     ) -> FlowRecord | bytes:
-        args: list[Any] = [
+        args: builtins.list[Any] = [
             "FLOW.COMPLETE",
             id,
             lease_token,
@@ -1016,7 +1075,7 @@ class FlowClient:
         )
         response = self.executor.execute_command(*args)
         if not return_record:
-            return response
+            return _flow_return(response)
         return self._record_or_get(response, id, partition_key)
 
     def transition_many(
@@ -1025,23 +1084,23 @@ class FlowClient:
         *,
         from_state: str,
         to_state: str,
-        items: list[FencedItem],
+        items: builtins.list[FencedItem],
         payload: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        drop_values: list[str] | None = None,
-        override_values: list[str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         priority: int | None = None,
         independent: bool | None = None,
-    ) -> list[FlowRecord] | Any:
+    ) -> builtins.list[FlowRecord] | Any:
         if not items:
             return []
 
         mixed = partition_key is None
         wire_partition = "MIXED" if mixed else partition_key
-        args: list[Any] = ["FLOW.TRANSITION_MANY", wire_partition, from_state, to_state]
+        args: builtins.list[Any] = ["FLOW.TRANSITION_MANY", wire_partition, from_state, to_state]
         _append(args, "PAYLOAD", self.codec.encode(payload) if payload is not None else None)
         _append(args, "RUN_AT", run_at_ms)
         _append(args, "PRIORITY", priority)
@@ -1075,13 +1134,13 @@ class FlowClient:
         payload: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        drop_values: list[str] | None = None,
-        override_values: list[str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
-        return_record: bool = True,
+        return_record: bool = False,
     ) -> FlowRecord | bytes:
-        args: list[Any] = [
+        args: builtins.list[Any] = [
             "FLOW.RETRY",
             id,
             lease_token,
@@ -1104,28 +1163,31 @@ class FlowClient:
         )
         response = self.executor.execute_command(*args)
         if not return_record:
-            return response
+            return _flow_return(response)
         return self._record_or_get(response, id, partition_key)
 
     def retry_many(
         self,
         partition_key: str | None,
-        items: list[ClaimedItem],
+        items: builtins.list[ClaimedItem],
         *,
         error: Any = None,
         payload: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        drop_values: list[str] | None = None,
-        override_values: list[str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
-    ) -> list[FlowRecord] | Any:
+    ) -> builtins.list[FlowRecord] | Any:
         if not items:
             return []
 
-        args: list[Any] = ["FLOW.RETRY_MANY", "MIXED" if partition_key is None else partition_key]
+        args: builtins.list[Any] = [
+            "FLOW.RETRY_MANY",
+            "MIXED" if partition_key is None else partition_key,
+        ]
         _append(args, "ERROR", self.codec.encode(error) if error is not None else None)
         _append(args, "PAYLOAD", self.codec.encode(payload) if payload is not None else None)
         _append(args, "RUN_AT", run_at_ms)
@@ -1153,13 +1215,13 @@ class FlowClient:
         payload: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        drop_values: list[str] | None = None,
-        override_values: list[str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
-        return_record: bool = True,
+        return_record: bool = False,
     ) -> FlowRecord | bytes:
-        args: list[Any] = [
+        args: builtins.list[Any] = [
             "FLOW.FAIL",
             id,
             lease_token,
@@ -1182,28 +1244,31 @@ class FlowClient:
         )
         response = self.executor.execute_command(*args)
         if not return_record:
-            return response
+            return _flow_return(response)
         return self._record_or_get(response, id, partition_key)
 
     def fail_many(
         self,
         partition_key: str | None,
-        items: list[ClaimedItem],
+        items: builtins.list[ClaimedItem],
         *,
         error: Any = None,
         payload: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        drop_values: list[str] | None = None,
-        override_values: list[str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
-    ) -> list[FlowRecord] | Any:
+    ) -> builtins.list[FlowRecord] | Any:
         if not items:
             return []
 
-        args: list[Any] = ["FLOW.FAIL_MANY", "MIXED" if partition_key is None else partition_key]
+        args: builtins.list[Any] = [
+            "FLOW.FAIL_MANY",
+            "MIXED" if partition_key is None else partition_key,
+        ]
         _append(args, "ERROR", self.codec.encode(error) if error is not None else None)
         _append(args, "PAYLOAD", self.codec.encode(payload) if payload is not None else None)
         _append(args, "TTL", ttl_ms)
@@ -1230,13 +1295,20 @@ class FlowClient:
         reason: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        drop_values: list[str] | None = None,
-        override_values: list[str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
-        return_record: bool = True,
+        return_record: bool = False,
     ) -> FlowRecord | bytes:
-        args: list[Any] = ["FLOW.CANCEL", id, "FENCING", fencing_token, "NOW", now_ms if now_ms is not None else _now_ms()]
+        args: builtins.list[Any] = [
+            "FLOW.CANCEL",
+            id,
+            "FENCING",
+            fencing_token,
+            "NOW",
+            now_ms if now_ms is not None else _now_ms(),
+        ]
         _append(args, "LEASE_TOKEN", lease_token)
         _append(args, "PARTITION", partition_key)
         _append(args, "REASON", self.codec.encode(reason) if reason is not None else None)
@@ -1251,27 +1323,30 @@ class FlowClient:
         )
         response = self.executor.execute_command(*args)
         if not return_record:
-            return response
+            return _flow_return(response)
         return self._record_or_get(response, id, partition_key)
 
     def cancel_many(
         self,
         partition_key: str | None,
-        items: list[FencedItem],
+        items: builtins.list[FencedItem],
         *,
         reason: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        drop_values: list[str] | None = None,
-        override_values: list[str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
-    ) -> list[FlowRecord] | Any:
+    ) -> builtins.list[FlowRecord] | Any:
         if not items:
             return []
 
-        args: list[Any] = ["FLOW.CANCEL_MANY", "MIXED" if partition_key is None else partition_key]
+        args: builtins.list[Any] = [
+            "FLOW.CANCEL_MANY",
+            "MIXED" if partition_key is None else partition_key,
+        ]
         _append(args, "REASON", self.codec.encode(reason) if reason is not None else None)
         _append(args, "TTL", ttl_ms)
         _append(args, "NOW", now_ms if now_ms is not None else _now_ms())
@@ -1297,16 +1372,23 @@ class FlowClient:
         run_at_ms: int | None = None,
         reason_ref: str | None = None,
         now_ms: int | None = None,
-        return_record: bool = True,
+        return_record: bool = False,
     ) -> FlowRecord | bytes:
-        args: list[Any] = ["FLOW.REWIND", id, "TO_EVENT", to_event, "NOW", now_ms if now_ms is not None else _now_ms()]
+        args: builtins.list[Any] = [
+            "FLOW.REWIND",
+            id,
+            "TO_EVENT",
+            to_event,
+            "NOW",
+            now_ms if now_ms is not None else _now_ms(),
+        ]
         _append(args, "PARTITION", partition_key)
         _append(args, "EXPECT_STATE", expect_state)
         _append(args, "RUN_AT", run_at_ms)
         _append(args, "REASON_REF", reason_ref)
         response = self.executor.execute_command(*args)
         if not return_record:
-            return response
+            return _flow_return(response)
         return self._record_or_get(response, id, partition_key)
 
     def get(
@@ -1314,10 +1396,10 @@ class FlowClient:
         id: str,
         *,
         partition_key: str | None = None,
-        values: list[str] | None = None,
+        values: builtins.list[str] | None = None,
         value_max_bytes: int | None = None,
     ) -> FlowRecord | None:
-        args: list[Any] = ["FLOW.GET", id]
+        args: builtins.list[Any] = ["FLOW.GET", id]
         _append(args, "PARTITION", partition_key)
         _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
         value = self.executor.execute_command(*args)
@@ -1334,8 +1416,8 @@ class FlowClient:
         count: int | None = None,
         include_cold: bool | None = None,
         consistent_projection: bool | None = None,
-    ) -> list[FlowRecord]:
-        args: list[Any] = ["FLOW.LIST", type]
+    ) -> builtins.list[FlowRecord]:
+        args: builtins.list[Any] = ["FLOW.LIST", type]
         _append(args, "STATE", state)
         _append(args, "COUNT", count)
         _append(args, "PARTITION", partition_key)
@@ -1355,8 +1437,8 @@ class FlowClient:
         rev: bool | None = None,
         include_cold: bool | None = None,
         consistent_projection: bool | None = None,
-    ) -> list[FlowRecord]:
-        args: list[Any] = ["FLOW.TERMINALS", type]
+    ) -> builtins.list[FlowRecord]:
+        args: builtins.list[Any] = ["FLOW.TERMINALS", type]
         _append_read_options(
             args,
             state=state,
@@ -1381,8 +1463,8 @@ class FlowClient:
         rev: bool | None = None,
         include_cold: bool | None = None,
         consistent_projection: bool | None = None,
-    ) -> list[FlowRecord]:
-        args: list[Any] = ["FLOW.FAILURES", type]
+    ) -> builtins.list[FlowRecord]:
+        args: builtins.list[Any] = ["FLOW.FAILURES", type]
         _append_read_options(
             args,
             partition_key=partition_key,
@@ -1395,13 +1477,13 @@ class FlowClient:
         )
         return self._records(self.executor.execute_command(*args))
 
-    def by_parent(self, parent_flow_id: str, **kwargs: Any) -> list[FlowRecord]:
+    def by_parent(self, parent_flow_id: str, **kwargs: Any) -> builtins.list[FlowRecord]:
         return self._index_query("FLOW.BY_PARENT", parent_flow_id, **kwargs)
 
-    def by_root(self, root_flow_id: str, **kwargs: Any) -> list[FlowRecord]:
+    def by_root(self, root_flow_id: str, **kwargs: Any) -> builtins.list[FlowRecord]:
         return self._index_query("FLOW.BY_ROOT", root_flow_id, **kwargs)
 
-    def by_correlation(self, correlation_id: str, **kwargs: Any) -> list[FlowRecord]:
+    def by_correlation(self, correlation_id: str, **kwargs: Any) -> builtins.list[FlowRecord]:
         return self._index_query("FLOW.BY_CORRELATION", correlation_id, **kwargs)
 
     def info(
@@ -1412,7 +1494,7 @@ class FlowClient:
         include_cold: bool | None = None,
         consistent_projection: bool | None = None,
     ) -> dict[Any, Any]:
-        args: list[Any] = ["FLOW.INFO", type]
+        args: builtins.list[Any] = ["FLOW.INFO", type]
         _append(args, "PARTITION", partition_key)
         _append_bool(args, "INCLUDE_COLD", include_cold)
         _append_bool(args, "CONSISTENT_PROJECTION", consistent_projection)
@@ -1426,8 +1508,8 @@ class FlowClient:
         count: int | None = None,
         older_than_ms: int | None = None,
         now_ms: int | None = None,
-    ) -> list[FlowRecord]:
-        args: list[Any] = ["FLOW.STUCK", type]
+    ) -> builtins.list[FlowRecord]:
+        args: builtins.list[Any] = ["FLOW.STUCK", type]
         _append(args, "PARTITION", partition_key)
         _append(args, "COUNT", count)
         _append(args, "OLDER_THAN", older_than_ms)
@@ -1453,8 +1535,8 @@ class FlowClient:
         consistent_projection: bool | None = None,
         values: bool | None = None,
         payload_max_bytes: int | None = None,
-    ) -> list[Any]:
-        args: list[Any] = ["FLOW.HISTORY", id, "COUNT", count]
+    ) -> builtins.list[Any]:
+        args: builtins.list[Any] = ["FLOW.HISTORY", id, "COUNT", count]
         _append(args, "PARTITION", partition_key)
         _append(args, "FROM_EVENT", from_event)
         _append(args, "TO_EVENT", to_event)
@@ -1474,7 +1556,7 @@ class FlowClient:
     def spawn_children(
         self,
         parent_id: str,
-        children: list[ChildSpec],
+        children: builtins.list[ChildSpec],
         *,
         partition_key: str | None = None,
         lease_token: bytes | None = None,
@@ -1491,7 +1573,7 @@ class FlowClient:
         value_refs: dict[str, str] | None = None,
         now_ms: int | None = None,
     ) -> Any:
-        args: list[Any] = [
+        args: builtins.list[Any] = [
             "FLOW.SPAWN_CHILDREN",
             parent_id,
             "GROUP",
@@ -1518,7 +1600,14 @@ class FlowClient:
                     raise ValueError("mixed spawn_children items require partition_key")
                 child_values = _merge_named_map(values, child.values)
                 child_refs = _merge_named_map(value_refs, child.value_refs)
-                args.extend([child.id, child.partition_key or "-", child.type, self.codec.encode(child.payload)])
+                args.extend(
+                    [
+                        child.id,
+                        child.partition_key or "-",
+                        child.type,
+                        self.codec.encode(child.payload),
+                    ]
+                )
                 _append_named_counts(args, self.codec, child_values, child_refs)
         else:
             _append_named_values(args, self.codec, values=values, value_refs=value_refs)
@@ -1529,7 +1618,14 @@ class FlowClient:
                 if mixed:
                     if child.partition_key is None:
                         raise ValueError("mixed spawn_children items require partition_key")
-                    args.extend([child.id, child.partition_key, child.type, self.codec.encode(child.payload)])
+                    args.extend(
+                        [
+                            child.id,
+                            child.partition_key,
+                            child.type,
+                            self.codec.encode(child.payload),
+                        ]
+                    )
                 else:
                     args.extend([child.id, child.type, self.codec.encode(child.payload)])
         return self.executor.execute_command(*args)
@@ -1541,7 +1637,7 @@ class FlowClient:
         retry: RetryPolicy | None = None,
         states: dict[str, RetryPolicy] | None = None,
     ) -> Any:
-        args: list[Any] = ["FLOW.POLICY.SET", type]
+        args: builtins.list[Any] = ["FLOW.POLICY.SET", type]
         if retry is not None:
             self._append_retry_policy(args, retry)
         for state, policy in (states or {}).items():
@@ -1550,7 +1646,7 @@ class FlowClient:
         return self.executor.execute_command(*args)
 
     def policy_get(self, type: str, *, state: str | None = None) -> dict[Any, Any]:
-        args: list[Any] = ["FLOW.POLICY.GET", type]
+        args: builtins.list[Any] = ["FLOW.POLICY.GET", type]
         _append(args, "STATE", state)
         return dict(self.executor.execute_command(*args) or {})
 
@@ -1560,23 +1656,23 @@ class FlowClient:
         limit: int | None = None,
         now_ms: int | None = None,
     ) -> dict[Any, Any]:
-        args: list[Any] = ["FLOW.RETENTION_CLEANUP"]
+        args: builtins.list[Any] = ["FLOW.RETENTION_CLEANUP"]
         _append(args, "LIMIT", limit)
         _append(args, "NOW", now_ms)
         return dict(self.executor.execute_command(*args) or {})
 
-    def _index_query(self, command: str, key: str, **kwargs: Any) -> list[FlowRecord]:
-        args: list[Any] = [command, key]
+    def _index_query(self, command: str, key: str, **kwargs: Any) -> builtins.list[FlowRecord]:
+        args: builtins.list[Any] = [command, key]
         _append_read_options(args, **kwargs)
         return self._records(self.executor.execute_command(*args))
 
     def _append_claimed_items(
         self,
-        args: list[Any],
+        args: builtins.list[Any],
         partition_key: str | None,
-        items: list[ClaimedItem],
+        items: builtins.list[ClaimedItem],
         command: str,
-    ) -> list[Any]:
+    ) -> builtins.list[Any]:
         mixed = partition_key is None
         args.append("ITEMS")
         for item in items:
@@ -1586,19 +1682,21 @@ class FlowClient:
                 args.extend([item.id, item.partition_key, item.lease_token, item.fencing_token])
             else:
                 if item.partition_key is not None and item.partition_key != partition_key:
-                    raise ValueError(f"{command} item partition_key does not match batch partition_key")
+                    raise ValueError(
+                        f"{command} item partition_key does not match batch partition_key"
+                    )
                 args.extend([item.id, item.lease_token, item.fencing_token])
         return args
 
     def _append_fenced_items(
         self,
-        args: list[Any],
+        args: builtins.list[Any],
         partition_key: str | None,
-        items: list[FencedItem],
+        items: builtins.list[FencedItem],
         command: str,
         *,
         include_lease: bool = False,
-    ) -> list[Any]:
+    ) -> builtins.list[Any]:
         mixed = partition_key is None
         args.append("ITEMS")
         for item in items:
@@ -1611,13 +1709,15 @@ class FlowClient:
                     args.append(lease)
             else:
                 if item.partition_key is not None and item.partition_key != partition_key:
-                    raise ValueError(f"{command} item partition_key does not match batch partition_key")
+                    raise ValueError(
+                        f"{command} item partition_key does not match batch partition_key"
+                    )
                 args.extend([item.id, item.fencing_token])
                 if include_lease:
                     args.append(lease)
         return args
 
-    def _append_retry_policy(self, args: list[Any], policy: RetryPolicy) -> None:
+    def _append_retry_policy(self, args: builtins.list[Any], policy: RetryPolicy) -> None:
         args.extend(
             [
                 "MAX_RETRIES",
@@ -1654,19 +1754,35 @@ class FlowClient:
     ) -> FlowRecord:
         if isinstance(value, dict):
             return self._record(value)
-        lookup_partition = _auto_partition_key_for_id(id) if partition_key is None else partition_key
+        lookup_partition = (
+            _auto_partition_key_for_id(id) if partition_key is None else partition_key
+        )
         record = self.get(id, partition_key=lookup_partition)
         if record is None:
             raise RuntimeError(f"FLOW command succeeded but record {id!r} was not found")
         return record
 
-    def _records(self, values: list[dict[Any, Any]]) -> list[FlowRecord]:
+    def _records(self, values: builtins.list[dict[Any, Any]]) -> builtins.list[FlowRecord]:
         return [self._record(value) for value in values]
 
-    def _records_or_response(self, value: Any) -> list[FlowRecord] | Any:
+    def _records_or_response(self, value: Any) -> builtins.list[FlowRecord] | Any:
         if isinstance(value, list) and all(isinstance(item, dict) for item in value):
             return self._records(value)
         return value
+
+    def _execute_producer_write(self, *args: Any) -> Any:
+        attempt = 0
+        while True:
+            self.backpressure.before_request()
+            try:
+                result = self.executor.execute_command(*args)
+                self.backpressure.record_success()
+                return result
+            except OverloadedError as exc:
+                if not self.backpressure.can_retry(attempt):
+                    raise
+                self.backpressure.record_overload(attempt, exc.retry_after_ms)
+                attempt += 1
 
 
 @dataclass
@@ -1691,9 +1807,11 @@ class AutobatchFlowClient:
         self.max_batch = max(1, max_batch)
         self.max_delay_s = max(0.0, max_delay_ms) / 1000.0
         self._condition = threading.Condition()
-        self._pending: list[_BatchOp] = []
+        self._pending: builtins.list[_BatchOp] = []
         self._closed = False
-        self._worker = threading.Thread(target=self._run, name="ferricstore-flow-autobatch", daemon=True)
+        self._worker = threading.Thread(
+            target=self._run, name="ferricstore-flow-autobatch", daemon=True
+        )
         self._worker.start()
         atexit.register(self._close_at_exit)
 
@@ -1708,16 +1826,12 @@ class AutobatchFlowClient:
             self._worker.join(timeout=timeout)
         if self._worker.is_alive():
             raise TimeoutError("AutobatchFlowClient close timed out")
-        try:
+        with contextlib.suppress(Exception):
             atexit.unregister(self._close_at_exit)
-        except Exception:
-            pass
 
     def _close_at_exit(self) -> None:
-        try:
+        with contextlib.suppress(TimeoutError):
             self.close(timeout=1.0)
-        except TimeoutError:
-            pass
 
     def flush(self) -> None:
         marker: Future[Any] = Future()
@@ -1741,9 +1855,9 @@ class AutobatchFlowClient:
         idempotent: bool | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        return_record: bool = True,
-    ) -> Future[Any]:
-        future: Future[Any] = Future()
+        return_record: bool = False,
+    ) -> Future[FlowRecord | bytes]:
+        future: Future[FlowRecord | bytes] = Future()
         if (
             return_record
             or parent_flow_id is not None
@@ -1777,7 +1891,16 @@ class AutobatchFlowClient:
         auto_partition = partition_key is None
         batch_partition_key = _auto_partition_key_for_id(id) if auto_partition else partition_key
         batch_key = (
-            ("create-auto", type, state, run_at_ms, now_ms, priority, idempotent, batch_partition_key)
+            (
+                "create-auto",
+                type,
+                state,
+                run_at_ms,
+                now_ms,
+                priority,
+                idempotent,
+                batch_partition_key,
+            )
             if auto_partition
             else ("create", type, state, run_at_ms, now_ms, priority, idempotent)
         )
@@ -1820,7 +1943,7 @@ class AutobatchFlowClient:
         idempotent: bool | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        return_record: bool = True,
+        return_record: bool = False,
     ) -> FlowRecord | bytes:
         return self.create_async(
             id,
@@ -1851,13 +1974,13 @@ class AutobatchFlowClient:
         payload: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        drop_values: list[str] | None = None,
-        override_values: list[str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
-        return_record: bool = True,
-    ) -> Future[Any]:
-        future: Future[Any] = Future()
+        return_record: bool = False,
+    ) -> Future[FlowRecord | bytes]:
+        future: Future[FlowRecord | bytes] = Future()
         if return_record or partition_key is None:
             try:
                 future.set_result(
@@ -1927,11 +2050,11 @@ class AutobatchFlowClient:
         payload: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        drop_values: list[str] | None = None,
-        override_values: list[str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
-        return_record: bool = True,
+        return_record: bool = False,
     ) -> FlowRecord | bytes:
         return self.complete_async(
             id,
@@ -1961,12 +2084,12 @@ class AutobatchFlowClient:
         payload: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        drop_values: list[str] | None = None,
-        override_values: list[str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         priority: int | None = None,
-        return_record: bool = True,
+        return_record: bool = False,
     ) -> FlowRecord | bytes:
         if return_record or partition_key is None:
             return self.client.transition(
@@ -2025,7 +2148,7 @@ class AutobatchFlowClient:
                 future,
             )
         )
-        return future.result()
+        return _flow_return(future.result())
 
     def retry(
         self,
@@ -2038,11 +2161,11 @@ class AutobatchFlowClient:
         payload: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        drop_values: list[str] | None = None,
-        override_values: list[str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
-        return_record: bool = True,
+        return_record: bool = False,
     ) -> FlowRecord | bytes:
         if return_record or partition_key is None:
             return self.client.retry(
@@ -2095,7 +2218,7 @@ class AutobatchFlowClient:
                 future,
             )
         )
-        return future.result()
+        return _flow_return(future.result())
 
     def fail(
         self,
@@ -2108,11 +2231,11 @@ class AutobatchFlowClient:
         payload: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        drop_values: list[str] | None = None,
-        override_values: list[str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
-        return_record: bool = True,
+        return_record: bool = False,
     ) -> FlowRecord | bytes:
         if return_record or partition_key is None:
             return self.client.fail(
@@ -2165,7 +2288,7 @@ class AutobatchFlowClient:
                 future,
             )
         )
-        return future.result()
+        return _flow_return(future.result())
 
     def cancel(
         self,
@@ -2177,11 +2300,11 @@ class AutobatchFlowClient:
         reason: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-        drop_values: list[str] | None = None,
-        override_values: list[str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
-        return_record: bool = True,
+        return_record: bool = False,
     ) -> FlowRecord | bytes:
         if return_record or partition_key is None:
             return self.client.cancel(
@@ -2231,7 +2354,7 @@ class AutobatchFlowClient:
                 future,
             )
         )
-        return future.result()
+        return _flow_return(future.result())
 
     def _enqueue(self, op: _BatchOp) -> None:
         with self._condition:
@@ -2247,7 +2370,7 @@ class AutobatchFlowClient:
                 return
             self._flush_ops(ops)
 
-    def _take_batch(self) -> list[_BatchOp]:
+    def _take_batch(self) -> builtins.list[_BatchOp]:
         with self._condition:
             while not self._pending and not self._closed:
                 self._condition.wait()
@@ -2265,8 +2388,8 @@ class AutobatchFlowClient:
             self._pending = []
             return ops
 
-    def _flush_ops(self, ops: list[_BatchOp]) -> None:
-        groups: dict[tuple[Any, ...], list[_BatchOp]] = {}
+    def _flush_ops(self, ops: builtins.list[_BatchOp]) -> None:
+        groups: dict[tuple[Any, ...], builtins.list[_BatchOp]] = {}
         for op in ops:
             groups.setdefault(op.key, []).append(op)
         for group in groups.values():
@@ -2276,7 +2399,7 @@ class AutobatchFlowClient:
                 continue
             self._flush_group(group)
 
-    def _flush_group(self, group: list[_BatchOp]) -> None:
+    def _flush_group(self, group: builtins.list[_BatchOp]) -> None:
         kind = group[0].kind
         try:
             if kind == "create":
@@ -2288,7 +2411,9 @@ class AutobatchFlowClient:
                         CreateItem(
                             op.args["id"],
                             op.args["payload"],
-                            partition_key=None if partition_key is not None else op.args["partition_key"],
+                            partition_key=None
+                            if partition_key is not None
+                            else op.args["partition_key"],
                             values=op.args.get("values"),
                             value_refs=op.args.get("value_refs"),
                         )
@@ -2382,9 +2507,9 @@ class AutobatchFlowClient:
 
         self._complete_group(group, response)
 
-    def _complete_group(self, group: list[_BatchOp], response: Any) -> None:
+    def _complete_group(self, group: builtins.list[_BatchOp], response: Any) -> None:
         if isinstance(response, list) and len(response) == len(group):
-            for op, item in zip(group, response):
+            for op, item in zip(group, response, strict=False):
                 op.future.set_result(item)
             return
         for op in group:

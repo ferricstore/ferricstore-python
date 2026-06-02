@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Run FerricFlow queue + workflow throughput benchmarks with fixed optimized defaults.
+"""Run FerricFlow queue + workflow throughput benchmarks with optimized defaults.
 
 This wrapper exists so benchmark runs are reproducible and apples-to-apples.
-It does not start FerricStore; start a clean server separately, then run this file.
+When --start-server is used, it starts FerricStore with production server
+defaults and only sets isolation/logging env by default.
 """
 
 from __future__ import annotations
@@ -17,10 +18,13 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples"
 DEFAULT_SERVER_REPO = Path("/Users/yoavgea/repos/ferricstore")
+
+
+def default_server_shards() -> int:
+    return max(os.cpu_count() or 16, 1)
 
 
 def run(name: str, argv: list[str]) -> None:
@@ -63,26 +67,31 @@ def start_server(args: argparse.Namespace) -> tuple[subprocess.Popen, str, objec
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError("--start-server only supports local benchmark URLs")
     if port_is_open(args.url):
-        raise RuntimeError(f"--start-server refused to reuse already-listening server at {host}:{port}")
+        raise RuntimeError(
+            f"--start-server refused to reuse already-listening server at {host}:{port}"
+        )
 
     data_dir = tempfile.mkdtemp(prefix="ferricstore-flow-bench.")
     log_path = Path(args.server_log)
     log_file = log_path.open("ab")
 
     env = os.environ.copy()
-    env.setdefault("FERRICSTORE_BUILD", "1")
     env.update(
         {
             "MIX_ENV": "prod",
             "FERRICSTORE_PORT": str(port),
             "FERRICSTORE_DATA_DIR": data_dir,
-            "FERRICSTORE_SHARD_COUNT": str(args.server_shards),
-            "FERRICSTORE_MAX_MEMORY": str(args.server_max_memory),
             "FERRICSTORE_LOG_LEVEL": args.server_log_level,
-            "FERRICSTORE_PROTECTED_MODE": "false",
-            "FERRICSTORE_FLOW_DUE_ANY_ENABLED": "false",
         }
     )
+    if args.server_shard_count is not None:
+        env["FERRICSTORE_SHARD_COUNT"] = str(args.server_shard_count)
+    if args.server_max_memory is not None:
+        env["FERRICSTORE_MAX_MEMORY"] = str(args.server_max_memory)
+    if args.server_protected_mode is not None:
+        env["FERRICSTORE_PROTECTED_MODE"] = (
+            "true" if args.server_protected_mode else "false"
+        )
 
     proc = subprocess.Popen(
         ["mix", "run", "--no-halt"],
@@ -135,27 +144,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fresh-server-per-benchmark", action="store_true")
     parser.add_argument("--server-repo", default=str(DEFAULT_SERVER_REPO))
     parser.add_argument("--server-log", default="/tmp/ferricstore-flow-bench-server.log")
-    parser.add_argument("--server-log-level", default="error")
-    parser.add_argument("--server-max-memory", type=int, default=100_000_000_000)
+    parser.add_argument("--server-log-level", default="warning")
+    parser.add_argument("--server-max-memory", type=int, default=None)
+    parser.add_argument("--server-shard-count", type=int, default=None)
+    parser.add_argument(
+        "--server-protected-mode",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--server-start-timeout-s", type=float, default=60.0)
     parser.add_argument("--queue-shape", choices=["live", "preloaded"], default="live")
     parser.add_argument("--workflow-shape", choices=["live", "preloaded"], default="live")
     parser.add_argument("--flows", type=int, default=1_000_000)
     parser.add_argument("--workers", type=int, default=16)
-    parser.add_argument("--producers", type=int, default=8)
-    parser.add_argument("--partitions", type=int, default=1024)
-    parser.add_argument("--server-shards", type=int, default=16)
-    parser.add_argument("--claim-batch-size", type=int, default=1000)
-    parser.add_argument("--claim-partition-batch-size", type=int, default=16)
-    parser.add_argument("--queue-create-batch-size", type=int, default=1000)
+    parser.add_argument("--producers", type=int, default=32)
+    parser.add_argument("--partitions", type=int, default=16)
+    parser.add_argument("--server-shards", type=int, default=default_server_shards())
+    parser.add_argument("--claim-batch-size", type=int, default=500)
+    parser.add_argument("--claim-partition-batch-size", type=int, default=2)
+    parser.add_argument("--queue-create-batch-size", type=int, default=500)
     parser.add_argument("--workflow-create-batch-size", type=int, default=1000)
     parser.add_argument("--complete-async-depth", type=int, default=4)
     parser.add_argument("--workflow-apply-async-depth", type=int, default=4)
     parser.add_argument("--async-create-inflight", type=int, default=32)
     parser.add_argument("--async-create-backpressure-credit", type=int, default=0)
-    parser.add_argument("--async-producer-loop-thread", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--queue-wake-coalesce-ms", type=float, default=0.0)
-    parser.add_argument("--workflow-wake-coalesce-ms", type=float, default=0.0)
+    parser.add_argument(
+        "--async-producer-loop-thread", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--workflow-steps", type=int, default=1)
     return parser.parse_args()
 
@@ -175,7 +190,7 @@ def queue_command(args: argparse.Namespace) -> list[str]:
         "--worker-api",
         "lowlevel",
         "--worker-mode",
-        "owner-wakeup",
+        "polling",
         "--partition-mode",
         "auto",
         "--flows",
@@ -196,8 +211,6 @@ def queue_command(args: argparse.Namespace) -> list[str]:
         str(args.complete_async_depth),
         "--server-shards",
         str(args.server_shards),
-        "--wake-coalesce-ms",
-        str(args.queue_wake_coalesce_ms),
         "--claim-job-only",
     ]
 
@@ -233,9 +246,7 @@ def workflow_command(args: argparse.Namespace) -> list[str]:
         "--apply-async-depth",
         str(args.workflow_apply_async_depth),
         "--worker-mode",
-        "owner-wakeup",
-        "--wake-coalesce-ms",
-        str(args.workflow_wake_coalesce_ms),
+        "blocking",
         "--server-shards",
         str(args.server_shards),
     ]
@@ -252,7 +263,7 @@ def async_queue_command(args: argparse.Namespace) -> list[str]:
         "--create-mode",
         "many",
         "--worker-mode",
-        "owner-wakeup",
+        "blocking",
         "--partition-mode",
         "auto",
         "--flows",
@@ -277,8 +288,6 @@ def async_queue_command(args: argparse.Namespace) -> list[str]:
         str(args.complete_async_depth),
         "--server-shards",
         str(args.server_shards),
-        "--wake-coalesce-ms",
-        str(args.queue_wake_coalesce_ms),
     ]
     if args.async_producer_loop_thread:
         command.append("--producer-loop-thread")
@@ -318,9 +327,7 @@ def async_workflow_command(args: argparse.Namespace) -> list[str]:
         "--apply-inflight",
         str(args.workflow_apply_async_depth),
         "--worker-mode",
-        "owner-wakeup",
-        "--wake-coalesce-ms",
-        str(args.workflow_wake_coalesce_ms),
+        "blocking",
         "--server-shards",
         str(args.server_shards),
     ]

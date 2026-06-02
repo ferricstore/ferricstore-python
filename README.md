@@ -2,195 +2,163 @@
 
 Python SDK for FerricStore and FerricFlow.
 
-The SDK gives Python apps a typed wrapper around FerricStore Flow commands and a
-small workflow DSL. It is intentionally explicit: workflows are state pipelines,
-not hidden replay engines. That keeps handlers easy to reason about, easy to test,
-and close to the command semantics FerricStore actually stores.
+Status: public alpha `0.1.0`. APIs may change before `1.0`.
 
-## What It Provides
+## What you use
 
-* `FlowClient`: low-level typed client for Flow and FerricStore-native commands.
-* `QueueFlowWorker`: high-throughput durable queue worker.
-* `Workflow`: class-based state workflow helper.
-* `@state`: decorator for state handlers.
-* `Worker`: polling worker for one workflow.
-* `client.command(...)`: passthrough for normal Redis-compatible commands.
-* `RedisAdapter`: default adapter for `redis-py`.
-* `RedisCommandExecutor`: Protocol for other Redis clients.
-* `RawCodec`: default raw bytes payload codec.
-* `JsonCodec`: optional JSON payload codec.
+- `QueueClient` / `AsyncQueueClient` for durable queues.
+- `WorkflowClient` / `AsyncWorkflowClient` for explicit durable state machines.
+- `FlowClient` / `AsyncFlowClient` for advanced command-level control.
+- `RetryPolicy`, `WorkerConfig`, `ValueConfig`, and `ExceptionPolicy` for runtime defaults.
+- `RawCodec` by default, `JsonCodec` when you want JSON payloads.
+- `client.command(...)` as the Redis/FerricStore escape hatch.
 
-## Flow Command Coverage
+FerricFlow is not a hidden deterministic replay engine. It is an explicit durable
+state pipeline:
 
-`FlowClient` supports the full FerricStore Flow command surface exposed over RESP3:
-
-* create: `create`, `create_many`
-* value refs: `value_put`
-* claiming/leases: `claim_due`, `reclaim`, `extend_lease`
-* mutations: `transition`, `transition_many`, `complete`, `complete_many`,
-  `retry`, `retry_many`, `fail`, `fail_many`, `cancel`, `cancel_many`, `rewind`
-* children: `spawn_children`
-* reads/queries: `get`, `history`, `list`, `terminals`, `failures`,
-  `by_parent`, `by_root`, `by_correlation`, `info`, `stuck`
-* policy/retention: `install_policy`, `policy_get`, `retention_cleanup`
-
-The workflow DSL wraps common create/claim/handle/query paths. Advanced batch and
-admin operations remain available through `workflow.client`.
-
-## Install
-
-Development install:
-
-```bash
-cd /Users/yoavgea/repos/ferricstore-python
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e ".[dev]"
+```text
+create -> claim -> handler -> transition/complete/retry/fail
 ```
 
-Runtime install, once published:
+Handlers should be idempotent because work can be retried after lease expiry,
+worker crash, or explicit retry.
+
+## Install
 
 ```bash
 pip install ferricstore
 ```
 
-## Quick Start
+Local development:
 
-```python
-from ferricstore import FlowClient
-
-client = FlowClient.from_url("redis://127.0.0.1:6379/0")
-
-flow = client.create(
-    "order-1",
-    type="order",
-    state="created",
-    partition_key="tenant-a:order-1",
-    payload=b"raw bytes",
-)
-
-jobs = client.claim_due(
-    "order",
-    state="created",
-    worker="worker-1",
-    partition_key=flow.partition_key,
-    limit=1,
-)
-
-job = jobs[0]
-
-client.transition(
-    job.id,
-    from_state=job.state,
-    to_state="charged",
-    lease_token=job.lease_token,
-    fencing_token=job.fencing_token,
-    partition_key=job.partition_key,
-    payload=b"next payload",
-)
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e ".[dev]"
 ```
 
-For DBOS-style queued work where the worker only needs the job handle, use the
-optimized helpers. They keep the application code simple while using ack-only
-creates, minimal claim responses, and batch completion behind the scenes:
+## Queue quickstart
 
 ```python
-client.enqueue(
-    "order-1",
-    type="order",
-    payload=b"raw bytes",
-    partition_key="tenant-a:order-1",
-)
+from ferricstore import QueueClient
 
-jobs = client.claim_jobs(
-    "order",
-    state="queued",
-    worker="worker-1",
-    partition_key="tenant-a:order-1",
-    limit=100,
-)
+client = QueueClient.from_url("redis://127.0.0.1:6379/0")
+emails = client.queue(type="email")
 
-for job in jobs:
-    process(job.id)
-
-client.complete_jobs(jobs)
+emails.enqueue("email-1", payload=b"welcome:user-1", idempotent=True)
+emails.worker(concurrency=100, batch_size=500).run(send_email)
 ```
 
-For larger producer-side bursts, use `enqueue_many(...)` with no partition key.
-The SDK groups items into FerricFlow hidden auto buckets before flushing, so
-application code remains partition-free while the server still receives
-shard-local batches.
+If the handler raises, the default worker policy is retry.
 
-For hot paths that do not need the updated record immediately, pass
-`return_record=False` to single mutators such as `create`, `transition`,
-`complete`, `retry`, `fail`, and `cancel`. FerricStore returns `OK`; the SDK then
-skips the extra `FLOW.GET`.
-
-## Workflow DSL
+## Workflow quickstart
 
 ```python
-from ferricstore import FlowClient, Workflow, complete, state, transition
+from ferricstore import WorkflowClient, complete, transition
 
+client = WorkflowClient.from_url("redis://127.0.0.1:6379/0")
+order = client.workflow(
+    type="order",
+    initial_state="created",
+    partition_by=("tenant_id", "order_id"),
+)
 
-class OrderWorkflow(Workflow):
-    type = "order"
-    initial_state = "created"
-    partition_by = ("tenant_id", "order_id")
+@order.state("created")
+def created(job):
+    charge_card(job.payload)
+    return transition("charged")
 
-    @state("created", lease_ms=30_000, claim_payload=True, on_error="fail")
-    def created(self, job):
-        return transition("charged", payload=job.payload)
+@order.state("charged")
+def charged(job):
+    send_receipt(job.id)
+    return complete(result=b"ok")
 
-    @state("charged", lease_ms=30_000, claim_payload=True, on_error="fail")
-    def charged(self, job):
-        return complete(result=b"ok")
-
-
-client = FlowClient.from_url("redis://127.0.0.1:6379/0")
-workflow = OrderWorkflow(client)
-
-record = workflow.create(
+order.start(
     "order-1",
     tenant_id="tenant-a",
     order_id="order-1",
     payload=b"order payload",
+    idempotent=True,
 )
-
-workflow.run_once("created", worker="worker-1", partition_key=record.partition_key)
-workflow.run_once("charged", worker="worker-1", partition_key=record.partition_key)
 ```
 
-Use `workflow.enqueue(...)` instead of `workflow.create(...)` when enqueueing
-does not need the created record returned immediately. State handlers can set
-`claim_payload=False` and `return_record=False` when they do not need payload
-hydration or post-mutation reads.
+## Named values
+
+Use named values when different states need different pieces of data:
+
+```python
+emails.enqueue(
+    "email-2",
+    payload=b"small routing bytes",
+    values={
+        "template": b"welcome template bytes",
+        "profile": b"user profile snapshot",
+    },
+)
+
+emails.worker(claim_values=["template"]).run(send_email)
+```
+
+Only requested values are hydrated for the handler. Use `ValueConfig` or
+`value_max_bytes` in production to cap large value reads.
+
+## Async
+
+```python
+import asyncio
+
+from ferricstore import AsyncQueueClient
+
+
+async def main():
+    client = AsyncQueueClient.from_url("redis://127.0.0.1:6379/0")
+    emails = client.queue(type="email")
+
+    async def handler(job):
+        await send_email_async(job.payload)
+
+    await emails.worker(concurrency=100, batch_size=500).run(handler)
+
+
+asyncio.run(main())
+```
+
+## Production shape
+
+Use one process/service to create work and a separate long-lived worker service
+to claim and complete work.
+
+```text
+web/serverless producer -> FerricStore -> worker service
+```
+
+Before production, configure timeouts, connection pools, lease duration,
+backpressure behavior, graceful shutdown, and value hydration caps.
 
 ## Docs
 
-* [SDK Guide](docs/sdk.md)
-* [Concepts](docs/concepts.md)
-* [Client API](docs/client.md)
-* [Workflow DSL](docs/workflow.md)
-* [Worker](docs/worker.md)
-* [Payload Codecs](docs/codecs.md)
-* [Redis Adapters](docs/adapters.md)
-* [Children and Fanout](docs/children.md)
-* [Retry and Errors](docs/retry.md)
-* [Benchmark Example](docs/benchmark.md)
-* [Testing](docs/testing.md)
+- [Documentation index](docs/index.md)
+- [Quickstart](docs/quickstart.md)
+- [SDK guide](docs/sdk.md)
+- [Configuration](docs/configuration.md)
+- [Production readiness](docs/production.md)
+- [Data in workflows](docs/data.md)
+- [Worker runtime](docs/worker.md)
+- [Async APIs](docs/async.md)
+- [Use cases](docs/use-cases.md)
+- [Testing](docs/testing.md)
+- [Troubleshooting](docs/troubleshooting.md)
 
 ## Examples
 
-* `examples/order_workflow.py`: simple two-state workflow.
-* `examples/queue_worker.py`: queue producer plus `QueueFlowWorker`.
-* `examples/async_queue_worker.py`: async queue worker.
-* `examples/state_machine_workflow.py`: explicit workflow runner.
-* `examples/native_commands.py`: lock, fetch-or-compute, rate limit, Redis passthrough.
-* `examples/dbos_style_benchmark.py`: DBOS-style sequential-step benchmark.
+- `examples/order_workflow.py`: two-state workflow.
+- `examples/queue_worker.py`: queue producer and worker.
+- `examples/async_queue_worker.py`: async queue producer and worker.
+- `examples/state_machine_workflow.py`: explicit workflow runner.
+- `examples/native_commands.py`: Redis/FerricStore command helpers.
+- `examples/dbos_style_benchmark.py`: DBOS-style throughput benchmark.
 
-## Current Scope
+## Contributing
 
-This repo is an SDK layer. FerricStore remains source of truth. The SDK does not
-run a separate workflow database and does not implement deterministic replay.
-Handlers should be idempotent because claimed work may be retried after lease
-expiry or worker crash.
+See [CONTRIBUTING.md](CONTRIBUTING.md), [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md),
+[SECURITY.md](SECURITY.md), and [RELEASE.md](RELEASE.md).

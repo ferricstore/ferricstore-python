@@ -1,7 +1,37 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, fields
+from enum import Enum
 from typing import Any
+
+
+class ExceptionPolicy(str, Enum):
+    """Policy for unexpected Python handler exceptions."""
+
+    RETRY = "retry"
+    FAIL = "fail"
+    RAISE = "raise"
+
+
+_EXCEPTION_POLICY_VALUES = {policy.value for policy in ExceptionPolicy}
+
+
+def normalize_exception_policy(
+    value: ExceptionPolicy | str | None,
+    *,
+    argument: str = "exception_policy",
+) -> str:
+    if value is None:
+        return ExceptionPolicy.RETRY.value
+    if isinstance(value, ExceptionPolicy):
+        return value.value
+    if isinstance(value, str) and value in _EXCEPTION_POLICY_VALUES:
+        return value
+    raise ValueError(
+        f"{argument} must be ExceptionPolicy.RETRY, ExceptionPolicy.FAIL, "
+        "ExceptionPolicy.RAISE, or 'retry', 'fail', 'raise'"
+    )
 
 
 def _get(mapping: dict[Any, Any], key: str, default: Any = None) -> Any:
@@ -64,6 +94,91 @@ class RetryPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class ValueConfig:
+    value_max_bytes: int | None = None
+    local_cache: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerConfig:
+    workers: int | None = None
+    concurrency: int | None = None
+    command_connections: int | None = None
+    claim_connections: int | None = None
+    batch_size: int | None = 10
+    lease_ms: int | None = None
+    priority: int | None = None
+    reclaim_expired: bool | None = None
+    reclaim_ratio: int | None = None
+    claim_values: Sequence[str] | None = None
+    value_max_bytes: int | None = None
+    block_ms: int | None = None
+    claim_scan_block_ms: int | None = None
+    idle_sleep_s: float | None = None
+    max_idle_sleep_s: float | None = None
+    exception_policy: ExceptionPolicy | str | None = None
+    complete_independent: bool | None = None
+    claim_partition_batch_size: int | None = 1
+    claim_drain_batches: int | None = None
+    scan_before_blocking: bool | None = None
+    complete_async_depth: int | None = None
+    apply_async_depth: int | None = 0
+    server_shards: int | None = None
+    producer_loop_thread: bool | None = None
+    empty_claim_cooldown_s: float | None = None
+    partial_claim_cooldown_s: float | None = None
+
+    def to_kwargs(self, allowed: set[str] | frozenset[str] | None = None) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
+        for field in fields(self):
+            name = field.name
+            if allowed is not None and name not in allowed:
+                continue
+            value = getattr(self, name)
+            if value is not None:
+                kwargs[name] = value
+        return kwargs
+
+
+def resolve_worker_connection_counts(
+    *,
+    workers: int | None = None,
+    concurrency: int | None = None,
+    command_connections: int | None = None,
+    claim_connections: int | None = None,
+    worker_config: WorkerConfig | None = None,
+    default_workers: int = 1,
+) -> tuple[int, int]:
+    """Return bounded command/claim pool sizes for blocking worker clients."""
+
+    if worker_config is not None:
+        workers = workers if workers is not None else worker_config.workers
+        concurrency = concurrency if concurrency is not None else worker_config.concurrency
+        command_connections = (
+            command_connections
+            if command_connections is not None
+            else worker_config.command_connections
+        )
+        claim_connections = (
+            claim_connections if claim_connections is not None else worker_config.claim_connections
+        )
+
+    worker_count = workers if workers is not None else concurrency
+    if worker_count is None:
+        worker_count = default_workers
+    if worker_count <= 0:
+        raise ValueError("workers/concurrency must be positive for connection sizing")
+
+    command_count = command_connections if command_connections is not None else max(2, worker_count)
+    claim_count = claim_connections if claim_connections is not None else worker_count
+    if command_count <= 0:
+        raise ValueError("command_connections must be positive")
+    if claim_count <= 0:
+        raise ValueError("claim_connections must be positive")
+    return command_count, claim_count
+
+
+@dataclass(frozen=True, slots=True)
 class ChildSpec:
     id: str
     type: str
@@ -101,6 +216,7 @@ class ClaimedItem:
                 partition_key=_optional_str(value[1]),
                 lease_token=_bytes(value[2]),
                 fencing_token=_int(value[3]),
+                run_state=_optional_str(value[4]) if len(value) > 4 else None,
             )
 
         return cls(

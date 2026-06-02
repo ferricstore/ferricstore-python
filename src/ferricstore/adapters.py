@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from ferricstore.errors import map_exception
 
@@ -32,7 +32,7 @@ class RedisAdapter:
     maintained by Redis, and supports RESP3 via `protocol=3`.
     """
 
-    def __init__(self, client: "redis.Redis") -> None:
+    def __init__(self, client: redis.Redis) -> None:
         self.client = client
 
     @classmethod
@@ -45,18 +45,22 @@ class RedisAdapter:
 
     def execute_command(self, *args: Any) -> Any:
         try:
-            return self.client.execute_command(*args)
+            client = cast(Any, self.client)
+            return client.execute_command(*args)
         except Exception as exc:
             mapped = map_exception(exc)
             if mapped is exc:
                 raise
             raise mapped from exc
 
+    def close(self) -> None:
+        self.client.close()
+
 
 class AsyncRedisAdapter:
     """`redis.asyncio` adapter using RESP3 and raw byte responses."""
 
-    def __init__(self, client: "aioredis.Redis") -> None:
+    def __init__(self, client: aioredis.Redis) -> None:
         self.client = client
 
     @classmethod
@@ -69,7 +73,8 @@ class AsyncRedisAdapter:
 
     async def execute_command(self, *args: Any) -> Any:
         try:
-            return await self.client.execute_command(*args)
+            client = cast(Any, self.client)
+            return await client.execute_command(*args)
         except Exception as exc:
             mapped = map_exception(exc)
             if mapped is exc:

@@ -1,9 +1,8 @@
-import queue
-
 import pytest
 
-from ferricstore.types import ClaimedItem
-from ferricstore.worker import FlowReadyCoordinator, FlowReadySignal, QueueFlowWorker
+from ferricstore import ExceptionPolicy, QueueClient, RetryPolicy, ValueConfig, WorkerConfig
+from ferricstore.types import ClaimedItem, resolve_worker_connection_counts
+from ferricstore.worker import QueueFlowWorker
 
 
 class FakeFlowClient:
@@ -13,6 +12,7 @@ class FakeFlowClient:
         self.completed = []
         self.retried = []
         self.failed = []
+        self.policies = []
 
     def claim_jobs(self, type, **kwargs):
         self.claim_calls.append((type, kwargs))
@@ -32,23 +32,27 @@ class FakeFlowClient:
         self.failed.append((partition_key, list(jobs), kwargs))
         return []
 
+    def enqueue(self, id, **kwargs):
+        self.enqueued = getattr(self, "enqueued", [])
+        self.enqueued.append((id, kwargs))
+        return b"OK"
 
-class FakeWakeSource:
-    def __init__(self, responses):
-        self.responses = list(responses)
-        self.calls = []
+    def enqueue_many(self, items, **kwargs):
+        self.enqueued_many = getattr(self, "enqueued_many", [])
+        self.enqueued_many.append((list(items), kwargs))
+        return [b"OK" for _ in items]
 
-    def next_partitions(self, worker_index, timeout_s, max_partitions, max_credit, same_group=None):
-        self.calls.append((worker_index, timeout_s, max_partitions, max_credit, same_group))
-        if not self.responses:
-            raise queue.Empty
-        response = self.responses.pop(0)
-        if response is None:
-            raise queue.Empty
-        return response
+    def command(self, *args):
+        self.commands = getattr(self, "commands", [])
+        self.commands.append(args)
+        return b"OK"
 
-    def take_credit(self, worker_index, partition_index):
-        return 0
+    def install_policy(self, type, **kwargs):
+        self.policies.append((type, kwargs))
+        return b"OK"
+
+    def close(self):
+        self.closed = True
 
 
 def test_flow_worker_drains_same_partition_group_while_batches_are_full():
@@ -67,6 +71,7 @@ def test_flow_worker_drains_same_partition_group_while_batches_are_full():
         partition_keys=["bucket-0", "bucket-1"],
         claim_partition_batch_size=1,
         claim_drain_batches=4,
+        scan_before_blocking=True,
     )
 
     result = worker.run_once(lambda _job: None)
@@ -91,29 +96,12 @@ def test_flow_worker_rejects_invalid_claim_drain_batches():
         )
 
 
-def test_flow_worker_uses_wake_credit_to_claim_owned_partition():
-    client = FakeFlowClient([[object(), object()]])
-    wake_source = FakeWakeSource([([0], 2)])
-    worker = QueueFlowWorker(
-        client,
-        type="email",
-        state="queued",
-        batch_size=2,
-        idle_sleep_s=0.01,
-        partition_keys=["bucket-0"],
-        partition_indices=[0],
-        wake_source=wake_source,
-        wake_worker_index=7,
-    )
+def test_flow_worker_rejects_old_owner_wakeup_options():
+    with pytest.raises(TypeError):
+        QueueFlowWorker(FakeFlowClient([]), type="email", wake_source=object())
 
-    result = worker.run_once(lambda _job: None)
-
-    assert result.claimed == 2
-    assert result.completed == 2
-    assert result.claim_calls == 1
-    assert wake_source.calls[0][:4] == (7, 0.01, 1, 2)
-    assert client.claim_calls[0][1]["partition_key"] == "bucket-0"
-    assert client.claim_calls[0][1]["limit"] == 2
+    with pytest.raises(TypeError):
+        WorkerConfig(owner_wakeup=True)
 
 
 def test_flow_worker_does_not_disable_reclaim_expired_by_default():
@@ -125,66 +113,179 @@ def test_flow_worker_does_not_disable_reclaim_expired_by_default():
     assert client.claim_calls[0][1]["reclaim_expired"] is None
 
 
-def test_flow_worker_wake_source_respects_single_partition_key():
-    coordinator = FlowReadyCoordinator()
-    coordinator.notify(
-        FlowReadySignal(type="email", state="queued", priority=0, partition_key="bucket-2", count=1)
-    )
-    coordinator.notify(
-        FlowReadySignal(type="email", state="queued", priority=0, partition_key="bucket-1", count=1)
-    )
+def test_flow_worker_uses_nonblocking_claim_by_default():
+    client = FakeFlowClient([[object()]])
+    worker = QueueFlowWorker(client, type="email", state="queued", batch_size=1)
+
+    worker.run_once(lambda _job: None)
+
+    assert client.claim_calls[0][1]["block_ms"] is None
+
+
+def test_flow_worker_defaults_match_easy_startup_profile():
+    worker = QueueFlowWorker(FakeFlowClient([]), type="email")
+
+    assert worker.batch_size == 10
+    assert worker.block_ms is None
+    assert worker.claim_partition_batch_size == 1
+    assert worker.scan_before_blocking is False
+    assert worker._complete_async_depth == 0
+
+
+def test_worker_config_defaults_match_easy_startup_profile():
+    kwargs = WorkerConfig().to_kwargs()
+
+    assert kwargs["batch_size"] == 10
+    assert "block_ms" not in kwargs
+    assert kwargs["claim_partition_batch_size"] == 1
+    assert "complete_async_depth" not in kwargs
+    assert kwargs["apply_async_depth"] == 0
+
+
+def test_flow_worker_blocks_on_all_owned_partitions_by_default():
     client = FakeFlowClient([[object()]])
     worker = QueueFlowWorker(
         client,
         type="email",
         state="queued",
         batch_size=1,
-        partition_key="bucket-1",
-        wake_source=coordinator,
-        wake_worker_index=0,
+        partition_keys=["bucket-0", "bucket-1", "bucket-2", "bucket-3"],
+        claim_partition_batch_size=2,
+        block_ms=5000,
         idle_sleep_s=0,
     )
 
     result = worker.run_once(lambda _job: None)
 
     assert result.claimed == 1
-    assert client.claim_calls[0][1]["partition_key"] == "bucket-1"
+    assert len(client.claim_calls) == 1
+    assert client.claim_calls[0][1]["partition_keys"] == [
+        "bucket-0",
+        "bucket-1",
+        "bucket-2",
+        "bucket-3",
+    ]
+    assert client.claim_calls[0][1]["block_ms"] == 5000
 
 
-def test_flow_worker_retries_rewake_owner_wakeup_partition():
-    coordinator = FlowReadyCoordinator()
-    coordinator.notify(
-        FlowReadySignal(type="email", state="queued", priority=0, partition_key="bucket-1", count=1)
-    )
-    job = ClaimedItem(id="flow-1", lease_token=b"lease", fencing_token=1, partition_key="bucket-1")
-    client = FakeFlowClient([[job]])
+def test_flow_worker_scans_partition_pages_before_blocking():
+    client = FakeFlowClient([[], [], [object()]])
     worker = QueueFlowWorker(
         client,
         type="email",
         state="queued",
         batch_size=1,
-        partition_keys=["bucket-1"],
-        wake_source=coordinator,
-        wake_worker_index=0,
+        partition_keys=["bucket-0", "bucket-1", "bucket-2", "bucket-3"],
+        claim_partition_batch_size=2,
+        block_ms=5000,
+        scan_before_blocking=True,
         idle_sleep_s=0,
     )
 
-    result = worker.run_once(lambda _job: (_ for _ in ()).throw(RuntimeError("boom")))
+    result = worker.run_once(lambda _job: None)
 
-    assert result.retried == 1
-    assert len(client.retried) == 1
-    keys, credit = coordinator.next_ready(
+    assert result.claimed == 1
+    assert [call[1]["partition_keys"] for call in client.claim_calls] == [
+        ["bucket-0", "bucket-1"],
+        ["bucket-2", "bucket-3"],
+        ["bucket-0", "bucket-1", "bucket-2", "bucket-3"],
+    ]
+    assert [call[1]["block_ms"] for call in client.claim_calls] == [None, None, 5000]
+
+
+def test_flow_worker_can_use_short_block_after_partition_scan():
+    client = FakeFlowClient([[], [], [object()]])
+    worker = QueueFlowWorker(
+        client,
         type="email",
         state="queued",
-        states=None,
-        priority=0,
-        partition_keys=["bucket-1"],
-        timeout_s=0,
-        max_partitions=1,
-        max_credit=1,
+        batch_size=1,
+        partition_keys=["bucket-0", "bucket-1", "bucket-2", "bucket-3"],
+        claim_partition_batch_size=2,
+        block_ms=5000,
+        claim_scan_block_ms=50,
+        scan_before_blocking=True,
+        idle_sleep_s=0,
     )
-    assert keys == ["bucket-1"]
-    assert credit == 1
+
+    result = worker.run_once(lambda _job: None)
+
+    assert result.claimed == 1
+    assert [call[1]["block_ms"] for call in client.claim_calls] == [None, None, 50]
+
+
+def test_flow_worker_rejects_invalid_claim_scan_block_ms():
+    with pytest.raises(ValueError, match="claim_scan_block_ms"):
+        QueueFlowWorker(
+            FakeFlowClient([]),
+            type="email",
+            partition_keys=["bucket-0"],
+            claim_scan_block_ms=-1,
+        )
+
+
+def test_flow_worker_does_not_block_when_scan_finds_ready_partition():
+    client = FakeFlowClient([[], [object()]])
+    worker = QueueFlowWorker(
+        client,
+        type="email",
+        state="queued",
+        batch_size=1,
+        partition_keys=["bucket-0", "bucket-1", "bucket-2", "bucket-3"],
+        claim_partition_batch_size=2,
+        block_ms=5000,
+        scan_before_blocking=True,
+        idle_sleep_s=0,
+    )
+
+    result = worker.run_once(lambda _job: None)
+
+    assert result.claimed == 1
+    assert [call[1]["partition_keys"] for call in client.claim_calls] == [
+        ["bucket-0", "bucket-1"],
+        ["bucket-2", "bucket-3"],
+    ]
+    assert [call[1]["block_ms"] for call in client.claim_calls] == [None, None]
+
+
+def test_flow_worker_batches_partition_keys_by_default():
+    client = FakeFlowClient([[object()]])
+    worker = QueueFlowWorker(
+        client,
+        type="email",
+        state="queued",
+        batch_size=1,
+        partition_keys=["bucket-0", "bucket-1", "bucket-2"],
+    )
+
+    worker.run_once(lambda _job: None)
+
+    assert client.claim_calls[0][1]["partition_key"] is None
+    assert client.claim_calls[0][1]["partition_keys"] == [
+        "bucket-0",
+        "bucket-1",
+        "bucket-2",
+    ]
+
+
+def test_flow_worker_uses_separate_claim_client_when_provided():
+    command_client = FakeFlowClient([])
+    claim_client = FakeFlowClient([[object()]])
+    worker = QueueFlowWorker(
+        command_client,
+        claim_client=claim_client,
+        type="email",
+        state="queued",
+        batch_size=1,
+    )
+
+    result = worker.run_once(lambda _job: "ok")
+
+    assert result.claimed == 1
+    assert command_client.claim_calls == []
+    assert len(claim_client.claim_calls) == 1
+    assert len(command_client.completed) == 1
+    assert claim_client.completed == []
 
 
 def test_flow_worker_cools_empty_partition_before_retrying_it():
@@ -196,6 +297,7 @@ def test_flow_worker_cools_empty_partition_before_retrying_it():
         batch_size=1,
         partition_keys=["bucket-0", "bucket-1"],
         claim_partition_batch_size=1,
+        block_ms=None,
         empty_claim_cooldown_s=1.0,
     )
 
@@ -237,6 +339,31 @@ def test_flow_worker_batch_handler_completes_claimed_batch_once():
     ]
 
 
+def test_flow_worker_can_run_batch_for_explicit_partition_keys():
+    client = FakeFlowClient([[object(), object()]])
+    worker = QueueFlowWorker(
+        client,
+        type="email",
+        state="queued",
+        batch_size=10,
+        partition_keys=["bucket-ignored"],
+        block_ms=5000,
+    )
+
+    result = worker.run_batch_once_for_partition_keys(
+        lambda claimed: "ok",
+        ["bucket-1", "bucket-2"],
+        claim_credit=2,
+        block_ms=None,
+    )
+
+    assert result.claimed == 2
+    assert result.completed == 2
+    assert client.claim_calls[0][1]["partition_keys"] == ["bucket-1", "bucket-2"]
+    assert client.claim_calls[0][1]["limit"] == 2
+    assert client.claim_calls[0][1]["block_ms"] is None
+
+
 def test_flow_worker_start_stop_join_tracks_stats():
     client = FakeFlowClient([[object()], []])
     worker = QueueFlowWorker(client, type="email", state="queued", idle_sleep_s=0.001)
@@ -250,373 +377,6 @@ def test_flow_worker_start_stop_join_tracks_stats():
     assert stats.claimed == 1
     assert stats.completed == 1
     assert worker.is_running is False
-
-
-def test_flow_ready_coordinator_filters_by_worker_claim_shape():
-    coordinator = FlowReadyCoordinator()
-    coordinator.notify(
-        FlowReadySignal(
-            type="sms",
-            state="queued",
-            priority=0,
-            partition_key="bucket-wrong-type",
-            count=10,
-        )
-    )
-    coordinator.notify(
-        FlowReadySignal(
-            type="email",
-            state="waiting",
-            priority=0,
-            partition_key="bucket-wrong-state",
-            count=10,
-        )
-    )
-    coordinator.notify(
-        FlowReadySignal(
-            type="email",
-            state="queued",
-            priority=0,
-            partition_key="bucket-ok",
-            count=7,
-        )
-    )
-
-    keys, credit = coordinator.next_ready(
-        type="email",
-        state="queued",
-        states=None,
-        priority=0,
-        partition_keys=["bucket-ok", "bucket-wrong-state", "bucket-wrong-type"],
-        timeout_s=0,
-        max_partitions=2,
-        max_credit=500,
-    )
-
-    assert keys == ["bucket-ok"]
-    assert credit == 7
-
-
-def test_flow_ready_coordinator_defers_future_due_signal_without_consuming_credit():
-    coordinator = FlowReadyCoordinator()
-    coordinator.notify(
-        FlowReadySignal(
-            type="email",
-            state="queued",
-            priority=0,
-            partition_key="bucket-future",
-            count=1,
-            due_at_ms=9_999_999_999_999,
-        )
-    )
-
-    with pytest.raises(queue.Empty):
-        coordinator.next_ready(
-            type="email",
-            state="queued",
-            states=None,
-            priority=0,
-            partition_keys=["bucket-future"],
-            timeout_s=0,
-            max_partitions=1,
-            max_credit=1,
-        )
-
-    coordinator.notify(
-        FlowReadySignal(
-            type="email",
-            state="queued",
-            priority=0,
-            partition_key="bucket-ready",
-            count=1,
-            due_at_ms=0,
-        )
-    )
-
-    keys, credit = coordinator.next_ready(
-        type="email",
-        state="queued",
-        states=None,
-        priority=0,
-        partition_keys=["bucket-future", "bucket-ready"],
-        timeout_s=0,
-        max_partitions=1,
-        max_credit=1,
-    )
-
-    assert keys == ["bucket-ready"]
-    assert credit == 1
-
-
-def test_flow_ready_coordinator_keeps_ready_credit_when_future_signal_shares_partition():
-    coordinator = FlowReadyCoordinator()
-    coordinator.notify(
-        FlowReadySignal(
-            type="email",
-            state="queued",
-            priority=0,
-            partition_key="bucket-1",
-            count=1,
-            due_at_ms=0,
-        )
-    )
-    coordinator.notify(
-        FlowReadySignal(
-            type="email",
-            state="queued",
-            priority=0,
-            partition_key="bucket-1",
-            count=1,
-            due_at_ms=9_999_999_999_999,
-        )
-    )
-
-    keys, credit = coordinator.next_ready(
-        type="email",
-        state="queued",
-        states=None,
-        priority=0,
-        partition_keys=["bucket-1"],
-        timeout_s=0,
-        max_partitions=1,
-        max_credit=1,
-    )
-
-    assert keys == ["bucket-1"]
-    assert credit == 1
-
-
-def test_flow_ready_coordinator_does_not_consume_future_credit_after_ready_signal():
-    coordinator = FlowReadyCoordinator()
-    coordinator.notify(
-        FlowReadySignal(
-            type="email",
-            state="queued",
-            priority=0,
-            partition_key="bucket-1",
-            count=1,
-            due_at_ms=9_999_999_999_999,
-        )
-    )
-    coordinator.notify(
-        FlowReadySignal(
-            type="email",
-            state="queued",
-            priority=0,
-            partition_key="bucket-1",
-            count=1,
-            due_at_ms=0,
-        )
-    )
-
-    keys, credit = coordinator.next_ready(
-        type="email",
-        state="queued",
-        states=None,
-        priority=0,
-        partition_keys=["bucket-1"],
-        timeout_s=0,
-        max_partitions=1,
-        max_credit=1,
-    )
-
-    assert keys == ["bucket-1"]
-    assert credit == 1
-
-    with pytest.raises(queue.Empty):
-        coordinator.next_ready(
-            type="email",
-            state="queued",
-            states=None,
-            priority=0,
-            partition_keys=["bucket-1"],
-            timeout_s=0,
-            max_partitions=1,
-            max_credit=1,
-        )
-
-
-def test_flow_worker_does_not_coalesce_wake_when_producers_are_done(monkeypatch):
-    sleeps = []
-    monkeypatch.setattr("ferricstore.worker.time.sleep", sleeps.append)
-
-    coordinator = FlowReadyCoordinator()
-    coordinator.notify(
-        FlowReadySignal(
-            type="email",
-            state="queued",
-            priority=0,
-            partition_key="bucket-ok",
-            count=2,
-        )
-    )
-    client = FakeFlowClient([[object(), object()]])
-    worker = QueueFlowWorker(
-        client,
-        type="email",
-        state="queued",
-        batch_size=500,
-        partition_keys=["bucket-ok"],
-        wake_source=coordinator,
-        wake_worker_index=0,
-        wake_producers_done=lambda: True,
-        wake_coalesce_s=0.005,
-    )
-
-    result = worker.run_once(lambda _job: None)
-
-    assert result.claimed == 2
-    assert sleeps == []
-
-
-def test_flow_worker_wake_coalesce_respects_single_partition_key(monkeypatch):
-    sleeps = []
-    monkeypatch.setattr("ferricstore.worker.time.sleep", sleeps.append)
-
-    coordinator = FlowReadyCoordinator()
-    coordinator.notify(
-        FlowReadySignal(type="email", state="queued", priority=0, partition_key="bucket-1", count=1)
-    )
-    coordinator.notify(
-        FlowReadySignal(type="email", state="queued", priority=0, partition_key="bucket-2", count=1)
-    )
-    worker = QueueFlowWorker(
-        FakeFlowClient([]),
-        type="email",
-        state="queued",
-        batch_size=2,
-        partition_key="bucket-1",
-        wake_source=coordinator,
-        wake_worker_index=0,
-        idle_sleep_s=0,
-        wake_coalesce_s=0.005,
-        claim_partition_batch_size=2,
-    )
-
-    assert worker._next_wake_claim() == ("bucket-1", None, 1)
-
-
-def test_flow_worker_wake_wait_ignores_unrelated_credit_for_filtered_worker():
-    coordinator = FlowReadyCoordinator()
-    coordinator.notify(
-        FlowReadySignal(type="email", state="queued", priority=0, partition_key="bucket-2", count=1)
-    )
-    worker = QueueFlowWorker(
-        FakeFlowClient([]),
-        type="email",
-        state="queued",
-        batch_size=1,
-        partition_key="bucket-1",
-        wake_source=coordinator,
-        wake_worker_index=0,
-    )
-
-    assert worker._wake_should_wait_for_signal() is False
-
-
-def test_flow_worker_wake_fallback_polls_while_producers_are_active():
-    coordinator = FlowReadyCoordinator()
-    client = FakeFlowClient([[object()]])
-    worker = QueueFlowWorker(
-        client,
-        type="email",
-        state="queued",
-        batch_size=1,
-        wake_source=coordinator,
-        wake_worker_index=0,
-        wake_producers_done=lambda: False,
-        wake_fallback_after=2,
-        idle_sleep_s=0,
-    )
-
-    first = worker.run_once(lambda _job: None)
-    second = worker.run_once(lambda _job: None)
-
-    assert first.claimed == 0
-    assert second.claimed == 1
-    assert len(client.claim_calls) == 1
-
-
-def test_flow_worker_retry_wake_uses_job_run_state():
-    coordinator = FlowReadyCoordinator()
-    worker = QueueFlowWorker(
-        FakeFlowClient([]),
-        type="email",
-        states=["queued", "retry"],
-        batch_size=1,
-        partition_keys=["bucket-1"],
-        wake_source=coordinator,
-        wake_worker_index=0,
-    )
-    job = ClaimedItem(
-        id="flow-1",
-        state="running",
-        run_state="retry",
-        lease_token=b"lease",
-        fencing_token=1,
-        partition_key="bucket-1",
-    )
-
-    worker._notify_retried_jobs([job])
-    keys, credit = coordinator.next_ready(
-        type="email",
-        state="retry",
-        states=None,
-        priority=0,
-        partition_keys=["bucket-1"],
-        timeout_s=0,
-        max_partitions=1,
-        max_credit=1,
-    )
-
-    assert keys == ["bucket-1"]
-    assert credit == 1
-
-
-def test_flow_worker_retry_wake_without_run_state_signals_all_configured_states():
-    coordinator = FlowReadyCoordinator()
-    worker = QueueFlowWorker(
-        FakeFlowClient([]),
-        type="email",
-        states=["queued", "retry"],
-        batch_size=1,
-        partition_keys=["bucket-1"],
-        wake_source=coordinator,
-        wake_worker_index=0,
-    )
-    job = ClaimedItem(
-        id="flow-1",
-        lease_token=b"lease",
-        fencing_token=1,
-        partition_key="bucket-1",
-    )
-
-    worker._notify_retried_jobs([job])
-    queued_keys, queued_credit = coordinator.next_ready(
-        type="email",
-        state="queued",
-        states=None,
-        priority=0,
-        partition_keys=["bucket-1"],
-        timeout_s=0,
-        max_partitions=1,
-        max_credit=1,
-    )
-    retry_keys, retry_credit = coordinator.next_ready(
-        type="email",
-        state="retry",
-        states=None,
-        priority=0,
-        partition_keys=["bucket-1"],
-        timeout_s=0,
-        max_partitions=1,
-        max_credit=1,
-    )
-
-    assert queued_keys == ["bucket-1"]
-    assert queued_credit == 1
-    assert retry_keys == ["bucket-1"]
-    assert retry_credit == 1
 
 
 def test_flow_worker_close_merges_async_completion_stats():
@@ -648,7 +408,7 @@ def test_flow_worker_resets_running_after_loop_exception():
         type="email",
         state="queued",
         batch_size=1,
-        on_error="raise",
+        exception_policy=ExceptionPolicy.RAISE,
         idle_sleep_s=0,
     )
 
@@ -684,3 +444,116 @@ def test_flow_worker_preserves_distinct_failure_messages_in_batch_retry():
     assert len(client.retried) == 2
     assert client.retried[0][2]["error"] == "boom-f1"
     assert client.retried[1][2]["error"] == "boom-f2"
+
+
+def test_queue_client_creates_queue_and_delegates_flow_commands():
+    client = FakeFlowClient([])
+    queue_client = QueueClient(client)
+    queue = queue_client.queue(type="email", state="queued")
+
+    assert queue.enqueue("email-1", payload=b"p") == b"OK"
+    worker = queue.worker(batch_size=10)
+    assert worker.type == "email"
+    assert worker.state == "queued"
+    assert queue_client.command("PING") == b"OK"
+    assert client.enqueued[0] == ("email-1", {"type": "email", "state": "queued", "payload": b"p"})
+    assert client.commands[0] == ("PING",)
+
+
+def test_queue_client_retry_policy_is_inherited_and_can_be_overridden():
+    client = FakeFlowClient([])
+    default_policy = RetryPolicy(max_retries=5)
+    queue_policy = RetryPolicy(max_retries=2)
+    queue_client = QueueClient(client, retry_policy=default_policy)
+    queue = queue_client.queue(type="email", retry_policy=queue_policy)
+
+    queue.install_policy()
+    queue_client.install_policy("sms")
+
+    assert client.policies[0] == ("email", {"retry": queue_policy})
+    assert client.policies[1] == ("sms", {"retry": default_policy, "states": None})
+
+
+def test_queue_client_worker_and_value_config_are_inherited_and_overridable():
+    client = FakeFlowClient([])
+    queue_client = QueueClient(
+        client,
+        worker_config=WorkerConfig(batch_size=50, concurrency=4, idle_sleep_s=0.01),
+        value_config=ValueConfig(value_max_bytes=64_000),
+    )
+    queue = queue_client.queue(type="email")
+
+    worker = queue.worker(batch_size=10)
+
+    assert worker.batch_size == 10
+    assert worker.concurrency == 4
+    assert worker.idle_sleep_s == 0.01
+    assert worker.value_max_bytes == 64_000
+
+
+def test_queue_client_from_url_creates_bounded_command_and_claim_pools(monkeypatch):
+    calls = []
+
+    def from_url(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeFlowClient([])
+
+    monkeypatch.setattr("ferricstore.worker.FlowClient.from_url", staticmethod(from_url))
+
+    queue_client = QueueClient.from_url(
+        "redis://example/0",
+        worker_config=WorkerConfig(workers=3),
+    )
+
+    worker = queue_client.queue(type="email").worker()
+
+    assert calls == [
+        ("redis://example/0", {"max_connections": 3}),
+        ("redis://example/0", {"max_connections": 3}),
+    ]
+    assert worker.client is queue_client.flow
+    assert worker.claim_client is queue_client.claim_flow
+
+
+def test_queue_worker_config_at_queue_time_resizes_claim_pool(monkeypatch):
+    calls = []
+
+    def from_url(url, **kwargs):
+        client = FakeFlowClient([])
+        client.url = url
+        client.kwargs = kwargs
+        calls.append((url, kwargs, client))
+        return client
+
+    monkeypatch.setattr("ferricstore.worker.FlowClient.from_url", staticmethod(from_url))
+
+    queue_client = QueueClient.from_url("redis://example/0")
+    worker = queue_client.queue(
+        type="email",
+        worker_config=WorkerConfig(workers=16),
+    ).worker()
+
+    assert calls[0][1]["max_connections"] == 2
+    assert calls[1][1]["max_connections"] == 1
+    assert calls[2][1]["max_connections"] == 16
+    assert worker.client is queue_client.flow
+    assert worker.claim_client is calls[2][2]
+
+
+def test_queue_client_close_does_not_close_externally_owned_clients():
+    flow = FakeFlowClient([])
+    claim_flow = FakeFlowClient([])
+
+    queue_client = QueueClient(flow, claim_client=claim_flow)
+    queue_client.close()
+
+    assert not hasattr(flow, "closed")
+    assert not hasattr(claim_flow, "closed")
+
+
+def test_worker_connection_counts_reject_zero_limits():
+    with pytest.raises(ValueError, match="command_connections"):
+        resolve_worker_connection_counts(workers=4, command_connections=0)
+
+    with pytest.raises(ValueError, match="claim_connections"):
+        resolve_worker_connection_counts(workers=4, claim_connections=0)
