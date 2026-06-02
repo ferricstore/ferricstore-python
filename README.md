@@ -4,17 +4,8 @@ Python SDK for FerricStore and FerricFlow.
 
 Status: public alpha `0.1.0`. APIs may change before `1.0`.
 
-## What you use
-
-- `QueueClient` / `AsyncQueueClient` for durable queues.
-- `WorkflowClient` / `AsyncWorkflowClient` for explicit durable state machines.
-- `FlowClient` / `AsyncFlowClient` for advanced command-level control.
-- `RetryPolicy`, `WorkerConfig`, `ValueConfig`, and `ExceptionPolicy` for runtime defaults.
-- `RawCodec` by default, `JsonCodec` when you want JSON payloads.
-- `client.command(...)` as the Redis/FerricStore escape hatch.
-
-FerricFlow is not a hidden deterministic replay engine. It is an explicit durable
-state pipeline:
+FerricFlow is an explicit durable state pipeline, not a hidden deterministic
+replay engine:
 
 ```text
 create -> claim -> handler -> transition/complete/retry/fail
@@ -23,13 +14,15 @@ create -> claim -> handler -> transition/complete/retry/fail
 Handlers should be idempotent because work can be retried after lease expiry,
 worker crash, or explicit retry.
 
-## Install
+## First 10 minutes
+
+### 1. Install
 
 ```bash
 pip install ferricstore
 ```
 
-Local development:
+For local development from this repo:
 
 ```bash
 python3 -m venv .venv
@@ -37,7 +30,22 @@ python3 -m venv .venv
 pip install -e ".[dev]"
 ```
 
-## Queue quickstart
+### 2. Start FerricStore
+
+Use a local FerricStore server with the Redis-compatible port enabled:
+
+```bash
+ferricstore start
+```
+
+If you are running from the FerricStore source repo, use that repo's documented
+server command. The SDK examples assume:
+
+```text
+redis://127.0.0.1:6379/0
+```
+
+### 3. Create a durable queue item
 
 ```python
 from ferricstore import QueueClient
@@ -46,12 +54,30 @@ client = QueueClient.from_url("redis://127.0.0.1:6379/0")
 emails = client.queue(type="email")
 
 emails.enqueue("email-1", payload=b"welcome:user-1", idempotent=True)
-emails.worker(concurrency=100, batch_size=500).run(send_email)
+```
+
+### 4. Run a queue worker
+
+```python
+from ferricstore import QueueClient
+
+client = QueueClient.from_url("redis://127.0.0.1:6379/0")
+emails = client.queue(type="email")
+
+
+def send_email(job):
+    print(f"send {job.id}: {job.payload!r}")
+    return b"sent"
+
+
+emails.worker(concurrency=10, batch_size=100).run(send_email)
 ```
 
 If the handler raises, the default worker policy is retry.
 
-## Workflow quickstart
+### 5. Create a workflow/state machine
+
+Use workflows when one durable flow moves through named states.
 
 ```python
 from ferricstore import WorkflowClient, complete, transition
@@ -63,15 +89,18 @@ order = client.workflow(
     partition_by=("tenant_id", "order_id"),
 )
 
+
 @order.state("created")
 def created(job):
     charge_card(job.payload)
     return transition("charged")
 
+
 @order.state("charged")
 def charged(job):
     send_receipt(job.id)
     return complete(result=b"ok")
+
 
 order.start(
     "order-1",
@@ -80,11 +109,14 @@ order.start(
     payload=b"order payload",
     idempotent=True,
 )
+
+order.worker(states=["created", "charged"], concurrency=10, batch_size=100).run()
 ```
 
-## Named values
+### 6. Store and fetch named values
 
-Use named values when different states need different pieces of data:
+Use named values when different states need different pieces of data. Values are
+stored as FerricFlow value refs and are only hydrated when requested.
 
 ```python
 emails.enqueue(
@@ -94,15 +126,58 @@ emails.enqueue(
         "template": b"welcome template bytes",
         "profile": b"user profile snapshot",
     },
+    idempotent=True,
 )
 
 emails.worker(claim_values=["template"]).run(send_email)
 ```
 
-Only requested values are hydrated for the handler. Use `ValueConfig` or
-`value_max_bytes` in production to cap large value reads.
+Fetch one or many values directly when needed:
 
-## Async
+```python
+profile = client.value_get(owner_flow_id="email-2", name="profile")
+values = client.value_mget(
+    owner_flow_id="email-2",
+    names=["template", "profile"],
+)
+```
+
+Use `ValueConfig` or `value_max_bytes` in production to cap large value reads.
+
+### 7. Inspect history
+
+```python
+record = emails.get("email-1")
+history = emails.history("email-1")
+
+print(record)
+for event in history:
+    print(event)
+```
+
+History is for debugging and audit. Handlers should use claimed job data and
+requested values, not history replay.
+
+### 8. Common errors
+
+| Error | Meaning | Usual fix |
+| --- | --- | --- |
+| `FlowAlreadyExistsError` | The flow id already exists. | Use `idempotent=True` for safe producer retries or generate a new id. |
+| `FlowNotFoundError` | The flow does not exist or was retained/expired. | Check id, partition inputs, and retention policy. |
+| `FlowWrongStateError` | The command expected a different current state. | Check worker state filters and handler transitions. |
+| `StaleLeaseError` | A worker tried to complete with an old lease. | Keep handlers under `lease_ms` or renew/retry safely. |
+| `OverloadedError` | Server backpressure rejected the write. | Let the SDK retry/back off; reduce producer rate under sustained pressure. |
+
+## What you use
+
+- `QueueClient` / `AsyncQueueClient` for durable queues.
+- `WorkflowClient` / `AsyncWorkflowClient` for explicit durable state machines.
+- `FlowClient` / `AsyncFlowClient` for advanced command-level control.
+- `RetryPolicy`, `WorkerConfig`, `ValueConfig`, and `ExceptionPolicy` for runtime defaults.
+- `RawCodec` by default, `JsonCodec` when you want JSON payloads.
+- `client.command(...)` as the Redis/FerricStore escape hatch.
+
+## Async quickstart
 
 ```python
 import asyncio
