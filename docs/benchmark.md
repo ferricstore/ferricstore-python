@@ -19,6 +19,60 @@ worker/producers/connections
 
 Use fresh data directories for apples-to-apples comparisons.
 
+Canonical high-throughput local queue run:
+
+```bash
+python examples/run_optimized_flow_benchmarks.py \
+  --start-server \
+  --fresh-server-per-benchmark \
+  --which queue \
+  --flows 1000000
+```
+
+The wrapper starts FerricStore with:
+
+```text
+MIX_ENV=prod
+FERRICSTORE_SHARD_COUNT=16
+FERRICSTORE_LOG_LEVEL=warning
+```
+
+The default queue benchmark expands to:
+
+```bash
+python examples/dbos_style_benchmark.py \
+  --url redis://127.0.0.1:6379/0 \
+  --mode queued \
+  --queued-shape live \
+  --transport many \
+  --worker-api lowlevel \
+  --worker-mode polling \
+  --partition-mode auto \
+  --flows 1000000 \
+  --workers 16 \
+  --producers 32 \
+  --partitions 16 \
+  --claim-batch-size 500 \
+  --claim-partition-batch-size 2 \
+  --create-batch-size 500 \
+  --complete-async-depth 4 \
+  --server-shards 16 \
+  --claim-job-only
+```
+
+Local lagged-projection validation on June 5, 2026 after restoring hot-only
+non-idempotent create duplicate checks:
+
+```text
+flows: 1000000
+created: 1000000
+completed: 1000000
+duplicates: 0
+create_flows_per_sec: 91817/s
+process_flows_per_sec: 78305/s
+end_to_end_flows_per_sec: 78249/s
+```
+
 `examples/dbos_style_benchmark.py` has two modes:
 
 * `queued`: throughput benchmark, closer to DBOS queued workflow numbers.
@@ -86,17 +140,19 @@ python examples/dbos_style_benchmark.py \
   --mode queued \
   --queued-shape live \
   --transport many \
-  --flows 100000 \
+  --flows 1000000 \
   --workers 16 \
   --producers 32 \
   --partitions 16 \
   --partition-mode auto \
-  --worker-mode blocking \
+  --worker-mode polling \
   --claim-batch-size 500 \
+  --claim-partition-batch-size 2 \
   --create-batch-size 500 \
   --no-reclaim-expired \
   --claim-priority 0 \
   --complete-async-depth 4 \
+  --server-shards 16 \
   --claim-job-only
 ```
 
@@ -254,7 +310,7 @@ explicit override. Production server defaults are:
 FERRICSTORE_SHARD_COUNT=0 -> schedulers online
 FERRICSTORE_MAX_MEMORY=auto -> 80% detected memory/cgroup limit
 FERRICSTORE_KEYDIR_MAX_RAM=auto -> derived from max memory
-FERRICSTORE_FLOW_LMDB_MODE=lagged
+Flow LMDB projection is always lagged
 FERRICSTORE_FLOW_HIBERNATION_ENABLED=true
 FERRICSTORE_PROTECTED_MODE=true
 ```
