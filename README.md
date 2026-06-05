@@ -2,10 +2,13 @@
 
 Python SDK for FerricStore and FerricFlow.
 
-Status: public alpha `0.1.0`. APIs may change before `1.0`.
+Status: public alpha `0.1.0`. APIs may change before `1.0`, but the SDK is
+tested against command construction, queue/workflow handlers, leases, retries,
+history, named values, idempotent create, worker loops, async flows, and local
+FerricStore integration scenarios.
 
-FerricFlow is an explicit durable state pipeline, not a hidden deterministic
-replay engine:
+FerricFlow keeps each workflow or job's state and history in one durable place. It
+is an explicit durable state pipeline, not a hidden deterministic replay engine:
 
 ```text
 create -> claim -> handler -> transition/complete/retry/fail
@@ -13,6 +16,10 @@ create -> claim -> handler -> transition/complete/retry/fail
 
 Handlers should be idempotent because work can be retried after lease expiry,
 worker crash, or explicit retry.
+
+Durability is the default contract. A workflow command returns success only
+after the state change is accepted through FerricStore's quorum path and written
+to disk.
 
 ## First 10 minutes
 

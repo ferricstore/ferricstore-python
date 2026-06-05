@@ -8,7 +8,8 @@ The SDK has two high-level execution styles:
 | `WorkflowClient` | You want an explicit durable state machine with named states. |
 
 Both use FerricFlow underneath. Neither replays Python code. Each claim/handler
-execution ends in one durable Flow command.
+execution ends in one durable Flow command that is accepted through quorum and
+written to disk before success is returned.
 
 For production deployment concerns such as lease sizing, idempotency, graceful
 shutdown, connection pools, and metrics, read [Production Readiness](production.md).

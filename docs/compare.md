@@ -67,13 +67,14 @@ Benefits of explicit states:
 | --- | --- |
 | Visible durable boundaries | Every state transition is observable. |
 | Easier debugging | Current state and history are direct records. |
-| Language-neutral commands | RESP commands can be used from any client. |
+| Language-neutral commands | A small command/API surface can be used from any client. |
 | Payload control | Large values are opt-in through named values/refs. |
 
 ## Compared with DBOS
 
 DBOS makes application code look close to normal functions with durable
-execution underneath. FerricFlow favors explicit queue/workflow primitives:
+execution underneath. FerricFlow favors explicit workflow state that workers
+mutate through durable commands:
 
 ```python
 workflow = client.workflow(type="order", initial_state="reserve")
@@ -105,4 +106,3 @@ queue.worker(batch_size=1000, concurrency=200).run(send_email)
 | Exact command control | `FlowClient` |
 | Large per-flow data | Named values and value refs |
 | Fanout/children | `spawn_children` or child workflows |
-

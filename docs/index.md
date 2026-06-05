@@ -2,9 +2,9 @@
 
 This is the documentation hub for the Python SDK.
 
-FerricStore is Redis-compatible storage plus FerricFlow durable execution. The
-Python SDK gives typed helpers, queue workers, workflow/state-machine helpers,
-async APIs, and access to normal Redis-compatible commands.
+FerricStore provides durable storage plus FerricFlow workflow state. The Python
+SDK gives typed helpers, queue workers, workflow/state-machine helpers, async
+APIs, and access to normal FerricStore commands.
 
 ## Start here
 
@@ -100,7 +100,8 @@ That means:
 - workers can be scaled horizontally
 - handlers must be idempotent
 - payload hydration is opt-in
-- normal Redis/FerricStore commands remain available
+- successful workflow commands are accepted through quorum and written to disk
+- normal FerricStore commands remain available
 
 ## Production minimum
 

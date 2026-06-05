@@ -8,8 +8,8 @@ worker service / pod / VM = long-running worker that claims and completes work
 both agree on Flow type/state
 ```
 
-This is the same operational split used by durable execution systems such as
-Temporal: request handlers start work; workers poll task queues.
+This is the same operational split used by many workflow systems: request
+handlers start work; workers claim due work and return durable outcomes.
 
 ## Shared configuration
 

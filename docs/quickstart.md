@@ -18,7 +18,9 @@ pip install -e ".[dev]"
 
 ## Workflow in 5 minutes
 
-Use a workflow when one durable flow moves through named states.
+Use a workflow when one durable flow moves through named states. Successful
+workflow commands mean durable state progress, not just a notification that work
+was seen.
 
 ```python
 from ferricstore import WorkflowClient, complete, transition

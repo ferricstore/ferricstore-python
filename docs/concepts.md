@@ -68,8 +68,9 @@ write value or value_ref
 
 ## Why Explicit State Pipeline
 
-Temporal and DBOS let user code look like one sequential function. FerricFlow
-chooses explicit states. This makes each durable boundary visible:
+Execution workflow engines often make user code look like one sequential
+function. FerricFlow chooses explicit states. This makes each durable boundary
+visible:
 
 ```text
 created -> charged -> shipped -> completed
@@ -81,7 +82,11 @@ That is better for:
 * AI/codegen readability
 * explicit retries per state
 * partition-aware work distribution
-* simple Redis/RESP usage from any language
+* simple command/API usage from any language
+
+Workflow commands return success only after the state change is accepted through
+the quorum path and written to disk. The application still runs the business
+logic; FerricFlow records the durable state around that logic.
 
 ## Idempotency
 

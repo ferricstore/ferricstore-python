@@ -467,5 +467,5 @@ The SDK does not:
 - auto-instrument OpenTelemetry
 - replace server-side backups, replication, or retention policy
 
-Those are application/operations responsibilities. The SDK gives the primitives
-and safe defaults needed to implement them.
+Those are application/operations responsibilities. The SDK gives the workflow
+state APIs and safe defaults needed to implement them.

@@ -13,25 +13,30 @@ python3 -m venv .venv
 pip install -e ".[dev]"
 ```
 
-## Start FerricStore with Docker Compose
+## Start FerricStore with Docker
 
 ```bash
-cp .env.example .env
-docker compose up -d ferricstore
+docker run --name ferricstore-dev \
+  -p 6379:6379 \
+  -e FERRICSTORE_PROTECTED_MODE=false \
+  -v ferricstore-dev-data:/data \
+  ghcr.io/ferricstore/ferricstore:0.4.1
 ```
 
-The compose file uses:
+This starts one local FerricStore server on:
 
 ```text
-FERRICSTORE_IMAGE=ferricstore/ferricstore:latest
-FERRICSTORE_PORT=6379
-FERRICSTORE_SHARD_COUNT=4
+redis://127.0.0.1:6379/0
 ```
 
-If you built the server image locally, set:
+If you built the server image locally, replace the image name:
 
 ```bash
-FERRICSTORE_IMAGE=your-local-image:tag docker compose up -d ferricstore
+docker run --name ferricstore-dev \
+  -p 6379:6379 \
+  -e FERRICSTORE_PROTECTED_MODE=false \
+  -v ferricstore-dev-data:/data \
+  your-local-image:tag
 ```
 
 ## Run examples
@@ -54,12 +59,12 @@ or benchmark runs need a local FerricStore server.
 ## Stop local services
 
 ```bash
-docker compose down
+docker stop ferricstore-dev
+docker rm ferricstore-dev
 ```
 
 Delete local data:
 
 ```bash
-docker compose down -v
+docker volume rm ferricstore-dev-data
 ```
-
