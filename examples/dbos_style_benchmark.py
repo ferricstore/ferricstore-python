@@ -21,6 +21,23 @@ AUTO_PARTITION_PREFIX = "__flow_auto__:"
 AUTO_PARTITION_BUCKETS = 256
 SERVER_SLOT_COUNT = 1024
 
+DBOS_QUEUE_DEFAULTS = {
+    "flows": 1_000_000,
+    "workers": 16,
+    "producers": 32,
+    "partitions": 16,
+    "claim_batch_size": 500,
+    "create_batch_size": 500,
+    "transport": "many",
+    "partition_mode": "auto",
+    "worker_mode": "polling",
+    "worker_api": "lowlevel",
+    "claim_partition_batch_size": 2,
+    "complete_async_depth": 4,
+    "claim_job_only": True,
+    "server_shards": 16,
+}
+
 
 def chunks(values: list[int], size: int) -> Iterable[list[int]]:
     for offset in range(0, len(values), size):
@@ -1739,24 +1756,42 @@ def main() -> None:
     parser.add_argument("--mode", choices=("queued", "serial-latency"), default="queued")
     parser.add_argument("--queued-shape", choices=("live", "preloaded"), default="live")
 
-    parser.add_argument("--flows", type=int, default=10_000)
-    parser.add_argument("--workers", type=int, default=16)
-    parser.add_argument("--producers", type=int, default=4)
-    parser.add_argument("--partitions", type=int, default=16)
-    parser.add_argument("--claim-batch-size", type=int, default=100)
-    parser.add_argument("--worker-capacity", type=int, default=0)
-    parser.add_argument("--create-batch-size", type=int, default=100)
+    parser.add_argument("--flows", type=int, default=DBOS_QUEUE_DEFAULTS["flows"])
+    parser.add_argument("--workers", type=int, default=DBOS_QUEUE_DEFAULTS["workers"])
+    parser.add_argument("--producers", type=int, default=DBOS_QUEUE_DEFAULTS["producers"])
+    parser.add_argument("--partitions", type=int, default=DBOS_QUEUE_DEFAULTS["partitions"])
     parser.add_argument(
-        "--transport", choices=("many", "pipeline", "autobatch"), default="pipeline"
+        "--claim-batch-size", type=int, default=DBOS_QUEUE_DEFAULTS["claim_batch_size"]
     )
-    parser.add_argument("--partition-mode", choices=("explicit", "auto"), default="explicit")
+    parser.add_argument("--worker-capacity", type=int, default=0)
+    parser.add_argument(
+        "--create-batch-size", type=int, default=DBOS_QUEUE_DEFAULTS["create_batch_size"]
+    )
+    parser.add_argument(
+        "--transport",
+        choices=("many", "pipeline", "autobatch"),
+        default=DBOS_QUEUE_DEFAULTS["transport"],
+    )
+    parser.add_argument(
+        "--partition-mode",
+        choices=("explicit", "auto"),
+        default=DBOS_QUEUE_DEFAULTS["partition_mode"],
+    )
     parser.add_argument("--payload-bytes", type=int, default=0)
     parser.add_argument("--result-bytes", type=int, default=0)
     parser.add_argument("--work-command", choices=("none", "incr"), default="none")
     parser.add_argument("--idle-sleep-ms", type=float, default=10.0)
     parser.add_argument("--max-idle-sleep-ms", type=float, default=50.0)
-    parser.add_argument("--worker-mode", choices=("polling", "blocking"), default="blocking")
-    parser.add_argument("--worker-api", choices=("lowlevel", "queue"), default="lowlevel")
+    parser.add_argument(
+        "--worker-mode",
+        choices=("polling", "blocking"),
+        default=DBOS_QUEUE_DEFAULTS["worker_mode"],
+    )
+    parser.add_argument(
+        "--worker-api",
+        choices=("lowlevel", "queue"),
+        default=DBOS_QUEUE_DEFAULTS["worker_api"],
+    )
     parser.add_argument("--wake-coalesce-ms", type=float, default=5.0)
     parser.add_argument("--partial-claim-retries", type=int, default=1)
     parser.add_argument("--partial-claim-delay-ms", type=float, default=1.0)
@@ -1765,17 +1800,27 @@ def main() -> None:
     parser.add_argument("--claim-priority", type=int, default=0)
     parser.add_argument("--claim-state", choices=("queued", "any", "omitted"), default="queued")
     parser.add_argument("--claim-states", default=None)
-    parser.add_argument("--claim-job-only", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--claim-job-only",
+        action=argparse.BooleanOptionalAction,
+        default=DBOS_QUEUE_DEFAULTS["claim_job_only"],
+    )
     parser.add_argument("--claim-block-ms", type=int, default=-1)
     parser.add_argument("--claim-drain-block-ms", type=int, default=-1)
     parser.add_argument("--claim-any", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--complete-batch", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--complete-async-depth", type=int, default=0)
+    parser.add_argument(
+        "--complete-async-depth", type=int, default=DBOS_QUEUE_DEFAULTS["complete_async_depth"]
+    )
     parser.add_argument("--independent-many", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--track-duplicates", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--claim-partition-batch-size", type=int, default=2)
+    parser.add_argument(
+        "--claim-partition-batch-size",
+        type=int,
+        default=DBOS_QUEUE_DEFAULTS["claim_partition_batch_size"],
+    )
     parser.add_argument("--claim-drain-batches", type=int, default=1)
-    parser.add_argument("--server-shards", type=int, default=16)
+    parser.add_argument("--server-shards", type=int, default=DBOS_QUEUE_DEFAULTS["server_shards"])
 
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
