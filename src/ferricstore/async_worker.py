@@ -812,6 +812,7 @@ class AsyncQueueFlow:
 
         return await asyncio.to_thread(run_thread)
 
+
 class AsyncQueue:
     """High-level async queue handle bound to one Flow type/state."""
 
@@ -1506,16 +1507,16 @@ class AsyncWorkflow:
             raise ValueError(f"no handler for workflow state: {state_name!r}")
         partition_key, partition_keys = self._next_claim_partition(worker_index)
         limit = self.batch_size
-        claim_kwargs = dict(
-            state=state_name,
-            worker=f"{self.type}:async-workflow:{worker_index}",
-            partition_key=partition_key,
-            partition_keys=partition_keys,
-            limit=limit,
-            priority=self.priority,
-            reclaim_expired=None,
-            block_ms=self.block_ms,
-        )
+        claim_kwargs = {
+            "state": state_name,
+            "worker": f"{self.type}:async-workflow:{worker_index}",
+            "partition_key": partition_key,
+            "partition_keys": partition_keys,
+            "limit": limit,
+            "priority": self.priority,
+            "reclaim_expired": None,
+            "block_ms": self.block_ms,
+        }
         if self.claim_values is not None:
             jobs = cast(
                 list[AsyncFlowJob],
@@ -1585,9 +1586,7 @@ class AsyncWorkflow:
             and all(state_name in self.handlers for state_name in self.states)
         )
 
-    def _group_jobs_by_run_state(
-        self, jobs: list[ClaimedItem]
-    ) -> dict[str, list[ClaimedItem]]:
+    def _group_jobs_by_run_state(self, jobs: list[ClaimedItem]) -> dict[str, list[ClaimedItem]]:
         grouped: dict[str, list[ClaimedItem]] = {}
         for job in jobs:
             state_name = job.run_state

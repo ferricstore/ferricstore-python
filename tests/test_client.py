@@ -1240,7 +1240,7 @@ def test_reclaim_rejects_non_running_state_alias():
     redis = FakeRedis()
     client = FlowClient(redis)
 
-    with pytest.raises(ValueError, match="FLOW.RECLAIM only supports running"):
+    with pytest.raises(ValueError, match=r"FLOW\.RECLAIM only supports running"):
         client.reclaim("order", state="queued", worker="worker-1")
 
     assert redis.calls == []

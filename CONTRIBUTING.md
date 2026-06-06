@@ -19,17 +19,20 @@ pip install -e ".[dev]"
 ## Run checks
 
 ```bash
-pytest
 ruff check .
+ruff format --check .
 mypy src/ferricstore
+pytest --cov=ferricstore --cov-report=term-missing
+bandit -q -r src/ferricstore
+pip-audit
 python -m build
+twine check dist/*
 ```
 
 If `python -m build` is unavailable:
 
 ```bash
-pip install build
-python -m build
+pip install -e ".[dev]"
 ```
 
 ## Pull request expectations
@@ -68,4 +71,3 @@ Please include:
 - Minimal reproduction.
 - Whether the issue is sync or async.
 - Relevant Flow type/state/partition options.
-

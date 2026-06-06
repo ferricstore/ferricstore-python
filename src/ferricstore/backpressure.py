@@ -119,5 +119,5 @@ class BackpressureController:
         if jitter > 0:
             low = max(1.0 - jitter, 0.0)
             high = 1.0 + jitter
-            delay *= random.uniform(low, high)
+            delay *= random.uniform(low, high)  # nosec B311
         return min(delay, cap)

@@ -468,7 +468,7 @@ class WorkflowFlowCommands:
 class WorkflowContext:
     """Handler context with current job metadata and Flow command helpers."""
 
-    __slots__ = ("workflow", "job", "state_name", "flow", "_value_cache")
+    __slots__ = ("_value_cache", "flow", "job", "state_name", "workflow")
 
     def __init__(
         self,
@@ -1124,7 +1124,7 @@ class Workflow:
                 outcome = self._exception_outcome(job, exc, state_name=state_name)
             planned.append((job, state_name, outcome))
 
-        first_job, first_state, first_outcome = planned[0]
+        _first_job, first_state, first_outcome = planned[0]
         if all(
             state_name == first_state and outcome == first_outcome
             for _job, state_name, outcome in planned

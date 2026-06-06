@@ -40,10 +40,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "bandit[toml]>=1.8,<2",
   "build>=1.2,<2",
-  "pytest>=8,<9",
-  "ruff>=0.6",
+  "pip-audit>=2.9,<3",
+  "pytest>=9.0.3,<10",
+  "pytest-cov>=6,<8",
+  "ruff>=0.15,<1",
   "mypy>=1.11",
+  "twine>=6,<7",
 ]
 
 [project.urls]
@@ -64,9 +68,46 @@ line-length = 100
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
+select = [
+  "ASYNC",
+  "B",
+  "C4",
+  "E",
+  "F",
+  "I",
+  "PERF",
+  "PIE",
+  "PTH",
+  "RUF",
+  "SIM",
+  "T20",
+  "UP",
+]
+ignore = [
+  "PERF203",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"examples/**/*.py" = ["ASYNC110", "PERF401", "T20"]
 
 [tool.mypy]
 python_version = "3.10"
 strict = true
 packages = ["ferricstore"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --strict-config"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["ferricstore"]
+
+[tool.coverage.report]
+fail_under = 76
+show_missing = true
+skip_covered = false
+
+[tool.bandit]
+exclude_dirs = [".venv", "build", "dist"]
+skips = ["B101"]

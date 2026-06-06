@@ -171,10 +171,14 @@ def test_async_queue_worker_config_at_queue_time_resizes_claim_pool(monkeypatch)
     monkeypatch.setattr("ferricstore.async_worker.AsyncFlowClient.from_url", staticmethod(from_url))
 
     client = AsyncQueueClient.from_url("redis://example/0")
-    worker = client.queue(
-        type="email",
-        worker_config=WorkerConfig(workers=64),
-    ).worker()._build_worker(0)
+    worker = (
+        client.queue(
+            type="email",
+            worker_config=WorkerConfig(workers=64),
+        )
+        .worker()
+        ._build_worker(0)
+    )
 
     assert calls[0][1]["max_connections"] == 2
     assert calls[1][1]["max_connections"] == 1

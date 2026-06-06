@@ -392,7 +392,7 @@ class PartitionWakeCoordinator:
         self._owner_for = owner_for
         self.queues = [queue.Queue() for _ in range(workers)]
         self.pending = [set() for _ in range(workers)]
-        self.credits = [dict() for _ in range(workers)]
+        self.credits = [{} for _ in range(workers)]
         self.locks = [threading.Lock() for _ in range(workers)]
         self.notifications = 0
         self.notified_jobs = 0

@@ -299,7 +299,7 @@ async def create_workflows(
                         partition_mode=partition_mode,
                         index=index,
                         partitions=partitions,
-                    run_id=run_id,
+                        run_id=run_id,
                     ),
                     run_at_ms=create_run_at_ms(command_now_ms),
                     now_ms=command_now_ms,
@@ -650,7 +650,7 @@ async def run_workflow_worker(
                 pending_set = set(pending_applies) - done
             pending_applies[:] = list(pending_set)
             for task in done:
-                completed_count, claimed_count, next_state, jobs = task.result()
+                completed_count, _claimed_count, next_state, jobs = task.result()
                 completed_workflows += completed_count
                 await counters.add(completed=completed_count, claimed_actions=0)
                 if next_state is not None:
@@ -817,11 +817,14 @@ async def run_workflow_worker(
                     while len(pending_applies) >= apply_inflight:
                         await drain_applies(block=True, limit=1)
                 else:
-                    completed_count, claimed_count, next_state, applied_jobs = (
-                        await apply_claimed_jobs(
-                            state_name,
-                            jobs,
-                        )
+                    (
+                        completed_count,
+                        _claimed_count,
+                        next_state,
+                        applied_jobs,
+                    ) = await apply_claimed_jobs(
+                        state_name,
+                        jobs,
                     )
                     completed_workflows += completed_count
                     await counters.add(completed=completed_count, claimed_actions=0)
@@ -863,14 +866,10 @@ async def run_state_machine_throughput(args: argparse.Namespace) -> dict[str, An
     indices = list(range(args.flows))
     payload = payload_bytes(args.payload_bytes)
     transition_payload = (
-        payload_bytes(args.transition_payload_bytes)
-        if args.transition_payload_bytes > 0
-        else None
+        payload_bytes(args.transition_payload_bytes) if args.transition_payload_bytes > 0 else None
     )
     terminal_payload = (
-        payload_bytes(args.terminal_payload_bytes)
-        if args.terminal_payload_bytes > 0
-        else None
+        payload_bytes(args.terminal_payload_bytes) if args.terminal_payload_bytes > 0 else None
     )
     result_payload = payload_bytes(args.result_bytes) if args.result_bytes > 0 else None
     counters = AsyncCounters(args.flows)
@@ -1107,9 +1106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--claim-batch-size", type=int, default=500)
     parser.add_argument("--claim-partition-batch-size", type=int, default=32)
     parser.add_argument("--apply-inflight", type=int, default=0)
-    parser.add_argument(
-        "--worker-mode", choices=("auto", "blocking", "polling"), default="auto"
-    )
+    parser.add_argument("--worker-mode", choices=("auto", "blocking", "polling"), default="auto")
     parser.add_argument("--wake-coalesce-ms", type=float, default=1.0)
     parser.add_argument("--claim-block-ms", type=int, default=-1)
     parser.add_argument("--idle-sleep-ms", type=float, default=1.0)

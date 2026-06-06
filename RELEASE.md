@@ -23,10 +23,14 @@ fixes.
 Before publishing:
 
 ```bash
-pytest
 ruff check .
+ruff format --check .
 mypy src/ferricstore
+pytest --cov=ferricstore --cov-report=term-missing
+bandit -q -r src/ferricstore
+pip-audit
 python -m build
+twine check dist/*
 ```
 
 Then:
@@ -45,4 +49,3 @@ Use this wording for `0.x` releases:
 FerricStore Python SDK is public alpha. APIs and server protocol may change
 before 1.0. Feedback and production-shape testing are welcome.
 ```
-

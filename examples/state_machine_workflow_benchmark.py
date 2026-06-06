@@ -748,9 +748,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--create-batch-size", type=int, default=5000)
     parser.add_argument("--claim-batch-size", type=int, default=1000)
     parser.add_argument("--claim-partition-batch-size", type=int, default=1)
-    parser.add_argument(
-        "--worker-mode", choices=("blocking", "polling"), default="blocking"
-    )
+    parser.add_argument("--worker-mode", choices=("blocking", "polling"), default="blocking")
     parser.add_argument("--wake-coalesce-ms", type=float, default=2.0)
     parser.add_argument("--apply-async-depth", type=int, default=4)
     parser.add_argument("--server-shards", type=int, default=16)

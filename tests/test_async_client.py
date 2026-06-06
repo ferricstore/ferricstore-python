@@ -477,7 +477,7 @@ def test_async_reclaim_rejects_non_running_state_alias():
         redis = FakeAsyncRedis()
         client = AsyncFlowClient(redis)
 
-        with pytest.raises(ValueError, match="FLOW.RECLAIM only supports running"):
+        with pytest.raises(ValueError, match=r"FLOW\.RECLAIM only supports running"):
             await client.reclaim("order", state="queued", worker="worker-1")
 
         assert redis.calls == []

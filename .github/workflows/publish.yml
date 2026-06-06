@@ -27,7 +27,22 @@ jobs:
       - name: Install build tools
         run: |
           python -m pip install --upgrade pip
-          python -m pip install build twine
+          python -m pip install -e ".[dev]"
+
+      - name: Ruff
+        run: python -m ruff check .
+
+      - name: Ruff format
+        run: python -m ruff format --check .
+
+      - name: Mypy
+        run: python -m mypy src/ferricstore
+
+      - name: Pytest
+        run: python -m pytest --cov=ferricstore --cov-report=term-missing
+
+      - name: Bandit
+        run: python -m bandit -q -r src/ferricstore
 
       - name: Build
         run: python -m build

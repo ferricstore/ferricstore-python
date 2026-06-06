@@ -89,9 +89,7 @@ def start_server(args: argparse.Namespace) -> tuple[subprocess.Popen, str, objec
     if args.server_max_memory is not None:
         env["FERRICSTORE_MAX_MEMORY"] = str(args.server_max_memory)
     if args.server_protected_mode is not None:
-        env["FERRICSTORE_PROTECTED_MODE"] = (
-            "true" if args.server_protected_mode else "false"
-        )
+        env["FERRICSTORE_PROTECTED_MODE"] = "true" if args.server_protected_mode else "false"
 
     proc = subprocess.Popen(
         ["mix", "run", "--no-halt"],
