@@ -667,7 +667,7 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
         assert len(many_jobs) == 2
         assert client.transition_many(
             many_partition,
-            from_state="many-transition",
+            from_state=many_jobs[0].state,
             to_state="many-complete",
             items=[_fenced(job) for job in many_jobs],
             now_ms=now,
