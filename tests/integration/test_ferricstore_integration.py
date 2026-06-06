@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from contextlib import suppress
 
 import pytest
 
@@ -65,5 +66,6 @@ def test_real_ferricstore_command_and_flow_cycle() -> None:
         assert record is not None
         assert record.state == "completed"
     finally:
-        client.command("DEL", key)
+        with suppress(Exception):
+            client.command("DEL", key)
         client.close()
