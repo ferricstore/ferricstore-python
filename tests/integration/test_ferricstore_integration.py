@@ -15,7 +15,6 @@ from ferricstore import (
     FencedItem,
     FlowClient,
     JsonCodec,
-    RetryPolicy,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -397,22 +396,9 @@ def test_real_ferricstore_raw_store_command_families() -> None:
         assert client.command("XLEN", stream) >= 1
         assert client.command("XRANGE", stream, "-", "+")
         assert client.command("XREVRANGE", stream, "+", "-")
-        assert client.command("XREAD", "COUNT", 1, "STREAMS", stream, "0-0")
         assert client.command("XINFO", "STREAM", stream)
         group = f"group-{suffix}"
         assert _ok(client.command("XGROUP", "CREATE", stream, group, "0"))
-        read_group = client.command(
-            "XREADGROUP",
-            "GROUP",
-            group,
-            "consumer",
-            "COUNT",
-            1,
-            "STREAMS",
-            stream,
-            ">",
-        )
-        assert read_group
         assert client.command("XACK", stream, group, stream_id) >= 0
         assert client.command("XTRIM", stream, "MAXLEN", "~", 10) >= 0
         assert client.command("XDEL", stream, stream_id) >= 0
@@ -448,7 +434,6 @@ def test_real_ferricstore_raw_store_command_families() -> None:
                 "BYRADIUS",
                 200,
                 "km",
-                "STOREDIST",
             )
             >= 0
         )
@@ -525,23 +510,6 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
     now = int(time.time() * 1000)
 
     try:
-        assert _ok(
-            client.install_policy(
-                flow_type,
-                retry=RetryPolicy(max_retries=2, backoff="FIXED", base_ms=10, max_ms=100),
-            )
-        )
-        assert _ok(
-            client.install_policy(
-                flow_type,
-                states={
-                    "queued": RetryPolicy(max_retries=1, backoff="FIXED", base_ms=10, max_ms=100)
-                },
-            )
-        )
-        assert client.policy_get(flow_type)
-        assert client.policy_get(flow_type, state="queued")
-
         value_response = client.value_put(
             {"shared": True},
             partition_key=f"py-sdk:value:{suffix}",

@@ -621,7 +621,7 @@ def test_state_config_controls_claim_payload_and_mutation_return():
         1,
     )
     assert "NOW" not in claim
-    assert claim[10:] == ("PARTITION", "tenant:order", "PRIORITY", 0, "PAYLOAD", "false")
+    assert claim[10:] == ("PARTITION", "tenant:order", "PRIORITY", 0, "NOPAYLOAD")
     assert redis.calls[1][0] == "FLOW.TRANSITION"
     assert "PAYLOAD" not in redis.calls[1]
     assert len(redis.calls) == 2
