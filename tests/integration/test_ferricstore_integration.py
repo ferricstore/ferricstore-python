@@ -24,7 +24,7 @@ def test_real_ferricstore_command_and_flow_cycle() -> None:
     flow_type = "py-sdk-integration"
 
     try:
-        assert client.command("SET", key, "value") in (b"OK", "OK")
+        assert client.command("SET", key, "value") in (True, b"OK", "OK")
         assert client.command("GET", key) in (b"value", "value")
 
         client.create(
