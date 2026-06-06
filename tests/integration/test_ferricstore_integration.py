@@ -578,7 +578,7 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
         assert extended.id == transition_id
         assert client.transition(
             transition_id,
-            from_state="queued",
+            from_state=transition_job.state,
             to_state="ready",
             lease_token=transition_job.lease_token,
             fencing_token=transition_job.fencing_token,
