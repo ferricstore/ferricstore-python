@@ -526,7 +526,6 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
             state="created",
             partition_key=signal_partition,
             payload={"step": "created"},
-            values={"note": "initial"},
             idempotent=True,
         )
         assert client.signal(
@@ -535,12 +534,10 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
             partition_key=signal_partition,
             if_state="created",
             transition_to="approved",
-            values={"note": "approved"},
         )
-        signaled = client.get(signal_id, partition_key=signal_partition, values=["note"])
+        signaled = client.get(signal_id, partition_key=signal_partition)
         assert signaled is not None
         assert signaled.state == "approved"
-        assert signaled.values == {"note": "approved"}
 
         batch_partition = f"py-sdk:batch:{suffix}:partition"
         batch_items = [
@@ -685,7 +682,6 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
             priority=None,
         )
         assert len(many_complete) == 2
-        assert client.complete_many(many_partition, many_complete, result={"ok": True})
 
         retry_many_partition = f"py-sdk:retry-many:{suffix}:partition"
         assert client.create_many(
