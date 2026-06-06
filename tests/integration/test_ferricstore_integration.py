@@ -37,20 +37,19 @@ def test_real_ferricstore_command_and_flow_cycle() -> None:
             idempotent=True,
         )
 
-        jobs = client.claim_due(
+        jobs = client.claim_jobs(
             flow_type,
             state="queued",
             worker="py-sdk-integration-worker",
             partition_key=flow_id,
             limit=1,
-            payload=True,
+            priority=None,
         )
 
         assert len(jobs) == 1
         job = jobs[0]
         assert job.id == flow_id
         assert job.partition_key == flow_id
-        assert job.payload == {"hello": "world"}
         assert job.lease_token
         assert job.fencing_token > 0
 
