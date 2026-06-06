@@ -15,6 +15,15 @@ pip install -e ".[dev]"
 
 ## Start FerricStore with Docker
 
+Using Docker Compose from this repo:
+
+```bash
+docker compose up -d ferricstore
+python scripts/wait_for_ferricstore.py
+```
+
+Or with a direct Docker command:
+
 ```bash
 docker run --name ferricstore-dev \
   -p 6379:6379 \
@@ -56,7 +65,21 @@ pytest
 Unit tests use fake Redis executors and do not require the server. Integration
 or benchmark runs need a local FerricStore server.
 
+Run the integration test against the Compose server:
+
+```bash
+FERRICSTORE_INTEGRATION=1 pytest tests/integration
+```
+
 ## Stop local services
+
+For the Compose server:
+
+```bash
+docker compose down -v
+```
+
+For the direct `docker run` server:
 
 ```bash
 docker stop ferricstore-dev

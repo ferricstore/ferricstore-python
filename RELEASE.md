@@ -33,6 +33,15 @@ python -m build
 twine check dist/*
 ```
 
+Run the real FerricStore integration test:
+
+```bash
+docker compose up -d ferricstore
+python scripts/wait_for_ferricstore.py
+FERRICSTORE_INTEGRATION=1 pytest tests/integration
+docker compose down -v
+```
+
 Then:
 
 1. Update `pyproject.toml` version.

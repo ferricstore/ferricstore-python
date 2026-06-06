@@ -29,6 +29,15 @@ python -m build
 twine check dist/*
 ```
 
+Run the Docker-backed integration test when touching protocol behavior:
+
+```bash
+docker compose up -d ferricstore
+python scripts/wait_for_ferricstore.py
+FERRICSTORE_INTEGRATION=1 pytest tests/integration
+docker compose down -v
+```
+
 If `python -m build` is unavailable:
 
 ```bash

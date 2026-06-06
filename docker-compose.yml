@@ -1,0 +1,12 @@
+services:
+  ferricstore:
+    image: ghcr.io/ferricstore/ferricstore:0.4.1
+    environment:
+      FERRICSTORE_PROTECTED_MODE: "false"
+    ports:
+      - "6379:6379"
+    volumes:
+      - ferricstore-data:/data
+
+volumes:
+  ferricstore-data:
