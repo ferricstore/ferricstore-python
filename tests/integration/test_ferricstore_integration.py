@@ -854,7 +854,7 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
         assert rewound is not None
         assert rewound.state == "queued"
 
-        assert client.list(flow_type, count=100)
+        assert isinstance(client.list(flow_type, count=100), list)
         assert isinstance(client.info(flow_type), dict)
         assert isinstance(client.history(signal_id, partition_key=signal_partition, count=5), list)
         assert isinstance(client.retention_cleanup(limit=10), dict)
