@@ -49,6 +49,17 @@ def _append_bool(args: builtins.list[Any], name: str, value: bool | None) -> Non
         args.extend([name, "true" if value else "false"])
 
 
+def _append_payload_read(
+    args: builtins.list[Any], payload: bool | None, max_bytes: int | None
+) -> None:
+    if payload is False:
+        args.append("NOPAYLOAD")
+        return
+    if payload is True or max_bytes is not None:
+        args.append("PAYLOAD")
+    _append(args, "MAXBYTES", max_bytes)
+
+
 def _append_encoded(args: builtins.list[Any], name: str, codec: Codec, value: Any) -> None:
     if value is not None:
         args.extend([name, codec.encode(value)])
@@ -791,8 +802,7 @@ class FlowClient:
         if job_only:
             _append(args, "RETURN", "JOBS_COMPACT_STATE" if include_state else "JOBS_COMPACT")
         _append(args, "BLOCK", block_ms)
-        _append_bool(args, "PAYLOAD", payload)
-        _append(args, "PAYLOAD_MAX_BYTES", payload_max_bytes)
+        _append_payload_read(args, payload, payload_max_bytes)
         _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
         _append_bool(args, "RECLAIM_EXPIRED", reclaim_expired)
         _append(args, "RECLAIM_RATIO", reclaim_ratio)
@@ -884,8 +894,7 @@ class FlowClient:
         _append(args, "PRIORITY", priority)
         if job_only:
             _append(args, "RETURN", "JOBS_COMPACT")
-        _append_bool(args, "PAYLOAD", payload)
-        _append(args, "PAYLOAD_MAX_BYTES", payload_max_bytes)
+        _append_payload_read(args, payload, payload_max_bytes)
         _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
         response = self.executor.execute_command(*args)
         if job_only:

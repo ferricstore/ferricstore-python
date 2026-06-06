@@ -13,6 +13,7 @@ from ferricstore.client import (
     _append_encoded,
     _append_named_counts,
     _append_named_values,
+    _append_payload_read,
     _append_read_options,
     _append_value_return,
     _auto_partition_key_for_id,
@@ -607,8 +608,7 @@ class AsyncFlowClient:
         if job_only:
             _append(args, "RETURN", "JOBS_COMPACT_STATE" if include_state else "JOBS_COMPACT")
         _append(args, "BLOCK", block_ms)
-        _append_bool(args, "PAYLOAD", payload)
-        _append(args, "PAYLOAD_MAX_BYTES", payload_max_bytes)
+        _append_payload_read(args, payload, payload_max_bytes)
         _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
         _append_bool(args, "RECLAIM_EXPIRED", reclaim_expired)
         _append(args, "RECLAIM_RATIO", reclaim_ratio)
@@ -699,8 +699,7 @@ class AsyncFlowClient:
         _append(args, "PRIORITY", priority)
         if job_only:
             _append(args, "RETURN", "JOBS_COMPACT")
-        _append_bool(args, "PAYLOAD", payload)
-        _append(args, "PAYLOAD_MAX_BYTES", payload_max_bytes)
+        _append_payload_read(args, payload, payload_max_bytes)
         _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
         response = await self.executor.execute_command(*args)
         if job_only:
