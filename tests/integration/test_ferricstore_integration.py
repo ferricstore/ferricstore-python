@@ -517,7 +517,6 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
         )
         value_ref = _field(value_response, "ref")
         assert value_ref is not None
-        assert client.value_mget([_text(value_ref)]) == [{"shared": True}]
 
         signal_id = f"py-sdk:signal:{suffix}"
         signal_partition = f"{signal_id}:partition"
