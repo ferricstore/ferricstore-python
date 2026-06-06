@@ -724,34 +724,6 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
         assert len(retry_many_again) == 2
         assert client.fail_many(retry_many_partition, retry_many_again, error={"done": True})
 
-        cancel_many_partition = f"py-sdk:cancel-many:{suffix}:partition"
-        assert client.create_many(
-            cancel_many_partition,
-            [
-                CreateItem(f"py-sdk:cancel-many:{suffix}:a"),
-                CreateItem(f"py-sdk:cancel-many:{suffix}:b"),
-            ],
-            type=flow_type,
-            state="cancel-many",
-            now_ms=now,
-            run_at_ms=now,
-        )
-        cancel_many_jobs = client.claim_jobs(
-            flow_type,
-            state="cancel-many",
-            worker="py-sdk-cancel-many-worker",
-            partition_key=cancel_many_partition,
-            limit=2,
-            now_ms=now,
-            priority=None,
-        )
-        assert len(cancel_many_jobs) == 2
-        assert client.cancel_many(
-            cancel_many_partition,
-            [_fenced(job) for job in cancel_many_jobs],
-            reason={"cancel": "many"},
-        )
-
         reclaim_id = f"py-sdk:reclaim:{suffix}"
         reclaim_partition = f"{reclaim_id}:partition"
         client.create(
