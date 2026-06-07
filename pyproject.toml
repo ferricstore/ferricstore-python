@@ -35,7 +35,7 @@ classifiers = [
 ]
 dependencies = [
   "hiredis>=2.3,<4",
-  "redis>=5,<7",
+  "redis>=5,<9",
 ]
 
 [project.optional-dependencies]
