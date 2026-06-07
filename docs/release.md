@@ -23,8 +23,8 @@ python -m twine check dist/*
 Create and push a version tag:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 The `Publish` GitHub Actions workflow builds the distribution and publishes it

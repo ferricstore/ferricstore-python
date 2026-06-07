@@ -2,7 +2,7 @@
 
 Python SDK for FerricStore and FerricFlow.
 
-Status: public alpha `0.1.0`. APIs may change before `1.0`, but the SDK is
+Status: public alpha `0.1.1`. APIs may change before `1.0`, but the SDK is
 tested against command construction, queue/workflow handlers, leases, retries,
 history, named values, idempotent create, worker loops, async flows, and local
 FerricStore integration scenarios.
