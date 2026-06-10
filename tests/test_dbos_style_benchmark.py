@@ -1,12 +1,78 @@
 import importlib.util
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 _BENCH_PATH = Path(__file__).resolve().parents[1] / "examples" / "dbos_style_benchmark.py"
 _SPEC = importlib.util.spec_from_file_location("dbos_style_benchmark", _BENCH_PATH)
 bench = importlib.util.module_from_spec(_SPEC)
 assert _SPEC.loader is not None
 _SPEC.loader.exec_module(bench)
+
+
+def test_dbos_queue_defaults_use_measured_claim_grouping():
+    assert bench.DBOS_QUEUE_DEFAULTS["workers"] == 1
+    assert bench.DBOS_QUEUE_DEFAULTS["worker_api"] == "queue"
+    assert bench.DBOS_QUEUE_DEFAULTS["claim_partition_batch_size"] == 16
+    assert bench.DBOS_QUEUE_DEFAULTS["claim_prefetch"] == 0
+    assert bench.DBOS_QUEUE_DEFAULTS["native_wake_hints"] is False
+    assert bench.DBOS_QUEUE_DEFAULTS["native_worker_connections"] == 1
+    assert bench.DBOS_QUEUE_DEFAULTS["native_lanes"] == 32
+    assert bench.DBOS_QUEUE_DEFAULTS["latency_sample_rate"] == 100
+
+
+def test_queue_latency_recorder_samples_create_ack_to_claim_start(monkeypatch):
+    ticks = iter([1_000_000_000, 1_007_500_000])
+    monkeypatch.setattr(bench.time, "perf_counter_ns", lambda: next(ticks))
+
+    recorder = bench.QueueLatencyRecorder(sample_rate=2)
+    recorder.mark_created_indices("run", [0, 1, 2])
+    recorder.mark_claimed(
+        [
+            SimpleNamespace(id="run:flow:0"),
+            SimpleNamespace(id="run:flow:1"),
+            SimpleNamespace(id="run:flow:2"),
+        ]
+    )
+
+    summary = recorder.summary()
+    assert summary["queue_latency_tracked"] == 2
+    assert summary["queue_latency_pending"] == 0
+    assert summary["queue_latency_sample_count"] == 2
+    assert summary["queue_latency_avg_ms"] == 7.5
+    assert summary["queue_latency_p50_ms"] == 7.5
+    assert summary["queue_latency_p99_ms"] == 7.5
+
+
+def test_native_url_detection_accepts_ferric_scheme():
+    assert bench.is_native_url("ferric://127.0.0.1:6388")
+    assert bench.is_native_url("ferrics://example:6388")
+    assert not bench.is_native_url("redis://127.0.0.1:6379")
+
+
+def test_native_queue_default_uses_internal_worker_lanes():
+    assert (
+        bench.native_queue_worker_lanes(
+            url="ferric://127.0.0.1:6388",
+            worker_api="queue",
+            workers=1,
+            claim_any=False,
+            partitions=16,
+            server_shards=16,
+        )
+        == 16
+    )
+    assert (
+        bench.native_queue_worker_lanes(
+            url="redis://127.0.0.1:6379",
+            worker_api="queue",
+            workers=1,
+            claim_any=False,
+            partitions=16,
+            server_shards=16,
+        )
+        == 1
+    )
 
 
 def test_queue_api_passes_claim_drain_batches_to_worker(monkeypatch):
@@ -48,7 +114,7 @@ def test_queue_api_passes_claim_drain_batches_to_worker(monkeypatch):
     monkeypatch.setattr(bench, "create_flows", fake_create_flows)
     monkeypatch.setattr(bench, "run_queue_api_worker", fake_queue_worker)
 
-    bench.run_queued_throughput(
+    result = bench.run_queued_throughput(
         Namespace(
             url="redis://127.0.0.1:7379",
             queued_shape="live",
@@ -84,13 +150,17 @@ def test_queue_api_passes_claim_drain_batches_to_worker(monkeypatch):
             complete_batch=True,
             complete_async_depth=0,
             independent_many=True,
+            complete_independent_many=False,
             track_duplicates=False,
             claim_partition_batch_size=2,
             server_shards=16,
+            claim_prefetch=8,
         )
     )
 
     assert seen_drain_batches == [3, 3]
+    assert result["claim_prefetch"] == 8
+    assert result["effective_claim_prefetch"] == 0
 
 
 def test_lowlevel_blocking_auto_many_enables_wake_coordinator(monkeypatch):
@@ -170,6 +240,7 @@ def test_lowlevel_blocking_auto_many_enables_wake_coordinator(monkeypatch):
             complete_batch=True,
             complete_async_depth=0,
             independent_many=True,
+            complete_independent_many=False,
             track_duplicates=False,
             claim_partition_batch_size=2,
             server_shards=2,
@@ -258,6 +329,7 @@ def test_queue_api_auto_many_enables_wake_coordinator(monkeypatch):
             complete_batch=True,
             complete_async_depth=0,
             independent_many=True,
+            complete_independent_many=False,
             track_duplicates=False,
             claim_partition_batch_size=2,
             server_shards=2,
@@ -366,6 +438,7 @@ def test_lowlevel_blocking_worker_claims_partition_batches(monkeypatch):
         complete_batch=True,
         complete_async_depth=0,
         independent_many=True,
+        complete_independent_many=False,
         transport="many",
         work_command="none",
         result=None,
@@ -454,6 +527,7 @@ def test_lowlevel_auto_worker_claim_pages_stay_on_one_server_shard(monkeypatch):
         complete_batch=True,
         complete_async_depth=0,
         independent_many=True,
+        complete_independent_many=False,
         transport="many",
         work_command="none",
         result=None,
@@ -547,6 +621,7 @@ def test_lowlevel_worker_scans_owned_partitions_before_drain_block(monkeypatch):
         complete_batch=True,
         complete_async_depth=0,
         independent_many=True,
+        complete_independent_many=False,
         transport="many",
         work_command="none",
         result=None,
@@ -652,6 +727,7 @@ def test_lowlevel_worker_does_not_block_while_producers_are_active(monkeypatch):
         complete_batch=True,
         complete_async_depth=0,
         independent_many=True,
+        complete_independent_many=False,
         transport="many",
         work_command="none",
         result=None,

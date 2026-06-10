@@ -120,6 +120,8 @@ class WorkerConfig:
     complete_independent: bool | None = None
     claim_partition_batch_size: int | None = 1
     claim_drain_batches: int | None = None
+    claim_prefetch: int | None = None
+    native_wake_hints: bool | None = None
     scan_before_blocking: bool | None = None
     complete_async_depth: int | None = None
     apply_async_depth: int | None = 0

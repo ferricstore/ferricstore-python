@@ -118,3 +118,5 @@ Before using the SDK in production:
 - Test crash plus reclaim behavior.
 
 See [Production Readiness](production.md) for the full checklist.
+
+- [Native transport](native.md)

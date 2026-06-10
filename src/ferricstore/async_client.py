@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 import inspect
 from typing import Any, cast
+from urllib.parse import urlparse
 
 from ferricstore.adapters import AsyncRedisAdapter, AsyncRedisCommandExecutor
 from ferricstore.backpressure import BackpressureController, BackpressurePolicy
@@ -130,6 +131,22 @@ class AsyncFlowClient:
         backpressure: BackpressurePolicy | None = None,
         **kwargs: Any,
     ) -> AsyncFlowClient:
+        if urlparse(url).scheme.lower() in {
+            "ferric",
+            "ferrics",
+            "ferric+tls",
+            "native",
+            "native+tls",
+            "ferricstore-native",
+            "ferricstore-native+tls",
+        }:
+            from ferricstore.native import AsyncNativeAdapterPool
+
+            return cls(
+                AsyncNativeAdapterPool.from_url(url, **kwargs),
+                codec=codec,
+                backpressure=backpressure,
+            )
         return cls(
             AsyncRedisAdapter.from_url(url, **kwargs),
             codec=codec,
@@ -346,6 +363,7 @@ class AsyncFlowClient:
         priority: int | None = 0,
         idempotent: bool | None = None,
         independent: bool | None = True,
+        return_ok_on_success: bool = False,
         retention_ttl_ms: int | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
@@ -364,6 +382,7 @@ class AsyncFlowClient:
                 priority=priority,
                 idempotent=idempotent,
                 independent=independent,
+                return_ok_on_success=return_ok_on_success,
                 retention_ttl_ms=retention_ttl_ms,
                 values=values,
                 value_refs=value_refs,
@@ -386,6 +405,7 @@ class AsyncFlowClient:
                 priority=priority,
                 idempotent=idempotent,
                 independent=independent,
+                return_ok_on_success=return_ok_on_success,
                 retention_ttl_ms=retention_ttl_ms,
                 values=values,
                 value_refs=value_refs,
@@ -410,6 +430,7 @@ class AsyncFlowClient:
         priority: int | None = None,
         idempotent: bool | None = None,
         independent: bool | None = None,
+        return_ok_on_success: bool = False,
         retention_ttl_ms: int | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
@@ -441,6 +462,8 @@ class AsyncFlowClient:
         _append(args, "PRIORITY", priority)
         _append_bool(args, "IDEMPOTENT", idempotent)
         _append_bool(args, "INDEPENDENT", independent)
+        if return_ok_on_success:
+            _append(args, "RETURN", "OK_ON_SUCCESS")
         _append(args, "RETENTION_TTL_MS", retention_ttl_ms)
         extended_items = _has_named_item_values(items) or (
             mixed and any(item.partition_key is None for item in items)

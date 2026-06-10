@@ -1,3 +1,5 @@
+from concurrent.futures import Future
+
 import pytest
 
 from ferricstore import ExceptionPolicy, QueueClient, RetryPolicy, ValueConfig, WorkerConfig
@@ -53,6 +55,39 @@ class FakeFlowClient:
 
     def close(self):
         self.closed = True
+
+
+class FakeFutureClaimFlowClient(FakeFlowClient):
+    def __init__(self, futures):
+        super().__init__([])
+        self.future_responses = list(futures)
+        self.future_claim_calls = []
+
+    def claim_jobs_future(self, type, **kwargs):
+        self.future_claim_calls.append((type, kwargs))
+        if not self.future_responses:
+            future = Future()
+            future.set_result([])
+            return future
+        return self.future_responses.pop(0)
+
+
+class FakeWakeFlowClient(FakeFlowClient):
+    def __init__(self, responses, events):
+        super().__init__(responses)
+        self.events = list(events)
+        self.wake_subscriptions = []
+        self.wait_timeouts = []
+
+    def subscribe_flow_wake(self, type, **kwargs):
+        self.wake_subscriptions.append((type, kwargs))
+        return {"subscribed": ["FLOW_WAKE"]}
+
+    def wait_event(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        if not self.events:
+            return None
+        return self.events.pop(0)
 
 
 def test_flow_worker_drains_same_partition_group_while_batches_are_full():
@@ -140,6 +175,80 @@ def test_worker_config_defaults_match_easy_startup_profile():
     assert kwargs["claim_partition_batch_size"] == 1
     assert "complete_async_depth" not in kwargs
     assert kwargs["apply_async_depth"] == 0
+
+
+def test_worker_config_exposes_native_claim_prefetch_when_explicit():
+    kwargs = WorkerConfig(claim_prefetch=8).to_kwargs()
+
+    assert kwargs["claim_prefetch"] == 8
+
+
+def test_worker_config_exposes_native_wake_hints_when_explicit():
+    kwargs = WorkerConfig(native_wake_hints=True).to_kwargs()
+
+    assert kwargs["native_wake_hints"] is True
+
+
+def test_flow_worker_rejects_invalid_claim_prefetch():
+    with pytest.raises(ValueError, match="claim_prefetch"):
+        QueueFlowWorker(FakeFlowClient([]), type="email", claim_prefetch=-1)
+
+
+def test_flow_worker_native_wake_hints_subscribes_to_claim_filter():
+    client = FakeWakeFlowClient([], [{"event": "FLOW_WAKE"}])
+    worker = QueueFlowWorker(
+        client,
+        type="email",
+        state="queued",
+        partition_keys=["bucket-0", "bucket-1"],
+        priority=0,
+        batch_size=500,
+        native_wake_hints=True,
+    )
+
+    assert client.wake_subscriptions == [
+        (
+            "email",
+            {
+                "state": "queued",
+                "states": None,
+                "partition_key": None,
+                "partition_keys": ["bucket-0", "bucket-1"],
+                "priority": 0,
+                "limit": 500,
+            },
+        )
+    ]
+    assert worker._wait_for_native_wake_hint(0.01) is True
+    assert client.wait_timeouts == [0.01]
+
+
+def test_flow_worker_prefetches_blocking_claims_with_native_future_client():
+    job = ClaimedItem("flow-1", b"lease-1", 1, partition_key="bucket-0")
+    first = Future()
+    first.set_result([job])
+    second = Future()
+    second.set_result([])
+    client = FakeFutureClaimFlowClient([first, second])
+    worker = QueueFlowWorker(
+        client,
+        type="email",
+        state="queued",
+        batch_size=1,
+        block_ms=5000,
+        claim_prefetch=2,
+        idle_sleep_s=0,
+    )
+
+    result = worker.run_once(lambda _job: "ok")
+
+    assert result.claimed == 1
+    assert result.completed == 1
+    assert result.claim_calls == 1
+    assert client.claim_calls == []
+    assert len(client.future_claim_calls) == 3
+    assert [call[1]["block_ms"] for call in client.future_claim_calls] == [5000, 5000, 5000]
+    assert client.completed == [([job], {"result": "ok", "independent": True})]
 
 
 def test_flow_worker_blocks_on_all_owned_partitions_by_default():
@@ -515,6 +624,55 @@ def test_queue_client_from_url_creates_bounded_command_and_claim_pools(monkeypat
     assert worker.claim_client is queue_client.claim_flow
 
 
+def test_queue_client_from_native_url_reuses_multiplexed_claim_client(monkeypatch):
+    calls = []
+
+    def from_url(url, **kwargs):
+        client = FakeFlowClient([])
+        client.url = url
+        client.kwargs = kwargs
+        calls.append((url, kwargs, client))
+        return client
+
+    monkeypatch.setattr("ferricstore.worker.FlowClient.from_url", staticmethod(from_url))
+
+    queue_client = QueueClient.from_url(
+        "ferric://example:6388",
+        worker_config=WorkerConfig(workers=3),
+    )
+    worker = queue_client.queue(type="email").worker()
+
+    assert len(calls) == 1
+    assert calls[0][1] == {"max_connections": 3}
+    assert queue_client.claim_flow is queue_client.flow
+    assert worker.client is queue_client.flow
+    assert worker.claim_client is queue_client.flow
+
+
+def test_flow_worker_from_native_url_reuses_multiplexed_claim_client(monkeypatch):
+    calls = []
+
+    def from_url(url, **kwargs):
+        client = FakeFlowClient([])
+        client.url = url
+        client.kwargs = kwargs
+        calls.append((url, kwargs, client))
+        return client
+
+    monkeypatch.setattr("ferricstore.worker.FlowClient.from_url", staticmethod(from_url))
+
+    worker = QueueFlowWorker(
+        "ferric://example:6388",
+        type="email",
+        state="queued",
+        concurrency=50,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1] == {"max_connections": 2}
+    assert worker.claim_client is worker.client
+
+
 def test_queue_worker_config_at_queue_time_resizes_claim_pool(monkeypatch):
     calls = []
 
@@ -538,6 +696,29 @@ def test_queue_worker_config_at_queue_time_resizes_claim_pool(monkeypatch):
     assert calls[2][1]["max_connections"] == 16
     assert worker.client is queue_client.flow
     assert worker.claim_client is calls[2][2]
+
+
+def test_queue_worker_config_does_not_resize_native_claim_pool(monkeypatch):
+    calls = []
+
+    def from_url(url, **kwargs):
+        client = FakeFlowClient([])
+        client.url = url
+        client.kwargs = kwargs
+        calls.append((url, kwargs, client))
+        return client
+
+    monkeypatch.setattr("ferricstore.worker.FlowClient.from_url", staticmethod(from_url))
+
+    queue_client = QueueClient.from_url("ferric://example:6388")
+    worker = queue_client.queue(
+        type="email",
+        worker_config=WorkerConfig(workers=16),
+    ).worker()
+
+    assert len(calls) == 1
+    assert worker.client is queue_client.flow
+    assert worker.claim_client is queue_client.flow
 
 
 def test_queue_client_close_does_not_close_externally_owned_clients():

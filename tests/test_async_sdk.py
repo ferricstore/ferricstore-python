@@ -158,6 +158,31 @@ def test_async_queue_client_from_url_creates_bounded_command_and_claim_pools(mon
     assert worker.claim_client is client.claim_flow
 
 
+def test_async_queue_client_from_native_url_reuses_multiplexed_claim_client(monkeypatch):
+    calls = []
+
+    def from_url(url, **kwargs):
+        client = AsyncFlowClient(FakeRedis())
+        client.url = url
+        client.kwargs = kwargs
+        calls.append((url, kwargs, client))
+        return client
+
+    monkeypatch.setattr("ferricstore.async_worker.AsyncFlowClient.from_url", staticmethod(from_url))
+
+    client = AsyncQueueClient.from_url(
+        "ferric://example:6388",
+        worker_config=WorkerConfig(workers=4),
+    )
+    worker = client.queue(type="email").worker()._build_worker(0)
+
+    assert len(calls) == 1
+    assert calls[0][1] == {"max_connections": 4}
+    assert client.claim_flow is client.flow
+    assert worker.client is client.flow
+    assert worker.claim_client is client.flow
+
+
 def test_async_queue_worker_config_at_queue_time_resizes_claim_pool(monkeypatch):
     calls = []
 
@@ -185,6 +210,33 @@ def test_async_queue_worker_config_at_queue_time_resizes_claim_pool(monkeypatch)
     assert calls[2][1]["max_connections"] == 64
     assert worker.client is client.flow
     assert worker.claim_client is calls[2][2]
+
+
+def test_async_queue_worker_config_does_not_resize_native_claim_pool(monkeypatch):
+    calls = []
+
+    def from_url(url, **kwargs):
+        client = AsyncFlowClient(FakeRedis())
+        client.url = url
+        client.kwargs = kwargs
+        calls.append((url, kwargs, client))
+        return client
+
+    monkeypatch.setattr("ferricstore.async_worker.AsyncFlowClient.from_url", staticmethod(from_url))
+
+    client = AsyncQueueClient.from_url("ferric://example:6388")
+    worker = (
+        client.queue(
+            type="email",
+            worker_config=WorkerConfig(workers=64),
+        )
+        .worker()
+        ._build_worker(0)
+    )
+
+    assert len(calls) == 1
+    assert worker.client is client.flow
+    assert worker.claim_client is client.flow
 
 
 def test_async_queue_client_close_does_not_close_externally_owned_clients():

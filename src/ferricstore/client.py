@@ -9,6 +9,7 @@ import zlib
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, cast
+from urllib.parse import urlparse
 
 from ferricstore.adapters import RedisAdapter, RedisCommandExecutor
 from ferricstore.backpressure import BackpressureController, BackpressurePolicy
@@ -322,6 +323,22 @@ class FlowClient:
         backpressure: BackpressurePolicy | None = None,
         **kwargs: Any,
     ) -> FlowClient:
+        if urlparse(url).scheme.lower() in {
+            "ferric",
+            "ferrics",
+            "ferric+tls",
+            "native",
+            "native+tls",
+            "ferricstore-native",
+            "ferricstore-native+tls",
+        }:
+            from ferricstore.native import NativeAdapterPool
+
+            return cls(
+                NativeAdapterPool.from_url(url, **kwargs),
+                codec=codec,
+                backpressure=backpressure,
+            )
         return cls(RedisAdapter.from_url(url, **kwargs), codec=codec, backpressure=backpressure)
 
     def autobatch(
@@ -342,6 +359,36 @@ class FlowClient:
         close = getattr(self.executor, "close", None)
         if callable(close):
             close()
+
+    def subscribe_flow_wake(
+        self,
+        type: str,
+        *,
+        state: str | None = None,
+        states: builtins.list[str] | None = None,
+        partition_key: str | None = None,
+        partition_keys: builtins.list[str] | None = None,
+        priority: int | None = 0,
+        limit: int | None = None,
+    ) -> Any:
+        subscribe = getattr(self.executor, "subscribe_flow_wake", None)
+        if not callable(subscribe):
+            raise RuntimeError("FLOW_WAKE subscriptions require native executor event support")
+        return subscribe(
+            type,
+            state=state,
+            states=states,
+            partition_key=partition_key,
+            partition_keys=partition_keys,
+            priority=priority,
+            limit=limit,
+        )
+
+    def wait_event(self, timeout: float | None = None) -> Any | None:
+        wait_event = getattr(self.executor, "wait_event", None)
+        if not callable(wait_event):
+            return None
+        return wait_event(timeout=timeout)
 
     def cas(self, key: str, expected: Any, value: Any, *, ex: int | None = None) -> bool:
         args: builtins.list[Any] = [
@@ -539,6 +586,7 @@ class FlowClient:
         priority: int | None = 0,
         idempotent: bool | None = None,
         independent: bool | None = True,
+        return_ok_on_success: bool = False,
         retention_ttl_ms: int | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
@@ -558,6 +606,7 @@ class FlowClient:
                 priority=priority,
                 idempotent=idempotent,
                 independent=independent,
+                return_ok_on_success=return_ok_on_success,
                 retention_ttl_ms=retention_ttl_ms,
                 values=values,
                 value_refs=value_refs,
@@ -580,6 +629,7 @@ class FlowClient:
                 priority=priority,
                 idempotent=idempotent,
                 independent=independent,
+                return_ok_on_success=return_ok_on_success,
                 retention_ttl_ms=retention_ttl_ms,
                 values=values,
                 value_refs=value_refs,
@@ -604,6 +654,7 @@ class FlowClient:
         priority: int | None = None,
         idempotent: bool | None = None,
         independent: bool | None = None,
+        return_ok_on_success: bool = False,
         retention_ttl_ms: int | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
@@ -635,6 +686,8 @@ class FlowClient:
         _append(args, "PRIORITY", priority)
         _append_bool(args, "IDEMPOTENT", idempotent)
         _append_bool(args, "INDEPENDENT", independent)
+        if return_ok_on_success:
+            _append(args, "RETURN", "OK_ON_SUCCESS")
         _append(args, "RETENTION_TTL_MS", retention_ttl_ms)
         extended_items = _has_named_item_values(items) or (
             mixed and any(item.partition_key is None for item in items)
@@ -766,6 +819,115 @@ class FlowClient:
         value_max_bytes: int | None = None,
         include_state: bool = False,
     ) -> builtins.list[FlowRecord] | builtins.list[ClaimedItem]:
+        args = self._claim_due_args(
+            type,
+            state=state,
+            states=states,
+            worker=worker,
+            partition_key=partition_key,
+            partition_keys=partition_keys,
+            lease_ms=lease_ms,
+            limit=limit,
+            priority=priority,
+            now_ms=now_ms,
+            block_ms=block_ms,
+            reclaim_expired=reclaim_expired,
+            reclaim_ratio=reclaim_ratio,
+            job_only=job_only,
+            payload=payload,
+            payload_max_bytes=payload_max_bytes,
+            values=values,
+            value_max_bytes=value_max_bytes,
+            include_state=include_state,
+        )
+        return self._decode_claim_due_response(self.executor.execute_command(*args), job_only)
+
+    def claim_due_future(
+        self,
+        type: str,
+        *,
+        state: str | None = None,
+        states: builtins.list[str] | None = None,
+        worker: str,
+        partition_key: str | None = None,
+        partition_keys: builtins.list[str] | None = None,
+        lease_ms: int = 30_000,
+        limit: int = 1,
+        priority: int | None = None,
+        now_ms: int | None = None,
+        block_ms: int | None = None,
+        reclaim_expired: bool | None = None,
+        reclaim_ratio: int | None = None,
+        job_only: bool = False,
+        payload: bool | None = None,
+        payload_max_bytes: int | None = None,
+        values: builtins.list[str] | None = None,
+        value_max_bytes: int | None = None,
+        include_state: bool = False,
+    ) -> Future[builtins.list[FlowRecord] | builtins.list[ClaimedItem]]:
+        submit_command = getattr(self.executor, "submit_command", None)
+        if not callable(submit_command):
+            raise RuntimeError("claim_due_future requires native executor submit support")
+        args = self._claim_due_args(
+            type,
+            state=state,
+            states=states,
+            worker=worker,
+            partition_key=partition_key,
+            partition_keys=partition_keys,
+            lease_ms=lease_ms,
+            limit=limit,
+            priority=priority,
+            now_ms=now_ms,
+            block_ms=block_ms,
+            reclaim_expired=reclaim_expired,
+            reclaim_ratio=reclaim_ratio,
+            job_only=job_only,
+            payload=payload,
+            payload_max_bytes=payload_max_bytes,
+            values=values,
+            value_max_bytes=value_max_bytes,
+            include_state=include_state,
+        )
+        source = submit_command(*args)
+        future: Future[builtins.list[FlowRecord] | builtins.list[ClaimedItem]] = Future()
+
+        def complete(done: Future[Any]) -> None:
+            if future.cancelled():
+                return
+            try:
+                future.set_result(self._decode_claim_due_response(done.result(), job_only))
+            except Exception as exc:
+                mapped = map_exception(exc)
+                if not future.cancelled():
+                    future.set_exception(mapped if mapped is not exc else exc)
+
+        source.add_done_callback(complete)
+        return future
+
+    def _claim_due_args(
+        self,
+        type: str,
+        *,
+        state: str | None = None,
+        states: builtins.list[str] | None = None,
+        worker: str,
+        partition_key: str | None = None,
+        partition_keys: builtins.list[str] | None = None,
+        lease_ms: int = 30_000,
+        limit: int = 1,
+        priority: int | None = None,
+        now_ms: int | None = None,
+        block_ms: int | None = None,
+        reclaim_expired: bool | None = None,
+        reclaim_ratio: int | None = None,
+        job_only: bool = False,
+        payload: bool | None = None,
+        payload_max_bytes: int | None = None,
+        values: builtins.list[str] | None = None,
+        value_max_bytes: int | None = None,
+        include_state: bool = False,
+    ) -> builtins.list[Any]:
         args: builtins.list[Any] = ["FLOW.CLAIM_DUE", type]
         if state is not None and states is not None:
             raise ValueError("state and states are mutually exclusive")
@@ -806,7 +968,13 @@ class FlowClient:
         _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
         _append_bool(args, "RECLAIM_EXPIRED", reclaim_expired)
         _append(args, "RECLAIM_RATIO", reclaim_ratio)
-        response = self.executor.execute_command(*args)
+        return args
+
+    def _decode_claim_due_response(
+        self,
+        response: Any,
+        job_only: bool,
+    ) -> builtins.list[FlowRecord] | builtins.list[ClaimedItem]:
         if job_only:
             return [ClaimedItem.from_resp(value) for value in response]
         return self._records(response)
@@ -833,6 +1001,45 @@ class FlowClient:
         return cast(
             builtins.list[ClaimedItem],
             self.claim_due(
+                type,
+                state=state,
+                states=states,
+                worker=worker,
+                partition_key=partition_key,
+                partition_keys=partition_keys,
+                lease_ms=lease_ms,
+                limit=limit,
+                priority=priority,
+                now_ms=now_ms,
+                block_ms=block_ms,
+                reclaim_expired=reclaim_expired,
+                reclaim_ratio=reclaim_ratio,
+                job_only=True,
+                include_state=include_state,
+            ),
+        )
+
+    def claim_jobs_future(
+        self,
+        type: str,
+        *,
+        state: str | None = None,
+        states: builtins.list[str] | None = None,
+        worker: str,
+        partition_key: str | None = None,
+        partition_keys: builtins.list[str] | None = None,
+        lease_ms: int = 30_000,
+        limit: int = 100,
+        priority: int | None = 0,
+        now_ms: int | None = None,
+        block_ms: int | None = None,
+        reclaim_expired: bool | None = None,
+        reclaim_ratio: int | None = None,
+        include_state: bool = False,
+    ) -> Future[builtins.list[ClaimedItem]]:
+        return cast(
+            Future[builtins.list[ClaimedItem]],
+            self.claim_due_future(
                 type,
                 state=state,
                 states=states,

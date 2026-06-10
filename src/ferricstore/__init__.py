@@ -31,6 +31,13 @@ from ferricstore.errors import (
     OverloadedError,
     StaleLeaseError,
 )
+from ferricstore.native import (
+    AsyncNativeAdapter,
+    AsyncNativePipeline,
+    NativeAdapter,
+    NativeCommand,
+    NativePipeline,
+)
 from ferricstore.types import (
     ChildSpec,
     ClaimedItem,
@@ -81,6 +88,8 @@ __version__ = "0.1.1"
 __all__ = [
     "AsyncCommandPipeline",
     "AsyncFlowClient",
+    "AsyncNativeAdapter",
+    "AsyncNativePipeline",
     "AsyncQueue",
     "AsyncQueueClient",
     "AsyncQueueWorker",
@@ -113,6 +122,9 @@ __all__ = [
     "KeyInfo",
     "LockHeldError",
     "LockNotOwnedError",
+    "NativeAdapter",
+    "NativeCommand",
+    "NativePipeline",
     "OverloadedError",
     "Queue",
     "QueueClient",

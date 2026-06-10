@@ -7,6 +7,7 @@ import uuid
 import zlib
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 from ferricstore import (
     CreateItem,
@@ -20,10 +21,19 @@ QUEUE_STATE = "queued"
 AUTO_PARTITION_PREFIX = "__flow_auto__:"
 AUTO_PARTITION_BUCKETS = 256
 SERVER_SLOT_COUNT = 1024
+NATIVE_URL_SCHEMES = {
+    "ferric",
+    "ferrics",
+    "ferric+tls",
+    "native",
+    "native+tls",
+    "ferricstore-native",
+    "ferricstore-native+tls",
+}
 
 DBOS_QUEUE_DEFAULTS = {
     "flows": 1_000_000,
-    "workers": 16,
+    "workers": 1,
     "producers": 32,
     "partitions": 16,
     "claim_batch_size": 500,
@@ -31,11 +41,16 @@ DBOS_QUEUE_DEFAULTS = {
     "transport": "many",
     "partition_mode": "auto",
     "worker_mode": "polling",
-    "worker_api": "lowlevel",
-    "claim_partition_batch_size": 2,
+    "worker_api": "queue",
+    "claim_partition_batch_size": 16,
+    "claim_prefetch": 0,
     "complete_async_depth": 4,
     "claim_job_only": True,
     "server_shards": 16,
+    "native_worker_connections": 1,
+    "native_lanes": 32,
+    "native_wake_hints": False,
+    "latency_sample_rate": 100,
 }
 
 
@@ -52,6 +67,75 @@ def percentile(values: list[float], pct: float) -> float:
     return ordered[min(max(index, 0), len(ordered) - 1)]
 
 
+def latency_summary(prefix: str, values: list[float]) -> dict[str, float | int]:
+    count = len(values)
+    return {
+        f"{prefix}_sample_count": count,
+        f"{prefix}_avg_ms": sum(values) / count if count > 0 else 0.0,
+        f"{prefix}_p50_ms": percentile(values, 50),
+        f"{prefix}_p95_ms": percentile(values, 95),
+        f"{prefix}_p99_ms": percentile(values, 99),
+        f"{prefix}_max_ms": max(values) if values else 0.0,
+    }
+
+
+class QueueLatencyRecorder:
+    def __init__(self, sample_rate: int) -> None:
+        self.sample_rate = max(int(sample_rate), 0)
+        self._created_at_ns: dict[str, int] = {}
+        self._queue_latency_ms: list[float] = []
+        self._tracked = 0
+        self._lock = threading.Lock()
+
+    def enabled(self) -> bool:
+        return self.sample_rate > 0
+
+    def mark_created_indices(self, run_id: str, indices: list[int]) -> None:
+        if not self.enabled():
+            return
+
+        now_ns = time.perf_counter_ns()
+        sampled = {
+            f"{run_id}:flow:{index}": now_ns
+            for index in indices
+            if index % self.sample_rate == 0
+        }
+        if not sampled:
+            return
+
+        with self._lock:
+            self._created_at_ns.update(sampled)
+            self._tracked += len(sampled)
+
+    def mark_claimed(self, jobs) -> None:
+        if not self.enabled():
+            return
+
+        now_ns = time.perf_counter_ns()
+        latencies: list[float] = []
+        with self._lock:
+            for job in jobs:
+                job_id = getattr(job, "id", None)
+                if job_id is None:
+                    continue
+                created_at_ns = self._created_at_ns.pop(job_id, None)
+                if created_at_ns is not None:
+                    latencies.append((now_ns - created_at_ns) / 1_000_000.0)
+            self._queue_latency_ms.extend(latencies)
+
+    def summary(self) -> dict[str, float | int]:
+        with self._lock:
+            samples = list(self._queue_latency_ms)
+            tracked = self._tracked
+            pending = len(self._created_at_ns)
+
+        return {
+            "queue_latency_tracked": tracked,
+            "queue_latency_pending": pending,
+            **latency_summary("queue_latency", samples),
+        }
+
+
 def payload_bytes(size: int) -> bytes:
     if size <= 0:
         return b""
@@ -65,6 +149,24 @@ def parse_claim_states(value: str | None) -> list[str] | None:
     if not states:
         raise ValueError("--claim-states must contain at least one state")
     return states
+
+
+def is_native_url(url: str) -> bool:
+    return urlparse(url).scheme.lower() in NATIVE_URL_SCHEMES
+
+
+def native_queue_worker_lanes(
+    *,
+    url: str,
+    worker_api: str,
+    workers: int,
+    claim_any: bool,
+    partitions: int,
+    server_shards: int,
+) -> int:
+    if worker_api != "queue" or not is_native_url(url) or workers != 1 or claim_any:
+        return workers
+    return max(1, min(partitions, server_shards, 16))
 
 
 def partition_for(index: int, partitions: int, prefix: str) -> str:
@@ -151,9 +253,17 @@ class BufferedRedisExecutor:
 
 
 class BenchFlowClient:
-    def __init__(self, url: str, transport: str, batch_size: int = 100) -> None:
+    def __init__(
+        self,
+        url: str,
+        transport: str,
+        batch_size: int = 100,
+        *,
+        client_kwargs: dict[str, object] | None = None,
+        base_client: FlowClient | None = None,
+    ) -> None:
         self.transport = transport
-        base = FlowClient.from_url(url)
+        base = base_client or FlowClient.from_url(url, **(client_kwargs or {}))
         self.read_client = base
         self.redis_client = getattr(base.executor, "client", None)
         self.autobatch_client = None
@@ -209,6 +319,7 @@ class BenchFlowClient:
                 type=flow_type,
                 state=QUEUE_STATE,
                 independent=independent_many,
+                return_ok_on_success=True,
             )
             return len(items)
 
@@ -548,8 +659,10 @@ def create_flows(
     partition_mode: str,
     independent_many: bool,
     wake_coordinator: PartitionWakeCoordinator | None,
+    latency_recorder: QueueLatencyRecorder | None = None,
+    client_kwargs: dict[str, object] | None = None,
 ) -> dict[str, int]:
-    flow = BenchFlowClient(url, transport, create_batch_size)
+    flow = BenchFlowClient(url, transport, create_batch_size, client_kwargs=client_kwargs)
     created = 0
 
     if partition_mode == "auto" and transport == "many":
@@ -570,6 +683,8 @@ def create_flows(
                 partition_mode=partition_mode,
                 independent_many=independent_many,
             )
+            if latency_recorder is not None:
+                latency_recorder.mark_created_indices(run_id, batch)
             auto_buffers[partition_index] = []
             if wake_coordinator is not None:
                 wake_coordinator.notify_partition(partition_index, batch_count)
@@ -596,6 +711,8 @@ def create_flows(
             partition_mode=partition_mode,
             independent_many=independent_many,
         )
+        if latency_recorder is not None:
+            latency_recorder.mark_created_indices(run_id, batch)
         if wake_coordinator is not None and partition_mode == "auto":
             partition_counts: dict[int, int] = {}
             for index in batch:
@@ -627,6 +744,7 @@ def run_claim_worker(
     complete_batch: bool,
     complete_async_depth: int,
     independent_many: bool,
+    complete_independent_many: bool,
     transport: str,
     work_command: str,
     result: bytes | None,
@@ -656,8 +774,19 @@ def run_claim_worker(
     completed_lock: threading.Lock,
     wake_coordinator: PartitionWakeCoordinator | None,
     track_duplicates: bool,
+    claim_prefetch: int = 0,
+    native_wake_hints: bool = False,
+    shared_client: FlowClient | None = None,
+    latency_recorder: QueueLatencyRecorder | None = None,
+    client_kwargs: dict[str, object] | None = None,
 ) -> dict[str, int]:
-    flow = BenchFlowClient(url, transport, claim_batch_size)
+    flow = BenchFlowClient(
+        url,
+        transport,
+        claim_batch_size,
+        client_kwargs=client_kwargs,
+        base_client=shared_client,
+    )
     worker = f"{run_id}:worker:{worker_index}"
     local_completed = 0
     claim_round = 0
@@ -707,10 +836,14 @@ def run_claim_worker(
     complete_executor = (
         ThreadPoolExecutor(max_workers=complete_async_depth) if complete_async_depth > 0 else None
     )
-    complete_clients = [
-        BenchFlowClient(url, transport, claim_batch_size)
-        for _ in range(max(complete_async_depth, 0))
-    ]
+    complete_clients = (
+        [flow]
+        if is_native_url(url) and complete_async_depth > 0
+        else [
+            BenchFlowClient(url, transport, claim_batch_size)
+            for _ in range(max(complete_async_depth, 0))
+        ]
+    )
     complete_client_index = 0
     pending_completions = []
 
@@ -723,9 +856,8 @@ def run_claim_worker(
             return claimed_total[0] >= total_flows
 
     def current_claim_block_ms() -> int | None:
-        if producers_done.is_set():
-            return claim_drain_block_ms
-        return claim_block_ms
+        value = claim_drain_block_ms if producers_done.is_set() else claim_block_ms
+        return value if value is not None and value > 0 else None
 
     def should_scan_owned_partitions() -> bool:
         block_ms = current_claim_block_ms()
@@ -823,7 +955,7 @@ def run_claim_worker(
             jobs,
             partition_key=None if claim_any else partition_key,
             use_many=complete_batch,
-            independent_many=independent_many,
+            independent_many=complete_independent_many,
             result=result,
         )
         return jobs
@@ -876,6 +1008,8 @@ def run_claim_worker(
         claimed_items += len(jobs)
         with completed_lock:
             claimed_total[0] += len(jobs)
+        if latency_recorder is not None:
+            latency_recorder.mark_claimed(jobs)
         flow.do_work(work_command, run_id, jobs)
 
         if complete_executor is None:
@@ -886,7 +1020,7 @@ def run_claim_worker(
         while len(pending_completions) >= complete_async_depth:
             drain_completed_completions(block=True)
 
-        client = complete_clients[complete_client_index % complete_async_depth]
+        client = complete_clients[complete_client_index % len(complete_clients)]
         complete_client_index += 1
         pending_completions.append(
             complete_executor.submit(complete_jobs, client, jobs, partition_key)
@@ -1083,6 +1217,7 @@ def run_queue_api_worker(
     complete_batch: bool,
     complete_async_depth: int,
     independent_many: bool,
+    complete_independent_many: bool,
     transport: str,
     work_command: str,
     result: bytes | None,
@@ -1112,6 +1247,11 @@ def run_queue_api_worker(
     completed_lock: threading.Lock,
     wake_coordinator: PartitionWakeCoordinator | None,
     track_duplicates: bool,
+    claim_prefetch: int = 0,
+    native_wake_hints: bool = False,
+    shared_client: FlowClient | None = None,
+    latency_recorder: QueueLatencyRecorder | None = None,
+    client_kwargs: dict[str, object] | None = None,
 ) -> dict[str, int]:
     del (
         complete_batch,
@@ -1119,10 +1259,9 @@ def run_queue_api_worker(
         partial_claim_retries,
         partial_claim_delay_ms,
         claim_job_only,
-        worker_capacity,
     )
 
-    client = FlowClient.from_url(url)
+    client = shared_client if shared_client is not None else FlowClient.from_url(url, **(client_kwargs or {}))
     partition_keys = None
     owned_partitions = None
     if not claim_any:
@@ -1168,10 +1307,19 @@ def run_queue_api_worker(
         ]
 
     completion_clients = (
-        [FlowClient.from_url(url) for _ in range(complete_async_depth)]
-        if complete_async_depth > 0
-        else None
+        None
+        if is_native_url(url) or complete_async_depth <= 0
+        else [FlowClient.from_url(url) for _ in range(complete_async_depth)]
     )
+    effective_concurrency = worker_capacity if worker_capacity > 0 else claim_batch_size
+    effective_claim_partition_batch_size = claim_partition_batch_size
+    if is_native_url(url) and partition_keys:
+        effective_claim_partition_batch_size = max(
+            claim_partition_batch_size,
+            len(partition_keys),
+        )
+    effective_claim_prefetch = 0 if wake_coordinator is not None else claim_prefetch
+    effective_block_ms = None if wake_coordinator is not None else claim_block_ms
 
     worker = QueueFlowWorker(
         client,
@@ -1179,18 +1327,20 @@ def run_queue_api_worker(
         worker=f"{run_id}:worker:{worker_index}",
         state=claim_state,
         states=claim_states,
-        concurrency=1,
+        concurrency=effective_concurrency,
         batch_size=claim_batch_size,
         priority=claim_priority,
         reclaim_expired=reclaim_expired,
         reclaim_ratio=reclaim_ratio,
         idle_sleep_s=max(idle_sleep_ms, 0.0) / 1000.0,
         max_idle_sleep_s=max(max_idle_sleep_ms, idle_sleep_ms, 0.0) / 1000.0,
-        complete_independent=independent_many,
+        complete_independent=complete_independent_many,
         partition_keys=partition_keys,
-        claim_partition_batch_size=claim_partition_batch_size,
+        claim_partition_batch_size=effective_claim_partition_batch_size,
         claim_drain_batches=claim_drain_batches,
-        block_ms=claim_block_ms,
+        claim_prefetch=effective_claim_prefetch,
+        native_wake_hints=native_wake_hints and wake_coordinator is None,
+        block_ms=effective_block_ms,
         claim_scan_block_ms=claim_drain_block_ms,
         complete_async_depth=complete_async_depth,
         completion_clients=completion_clients,
@@ -1216,6 +1366,8 @@ def run_queue_api_worker(
             return claimed_total[0] >= total_flows
 
     def handle_batch(jobs):
+        if latency_recorder is not None:
+            latency_recorder.mark_claimed(jobs)
         if work_command == "incr":
             for _job in jobs:
                 client.executor.execute_command("INCR", f"{run_id}:counter")
@@ -1349,15 +1501,19 @@ def run_queue_api_worker(
             "claimed_items": claimed_items,
             "max_claim_batch": max_claim_batch,
             "fallback_claims": fallback_claims,
-            "worker_capacity": 0,
+            "worker_capacity": effective_concurrency,
             "wake_coalesce_sleeps": 0,
             "wake_coalesce_ms": 0.0,
             "process_pipeline_flushes": 0,
             "process_pipeline_commands": 0,
             "process_pipeline_max_depth": 0,
+            "effective_claim_prefetch": effective_claim_prefetch,
+            "native_wake_hints": int(native_wake_hints and wake_coordinator is None),
         }
     finally:
         worker.close()
+        if shared_client is None:
+            client.close()
 
 
 def partition_index_for_claim(
@@ -1433,6 +1589,12 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
     duplicate_completions = [0]
     completed_lock = threading.Lock()
     producers_done = threading.Event()
+    latency_sample_rate = getattr(
+        args,
+        "latency_sample_rate",
+        DBOS_QUEUE_DEFAULTS["latency_sample_rate"],
+    )
+    latency_recorder = QueueLatencyRecorder(latency_sample_rate)
     effective_worker_mode = (
         "queue-api"
         if args.worker_api == "queue"
@@ -1445,6 +1607,37 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
         partition_mode = "auto"
     worker_partitions = AUTO_PARTITION_BUCKETS if partition_mode == "auto" else args.partitions
     worker_capacity = args.worker_capacity
+    worker_lanes = native_queue_worker_lanes(
+        url=args.url,
+        worker_api=args.worker_api,
+        workers=args.workers,
+        claim_any=args.claim_any,
+        partitions=worker_partitions,
+        server_shards=args.server_shards,
+    )
+    native_kwargs: dict[str, object] = (
+        {
+            "lanes": getattr(args, "native_lanes", DBOS_QUEUE_DEFAULTS["native_lanes"]),
+            "max_connections": max(
+                1,
+                getattr(
+                    args,
+                    "native_worker_connections",
+                    DBOS_QUEUE_DEFAULTS["native_worker_connections"],
+                ),
+            ),
+        }
+        if is_native_url(args.url)
+        else {}
+    )
+    shared_worker_client = (
+        FlowClient.from_url(
+            args.url,
+            **native_kwargs,
+        )
+        if is_native_url(args.url)
+        else None
+    )
     wake_coordinator = None
     if (
         effective_worker_mode in {"blocking", "queue-api"}
@@ -1454,13 +1647,13 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
         if partition_mode == "auto":
             wake_owner = lambda partition_index: auto_partition_owner(  # noqa: E731
                 partition_index,
-                args.workers,
+                worker_lanes,
                 args.server_shards,
             )
         else:
-            wake_owner = lambda partition_index: partition_index % max(args.workers, 1)  # noqa: E731
+            wake_owner = lambda partition_index: partition_index % max(worker_lanes, 1)  # noqa: E731
         wake_coordinator = PartitionWakeCoordinator(
-            args.workers,
+            worker_lanes,
             worker_partitions,
             owner_for=wake_owner,
         )
@@ -1496,6 +1689,8 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
                 partition_mode=partition_mode,
                 independent_many=args.independent_many,
                 wake_coordinator=wake_coordinator,
+                latency_recorder=latency_recorder,
+                client_kwargs=native_kwargs,
             )
             for batch in create_ranges
         ]
@@ -1509,7 +1704,7 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
                 run_id=run_id,
                 flow_type=flow_type,
                 worker_index=worker_index,
-                worker_count=args.workers,
+                worker_count=worker_lanes,
                 partitions=worker_partitions,
                 partition_mode=partition_mode,
                 claim_any=args.claim_any,
@@ -1517,6 +1712,7 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
                 complete_batch=args.complete_batch,
                 complete_async_depth=args.complete_async_depth,
                 independent_many=args.independent_many,
+                complete_independent_many=args.complete_independent_many,
                 transport=args.transport,
                 work_command=args.work_command,
                 result=result,
@@ -1536,6 +1732,17 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
                 claim_states=claim_states,
                 claim_partition_batch_size=args.claim_partition_batch_size,
                 claim_drain_batches=args.claim_drain_batches,
+                claim_prefetch=getattr(
+                    args,
+                    "claim_prefetch",
+                    DBOS_QUEUE_DEFAULTS["claim_prefetch"],
+                ),
+                native_wake_hints=getattr(
+                    args,
+                    "native_wake_hints",
+                    DBOS_QUEUE_DEFAULTS["native_wake_hints"],
+                ),
+                client_kwargs=native_kwargs,
                 worker_capacity=worker_capacity,
                 server_shards=args.server_shards,
                 producers_done=producers_done,
@@ -1546,8 +1753,10 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
                 completed_lock=completed_lock,
                 wake_coordinator=wake_coordinator,
                 track_duplicates=args.track_duplicates,
+                shared_client=shared_worker_client,
+                latency_recorder=latency_recorder,
             )
-            for worker_index in range(args.workers)
+            for worker_index in range(worker_lanes)
         ]
 
     if args.queued_shape == "preloaded":
@@ -1560,13 +1769,13 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
         producers_done.set()
 
         process_started = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        with ThreadPoolExecutor(max_workers=worker_lanes) as executor:
             worker_futures = submit_worker_jobs(executor)
             for future in as_completed(worker_futures):
                 worker_results.append(future.result())
         process_finished = time.perf_counter()
     else:
-        with ThreadPoolExecutor(max_workers=args.producers + args.workers) as executor:
+        with ThreadPoolExecutor(max_workers=args.producers + worker_lanes) as executor:
             worker_futures = submit_worker_jobs(executor)
 
             process_started = time.perf_counter()
@@ -1581,6 +1790,9 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
             for future in as_completed(worker_futures):
                 worker_results.append(future.result())
             process_finished = time.perf_counter()
+
+    if shared_worker_client is not None:
+        shared_worker_client.close()
 
     total_seconds = process_finished - started
     create_seconds = create_finished - create_started
@@ -1620,6 +1832,11 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
         (result["worker_capacity"] for result in worker_results),
         default=worker_capacity,
     )
+    effective_claim_prefetch = max(
+        (result.get("effective_claim_prefetch", 0) for result in worker_results),
+        default=0,
+    )
+    queue_latency_stats = latency_recorder.summary()
 
     return {
         "mode": "queued",
@@ -1631,6 +1848,7 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
         "claimed_items": process_claimed_items,
         "duplicate_completions": duplicate_completed,
         "workers": args.workers,
+        "worker_lanes": worker_lanes,
         "producers": args.producers,
         "partitions": args.partitions,
         "claim_any": args.claim_any,
@@ -1643,6 +1861,7 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
         "complete_batch": args.complete_batch,
         "complete_async_depth": args.complete_async_depth,
         "independent_many": args.independent_many,
+        "complete_independent_many": args.complete_independent_many,
         "transport": args.transport,
         "payload_bytes": args.payload_bytes,
         "result_bytes": args.result_bytes,
@@ -1665,7 +1884,22 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
         "track_duplicates": args.track_duplicates,
         "claim_partition_batch_size": args.claim_partition_batch_size,
         "claim_drain_batches": args.claim_drain_batches,
+        "claim_prefetch": getattr(args, "claim_prefetch", DBOS_QUEUE_DEFAULTS["claim_prefetch"]),
+        "effective_claim_prefetch": effective_claim_prefetch,
         "server_shards": args.server_shards,
+        "native_worker_connections": getattr(
+            args,
+            "native_worker_connections",
+            DBOS_QUEUE_DEFAULTS["native_worker_connections"],
+        ),
+        "native_lanes": getattr(args, "native_lanes", DBOS_QUEUE_DEFAULTS["native_lanes"]),
+        "native_wake_hints": getattr(
+            args,
+            "native_wake_hints",
+            DBOS_QUEUE_DEFAULTS["native_wake_hints"],
+        ),
+        "latency_sample_rate": latency_sample_rate,
+        **queue_latency_stats,
         "wake_notifications": wake_coordinator.notifications if wake_coordinator is not None else 0,
         "wake_credits": wake_coordinator.notified_jobs if wake_coordinator is not None else 0,
         "process_wake_coalesce_sleeps": process_wake_coalesce_sleeps,
@@ -1813,6 +2047,11 @@ def main() -> None:
         "--complete-async-depth", type=int, default=DBOS_QUEUE_DEFAULTS["complete_async_depth"]
     )
     parser.add_argument("--independent-many", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--complete-independent-many",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--track-duplicates", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--claim-partition-batch-size",
@@ -1820,7 +2059,25 @@ def main() -> None:
         default=DBOS_QUEUE_DEFAULTS["claim_partition_batch_size"],
     )
     parser.add_argument("--claim-drain-batches", type=int, default=1)
+    parser.add_argument("--claim-prefetch", type=int, default=DBOS_QUEUE_DEFAULTS["claim_prefetch"])
+    parser.add_argument(
+        "--native-wake-hints",
+        action=argparse.BooleanOptionalAction,
+        default=DBOS_QUEUE_DEFAULTS["native_wake_hints"],
+    )
     parser.add_argument("--server-shards", type=int, default=DBOS_QUEUE_DEFAULTS["server_shards"])
+    parser.add_argument(
+        "--native-worker-connections",
+        type=int,
+        default=DBOS_QUEUE_DEFAULTS["native_worker_connections"],
+    )
+    parser.add_argument("--native-lanes", type=int, default=DBOS_QUEUE_DEFAULTS["native_lanes"])
+    parser.add_argument(
+        "--latency-sample-rate",
+        type=int,
+        default=DBOS_QUEUE_DEFAULTS["latency_sample_rate"],
+        help="Sample every Nth created flow for create-ACK to handler-start latency; 0 disables.",
+    )
 
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
@@ -1842,8 +2099,16 @@ def main() -> None:
         parser.error("--claim-partition-batch-size must be positive")
     if args.claim_drain_batches <= 0:
         parser.error("--claim-drain-batches must be positive")
+    if args.claim_prefetch < 0:
+        parser.error("--claim-prefetch must be non-negative")
     if args.server_shards <= 0:
         parser.error("--server-shards must be positive")
+    if args.native_worker_connections <= 0:
+        parser.error("--native-worker-connections must be positive")
+    if args.native_lanes <= 0:
+        parser.error("--native-lanes must be positive")
+    if args.latency_sample_rate < 0:
+        parser.error("--latency-sample-rate must be non-negative")
     if args.create_batch_size <= 0:
         parser.error("--create-batch-size must be positive")
     if args.complete_async_depth < 0:

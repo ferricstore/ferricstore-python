@@ -1,5 +1,6 @@
 import threading
 import zlib
+from concurrent.futures import Future
 
 import pytest
 
@@ -84,6 +85,14 @@ class FakeRedis:
         if command == "FLOW.VALUE.PUT":
             return {b"ref": b"v1"}
         return record
+
+    def submit_command(self, *args):
+        future = Future()
+        try:
+            future.set_result(self.execute_command(*args))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
 
 
 class CloseRedis(FakeRedis):
@@ -1043,6 +1052,47 @@ def test_claim_jobs_can_request_compact_state_items():
         0,
         "RETURN",
         "JOBS_COMPACT_STATE",
+        "BLOCK",
+        5000,
+    )
+
+
+def test_claim_jobs_future_uses_native_submit_and_decodes_items():
+    redis = FakeRedis()
+    redis.responses.append([[b"f1", b"tenant:1", b"lease", 7]])
+    client = FlowClient(redis)
+
+    future = client.claim_jobs_future(
+        "order",
+        worker="worker-1",
+        partition_key="tenant:1",
+        limit=10,
+        block_ms=5000,
+    )
+
+    assert future.result(timeout=1.0) == [
+        ClaimedItem(
+            id="f1",
+            partition_key="tenant:1",
+            lease_token=b"lease",
+            fencing_token=7,
+        )
+    ]
+    assert redis.calls[0] == (
+        "FLOW.CLAIM_DUE",
+        "order",
+        "WORKER",
+        "worker-1",
+        "LEASE_MS",
+        30000,
+        "LIMIT",
+        10,
+        "PARTITION",
+        "tenant:1",
+        "PRIORITY",
+        0,
+        "RETURN",
+        "JOBS_COMPACT",
         "BLOCK",
         5000,
     )
