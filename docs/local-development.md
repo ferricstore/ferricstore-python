@@ -53,7 +53,7 @@ docker run --name ferricstore-dev \
 ```bash
 python examples/order_workflow.py
 python examples/queue_worker.py
-python examples/native_commands.py
+python examples/protocol_commands.py
 ```
 
 ## Run tests

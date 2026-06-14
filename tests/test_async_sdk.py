@@ -158,7 +158,7 @@ def test_async_queue_client_from_url_creates_bounded_command_and_claim_pools(mon
     assert worker.claim_client is client.claim_flow
 
 
-def test_async_queue_client_from_native_url_reuses_multiplexed_claim_client(monkeypatch):
+def test_async_queue_client_from_protocol_url_reuses_multiplexed_claim_client(monkeypatch):
     calls = []
 
     def from_url(url, **kwargs):
@@ -212,7 +212,7 @@ def test_async_queue_worker_config_at_queue_time_resizes_claim_pool(monkeypatch)
     assert worker.claim_client is calls[2][2]
 
 
-def test_async_queue_worker_config_does_not_resize_native_claim_pool(monkeypatch):
+def test_async_queue_worker_config_does_not_resize_protocol_claim_pool(monkeypatch):
     calls = []
 
     def from_url(url, **kwargs):

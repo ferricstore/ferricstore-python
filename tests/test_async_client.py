@@ -158,13 +158,74 @@ def test_async_create_honors_zero_now_ms():
     run(main())
 
 
+def test_async_start_and_step_continue_send_protocol_step_commands():
+    async def main():
+        redis = FakeAsyncRedis()
+        redis.responses.extend(
+            [
+                {
+                    b"id": b"f1",
+                    b"type": b"order",
+                    b"state": b"running",
+                    b"run_state": b"reserve_inventory",
+                    b"partition_key": b"tenant:1",
+                    b"lease_token": b"lease-1",
+                    b"fencing_token": 1,
+                },
+                {
+                    b"id": b"f1",
+                    b"type": b"order",
+                    b"state": b"running",
+                    b"run_state": b"charge_card",
+                    b"partition_key": b"tenant:1",
+                    b"lease_token": b"lease-2",
+                    b"fencing_token": 2,
+                },
+            ]
+        )
+        client = AsyncFlowClient(redis)
+
+        started = await client.start_and_claim(
+            "f1",
+            type="order",
+            initial_state="reserve_inventory",
+            worker="worker-1",
+            partition_key="tenant:1",
+            lease_ms=30_000,
+            now_ms=100,
+        )
+        continued = await client.step_continue(
+            "f1",
+            lease_token=started.lease_token,
+            from_state="reserve_inventory",
+            to_state="charge_card",
+            fencing_token=started.fencing_token,
+            partition_key="tenant:1",
+            lease_ms=45_000,
+            now_ms=101,
+        )
+
+        assert started.run_state == "reserve_inventory"
+        assert continued.run_state == "charge_card"
+        assert redis.calls[0][:2] == ("FLOW.START_AND_CLAIM", "f1")
+        assert redis.calls[1][:5] == (
+            "FLOW.STEP_CONTINUE",
+            "f1",
+            b"lease-1",
+            "reserve_inventory",
+            "charge_card",
+        )
+
+    run(main())
+
+
 def test_async_command_pipeline_is_top_level_exported():
     from ferricstore import AsyncCommandPipeline
 
     assert AsyncCommandPipeline.__name__ == "AsyncCommandPipeline"
 
 
-def test_async_command_pipeline_maps_native_redis_pipeline_errors():
+def test_async_command_pipeline_maps_protocol_redis_pipeline_errors():
     async def main():
         class ErrorPipe:
             def execute_command(self, *args):
@@ -173,12 +234,12 @@ def test_async_command_pipeline_maps_native_redis_pipeline_errors():
             async def execute(self):
                 raise RuntimeError("ERR flow already exists")
 
-        class NativeRedis:
+        class ProtocolRedis:
             def pipeline(self, transaction=False):
                 return ErrorPipe()
 
         class RedisExecutor:
-            client = NativeRedis()
+            client = ProtocolRedis()
 
             async def execute_command(self, *args):
                 return b"OK"

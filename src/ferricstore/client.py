@@ -8,6 +8,7 @@ import time
 import zlib
 from concurrent.futures import Future
 from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import Any, cast
 from urllib.parse import urlparse
 
@@ -323,19 +324,11 @@ class FlowClient:
         backpressure: BackpressurePolicy | None = None,
         **kwargs: Any,
     ) -> FlowClient:
-        if urlparse(url).scheme.lower() in {
-            "ferric",
-            "ferrics",
-            "ferric+tls",
-            "native",
-            "native+tls",
-            "ferricstore-native",
-            "ferricstore-native+tls",
-        }:
-            from ferricstore.native import NativeAdapterPool
+        if urlparse(url).scheme.lower() in {"ferric", "ferrics"}:
+            from ferricstore.protocol import ProtocolAdapterPool
 
             return cls(
-                NativeAdapterPool.from_url(url, **kwargs),
+                ProtocolAdapterPool.from_url(url, **kwargs),
                 codec=codec,
                 backpressure=backpressure,
             )
@@ -373,7 +366,7 @@ class FlowClient:
     ) -> Any:
         subscribe = getattr(self.executor, "subscribe_flow_wake", None)
         if not callable(subscribe):
-            raise RuntimeError("FLOW_WAKE subscriptions require native executor event support")
+            raise RuntimeError("FLOW_WAKE subscriptions require protocol executor event support")
         return subscribe(
             type,
             state=state,
@@ -574,6 +567,125 @@ class FlowClient:
             return_record=return_record,
         )
 
+    def start_and_claim(
+        self,
+        id: str,
+        *,
+        type: str,
+        initial_state: str,
+        worker: str,
+        lease_ms: int = 30_000,
+        payload: Any = None,
+        partition_key: str | None = None,
+        parent_flow_id: str | None = None,
+        root_flow_id: str | None = None,
+        correlation_id: str | None = None,
+        now_ms: int | None = None,
+        priority: int | None = None,
+        retention_ttl_ms: int | None = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+    ) -> FlowRecord:
+        now_ms = now_ms if now_ms is not None else _now_ms()
+        args: builtins.list[Any] = [
+            "FLOW.START_AND_CLAIM",
+            id,
+            "TYPE",
+            type,
+            "INITIAL_STATE",
+            initial_state,
+            "WORKER",
+            worker,
+            "LEASE_MS",
+            lease_ms,
+            "NOW",
+            now_ms,
+        ]
+        _append(args, "PARTITION", partition_key)
+        _append_encoded(args, "PAYLOAD", self.codec, payload)
+        _append(args, "PARENT_FLOW_ID", parent_flow_id)
+        _append(args, "ROOT_FLOW_ID", root_flow_id)
+        _append(args, "CORRELATION_ID", correlation_id)
+        _append(args, "PRIORITY", priority)
+        _append(args, "RETENTION_TTL_MS", retention_ttl_ms)
+        _append_named_values(args, self.codec, values=values, value_refs=value_refs)
+        response = self.executor.execute_command(*args)
+        return self._record_or_get(response, id, partition_key)
+
+    def run_steps_many(
+        self,
+        items: builtins.list[str | dict[str, Any] | CreateItem],
+        *,
+        type: str,
+        states: Sequence[str] | None = None,
+        steps: int | None = None,
+        worker: str,
+        lease_ms: int = 30_000,
+        now_ms: int | None = None,
+        payload: Any = None,
+        result: Any = None,
+        partition_key: str | None = None,
+        retention_ttl_ms: int | None = None,
+    ) -> bytes:
+        """Run deterministic workflow step chains in one durable Flow command.
+
+        This is the low-latency workflow-continuation path: FerricStore writes the
+        created/step/completed state and history for each item in one Ra command.
+        Use it only when the step chain is deterministic and does not need worker
+        code between individual states.
+        """
+        if not items:
+            return b"OK"
+        if (states is None) == (steps is None):
+            raise ValueError("run_steps_many requires exactly one of states or steps")
+        if states is not None and not states:
+            raise ValueError("run_steps_many states must be non-empty")
+        if steps is not None and steps <= 0:
+            raise ValueError("run_steps_many steps must be positive")
+
+        args: builtins.list[Any] = ["FLOW.RUN_STEPS_MANY", "TYPE", type]
+        if states is not None:
+            args.extend(["STATES", list(states)])
+        else:
+            args.extend(["STEPS", steps])
+        args.extend(["WORKER", worker, "LEASE_MS", lease_ms, "NOW", now_ms or _now_ms()])
+        _append_encoded(args, "PAYLOAD", self.codec, payload)
+        _append_encoded(args, "RESULT", self.codec, result)
+        _append(args, "RETENTION_TTL_MS", retention_ttl_ms)
+        args.extend(["ITEMS", self._run_steps_many_items(items, partition_key)])
+        return _flow_return(self.executor.execute_command(*args))
+
+    @staticmethod
+    def _run_steps_many_items(
+        items: builtins.list[str | dict[str, Any] | CreateItem],
+        partition_key: str | None,
+    ) -> builtins.list[dict[str, str]]:
+        normalized: builtins.list[dict[str, str]] = []
+        for item in items:
+            if isinstance(item, CreateItem):
+                id = item.id
+                item_partition = item.partition_key or partition_key
+            elif isinstance(item, dict):
+                raw_id = item.get("id")
+                if not isinstance(raw_id, str) or not raw_id:
+                    raise ValueError("run_steps_many item id must be a non-empty string")
+                id = raw_id
+                raw_partition = item.get("partition_key", partition_key)
+                if raw_partition is not None and not isinstance(raw_partition, str):
+                    raise ValueError("run_steps_many item partition_key must be a string")
+                item_partition = raw_partition
+            else:
+                if not isinstance(item, str) or not item:
+                    raise ValueError("run_steps_many item id must be a non-empty string")
+                id = item
+                item_partition = partition_key
+
+            normalized_item = {"id": id}
+            if item_partition is not None:
+                normalized_item["partition_key"] = item_partition
+            normalized.append(normalized_item)
+        return normalized
+
     def enqueue_many(
         self,
         items: builtins.list[CreateItem],
@@ -595,7 +707,7 @@ class FlowClient:
         if not items:
             return []
 
-        if partition_key is not None or any(item.partition_key is not None for item in items):
+        if partition_key is not None:
             return self.create_many(
                 partition_key,
                 items,
@@ -611,6 +723,38 @@ class FlowClient:
                 values=values,
                 value_refs=value_refs,
             )
+
+        if any(item.partition_key is not None for item in items):
+            grouped: dict[str, builtins.list[tuple[int, CreateItem]]] = {}
+            for idx, item in enumerate(items):
+                group_key = item.partition_key or _auto_partition_key_for_id(item.id)
+                grouped.setdefault(group_key, []).append((idx, item))
+
+            results: builtins.list[Any] = [None] * len(items)
+            for group_key, indexed_items in grouped.items():
+                group_items = [item for _idx, item in indexed_items]
+                response = self.create_many(
+                    group_key,
+                    group_items,
+                    type=type,
+                    state=state,
+                    run_at_ms=run_at_ms,
+                    now_ms=now_ms,
+                    priority=priority,
+                    idempotent=idempotent,
+                    independent=independent,
+                    return_ok_on_success=return_ok_on_success,
+                    retention_ttl_ms=retention_ttl_ms,
+                    values=values,
+                    value_refs=value_refs,
+                )
+                for (idx, _item), item_result in zip(
+                    indexed_items,
+                    _expand_many_response(response, len(indexed_items)),
+                    strict=False,
+                ):
+                    results[idx] = item_result
+            return results
 
         grouped: dict[str, builtins.list[tuple[int, CreateItem]]] = {}
         for idx, item in enumerate(items):
@@ -642,7 +786,7 @@ class FlowClient:
                 results[idx] = item_result
         return results
 
-    def create_many(
+    def _create_many_args(
         self,
         partition_key: str | None,
         items: builtins.list[CreateItem],
@@ -658,10 +802,7 @@ class FlowClient:
         retention_ttl_ms: int | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
-    ) -> builtins.list[FlowRecord] | Any:
-        if not items:
-            return []
-
+    ) -> builtins.list[Any]:
         now_ms = now_ms if now_ms is not None else _now_ms()
         if partition_key is not None:
             for item in items:
@@ -711,7 +852,100 @@ class FlowClient:
                     args.extend([item.id, item.partition_key, self.codec.encode(item.payload)])
                 else:
                     args.extend([item.id, self.codec.encode(item.payload)])
+        return args
+
+    def create_many(
+        self,
+        partition_key: str | None,
+        items: builtins.list[CreateItem],
+        *,
+        type: str,
+        state: str = "queued",
+        run_at_ms: int | None = None,
+        now_ms: int | None = None,
+        priority: int | None = None,
+        idempotent: bool | None = None,
+        independent: bool | None = None,
+        return_ok_on_success: bool = False,
+        retention_ttl_ms: int | None = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+    ) -> builtins.list[FlowRecord] | Any:
+        if not items:
+            return []
+
+        args = self._create_many_args(
+            partition_key,
+            items,
+            type=type,
+            state=state,
+            run_at_ms=run_at_ms,
+            now_ms=now_ms,
+            priority=priority,
+            idempotent=idempotent,
+            independent=independent,
+            return_ok_on_success=return_ok_on_success,
+            retention_ttl_ms=retention_ttl_ms,
+            values=values,
+            value_refs=value_refs,
+        )
         return self._records_or_response(self._execute_producer_write(*args))
+
+    def submit_create_many(
+        self,
+        partition_key: str | None,
+        items: builtins.list[CreateItem],
+        *,
+        type: str,
+        state: str = "queued",
+        run_at_ms: int | None = None,
+        now_ms: int | None = None,
+        priority: int | None = None,
+        idempotent: bool | None = None,
+        independent: bool | None = None,
+        return_ok_on_success: bool = False,
+        retention_ttl_ms: int | None = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+    ) -> Future[Any]:
+        future: Future[Any] = Future()
+        if not items:
+            future.set_result([])
+            return future
+
+        submit_command = getattr(self.executor, "submit_command", None)
+        if not callable(submit_command):
+            future.set_exception(RuntimeError("submit_create_many requires async executor support"))
+            return future
+
+        args = self._create_many_args(
+            partition_key,
+            items,
+            type=type,
+            state=state,
+            run_at_ms=run_at_ms,
+            now_ms=now_ms,
+            priority=priority,
+            idempotent=idempotent,
+            independent=independent,
+            return_ok_on_success=return_ok_on_success,
+            retention_ttl_ms=retention_ttl_ms,
+            values=values,
+            value_refs=value_refs,
+        )
+        source = submit_command(*args)
+
+        def complete(source_future: Future[Any]) -> None:
+            if future.cancelled():
+                return
+            try:
+                future.set_result(self._records_or_response(source_future.result()))
+            except Exception as exc:
+                mapped = map_exception(exc)
+                future.set_exception(mapped if mapped is not exc else exc)
+
+        source.add_done_callback(complete)
+        return future
 
     def value_put(
         self,
@@ -867,7 +1101,7 @@ class FlowClient:
     ) -> Future[builtins.list[FlowRecord] | builtins.list[ClaimedItem]]:
         submit_command = getattr(self.executor, "submit_command", None)
         if not callable(submit_command):
-            raise RuntimeError("claim_due_future requires native executor submit support")
+            raise RuntimeError("claim_due_future requires protocol executor submit support")
         args = self._claim_due_args(
             type,
             state=state,
@@ -976,7 +1210,7 @@ class FlowClient:
         job_only: bool,
     ) -> builtins.list[FlowRecord] | builtins.list[ClaimedItem]:
         if job_only:
-            return [ClaimedItem.from_resp(value) for value in response]
+            return ClaimedItem.from_compact_rows(response)
         return self._records(response)
 
     def claim_jobs(
@@ -1105,7 +1339,7 @@ class FlowClient:
         _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
         response = self.executor.execute_command(*args)
         if job_only:
-            return [ClaimedItem.from_resp(value) for value in response]
+            return ClaimedItem.from_compact_rows(response)
         return self._records(response)
 
     def extend_lease(
@@ -1182,6 +1416,56 @@ class FlowClient:
             return _flow_return(response)
         return self._record_or_get(response, id, partition_key)
 
+    def step_continue(
+        self,
+        id: str,
+        *,
+        lease_token: bytes,
+        from_state: str,
+        to_state: str,
+        fencing_token: int,
+        lease_ms: int = 30_000,
+        partition_key: str | None = None,
+        payload: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
+        now_ms: int | None = None,
+        worker: str | None = None,
+        return_job: bool = False,
+    ) -> FlowRecord:
+        args: builtins.list[Any] = [
+            "FLOW.STEP_CONTINUE",
+            id,
+            lease_token,
+            from_state,
+            to_state,
+            "FENCING",
+            fencing_token,
+            "LEASE_MS",
+            lease_ms,
+            "NOW",
+            now_ms if now_ms is not None else _now_ms(),
+        ]
+        _append(args, "PARTITION", partition_key)
+        _append(args, "WORKER", worker)
+        _append_encoded(args, "PAYLOAD", self.codec, payload)
+        if return_job:
+            args.extend(["RETURN", "JOBS_COMPACT"])
+        _append_named_values(
+            args,
+            self.codec,
+            values=values,
+            value_refs=value_refs,
+            drop_values=drop_values,
+            override_values=override_values,
+        )
+        response = self.executor.execute_command(*args)
+        if return_job:
+            return ClaimedItem.from_resp(response)  # type: ignore[return-value]
+        return self._record_or_get(response, id, partition_key)
+
     def complete_many(
         self,
         partition_key: str | None,
@@ -1196,6 +1480,7 @@ class FlowClient:
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
+        return_ok_on_success: bool = False,
     ) -> builtins.list[FlowRecord] | Any:
         if not items:
             return []
@@ -1209,6 +1494,8 @@ class FlowClient:
         _append(args, "TTL", ttl_ms)
         _append(args, "NOW", now_ms if now_ms is not None else _now_ms())
         _append_bool(args, "INDEPENDENT", independent)
+        if return_ok_on_success:
+            _append(args, "RETURN", "OK_ON_SUCCESS")
         _append_named_values(
             args,
             self.codec,
@@ -1229,6 +1516,7 @@ class FlowClient:
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = True,
+        return_ok_on_success: bool = False,
     ) -> builtins.list[FlowRecord] | Any:
         """Complete claimed jobs, choosing single-partition or mixed batch wire format."""
         if not jobs:
@@ -1249,7 +1537,218 @@ class FlowClient:
             ttl_ms=ttl_ms,
             now_ms=now_ms,
             independent=independent,
+            return_ok_on_success=return_ok_on_success,
         )
+
+    def _complete_jobs_args(
+        self,
+        jobs: builtins.list[ClaimedItem],
+        *,
+        result: Any = None,
+        payload: Any = None,
+        ttl_ms: int | None = None,
+        now_ms: int | None = None,
+        independent: bool | None = True,
+    ) -> builtins.list[Any]:
+        first_partition = jobs[0].partition_key
+        complete_partition_key = (
+            first_partition
+            if first_partition is not None
+            and all(job.partition_key == first_partition for job in jobs)
+            else None
+        )
+        args: builtins.list[Any] = [
+            "FLOW.COMPLETE_MANY",
+            "MIXED" if complete_partition_key is None else complete_partition_key,
+        ]
+        _append_encoded(args, "RESULT", self.codec, result)
+        _append_encoded(args, "PAYLOAD", self.codec, payload)
+        _append(args, "TTL", ttl_ms)
+        _append(args, "NOW", now_ms if now_ms is not None else _now_ms())
+        _append_bool(args, "INDEPENDENT", independent)
+        _append_bool(args, "TERMINAL_LOCAL_ONLY", True)
+        self._append_claimed_items(args, complete_partition_key, jobs, "FLOW.COMPLETE_MANY")
+        return args
+
+    def complete_jobs_and_claim_jobs(
+        self,
+        jobs: builtins.list[ClaimedItem],
+        *,
+        result: Any = None,
+        payload: Any = None,
+        ttl_ms: int | None = None,
+        now_ms: int | None = None,
+        independent: bool | None = True,
+        type: str,
+        state: str | None = None,
+        states: builtins.list[str] | None = None,
+        worker: str,
+        partition_key: str | None = None,
+        partition_keys: builtins.list[str] | None = None,
+        lease_ms: int = 30_000,
+        limit: int = 100,
+        priority: int | None = 0,
+        claim_now_ms: int | None = None,
+        block_ms: int | None = None,
+        reclaim_expired: bool | None = None,
+        reclaim_ratio: int | None = None,
+        include_state: bool = False,
+    ) -> builtins.list[ClaimedItem]:
+        """Complete claimed jobs and claim more jobs in one transport round trip."""
+        if not jobs:
+            return self.claim_jobs(
+                type,
+                state=state,
+                states=states,
+                worker=worker,
+                partition_key=partition_key,
+                partition_keys=partition_keys,
+                lease_ms=lease_ms,
+                limit=limit,
+                priority=priority,
+                now_ms=claim_now_ms,
+                block_ms=block_ms,
+                reclaim_expired=reclaim_expired,
+                reclaim_ratio=reclaim_ratio,
+                include_state=include_state,
+            )
+
+        complete_args = self._complete_jobs_args(
+            jobs,
+            result=result,
+            payload=payload,
+            ttl_ms=ttl_ms,
+            now_ms=now_ms,
+            independent=independent,
+        )
+        claim_args = self._claim_due_args(
+            type,
+            state=state,
+            states=states,
+            worker=worker,
+            partition_key=partition_key,
+            partition_keys=partition_keys,
+            lease_ms=lease_ms,
+            limit=limit,
+            priority=priority,
+            now_ms=claim_now_ms,
+            block_ms=block_ms,
+            reclaim_expired=reclaim_expired,
+            reclaim_ratio=reclaim_ratio,
+            job_only=True,
+            include_state=include_state,
+        )
+        complete_response, claim_response = self._execute_command_batch(
+            [tuple(complete_args), tuple(claim_args)]
+        )
+        self._records_or_response(complete_response)
+        return cast(
+            builtins.list[ClaimedItem],
+            self._decode_claim_due_response(claim_response, True),
+        )
+
+    def submit_complete_jobs_and_claim_jobs(
+        self,
+        jobs: builtins.list[ClaimedItem],
+        *,
+        result: Any = None,
+        payload: Any = None,
+        ttl_ms: int | None = None,
+        now_ms: int | None = None,
+        independent: bool | None = True,
+        type: str,
+        state: str | None = None,
+        states: builtins.list[str] | None = None,
+        worker: str,
+        partition_key: str | None = None,
+        partition_keys: builtins.list[str] | None = None,
+        lease_ms: int = 30_000,
+        limit: int = 100,
+        priority: int | None = 0,
+        claim_now_ms: int | None = None,
+        block_ms: int | None = None,
+        reclaim_expired: bool | None = None,
+        reclaim_ratio: int | None = None,
+        include_state: bool = False,
+    ) -> tuple[Future[int], Future[builtins.list[ClaimedItem]]] | None:
+        submit_commands = getattr(self.executor, "submit_commands", None)
+        if not callable(submit_commands) or not jobs:
+            return None
+
+        complete_args = self._complete_jobs_args(
+            jobs,
+            result=result,
+            payload=payload,
+            ttl_ms=ttl_ms,
+            now_ms=now_ms,
+            independent=independent,
+        )
+        claim_args = self._claim_due_args(
+            type,
+            state=state,
+            states=states,
+            worker=worker,
+            partition_key=partition_key,
+            partition_keys=partition_keys,
+            lease_ms=lease_ms,
+            limit=limit,
+            priority=priority,
+            now_ms=claim_now_ms,
+            block_ms=block_ms,
+            reclaim_expired=reclaim_expired,
+            reclaim_ratio=reclaim_ratio,
+            job_only=True,
+            include_state=include_state,
+        )
+        source_complete, source_claim = submit_commands([tuple(complete_args), tuple(claim_args)])
+        complete_future: Future[int] = Future()
+        claim_future: Future[builtins.list[ClaimedItem]] = Future()
+
+        def complete_done(source: Future[Any]) -> None:
+            if complete_future.cancelled():
+                return
+            try:
+                self._records_or_response(source.result())
+                complete_future.set_result(len(jobs))
+            except Exception as exc:
+                mapped = map_exception(exc)
+                if not complete_future.cancelled():
+                    complete_future.set_exception(mapped if mapped is not exc else exc)
+
+        def claim_done(source: Future[Any]) -> None:
+            if claim_future.cancelled():
+                return
+            try:
+                claim_future.set_result(
+                    cast(
+                        builtins.list[ClaimedItem],
+                        self._decode_claim_due_response(source.result(), True),
+                    )
+                )
+            except Exception as exc:
+                mapped = map_exception(exc)
+                if not claim_future.cancelled():
+                    claim_future.set_exception(mapped if mapped is not exc else exc)
+
+        source_complete.add_done_callback(complete_done)
+        source_claim.add_done_callback(claim_done)
+        return complete_future, claim_future
+
+    def _execute_command_batch(self, commands: builtins.list[tuple[Any, ...]]) -> builtins.list[Any]:
+        execute_batch = getattr(self.executor, "execute_batch", None)
+        if callable(execute_batch):
+            try:
+                return list(execute_batch(commands))
+            except Exception as exc:
+                mapped = map_exception(exc)
+                if mapped is exc:
+                    raise
+                raise mapped from exc
+
+        with self.pipeline() as pipe:
+            for command in commands:
+                pipe.command(*command)
+            return pipe.execute()
 
     def complete(
         self,

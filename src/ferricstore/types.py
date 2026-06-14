@@ -121,9 +121,10 @@ class WorkerConfig:
     claim_partition_batch_size: int | None = 1
     claim_drain_batches: int | None = None
     claim_prefetch: int | None = None
-    native_wake_hints: bool | None = None
+    protocol_wake_hints: bool | None = None
     scan_before_blocking: bool | None = None
     complete_async_depth: int | None = None
+    fuse_complete_claim: bool | None = None
     apply_async_depth: int | None = 0
     server_shards: int | None = None
     producer_loop_thread: bool | None = None
@@ -213,11 +214,38 @@ class ClaimedItem:
     @classmethod
     def from_resp(cls, value: dict[Any, Any] | list[Any] | tuple[Any, ...]) -> ClaimedItem:
         if isinstance(value, (list, tuple)):
+            raw_id = value[0]
+            raw_partition = value[1]
+            raw_lease = value[2]
+            raw_fencing = value[3]
+            if raw_id is None:
+                id_value = ""
+            elif isinstance(raw_id, bytes):
+                id_value = raw_id.decode()
+            else:
+                id_value = str(raw_id)
+
+            if raw_partition is None or raw_partition == b"" or raw_partition == "":
+                partition_key = None
+            elif isinstance(raw_partition, bytes):
+                partition_key = raw_partition.decode()
+            else:
+                partition_key = str(raw_partition)
+
+            if isinstance(raw_lease, bytes):
+                lease_token = raw_lease
+            elif raw_lease is None:
+                lease_token = b""
+            else:
+                lease_token = str(raw_lease).encode()
+
+            fencing_token = raw_fencing if isinstance(raw_fencing, int) else int(raw_fencing)
+
             return cls(
-                id=_str(value[0]),
-                partition_key=_optional_str(value[1]),
-                lease_token=_bytes(value[2]),
-                fencing_token=_int(value[3]),
+                id=id_value,
+                partition_key=partition_key,
+                lease_token=lease_token,
+                fencing_token=fencing_token,
                 run_state=_optional_str(value[4]) if len(value) > 4 else None,
             )
 
@@ -231,6 +259,54 @@ class ClaimedItem:
             run_state=_optional_str(_get(value, "run_state")),
             payload=_get(value, "payload"),
         )
+
+    @classmethod
+    def from_compact_rows(cls, values: list[Any]) -> list[ClaimedItem]:
+        items: list[ClaimedItem] = []
+        append = items.append
+
+        for value in values:
+            if not isinstance(value, (list, tuple)):
+                append(cls.from_resp(value))
+                continue
+
+            raw_id = value[0]
+            raw_partition = value[1]
+            raw_lease = value[2]
+            raw_fencing = value[3]
+
+            if raw_id is None:
+                id_value = ""
+            elif isinstance(raw_id, bytes):
+                id_value = raw_id.decode()
+            else:
+                id_value = str(raw_id)
+
+            if raw_partition is None or raw_partition == b"" or raw_partition == "":
+                partition_key = None
+            elif isinstance(raw_partition, bytes):
+                partition_key = raw_partition.decode()
+            else:
+                partition_key = str(raw_partition)
+
+            if isinstance(raw_lease, bytes):
+                lease_token = raw_lease
+            elif raw_lease is None:
+                lease_token = b""
+            else:
+                lease_token = str(raw_lease).encode()
+
+            append(
+                cls(
+                    id=id_value,
+                    partition_key=partition_key,
+                    lease_token=lease_token,
+                    fencing_token=raw_fencing if isinstance(raw_fencing, int) else int(raw_fencing),
+                    run_state=_optional_str(value[4]) if len(value) > 4 else None,
+                )
+            )
+
+        return items
 
 
 @dataclass(frozen=True, slots=True)

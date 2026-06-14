@@ -183,10 +183,10 @@ def test_real_ferricstore_command_and_flow_cycle() -> None:
         client.close()
 
 
-def test_real_ferricstore_native_helpers_and_diagnostics() -> None:
+def test_real_ferricstore_protocol_helpers_and_diagnostics() -> None:
     client = _client()
     suffix = _suffix()
-    prefix = f"py-sdk:native:{suffix}:"
+    prefix = f"py-sdk:protocol:{suffix}:"
     key = f"{prefix}cas"
     lock_key = f"{prefix}lock"
     rate_key = f"{prefix}rate"

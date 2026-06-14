@@ -95,6 +95,33 @@ class FakeRedis:
         return future
 
 
+class FakeBatchRedis(FakeRedis):
+    def __init__(self):
+        super().__init__()
+        self.batches = []
+
+    def execute_batch(self, commands):
+        self.batches.append(list(commands))
+        return [
+            [b"OK"],
+            [[b"f2", b"tenant:1", b"lease-2", 8]],
+        ]
+
+
+class FakeSubmitCommandsRedis(FakeRedis):
+    def __init__(self):
+        super().__init__()
+        self.submitted = []
+
+    def submit_commands(self, commands):
+        self.submitted.append(list(commands))
+        complete = Future()
+        claim = Future()
+        complete.set_result([b"OK"])
+        claim.set_result([[b"f2", b"tenant:1", b"lease-2", 8]])
+        return [complete, claim]
+
+
 class CloseRedis(FakeRedis):
     def __init__(self):
         super().__init__()
@@ -533,6 +560,77 @@ def test_enqueue_many_groups_no_partition_items_by_auto_bucket():
             assert bucket == f"__flow_auto__:{zlib.crc32(id.encode()) % 256}"
 
 
+def test_enqueue_many_groups_per_item_partition_keys_without_mixed_frame():
+    redis = PerItemAckRedis()
+    client = FlowClient(redis)
+    items = [
+        CreateItem("flow-0", b"payload", partition_key="tenant:a"),
+        CreateItem("flow-1", b"payload", partition_key="tenant:b"),
+        CreateItem("flow-2", b"payload", partition_key="tenant:a"),
+        CreateItem("flow-3", b"payload"),
+    ]
+
+    results = client.enqueue_many(items, type="order", now_ms=100)
+
+    assert results == [b"OK"] * len(items)
+    assert len(redis.calls) == 3
+    partitions = [call[1] for call in redis.calls]
+    assert "MIXED" not in partitions
+    assert "tenant:a" in partitions
+    assert "tenant:b" in partitions
+    assert f"__flow_auto__:{zlib.crc32(b'flow-3') % 256}" in partitions
+
+    by_partition = {call[1]: call for call in redis.calls}
+    tenant_a_items = by_partition["tenant:a"][by_partition["tenant:a"].index("ITEMS") + 1 :]
+    assert tenant_a_items[0::2] == ("flow-0", "flow-2")
+
+
+def test_submit_create_many_uses_executor_submit_command():
+    class SubmitExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def submit_command(self, *args):
+            self.calls.append(args)
+            future = Future()
+            future.set_result(b"OK")
+            return future
+
+    executor = SubmitExecutor()
+    client = FlowClient(executor)
+    future = client.submit_create_many(
+        "__flow_auto__:1",
+        [CreateItem("flow-1", b"payload")],
+        type="order",
+        now_ms=100,
+        return_ok_on_success=True,
+        independent=True,
+    )
+
+    assert future.result() == b"OK"
+    assert executor.calls == [
+        (
+            "FLOW.CREATE_MANY",
+            "__flow_auto__:1",
+            "TYPE",
+            "order",
+            "STATE",
+            "queued",
+            "NOW",
+            100,
+            "RUN_AT",
+            100,
+            "INDEPENDENT",
+            "true",
+            "RETURN",
+            "OK_ON_SUCCESS",
+            "ITEMS",
+            "flow-1",
+            b"payload",
+        )
+    ]
+
+
 def test_enqueue_many_passes_retention_ttl_ms_to_auto_bucket_batches():
     redis = PerItemAckRedis()
     client = FlowClient(redis)
@@ -834,6 +932,23 @@ def test_complete_many_can_attach_named_values_and_refs():
     assert call.index("VALUE") < call.index("ITEMS")
 
 
+def test_complete_many_can_return_ok_on_success():
+    redis = PerItemAckRedis()
+    client = FlowClient(redis)
+
+    result = client.complete_many(
+        "tenant:1",
+        [ClaimedItem(id="f1", lease_token=b"lease", fencing_token=7)],
+        now_ms=100,
+        independent=True,
+        return_ok_on_success=True,
+    )
+
+    assert result == [b"OK"]
+    assert "RETURN" in redis.calls[0]
+    assert "OK_ON_SUCCESS" in redis.calls[0]
+
+
 def test_claim_due_rejects_state_and_states_together():
     redis = FakeRedis()
     client = FlowClient(redis)
@@ -976,6 +1091,85 @@ def test_transition_and_terminal_commands_can_mutate_named_values():
     )
 
 
+def test_run_steps_many_sends_fused_deterministic_step_command():
+    redis = AckRedis()
+    client = FlowClient(redis)
+
+    result = client.run_steps_many(
+        [
+            "f1",
+            {"id": "f2", "partition_key": "tenant:2"},
+            CreateItem("f3", partition_key="tenant:3"),
+        ],
+        type="order",
+        states=["reserve", "charge", "email"],
+        worker="worker-1",
+        lease_ms=45_000,
+        now_ms=123,
+        payload=b"payload",
+        result=b"ok",
+        partition_key="tenant:1",
+        retention_ttl_ms=60_000,
+    )
+
+    assert result == b"OK"
+    assert redis.calls[0] == (
+        "FLOW.RUN_STEPS_MANY",
+        "TYPE",
+        "order",
+        "STATES",
+        ["reserve", "charge", "email"],
+        "WORKER",
+        "worker-1",
+        "LEASE_MS",
+        45_000,
+        "NOW",
+        123,
+        "PAYLOAD",
+        b"payload",
+        "RESULT",
+        b"ok",
+        "RETENTION_TTL_MS",
+        60_000,
+        "ITEMS",
+        [
+            {"id": "f1", "partition_key": "tenant:1"},
+            {"id": "f2", "partition_key": "tenant:2"},
+            {"id": "f3", "partition_key": "tenant:3"},
+        ],
+    )
+
+
+def test_run_steps_many_can_use_step_count_and_rejects_ambiguous_state_shape():
+    redis = AckRedis()
+    client = FlowClient(redis)
+
+    assert client.run_steps_many(["f1"], type="order", steps=3, worker="worker-1", now_ms=123)
+    assert redis.calls[0] == (
+        "FLOW.RUN_STEPS_MANY",
+        "TYPE",
+        "order",
+        "STEPS",
+        3,
+        "WORKER",
+        "worker-1",
+        "LEASE_MS",
+        30_000,
+        "NOW",
+        123,
+        "ITEMS",
+        [{"id": "f1"}],
+    )
+
+    with pytest.raises(ValueError, match="exactly one"):
+        client.run_steps_many(["f1"], type="order", worker="worker-1")
+
+    with pytest.raises(ValueError, match="exactly one"):
+        client.run_steps_many(
+            ["f1"], type="order", states=["reserve"], steps=1, worker="worker-1"
+        )
+
+
 def test_claim_due_can_return_job_only_items():
     redis = FakeRedis()
     client = FlowClient(redis)
@@ -1057,7 +1251,7 @@ def test_claim_jobs_can_request_compact_state_items():
     )
 
 
-def test_claim_jobs_future_uses_native_submit_and_decodes_items():
+def test_claim_jobs_future_uses_protocol_submit_and_decodes_items():
     redis = FakeRedis()
     redis.responses.append([[b"f1", b"tenant:1", b"lease", 7]])
     client = FlowClient(redis)
@@ -1202,7 +1396,7 @@ def test_claim_jobs_and_complete_jobs_hide_hot_path_options():
         limit=10,
         now_ms=100,
     )
-    result = client.complete_jobs(jobs, now_ms=200)
+    result = client.complete_jobs(jobs, now_ms=200, return_ok_on_success=True)
 
     assert isinstance(jobs[0], ClaimedItem)
     assert result == [b"OK"]
@@ -1233,11 +1427,114 @@ def test_claim_jobs_and_complete_jobs_hide_hot_path_options():
         200,
         "INDEPENDENT",
         "true",
+        "RETURN",
+        "OK_ON_SUCCESS",
         "ITEMS",
         "f1",
         b"lease",
         7,
     )
+
+
+def test_complete_jobs_and_claim_jobs_batches_ack_then_next_claim():
+    redis = FakeBatchRedis()
+    client = FlowClient(redis)
+
+    next_jobs = client.complete_jobs_and_claim_jobs(
+        [ClaimedItem("f1", b"lease-1", 7, partition_key="tenant:1")],
+        result=b"ok",
+        now_ms=200,
+        type="order",
+        state="queued",
+        worker="worker-1",
+        partition_key="tenant:1",
+        lease_ms=10_000,
+        limit=50,
+        priority=0,
+        block_ms=5,
+    )
+
+    assert next_jobs == [
+        ClaimedItem(
+            id="f2",
+            partition_key="tenant:1",
+            lease_token=b"lease-2",
+            fencing_token=8,
+        )
+    ]
+    assert redis.calls == []
+    assert redis.batches == [
+        [
+                (
+                    "FLOW.COMPLETE_MANY",
+                    "tenant:1",
+                    "RESULT",
+                    b"ok",
+                    "NOW",
+                    200,
+                    "INDEPENDENT",
+                    "true",
+                    "TERMINAL_LOCAL_ONLY",
+                    "true",
+                    "ITEMS",
+                    "f1",
+                    b"lease-1",
+                    7,
+                ),
+            (
+                "FLOW.CLAIM_DUE",
+                "order",
+                "STATE",
+                "queued",
+                "WORKER",
+                "worker-1",
+                "LEASE_MS",
+                10000,
+                "LIMIT",
+                50,
+                "PARTITION",
+                "tenant:1",
+                "PRIORITY",
+                0,
+                "RETURN",
+                "JOBS_COMPACT",
+                "BLOCK",
+                5,
+            ),
+        ]
+    ]
+
+
+def test_submit_complete_jobs_and_claim_jobs_returns_independent_futures():
+    redis = FakeSubmitCommandsRedis()
+    client = FlowClient(redis)
+
+    submitted = client.submit_complete_jobs_and_claim_jobs(
+        [ClaimedItem("f1", b"lease-1", 7, partition_key="tenant:1")],
+        result=b"ok",
+        now_ms=200,
+        type="order",
+        state="queued",
+        worker="worker-1",
+        partition_key="tenant:1",
+        lease_ms=10_000,
+        limit=50,
+        priority=0,
+    )
+
+    assert submitted is not None
+    complete_future, claim_future = submitted
+    assert complete_future.result(timeout=1.0) == 1
+    assert claim_future.result(timeout=1.0) == [
+        ClaimedItem(
+            id="f2",
+            partition_key="tenant:1",
+            lease_token=b"lease-2",
+            fencing_token=8,
+        )
+    ]
+    assert redis.submitted[0][0][0] == "FLOW.COMPLETE_MANY"
+    assert redis.submitted[0][1][0] == "FLOW.CLAIM_DUE"
 
 
 def test_reclaim_exposes_claim_due_response_options_and_partitions():
@@ -2133,8 +2430,8 @@ def test_query_policy_and_cleanup_commands():
     assert client.retention_cleanup(limit=100, now_ms=123) == {b"ok": 1}
 
 
-def test_native_ferricstore_commands_are_first_class():
-    class NativeRedis(FakeRedis):
+def test_protocol_ferricstore_commands_are_first_class():
+    class ProtocolRedis(FakeRedis):
         def execute_command(self, *args):
             self.calls.append(args)
             command = args[0]
@@ -2182,7 +2479,7 @@ def test_native_ferricstore_commands_are_first_class():
                 return [b"ops", b"10", b"latency_ms", b"2"]
             return b"OK"
 
-    redis = NativeRedis()
+    redis = ProtocolRedis()
     client = FlowClient(redis)
 
     assert client.cas("k", b"old", b"new", ex=10) is True
@@ -2258,7 +2555,7 @@ def test_command_pipeline_context_executes_on_success():
     assert redis.calls[-2:] == [("GET", "k"), ("HSET", "h", "f", "v")]
 
 
-def test_command_pipeline_maps_native_redis_pipeline_errors():
+def test_command_pipeline_maps_protocol_redis_pipeline_errors():
     class ErrorPipe:
         def execute_command(self, *args):
             return self
@@ -2266,12 +2563,12 @@ def test_command_pipeline_maps_native_redis_pipeline_errors():
         def execute(self):
             raise RuntimeError("ERR flow already exists")
 
-    class NativeRedis:
+    class ProtocolRedis:
         def pipeline(self, transaction=False):
             return ErrorPipe()
 
     class RedisExecutor:
-        client = NativeRedis()
+        client = ProtocolRedis()
 
         def execute_command(self, *args):
             return b"OK"
@@ -2304,6 +2601,35 @@ def test_stale_lease_errors_are_typed():
 
     with pytest.raises(StaleLeaseError):
         client.complete("f1", lease_token=b"old", fencing_token=1, return_record=False)
+
+
+def test_claimed_item_decodes_compact_rows_without_resp_dict():
+    rows = [
+        [b"flow-1", b"tenant-1", b"lease-1", 7],
+        [b"flow-2", None, b"lease-2", 8, b"running:step"],
+    ]
+
+    items = ClaimedItem.from_compact_rows(rows)
+
+    assert items == [
+        ClaimedItem("flow-1", b"lease-1", 7, partition_key="tenant-1"),
+        ClaimedItem("flow-2", b"lease-2", 8, run_state="running:step"),
+    ]
+
+
+def test_claimed_item_compact_rows_fallback_to_resp_maps():
+    items = ClaimedItem.from_compact_rows(
+        [
+            {
+                b"id": b"flow-1",
+                b"lease_token": b"lease-1",
+                b"fencing_token": 7,
+                b"partition_key": b"tenant-1",
+            }
+        ]
+    )
+
+    assert items == [ClaimedItem("flow-1", b"lease-1", 7, partition_key="tenant-1")]
 
 
 def test_install_policy_still_builds_state_policy():

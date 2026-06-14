@@ -237,7 +237,9 @@ backpressure behavior, graceful shutdown, and value hydration caps.
 - `examples/queue_worker.py`: queue producer and worker.
 - `examples/async_queue_worker.py`: async queue producer and worker.
 - `examples/state_machine_workflow.py`: explicit workflow runner.
-- `examples/native_commands.py`: Redis/FerricStore command helpers.
+- `examples/protocol_commands.py`: Redis/FerricStore command helpers.
+- `examples/protocol_kv_benchmark.py`: protocol SET/GET benchmark.
+- `examples/protocol_dbos_benchmark.py`: protocol DBOS-style queued workflow benchmark.
 - `examples/dbos_style_benchmark.py`: DBOS-style throughput benchmark.
 
 ## Contributing

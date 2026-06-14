@@ -202,6 +202,27 @@ class WorkflowFlowCommands:
             **kwargs,
         )
 
+    def start_and_claim(
+        self,
+        id: str,
+        *,
+        type: str | None = None,
+        initial_state: str | None = None,
+        worker: str,
+        payload: Any = None,
+        partition_key: str | None | object = _CURRENT_PARTITION,
+        **kwargs: Any,
+    ) -> FlowRecord:
+        return self.client.start_and_claim(
+            id,
+            type=self._type(type),
+            initial_state=initial_state or self._state(type, None),
+            worker=worker,
+            payload=payload,
+            partition_key=self._partition(partition_key),
+            **kwargs,
+        )
+
     def create_many(
         self,
         items: builtins.list[CreateItem],
@@ -232,6 +253,31 @@ class WorkflowFlowCommands:
             items,
             type=self._type(type),
             state=self._state(type, state),
+            partition_key=self._partition(partition_key),
+            **kwargs,
+        )
+
+    def run_steps_many(
+        self,
+        items: builtins.list[str | dict[str, Any] | CreateItem],
+        *,
+        type: str | None = None,
+        states: Sequence[str] | None = None,
+        steps: int | None = None,
+        worker: str,
+        payload: Any = None,
+        result: Any = None,
+        partition_key: str | None | object = _CURRENT_PARTITION,
+        **kwargs: Any,
+    ) -> bytes:
+        return self.client.run_steps_many(
+            items,
+            type=self._type(type),
+            states=states,
+            steps=steps,
+            worker=worker,
+            payload=payload,
+            result=result,
             partition_key=self._partition(partition_key),
             **kwargs,
         )
@@ -291,6 +337,27 @@ class WorkflowFlowCommands:
             fencing_token=self._ctx.fencing_token if fencing_token is None else fencing_token,
             partition_key=self._partition(partition_key),
             return_record=return_record,
+            **kwargs,
+        )
+
+    def step_continue(
+        self,
+        to_state: str,
+        *,
+        id: str | None = None,
+        from_state: str | None = None,
+        lease_token: bytes | None = None,
+        fencing_token: int | None = None,
+        partition_key: str | None | object = _CURRENT_PARTITION,
+        **kwargs: Any,
+    ) -> FlowRecord:
+        return self.client.step_continue(
+            id or self._ctx.id,
+            lease_token=lease_token or self._ctx.lease_token,
+            from_state=from_state or self._ctx.state,
+            to_state=to_state,
+            fencing_token=self._ctx.fencing_token if fencing_token is None else fencing_token,
+            partition_key=self._partition(partition_key),
             **kwargs,
         )
 
@@ -830,6 +897,28 @@ class Workflow:
             **attrs,
         )
 
+    def start_and_claim(
+        self,
+        id: str,
+        *,
+        worker: str,
+        payload: Any = None,
+        initial_state: str | None = None,
+        **attrs: Any,
+    ) -> FlowRecord:
+        partition_key = attrs.pop("partition_key", None) or self.partition_key(attrs)
+        for name in self.partition_by:
+            attrs.pop(name, None)
+        return self.client.start_and_claim(
+            id,
+            type=self.type,
+            initial_state=initial_state or self.initial_state,
+            worker=worker,
+            payload=payload,
+            partition_key=partition_key,
+            **attrs,
+        )
+
     def create_many(
         self,
         partition_key: str | None,
@@ -841,6 +930,32 @@ class Workflow:
             items,
             type=self.type,
             state=attrs.pop("state", self.initial_state),
+            **attrs,
+        )
+
+    def run_steps_many(
+        self,
+        items: builtins.list[str | dict[str, Any] | CreateItem],
+        *,
+        states: Sequence[str] | None = None,
+        steps: int | None = None,
+        worker: str,
+        payload: Any = None,
+        result: Any = None,
+        **attrs: Any,
+    ) -> bytes:
+        partition_key = attrs.pop("partition_key", None) or self.partition_key(attrs)
+        for name in self.partition_by:
+            attrs.pop(name, None)
+        return self.client.run_steps_many(
+            items,
+            type=self.type,
+            states=states,
+            steps=steps,
+            worker=worker,
+            payload=payload,
+            result=result,
+            partition_key=partition_key,
             **attrs,
         )
 

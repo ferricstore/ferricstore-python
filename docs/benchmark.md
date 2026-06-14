@@ -19,6 +19,45 @@ worker/producers/connections
 
 Use fresh data directories for apples-to-apples comparisons.
 
+## Protocol transport benchmarks
+
+SET/GET over the FerricStore protocol transport:
+
+```bash
+python examples/protocol_kv_benchmark.py \
+  --url ferric://127.0.0.1:6388 \
+  --preset set-throughput
+```
+
+```bash
+python examples/protocol_kv_benchmark.py \
+  --url ferric://127.0.0.1:6388 \
+  --preset get-throughput
+```
+
+Lower-latency GET/SET shapes:
+
+```bash
+python examples/protocol_kv_benchmark.py \
+  --url ferric://127.0.0.1:6388 \
+  --preset get-low-latency
+```
+
+```bash
+python examples/protocol_kv_benchmark.py \
+  --url ferric://127.0.0.1:6388 \
+  --preset set-latency
+```
+
+DBOS-style queued workflow benchmark over the protocol transport:
+
+```bash
+python examples/protocol_dbos_benchmark.py \
+  --url ferric://127.0.0.1:6388 \
+  --flows 1000000 \
+  --server-shards 16
+```
+
 Canonical high-throughput local queue run:
 
 ```bash

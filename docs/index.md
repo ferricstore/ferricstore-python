@@ -119,4 +119,4 @@ Before using the SDK in production:
 
 See [Production Readiness](production.md) for the full checklist.
 
-- [Native transport](native.md)
+- [FerricStore protocol transport](protocol.md)

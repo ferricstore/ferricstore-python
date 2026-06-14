@@ -131,19 +131,11 @@ class AsyncFlowClient:
         backpressure: BackpressurePolicy | None = None,
         **kwargs: Any,
     ) -> AsyncFlowClient:
-        if urlparse(url).scheme.lower() in {
-            "ferric",
-            "ferrics",
-            "ferric+tls",
-            "native",
-            "native+tls",
-            "ferricstore-native",
-            "ferricstore-native+tls",
-        }:
-            from ferricstore.native import AsyncNativeAdapterPool
+        if urlparse(url).scheme.lower() in {"ferric", "ferrics"}:
+            from ferricstore.protocol import AsyncProtocolAdapterPool
 
             return cls(
-                AsyncNativeAdapterPool.from_url(url, **kwargs),
+                AsyncProtocolAdapterPool.from_url(url, **kwargs),
                 codec=codec,
                 backpressure=backpressure,
             )
@@ -350,6 +342,51 @@ class AsyncFlowClient:
             value_refs=value_refs,
             return_record=return_record,
         )
+
+    async def start_and_claim(
+        self,
+        id: str,
+        *,
+        type: str,
+        initial_state: str,
+        worker: str,
+        lease_ms: int = 30_000,
+        payload: Any = None,
+        partition_key: str | None = None,
+        parent_flow_id: str | None = None,
+        root_flow_id: str | None = None,
+        correlation_id: str | None = None,
+        now_ms: int | None = None,
+        priority: int | None = None,
+        retention_ttl_ms: int | None = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+    ) -> FlowRecord:
+        now_ms = now_ms if now_ms is not None else _now_ms()
+        args: builtins.list[Any] = [
+            "FLOW.START_AND_CLAIM",
+            id,
+            "TYPE",
+            type,
+            "INITIAL_STATE",
+            initial_state,
+            "WORKER",
+            worker,
+            "LEASE_MS",
+            lease_ms,
+            "NOW",
+            now_ms,
+        ]
+        _append(args, "PARTITION", partition_key)
+        _append_encoded(args, "PAYLOAD", self.codec, payload)
+        _append(args, "PARENT_FLOW_ID", parent_flow_id)
+        _append(args, "ROOT_FLOW_ID", root_flow_id)
+        _append(args, "CORRELATION_ID", correlation_id)
+        _append(args, "PRIORITY", priority)
+        _append(args, "RETENTION_TTL_MS", retention_ttl_ms)
+        _append_named_values(args, self.codec, values=values, value_refs=value_refs)
+        response = await self.executor.execute_command(*args)
+        return await self._record_or_get(response, id, partition_key)
 
     async def enqueue_many(
         self,
@@ -637,7 +674,7 @@ class AsyncFlowClient:
         _append(args, "RECLAIM_RATIO", reclaim_ratio)
         response = await self.executor.execute_command(*args)
         if job_only:
-            return [ClaimedItem.from_resp(value) for value in response]
+            return ClaimedItem.from_compact_rows(response)
         return self._records(response)
 
     async def claim_jobs(
@@ -726,7 +763,7 @@ class AsyncFlowClient:
         _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
         response = await self.executor.execute_command(*args)
         if job_only:
-            return [ClaimedItem.from_resp(value) for value in response]
+            return ClaimedItem.from_compact_rows(response)
         return self._records(response)
 
     async def extend_lease(
@@ -801,6 +838,51 @@ class AsyncFlowClient:
         response = await self.executor.execute_command(*args)
         if not return_record:
             return _flow_return(response)
+        return await self._record_or_get(response, id, partition_key)
+
+    async def step_continue(
+        self,
+        id: str,
+        *,
+        lease_token: bytes,
+        from_state: str,
+        to_state: str,
+        fencing_token: int,
+        lease_ms: int = 30_000,
+        partition_key: str | None = None,
+        payload: Any = None,
+        values: dict[str, Any] | None = None,
+        value_refs: dict[str, str] | None = None,
+        drop_values: builtins.list[str] | None = None,
+        override_values: builtins.list[str] | None = None,
+        now_ms: int | None = None,
+        worker: str | None = None,
+    ) -> FlowRecord:
+        args: builtins.list[Any] = [
+            "FLOW.STEP_CONTINUE",
+            id,
+            lease_token,
+            from_state,
+            to_state,
+            "FENCING",
+            fencing_token,
+            "LEASE_MS",
+            lease_ms,
+            "NOW",
+            now_ms if now_ms is not None else _now_ms(),
+        ]
+        _append(args, "PARTITION", partition_key)
+        _append(args, "WORKER", worker)
+        _append_encoded(args, "PAYLOAD", self.codec, payload)
+        _append_named_values(
+            args,
+            self.codec,
+            values=values,
+            value_refs=value_refs,
+            drop_values=drop_values,
+            override_values=override_values,
+        )
+        response = await self.executor.execute_command(*args)
         return await self._record_or_get(response, id, partition_key)
 
     async def complete_many(

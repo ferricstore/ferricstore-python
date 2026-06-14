@@ -3,7 +3,7 @@
 This guide covers the public Python SDK surface and when to use each layer.
 
 FerricStore speaks Redis-compatible RESP. The SDK gives typed helpers for
-FerricFlow and FerricStore-native commands, while still letting you call any
+FerricFlow and FerricStore protocol commands, while still letting you call any
 normal Redis command through one passthrough method.
 
 If you are new, start with [Quickstart](quickstart.md). If you need
@@ -20,7 +20,7 @@ approval, webhooks, or batch fanout, read [Use Case Examples](use-cases.md).
 | Async high-level queues | `AsyncQueueClient` |
 | Low-level Flow commands | `FlowClient` |
 | Queue/workflow support types | `CreateItem`, `ClaimedItem`, `FencedItem`, `ChildSpec`, `RetryPolicy`, `WorkerConfig`, `ValueConfig`, `ExceptionPolicy`, `FlowRecord` |
-| Native FerricStore commands | `cas`, `lock`, `ratelimit_add`, `fetch_or_compute`, `key_info`, cluster/admin helpers |
+| Protocol FerricStore commands | `cas`, `lock`, `ratelimit_add`, `fetch_or_compute`, `key_info`, cluster/admin helpers |
 | Normal Redis commands | `client.command(...)` |
 | Payload codecs | `RawCodec`, `JsonCodec` |
 | Transport adapter | `RedisAdapter`, `RedisCommandExecutor` |
@@ -78,7 +78,7 @@ raw bytes on decode.
 | Async queue or workflow service | `AsyncQueueClient` / `AsyncWorkflowClient` |
 | Advanced batching, fanout, custom routing | `FlowClient` directly |
 | Normal Redis data structures | `client.command("SET", ...)`, `client.command("HSET", ...)` |
-| Locks, CAS, rate limits, fetch stampede protection | First-class native helpers on `FlowClient` |
+| Locks, CAS, rate limits, fetch stampede protection | First-class protocol helpers on `FlowClient` |
 | Cluster/admin operations | Cluster/admin helpers or `client.command(...)` |
 
 Rule of thumb: start with `QueueClient` for queues, start with `WorkflowClient`
@@ -120,7 +120,7 @@ client.command("ZADD", "scores", 10, "a")
 The SDK does not try to wrap every Redis command. FerricStore-specific behavior
 gets typed helpers; standard Redis commands stay reachable through `command`.
 
-## FerricStore-native commands
+## FerricStore protocol commands
 
 FerricStore adds commands that are not part of vanilla Redis. The SDK exposes the
 main ones directly.
@@ -729,7 +729,7 @@ def email_sent(job):
 signup.start("signup-1", payload=b"user")
 ```
 
-### Native command plus Redis passthrough
+### Protocol command plus Redis passthrough
 
 ```python
 if client.ratelimit_add("rl:user:1", window_ms=1_000, max=10).allowed:

@@ -64,19 +64,11 @@ ASYNC_QUEUE_WORKER_CONFIG_KEYS = frozenset(
     }
 )
 
-_NATIVE_URL_SCHEMES = {
-    "ferric",
-    "ferrics",
-    "ferric+tls",
-    "native",
-    "native+tls",
-    "ferricstore-native",
-    "ferricstore-native+tls",
-}
+_PROTOCOL_URL_SCHEMES = {"ferric", "ferrics"}
 
 
-def _is_native_url(value: str) -> bool:
-    return urlparse(value).scheme.lower() in _NATIVE_URL_SCHEMES
+def _is_protocol_url(value: str) -> bool:
+    return urlparse(value).scheme.lower() in _PROTOCOL_URL_SCHEMES
 
 
 ASYNC_WORKFLOW_CONFIG_KEYS = frozenset(
@@ -245,7 +237,7 @@ class AsyncQueueFlowWorker:
             self.client = _client_from(client)
             self._close_client = False if close_client is None else close_client
         if claim_client is None:
-            if isinstance(client, str) and _is_native_url(client):
+            if isinstance(client, str) and _is_protocol_url(client):
                 self.claim_client = self.client
                 self._close_claim_client = False
             elif isinstance(client, str):
@@ -667,7 +659,7 @@ class AsyncQueueFlow:
             self._owns_client = False
             self.client = _client_from(client)
         if claim_client is None:
-            if isinstance(client, str) and _is_native_url(client):
+            if isinstance(client, str) and _is_protocol_url(client):
                 self.claim_client = self.client
                 self._owns_claim_client = False
             elif isinstance(client, str):
@@ -948,7 +940,7 @@ class AsyncQueueClient:
             else _client_from(client)
         )
         if claim_client is None:
-            if isinstance(client, str) and not _is_native_url(client):
+            if isinstance(client, str) and not _is_protocol_url(client):
                 self.claim_flow = AsyncFlowClient.from_url(client, max_connections=claim_pool_size)
             else:
                 self.claim_flow = self.flow
@@ -965,7 +957,7 @@ class AsyncQueueClient:
         self._owns_claim_flow = (
             (_owns_clients and self.claim_flow is not self.flow)
             or isinstance(claim_client, str)
-            or (claim_client is None and isinstance(client, str) and not _is_native_url(client))
+            or (claim_client is None and isinstance(client, str) and not _is_protocol_url(client))
         )
 
     @classmethod
@@ -986,7 +978,7 @@ class AsyncQueueClient:
         command_kwargs.setdefault("max_connections", command_pool_size)
         claim_kwargs = dict(kwargs)
         claim_kwargs["max_connections"] = claim_pool_size
-        if _is_native_url(url):
+        if _is_protocol_url(url):
             instance = cls(
                 AsyncFlowClient.from_url(url, **command_kwargs),
                 retry_policy=retry_policy,
@@ -1017,7 +1009,7 @@ class AsyncQueueClient:
             self._claim_client_explicit
             or self._url is None
             or worker_config is None
-            or _is_native_url(self._url)
+            or _is_protocol_url(self._url)
         ):
             return self.claim_flow
         _, claim_pool_size = resolve_worker_connection_counts(
@@ -1360,7 +1352,7 @@ class AsyncWorkflow:
             self._owns_client = False
             self.client = _client_from(client)
         if claim_client is None:
-            if isinstance(client, str) and _is_native_url(client):
+            if isinstance(client, str) and _is_protocol_url(client):
                 self.claim_client = self.client
                 self._owns_claim_client = False
             elif isinstance(client, str):
@@ -1873,7 +1865,7 @@ class AsyncWorkflowClient:
             else _client_from(client)
         )
         if claim_client is None:
-            if isinstance(client, str) and not _is_native_url(client):
+            if isinstance(client, str) and not _is_protocol_url(client):
                 self.claim_flow = AsyncFlowClient.from_url(client, max_connections=claim_pool_size)
             else:
                 self.claim_flow = self.flow
@@ -1890,7 +1882,7 @@ class AsyncWorkflowClient:
         self._owns_claim_flow = (
             (_owns_clients and self.claim_flow is not self.flow)
             or isinstance(claim_client, str)
-            or (claim_client is None and isinstance(client, str) and not _is_native_url(client))
+            or (claim_client is None and isinstance(client, str) and not _is_protocol_url(client))
         )
 
     @classmethod
@@ -1911,7 +1903,7 @@ class AsyncWorkflowClient:
         command_kwargs.setdefault("max_connections", command_pool_size)
         claim_kwargs = dict(kwargs)
         claim_kwargs["max_connections"] = claim_pool_size
-        if _is_native_url(url):
+        if _is_protocol_url(url):
             instance = cls(
                 AsyncFlowClient.from_url(url, **command_kwargs),
                 retry_policy=retry_policy,
@@ -1942,7 +1934,7 @@ class AsyncWorkflowClient:
             self._claim_client_explicit
             or self._url is None
             or worker_config is None
-            or _is_native_url(self._url)
+            or _is_protocol_url(self._url)
         ):
             return self.claim_flow
         _, claim_pool_size = resolve_worker_connection_counts(

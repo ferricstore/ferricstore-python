@@ -921,6 +921,119 @@ def test_workflow_client_creates_workflow_and_delegates_flow_commands():
     assert redis.calls[1] == ("PING",)
 
 
+def test_workflow_start_and_claim_uses_initial_state_and_partitioning():
+    redis = FakeRedis()
+    workflow = OrderWorkflow(FlowClient(redis))
+
+    started = workflow.start_and_claim(
+        "f1",
+        tenant_id="tenant-a",
+        order_id="order-1",
+        worker="worker-1",
+        payload=b"payload",
+        now_ms=100,
+    )
+
+    assert started.id == "f1"
+    assert redis.calls[0][:2] == ("FLOW.START_AND_CLAIM", "f1")
+    assert redis.calls[0][redis.calls[0].index("INITIAL_STATE") + 1] == "created"
+    assert redis.calls[0][redis.calls[0].index("PARTITION") + 1] == "tenant-a:order-1"
+
+
+def test_workflow_context_step_continue_uses_current_lease_and_state():
+    redis = FakeRedis()
+    workflow = OrderWorkflow(FlowClient(redis))
+    job = FlowRecord(
+        id="f1",
+        type="order",
+        state="created",
+        partition_key="tenant:order",
+        lease_token=b"lease-1",
+        fencing_token=3,
+    )
+    ctx = WorkflowContext(workflow, job, "created")
+
+    continued = ctx.flow.step_continue("charge_card", lease_ms=45_000, now_ms=101)
+
+    assert continued.id == "f1"
+    assert redis.calls[0][:5] == (
+        "FLOW.STEP_CONTINUE",
+        "f1",
+        b"lease-1",
+        "created",
+        "charge_card",
+    )
+    assert redis.calls[0][redis.calls[0].index("FENCING") + 1] == 3
+    assert redis.calls[0][redis.calls[0].index("PARTITION") + 1] == "tenant:order"
+
+
+def test_workflow_context_run_steps_many_uses_workflow_type_and_current_partition():
+    redis = FakeRedis()
+    workflow = OrderWorkflow(FlowClient(redis))
+    job = FlowRecord(
+        id="f1",
+        type="order",
+        state="created",
+        partition_key="tenant:order",
+        lease_token=b"lease-1",
+        fencing_token=3,
+    )
+    ctx = WorkflowContext(workflow, job, "created")
+
+    ctx.flow.run_steps_many(
+        ["child-1"],
+        states=["reserve", "charge", "email"],
+        worker="worker-1",
+        now_ms=101,
+    )
+
+    assert redis.calls[0] == (
+        "FLOW.RUN_STEPS_MANY",
+        "TYPE",
+        "order",
+        "STATES",
+        ["reserve", "charge", "email"],
+        "WORKER",
+        "worker-1",
+        "LEASE_MS",
+        30_000,
+        "NOW",
+        101,
+        "ITEMS",
+        [{"id": "child-1", "partition_key": "tenant:order"}],
+    )
+
+
+def test_flow_workflow_run_steps_many_uses_partition_by_attrs():
+    redis = FakeRedis()
+    workflow = OrderWorkflow(FlowClient(redis))
+
+    workflow.run_steps_many(
+        ["order-flow-1"],
+        states=["reserve", "charge", "email"],
+        worker="worker-1",
+        tenant_id="tenant-a",
+        order_id="order-1",
+        now_ms=101,
+    )
+
+    assert redis.calls[0] == (
+        "FLOW.RUN_STEPS_MANY",
+        "TYPE",
+        "order",
+        "STATES",
+        ["reserve", "charge", "email"],
+        "WORKER",
+        "worker-1",
+        "LEASE_MS",
+        30_000,
+        "NOW",
+        101,
+        "ITEMS",
+        [{"id": "order-flow-1", "partition_key": "tenant-a:order-1"}],
+    )
+
+
 def test_workflow_client_retry_policy_is_inherited_and_state_can_override():
     redis = FakeRedis()
     default_policy = RetryPolicy(max_retries=5, backoff="exponential", base_ms=200)

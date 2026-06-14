@@ -4,7 +4,7 @@ import pytest
 
 from ferricstore import ExceptionPolicy, QueueClient, RetryPolicy, ValueConfig, WorkerConfig
 from ferricstore.types import ClaimedItem, resolve_worker_connection_counts
-from ferricstore.worker import QueueFlowWorker
+from ferricstore.worker import QueueFlowWorker, QueueFlowWorkerResult
 
 
 class FakeFlowClient:
@@ -55,6 +55,28 @@ class FakeFlowClient:
 
     def close(self):
         self.closed = True
+
+
+class FusedFakeFlowClient(FakeFlowClient):
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.complete_claim_calls = []
+
+    def complete_jobs_and_claim_jobs(self, jobs, **kwargs):
+        self.complete_claim_calls.append((list(jobs), kwargs))
+        if not self.responses:
+            return []
+        return self.responses.pop(0)
+
+
+class AsyncFusedFakeFlowClient(FusedFakeFlowClient):
+    def submit_complete_jobs_and_claim_jobs(self, jobs, **kwargs):
+        self.complete_claim_calls.append((list(jobs), kwargs))
+        complete_future = Future()
+        claim_future = Future()
+        complete_future.set_result(len(jobs))
+        claim_future.set_result(self.responses.pop(0) if self.responses else [])
+        return complete_future, claim_future
 
 
 class FakeFutureClaimFlowClient(FakeFlowClient):
@@ -121,6 +143,93 @@ def test_flow_worker_drains_same_partition_group_while_batches_are_full():
     ]
 
 
+def test_flow_worker_fuses_complete_and_next_claim_on_sync_hot_path():
+    first = ClaimedItem("f1", b"lease-1", 1, partition_key="p1")
+    second = ClaimedItem("f2", b"lease-2", 2, partition_key="p1")
+    client = FusedFakeFlowClient([[first], [second]])
+    worker = QueueFlowWorker(
+        client,
+        type="email",
+        state="queued",
+        worker="w1",
+        batch_size=1,
+        claim_drain_batches=2,
+        partition_key="p1",
+        fuse_complete_claim=True,
+    )
+
+    result = worker.run_batch_once(lambda jobs: f"done-{jobs[0].id}")
+    worker.close()
+
+    assert result == QueueFlowWorkerResult(claimed=2, completed=2, claim_calls=2)
+    assert len(client.claim_calls) == 1
+    assert len(client.complete_claim_calls) == 1
+    assert len(client.completed) == 1
+    assert [job.id for job in client.complete_claim_calls[0][0]] == ["f1"]
+    assert client.complete_claim_calls[0][1]["result"] == "done-f1"
+    assert client.complete_claim_calls[0][1]["type"] == "email"
+    assert client.complete_claim_calls[0][1]["state"] == "queued"
+    assert client.complete_claim_calls[0][1]["partition_key"] == "p1"
+    assert [job.id for job in client.completed[0][0]] == ["f2"]
+
+
+def test_flow_worker_async_fuses_complete_and_next_claim_without_completion_thread():
+    first = ClaimedItem("f1", b"lease-1", 1, partition_key="p1")
+    second = ClaimedItem("f2", b"lease-2", 2, partition_key="p1")
+    client = AsyncFusedFakeFlowClient([[first], [second]])
+    worker = QueueFlowWorker(
+        client,
+        type="email",
+        state="queued",
+        worker="w1",
+        batch_size=1,
+        claim_drain_batches=2,
+        partition_key="p1",
+        complete_async_depth=4,
+        fuse_complete_claim=True,
+    )
+
+    result = worker.run_batch_once(lambda jobs: f"done-{jobs[0].id}")
+    worker.close()
+
+    assert result == QueueFlowWorkerResult(claimed=2, claim_calls=2)
+    assert worker.stats.completed == 2
+    assert len(client.claim_calls) == 1
+    assert len(client.complete_claim_calls) == 1
+    assert len(client.completed) == 1
+    assert [job.id for job in client.complete_claim_calls[0][0]] == ["f1"]
+    assert client.complete_claim_calls[0][1]["result"] == "done-f1"
+    assert [job.id for job in client.completed[0][0]] == ["f2"]
+
+
+def test_flow_worker_async_fusion_can_use_separate_protocol_claim_client():
+    first = ClaimedItem("f1", b"lease-1", 1, partition_key="p1")
+    second = ClaimedItem("f2", b"lease-2", 2, partition_key="p1")
+    command_client = FakeFlowClient([])
+    claim_client = AsyncFusedFakeFlowClient([[first], [second]])
+    worker = QueueFlowWorker(
+        command_client,
+        claim_client=claim_client,
+        type="email",
+        state="queued",
+        worker="w1",
+        batch_size=1,
+        claim_drain_batches=2,
+        partition_key="p1",
+        complete_async_depth=4,
+        fuse_complete_claim=True,
+    )
+
+    result = worker.run_batch_once(lambda jobs: f"done-{jobs[0].id}")
+    worker.close()
+
+    assert result == QueueFlowWorkerResult(claimed=2, claim_calls=2)
+    assert len(claim_client.claim_calls) == 1
+    assert len(claim_client.complete_claim_calls) == 1
+    assert command_client.completed[0][0] == [second]
+    assert claim_client.completed == []
+
+
 def test_flow_worker_rejects_invalid_claim_drain_batches():
     with pytest.raises(ValueError, match="claim_drain_batches"):
         QueueFlowWorker(
@@ -177,16 +286,16 @@ def test_worker_config_defaults_match_easy_startup_profile():
     assert kwargs["apply_async_depth"] == 0
 
 
-def test_worker_config_exposes_native_claim_prefetch_when_explicit():
+def test_worker_config_exposes_protocol_claim_prefetch_when_explicit():
     kwargs = WorkerConfig(claim_prefetch=8).to_kwargs()
 
     assert kwargs["claim_prefetch"] == 8
 
 
-def test_worker_config_exposes_native_wake_hints_when_explicit():
-    kwargs = WorkerConfig(native_wake_hints=True).to_kwargs()
+def test_worker_config_exposes_protocol_wake_hints_when_explicit():
+    kwargs = WorkerConfig(protocol_wake_hints=True).to_kwargs()
 
-    assert kwargs["native_wake_hints"] is True
+    assert kwargs["protocol_wake_hints"] is True
 
 
 def test_flow_worker_rejects_invalid_claim_prefetch():
@@ -194,7 +303,7 @@ def test_flow_worker_rejects_invalid_claim_prefetch():
         QueueFlowWorker(FakeFlowClient([]), type="email", claim_prefetch=-1)
 
 
-def test_flow_worker_native_wake_hints_subscribes_to_claim_filter():
+def test_flow_worker_protocol_wake_hints_subscribes_to_claim_filter():
     client = FakeWakeFlowClient([], [{"event": "FLOW_WAKE"}])
     worker = QueueFlowWorker(
         client,
@@ -203,7 +312,7 @@ def test_flow_worker_native_wake_hints_subscribes_to_claim_filter():
         partition_keys=["bucket-0", "bucket-1"],
         priority=0,
         batch_size=500,
-        native_wake_hints=True,
+        protocol_wake_hints=True,
     )
 
     assert client.wake_subscriptions == [
@@ -219,11 +328,11 @@ def test_flow_worker_native_wake_hints_subscribes_to_claim_filter():
             },
         )
     ]
-    assert worker._wait_for_native_wake_hint(0.01) is True
+    assert worker._wait_for_protocol_wake_hint(0.01) is True
     assert client.wait_timeouts == [0.01]
 
 
-def test_flow_worker_prefetches_blocking_claims_with_native_future_client():
+def test_flow_worker_prefetches_blocking_claims_with_protocol_future_client():
     job = ClaimedItem("flow-1", b"lease-1", 1, partition_key="bucket-0")
     first = Future()
     first.set_result([job])
@@ -473,6 +582,33 @@ def test_flow_worker_can_run_batch_for_explicit_partition_keys():
     assert client.claim_calls[0][1]["block_ms"] is None
 
 
+def test_flow_worker_does_not_claim_when_async_completion_slots_are_full():
+    blocked = Future()
+    client = FakeFlowClient([[object()]])
+    worker = QueueFlowWorker(
+        client,
+        type="email",
+        state="queued",
+        batch_size=10,
+        complete_async_depth=1,
+    )
+    worker._pending_completions.append(blocked)
+
+    result = worker.run_batch_once_for_partition_keys(
+        lambda claimed: "ok",
+        ["bucket-1"],
+        claim_credit=10,
+        block_ms=None,
+    )
+
+    assert result.claimed == 0
+    assert result.claim_calls == 0
+    assert client.claim_calls == []
+
+    blocked.set_result(QueueFlowWorkerResult(completed=1))
+    worker.close()
+
+
 def test_flow_worker_start_stop_join_tracks_stats():
     client = FakeFlowClient([[object()], []])
     worker = QueueFlowWorker(client, type="email", state="queued", idle_sleep_s=0.001)
@@ -624,7 +760,7 @@ def test_queue_client_from_url_creates_bounded_command_and_claim_pools(monkeypat
     assert worker.claim_client is queue_client.claim_flow
 
 
-def test_queue_client_from_native_url_reuses_multiplexed_claim_client(monkeypatch):
+def test_queue_client_from_protocol_url_reuses_multiplexed_claim_client(monkeypatch):
     calls = []
 
     def from_url(url, **kwargs):
@@ -649,7 +785,7 @@ def test_queue_client_from_native_url_reuses_multiplexed_claim_client(monkeypatc
     assert worker.claim_client is queue_client.flow
 
 
-def test_flow_worker_from_native_url_reuses_multiplexed_claim_client(monkeypatch):
+def test_flow_worker_from_protocol_url_reuses_multiplexed_claim_client(monkeypatch):
     calls = []
 
     def from_url(url, **kwargs):
@@ -698,7 +834,7 @@ def test_queue_worker_config_at_queue_time_resizes_claim_pool(monkeypatch):
     assert worker.claim_client is calls[2][2]
 
 
-def test_queue_worker_config_does_not_resize_native_claim_pool(monkeypatch):
+def test_queue_worker_config_does_not_resize_protocol_claim_pool(monkeypatch):
     calls = []
 
     def from_url(url, **kwargs):

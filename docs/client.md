@@ -409,7 +409,7 @@ policy = client.policy_get("order", state="charge")
 summary = client.retention_cleanup(limit=1_000)
 ```
 
-## FerricStore-native commands
+## FerricStore protocol commands
 
 `FlowClient` also exposes FerricStore commands that are not part of vanilla
 Redis.
