@@ -1,6 +1,8 @@
 import pytest
 
+import ferricstore.workflow as workflow_module
 from ferricstore import (
+    BudgetPolicy,
     ChildSpec,
     Complete,
     ExceptionPolicy,
@@ -13,6 +15,7 @@ from ferricstore import (
     Workflow,
     WorkflowClient,
     WorkflowContext,
+    WorkflowEffect,
     WorkflowWorker,
     complete,
     fail,
@@ -32,6 +35,50 @@ class FakeRedis:
 
     def execute_command(self, *args):
         self.calls.append(args)
+        if args[0] in {"FLOW.EFFECT.RESERVE", "FLOW.EFFECT.CONFIRM", "FLOW.EFFECT.FAIL"}:
+            status = {
+                "FLOW.EFFECT.RESERVE": b"reserved",
+                "FLOW.EFFECT.CONFIRM": b"confirmed",
+                "FLOW.EFFECT.FAIL": b"failed",
+            }[args[0]]
+            effect_key = args[args.index("EFFECT_KEY") + 1]
+            effect_type = (
+                args[args.index("EFFECT_TYPE") + 1] if "EFFECT_TYPE" in args else b"external"
+            )
+            return {
+                b"id": b"f1:effect",
+                b"flow_id": args[1].encode() if isinstance(args[1], str) else args[1],
+                b"effect_key": effect_key.encode() if isinstance(effect_key, str) else effect_key,
+                b"effect_type": effect_type.encode()
+                if isinstance(effect_type, str)
+                else effect_type,
+                b"status": status,
+                b"decision": b"allowed",
+            }
+        if args[0] in {"FLOW.BUDGET.RESERVE", "FLOW.BUDGET.COMMIT", "FLOW.BUDGET.RELEASE"}:
+            status = {
+                "FLOW.BUDGET.RESERVE": b"reserved",
+                "FLOW.BUDGET.COMMIT": b"committed",
+                "FLOW.BUDGET.RELEASE": b"released",
+            }[args[0]]
+            actual_amount = (
+                args[args.index("ACTUAL_AMOUNT") + 1] if "ACTUAL_AMOUNT" in args else None
+            )
+            return {
+                b"scope": args[1].encode() if isinstance(args[1], str) else args[1],
+                b"limit": 100,
+                b"window_ms": 60_000,
+                b"window_start_ms": 1_000,
+                b"used": actual_amount if actual_amount is not None else 10,
+                b"remaining": 90,
+                b"over_budget": False,
+                b"reservations_count": 1,
+                b"reservation_id": b"budget-res-1",
+                b"reserved_amount": 10,
+                b"actual_amount": actual_amount,
+                b"status": status,
+                b"overage_amount": 0,
+            }
         if args[0] == "FLOW.CLAIM_DUE":
             records = []
             for idx, claim_id in enumerate(self.claim_ids, start=1):
@@ -195,6 +242,49 @@ class PlainReturnWorkflow(Workflow):
         return b"plain-result"
 
 
+class BudgetPolicyWorkflow(Workflow):
+    type = "budget-order"
+    initial_state = "created"
+
+    @state(
+        "created",
+        return_record=False,
+        budget=BudgetPolicy(scope=lambda ctx: f"tenant:{ctx.partition_key}", amount=10, limit=100),
+    )
+    def created(self, _ctx):
+        return complete(result=b"ok")
+
+
+class ManualBudgetWorkflow(Workflow):
+    type = "manual-budget-order"
+    initial_state = "created"
+
+    @state("created", return_record=False)
+    def created(self, ctx: WorkflowContext):
+        with ctx.budget("tenant-a", 10, limit=100) as budget:
+            budget.commit(7, usage={"tokens": 7})
+        return transition("next")
+
+
+class EffectWorkflow(Workflow):
+    type = "effect-order"
+    initial_state = "created"
+
+    @state("created", return_record=False)
+    def created(self, ctx: WorkflowContext):
+        @ctx.effect(
+            "charge",
+            "payment.charge",
+            operation_digest="charge:v1",
+            external_id=lambda result: result["id"],
+        )
+        def charge():
+            return {"id": "ch_1"}
+
+        charge()
+        return complete(result=b"ok")
+
+
 def test_workflow_create_uses_partition_by():
     redis = FakeRedis()
     workflow = OrderWorkflow(FlowClient(redis))
@@ -301,7 +391,7 @@ def test_workflow_can_claim_compact_metadata_without_full_record():
 
     assert len(results) == 2
     assert redis.calls[0][0] == "FLOW.CLAIM_DUE"
-    assert redis.calls[0][-2:] == ("RETURN", "JOBS_COMPACT")
+    assert redis.calls[0][-2:] == ("RETURN", "JOBS_COMPACT_ATTRS")
     assert redis.calls[1][0] == "FLOW.TRANSITION_MANY"
     assert redis.calls[1][2:4] == ("running", "next")
 
@@ -343,7 +433,7 @@ def test_blocking_workflow_worker_claims_all_states_with_compact_state_return():
     assert "STATE" not in claim
     assert claim[claim.index("RETURN") : claim.index("RETURN") + 2] == (
         "RETURN",
-        "JOBS_COMPACT_STATE",
+        "JOBS_COMPACT_STATE_ATTRS",
     )
     assert redis.calls[1][0] == "FLOW.TRANSITION_MANY"
     assert redis.calls[2][0] == "FLOW.COMPLETE_MANY"
@@ -464,7 +554,7 @@ def test_workflow_worker_runs_compact_batch_without_materializing_records():
     assert result.applied == 2
     assert result.claim_calls == 1
     return_idx = redis.calls[0].index("RETURN")
-    assert redis.calls[0][return_idx : return_idx + 2] == ("RETURN", "JOBS_COMPACT")
+    assert redis.calls[0][return_idx : return_idx + 2] == ("RETURN", "JOBS_COMPACT_ATTRS")
     assert redis.calls[1][0] == "FLOW.TRANSITION_MANY"
 
 
@@ -1034,6 +1124,151 @@ def test_flow_workflow_run_steps_many_uses_partition_by_attrs():
     )
 
 
+def test_workflow_state_budget_policy_reserves_commits_and_stamps_attributes():
+    redis = FakeRedis()
+    workflow = BudgetPolicyWorkflow(FlowClient(redis))
+    job = FlowRecord(
+        id="f1",
+        type="budget-order",
+        state="created",
+        partition_key="tenant-a",
+        lease_token=b"lease-1",
+        fencing_token=3,
+    )
+
+    workflow.handle(job)
+
+    assert redis.calls[0][:4] == ("FLOW.BUDGET.RESERVE", "tenant:tenant-a", "AMOUNT", 10)
+    assert redis.calls[1][:6] == (
+        "FLOW.BUDGET.COMMIT",
+        "tenant:tenant-a",
+        "RESERVATION_ID",
+        "budget-res-1",
+        "ACTUAL_AMOUNT",
+        10,
+    )
+    complete_call = redis.calls[2]
+    assert complete_call[0] == "FLOW.COMPLETE"
+    assert complete_call[complete_call.index("ATTRIBUTE_MERGE") + 1] == "governance_budget_scope"
+    assert "governance_budget_status" in complete_call
+    assert "committed" in complete_call
+
+
+def test_workflow_context_budget_allows_explicit_actual_usage():
+    redis = FakeRedis()
+    workflow = ManualBudgetWorkflow(FlowClient(redis))
+    job = FlowRecord(
+        id="f1",
+        type="manual-budget-order",
+        state="created",
+        partition_key="tenant-a",
+        lease_token=b"lease-1",
+        fencing_token=3,
+    )
+
+    workflow.handle(job)
+
+    assert redis.calls[0][:4] == ("FLOW.BUDGET.RESERVE", "tenant-a", "AMOUNT", 10)
+    assert redis.calls[1] == (
+        "FLOW.BUDGET.COMMIT",
+        "tenant-a",
+        "RESERVATION_ID",
+        "budget-res-1",
+        "ACTUAL_AMOUNT",
+        7,
+        "USAGE",
+        {"tokens": 7},
+    )
+    transition_call = redis.calls[2]
+    assert transition_call[0] == "FLOW.TRANSITION"
+    assert "governance_budget_actual_amount" in transition_call
+    assert 7 in transition_call
+
+
+def test_workflow_context_effect_decorator_reserves_and_confirms():
+    redis = FakeRedis()
+    workflow = EffectWorkflow(FlowClient(redis))
+    job = FlowRecord(
+        id="f1",
+        type="effect-order",
+        state="created",
+        partition_key="tenant-a",
+        lease_token=b"lease-1",
+        fencing_token=3,
+    )
+
+    workflow.handle(job)
+
+    reserve_call = redis.calls[0]
+    assert reserve_call[:4] == ("FLOW.EFFECT.RESERVE", "f1", "EFFECT_KEY", "charge")
+    assert reserve_call[reserve_call.index("EFFECT_TYPE") + 1] == "payment.charge"
+    assert reserve_call[reserve_call.index("OPERATION_DIGEST") + 1] == "charge:v1"
+    assert reserve_call[reserve_call.index("LEASE_TOKEN") + 1] == b"lease-1"
+    assert reserve_call[reserve_call.index("FENCING") + 1] == 3
+
+    confirm_call = redis.calls[1]
+    assert confirm_call[:4] == ("FLOW.EFFECT.CONFIRM", "f1", "EFFECT_KEY", "charge")
+    assert confirm_call[confirm_call.index("EXTERNAL_ID") + 1] == "ch_1"
+    assert isinstance(confirm_call[confirm_call.index("LATENCY_MS") + 1], int)
+
+    assert redis.calls[2][0] == "FLOW.COMPLETE"
+
+
+def test_workflow_effect_auto_latency_starts_after_reserve(monkeypatch):
+    redis = FakeRedis()
+    workflow = EffectWorkflow(FlowClient(redis))
+    job = FlowRecord(
+        id="f1",
+        type="effect-order",
+        state="created",
+        partition_key="tenant-a",
+        lease_token=b"lease-1",
+        fencing_token=3,
+    )
+    ctx = WorkflowContext(workflow, job, "created")
+    effect = ctx.effect("charge", "payment.charge", operation_digest="charge:v1")
+    ticks = iter([10.0, 10.25])
+
+    monkeypatch.setattr(workflow_module.time, "perf_counter", lambda: next(ticks))
+
+    effect.reserve()
+    effect.confirm(external_id="ch_1")
+
+    confirm_call = redis.calls[1]
+    assert confirm_call[confirm_call.index("LATENCY_MS") + 1] == 250
+
+
+def test_workflow_context_effect_decorator_fails_on_exception():
+    redis = FakeRedis()
+    workflow = EffectWorkflow(FlowClient(redis))
+    job = FlowRecord(
+        id="f1",
+        type="effect-order",
+        state="created",
+        partition_key="tenant-a",
+        lease_token=b"lease-1",
+        fencing_token=3,
+    )
+    ctx = WorkflowContext(workflow, job, "created")
+    effect = ctx.effect("charge", "payment.charge", operation_digest="charge:v1")
+
+    assert isinstance(effect, WorkflowEffect)
+
+    @effect
+    def boom():
+        raise RuntimeError("stripe down")
+
+    with pytest.raises(RuntimeError):
+        boom()
+
+    assert redis.calls[0][0] == "FLOW.EFFECT.RESERVE"
+    fail_call = redis.calls[1]
+    assert fail_call[:4] == ("FLOW.EFFECT.FAIL", "f1", "EFFECT_KEY", "charge")
+    assert fail_call[fail_call.index("ERROR") + 1] == "stripe down"
+    assert fail_call[fail_call.index("REASON") + 1] == "RuntimeError"
+    assert isinstance(fail_call[fail_call.index("LATENCY_MS") + 1], int)
+
+
 def test_workflow_client_retry_policy_is_inherited_and_state_can_override():
     redis = FakeRedis()
     default_policy = RetryPolicy(max_retries=5, backoff="exponential", base_ms=200)
@@ -1124,6 +1359,30 @@ def test_workflow_client_from_url_creates_separate_claim_pool(monkeypatch):
     assert workflow.claim_client is client.claim_flow
     assert client.flow.executor._executor.calls == []
     assert client.claim_flow.executor._executor.calls[0][0] == "FLOW.CLAIM_DUE"
+
+
+def test_workflow_client_from_protocol_url_reuses_multiplexed_claim_client(monkeypatch):
+    calls = []
+
+    def from_url(url, **kwargs):
+        client = FlowClient(FakeRedis())
+        client.url = url
+        client.kwargs = kwargs
+        calls.append((url, kwargs, client))
+        return client
+
+    monkeypatch.setattr("ferricstore.workflow.FlowClient.from_url", staticmethod(from_url))
+
+    client = WorkflowClient.from_url(
+        "ferric://example:6388",
+        worker_config=WorkerConfig(workers=4),
+    )
+    workflow = client.workflow(type="order", initial_state="created")
+
+    assert len(calls) == 1
+    assert calls[0][1] == {"max_connections": 1}
+    assert workflow.client is client.flow
+    assert workflow.claim_client is client.flow
 
 
 def test_workflow_worker_config_at_workflow_time_resizes_claim_pool(monkeypatch):

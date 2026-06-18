@@ -22,6 +22,9 @@ client = FlowClient.from_url("redis://127.0.0.1:6379/0")
 | Mutate | `transition`, `transition_many`, `complete`, `complete_many`, `retry`, `retry_many`, `fail`, `fail_many`, `cancel`, `cancel_many`, `rewind` |
 | Children | `spawn_children` |
 | Query | `get`, `history`, `list`, `terminals`, `failures`, `by_parent`, `by_root`, `by_correlation`, `info`, `stuck` |
+| Attribute discovery | `attributes`, `attribute_values` |
+| Schedules | `schedule_create`, `schedule_get`, `schedule_fire`, `schedule_pause`, `schedule_resume`, `schedule_delete`, `schedule_fire_due`, `schedule_list` |
+| Governance | `effect_reserve`, `effect_confirm`, `effect_fail`, `effect_compensate`, `effect_get`, `governance_ledger`, `approval_request`, `approval_approve`, `approval_reject`, `approval_get`, `approval_list`, `governance_overview`, `circuit_open`, `circuit_close`, `circuit_get`, `budget_reserve`, `budget_commit`, `budget_release`, `budget_get`, `budget_list`, `limit_lease`, `limit_spend`, `limit_release`, `limit_get`, `limit_list` |
 | Policy/cleanup | `install_policy`, `policy_get`, `retention_cleanup` |
 
 `from_url` uses `redis-py` with RESP3:
@@ -131,7 +134,7 @@ values = client.value_mget([ref["ref"]], max_bytes=64 * 1024)
 Claims due work for a type/state.
 
 ```python
-jobs = client.claim_due(
+records = client.claim_due(
     "order",
     state="created",
     worker="worker-1",
@@ -144,6 +147,23 @@ jobs = client.claim_due(
 Returns `list[FlowRecord]`. Each record includes `lease_token` and
 `fencing_token`; pass both into mutation commands.
 
+For a lean worker claim response, set `include_record=False`. This returns
+`ClaimedFlow` values with `attributes` included by default:
+
+```python
+claims = client.claim_due(
+    "order",
+    state="created",
+    worker="worker-1",
+    include_record=False,
+)
+```
+
+`client.claim_flows(...)` is a convenience wrapper for the same lean shape.
+
+Pass `include_attributes=False` only when a hot path needs just id, lease token,
+fencing token, and partition key.
+
 Default behavior:
 
 | Concern | Default |
@@ -151,18 +171,18 @@ Default behavior:
 | Long timers | Delayed flows may be hibernated in FerricStore cold-due storage, but `claim_due` claims them normally once due. |
 | Payload | Payload is not hydrated unless `payload=True` or named `values=[...]` are requested. |
 | Blocking | `block_ms=None` means one immediate claim attempt. Set `block_ms` to wait server-side. |
-| Lease recovery | `reclaim_expired=True` by default for `claim_due`; `claim_jobs` only sends it when explicit. |
+| Lease recovery | `reclaim_expired=True` by default for `claim_due`; set it explicitly on lean worker paths when desired. |
 
 ## `reclaim`
 
 Claims expired leases, typically for recovery workers.
 
 ```python
-jobs = client.reclaim("order", worker="reaper-1", limit=100)
+records = client.reclaim("order", worker="reaper-1", limit=100)
 ```
 
 `reclaim` supports the same partition and response controls as `claim_due`:
-`partition_key`, `partition_keys`, `priority`, `job_only`, `payload`,
+`partition_key`, `partition_keys`, `priority`, `include_record`, `payload`,
 `payload_max_bytes`, `values`, and `value_max_bytes`.
 
 ## `extend_lease`
@@ -199,6 +219,38 @@ client.transition(
 Mutators are ack-only by default. Set `return_record=True` only when the caller
 needs the new record immediately.
 
+## Governance budgets
+
+Budget commands return `BudgetResult`, a typed object that is also compatible
+with dict-style access.
+
+```python
+reservation = client.budget_reserve(
+    "tenant:acme:llm",
+    10_000,
+    limit=1_000_000,
+    window_ms=60_000,
+)
+
+committed = False
+try:
+    used_tokens = call_model()
+    result = client.budget_commit(
+        "tenant:acme:llm",
+        reservation.reservation_id,
+        used_tokens,
+        usage={"tokens": used_tokens},
+    )
+    committed = result.status == "committed"
+finally:
+    if not committed:
+        client.budget_release("tenant:acme:llm", reservation.reservation_id)
+```
+
+For normal workflow handlers, prefer `BudgetPolicy` or `ctx.budget(...)` from
+[Workflow and Queue APIs](workflow.md). The low-level commands are useful for
+admin tools and custom runtimes.
+
 ## `complete`
 
 Closes a flow as completed.
@@ -219,13 +271,13 @@ option when the caller needs the post-mutation record.
 
 ## Batch Mutations
 
-Use `ClaimedItem` for commands that require lease token:
+Use `ClaimedFlow` for commands that require lease token:
 
 ```python
-from ferricstore import ClaimedItem
+from ferricstore import ClaimedFlow
 
 items = [
-    ClaimedItem(job.id, job.lease_token, job.fencing_token, partition_key=job.partition_key)
+    ClaimedFlow(claim.id, claim.lease_token, claim.fencing_token, partition_key=claim.partition_key)
 ]
 
 client.complete_many(None, items, result=b"ok")
@@ -380,6 +432,199 @@ client.by_correlation("checkout-123", include_cold=True)
 client.info("order", include_cold=True)
 client.stuck("order", older_than_ms=60_000)
 ```
+
+## Attribute Discovery
+
+Use attributes for workflow search/debug filters. Attribute indexes are projected
+asynchronously by FerricStore; payload bytes are not indexed.
+
+```python
+keys = client.attributes("order", state="queued", partition_key="tenant-a")
+values = client.attribute_values("order", "tenant", state="queued", count=20)
+```
+
+`attributes(...)` returns key/count rows. `attribute_values(...)` returns
+value/count rows for one attribute key. Use these for dashboard filter pickers
+and saved views.
+
+## Schedules
+
+Schedules create Flow work at durable times. The schedule only starts work; the
+Flow state machine handles the rest.
+
+```python
+client.schedule_create(
+    "daily-report",
+    target={
+        "id": "report-2026-06-17",
+        "type": "report",
+        "state": "queued",
+        "partition_key": "tenant-a",
+        "payload": b"{}",
+    },
+    cron="0 7 * * *",
+    timezone="Asia/Jerusalem",
+    overlap_policy="skip",
+)
+
+due = client.schedule_fire_due(limit=100, block_ms=1000)
+client.schedule_pause("daily-report")
+client.schedule_resume("daily-report")
+client.schedule_fire("daily-report")  # manual/admin fire
+client.schedule_delete("daily-report")
+```
+
+Use `overwrite=True` only when replacing an existing schedule definition.
+
+## Governance
+
+Governance APIs are explicit Flow-side controls for effects, approvals,
+circuits, budgets, and distributed limits. They are useful when a workflow must
+explain why it paused, retried, or did not call an external system.
+
+For concepts, error shapes, telemetry events, and production patterns, read the
+[Governance guide](governance.md).
+
+In workflow handlers, prefer `ctx.effect(...)` so reserve/confirm/fail happens
+around the actual external call. Use the raw client methods below when you are
+building your own worker runtime or admin tooling.
+
+```python
+import time
+
+effect = client.effect_reserve(
+    job.id,
+    "stripe-charge",
+    "payment.charge",
+    partition_key=job.partition_key,
+    lease_token=job.lease_token,
+    fencing_token=job.fencing_token,
+    operation_digest="sha256:...",
+)
+
+started = time.perf_counter()
+
+try:
+    external_id = charge_card()
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    client.effect_confirm(
+        job.id,
+        "stripe-charge",
+        external_id=external_id,
+        latency_ms=latency_ms,
+    )
+except Exception as exc:
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    client.effect_fail(
+        job.id,
+        "stripe-charge",
+        error=str(exc),
+        reason=type(exc).__name__,
+        latency_ms=latency_ms,
+    )
+    raise
+```
+
+`ctx.effect(...)` in the workflow API measures `latency_ms` automatically. Pass
+it manually only when using raw client methods.
+
+Approvals:
+
+```python
+approval = client.approval_request(
+    "approval:order-1",
+    flow_id="order-1",
+    scope="tenant-a",
+    reason="manual fraud review",
+    requested_by="fraud-worker",
+    assignees=["ops"],
+)
+
+client.approval_approve(approval["id"], approver="ops-user")
+```
+
+Budgets and limits:
+
+```python
+budget = client.budget_reserve(
+    "tenant-a:ai:tokens:daily",
+    8_000,
+    limit=2_000_000,
+    window_ms=86_400_000,
+)
+
+try:
+    result = call_llm(max_tokens=budget["reserved_amount"])
+    client.budget_commit(
+        "tenant-a:ai:tokens:daily",
+        budget["reservation_id"],
+        result.usage.total_tokens,
+        usage={
+            "model": result.model,
+            "input_tokens": result.usage.input_tokens,
+            "output_tokens": result.usage.output_tokens,
+        },
+    )
+except Exception:
+    client.budget_release("tenant-a:ai:tokens:daily", budget["reservation_id"])
+    raise
+```
+
+`budget_commit(...)` records actual usage. If actual usage is lower than the
+reservation, unused budget is refunded. If actual usage is higher, the overage
+is recorded so later reservations are denied until the window resets.
+
+Distributed limits:
+
+```python
+lease = client.limit_lease("tenant-a:email", shard_id=0, amount=10, ttl_ms=30_000)
+client.limit_release("tenant-a:email", shard_id=0, amount=10)
+```
+
+Circuits:
+
+```python
+client.circuit_open("payment-api", open_ms=30_000, failure_threshold=5)
+client.circuit_close("payment-api")
+```
+
+Circuit policies can also use `window_ms`, `min_calls`, `failure_rate_pct`,
+`latency_threshold_ms`, `error_classes`, `half_open_max_probes`, and
+`half_open_success_threshold`. See [Governance](governance.md) for the full
+policy shape.
+
+Read APIs:
+
+```python
+client.governance_ledger("order-1", rev=True, limit=100)
+client.approval_list(scope="tenant-a", limit=100)
+client.governance_overview(scope="tenant-a")
+client.budget_list(scope="tenant-a")
+client.limit_list(scope="tenant-a")
+```
+
+Schedule, effect, approval, circuit, budget, and overview calls return typed result
+objects for autocomplete:
+
+```python
+schedule.status
+effect.external_id
+approval.flow_id
+circuit.status
+budget.remaining
+overview.counts
+```
+
+They remain dict-compatible for escape-hatch fields:
+
+```python
+effect["status"]
+approval.get("reason")
+```
+
+The public result classes are `ScheduleResult`, `EffectResult`,
+`ApprovalResult`, `CircuitBreakerStatus`, `BudgetResult`, and
+`GovernanceOverview`.
 
 ## `install_policy`
 

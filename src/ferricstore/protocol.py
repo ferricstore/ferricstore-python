@@ -8,10 +8,11 @@ import struct
 import threading
 import time
 import zlib
+from collections.abc import Sequence
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, replace
-from typing import Any, Sequence, cast
+from typing import Any, cast
 from urllib.parse import unquote, urlparse
 
 from ferricstore.errors import FerricStoreError, InvalidCommandError, OverloadedError
@@ -81,6 +82,9 @@ _COMPACT_I64 = struct.Struct(">q")
 _COMPACT_F64 = struct.Struct(">d")
 _NULL_U32 = 0xFFFFFFFF
 _I64_MIN = -(1 << 63)
+_DEFAULT_PROTOCOL_LANES = 8
+_DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+_DEFAULT_MAX_DECOMPRESSED_RESPONSE_BYTES = 128 * 1024 * 1024
 _COMPACT_HGET_PIPELINE_MODE = 18
 _COMPACT_SISMEMBER_PIPELINE_MODE = 19
 _COMPACT_LRANGE_PIPELINE_MODE = 20
@@ -147,6 +151,7 @@ _FLOW_RECORD_FIELD_KEYS = (
     b"error_omitted",
     b"error_size",
     b"max_attempts",
+    b"attributes",
 )
 _FLOW_RECORD_FIELD_KEYS_LEN = len(_FLOW_RECORD_FIELD_KEYS)
 
@@ -248,34 +253,95 @@ _OPCODES = {
     "FLOW.STEP_CONTINUE": 0x0222,
     "FLOW.START_AND_CLAIM": 0x0223,
     "FLOW.RUN_STEPS_MANY": _OP_FLOW_RUN_STEPS_MANY,
+    "FLOW.SCHEDULE.CREATE": 0x0225,
+    "FLOW.SCHEDULE.GET": 0x0226,
+    "FLOW.SCHEDULE.DELETE": 0x0227,
+    "FLOW.SCHEDULE.FIRE_DUE": 0x0228,
+    "FLOW.SCHEDULE.LIST": 0x0229,
+    "FLOW.SCHEDULE.FIRE": 0x022A,
+    "FLOW.SCHEDULE.PAUSE": 0x022B,
+    "FLOW.SCHEDULE.RESUME": 0x022C,
+    "FLOW.STATS": 0x022D,
+    "FLOW.ATTRIBUTES": 0x022E,
+    "FLOW.ATTRIBUTE_VALUES": 0x022F,
+    "FLOW.EFFECT.RESERVE": 0x0240,
+    "FLOW.EFFECT.CONFIRM": 0x0241,
+    "FLOW.EFFECT.FAIL": 0x0242,
+    "FLOW.EFFECT.COMPENSATE": 0x0243,
+    "FLOW.EFFECT.GET": 0x0244,
+    "FLOW.GOVERNANCE.LEDGER": 0x0245,
+    "FLOW.APPROVAL.REQUEST": 0x0246,
+    "FLOW.APPROVAL.APPROVE": 0x0247,
+    "FLOW.APPROVAL.REJECT": 0x0248,
+    "FLOW.APPROVAL.GET": 0x0249,
+    "FLOW.CIRCUIT.OPEN": 0x024A,
+    "FLOW.CIRCUIT.CLOSE": 0x024B,
+    "FLOW.CIRCUIT.GET": 0x024C,
+    "FLOW.BUDGET.RESERVE": 0x024D,
+    "FLOW.BUDGET.GET": 0x024E,
+    "FLOW.LIMIT.LEASE": 0x024F,
+    "FLOW.LIMIT.SPEND": 0x0250,
+    "FLOW.LIMIT.RELEASE": 0x0251,
+    "FLOW.LIMIT.GET": 0x0252,
+    "FLOW.APPROVAL.LIST": 0x0253,
+    "FLOW.GOVERNANCE.OVERVIEW": 0x0254,
+    "FLOW.BUDGET.LIST": 0x0255,
+    "FLOW.LIMIT.LIST": 0x0256,
+    "FLOW.BUDGET.COMMIT": 0x0257,
+    "FLOW.BUDGET.RELEASE": 0x0258,
 }
 
 _CONTROL_OPCODES = set(range(0x0001, 0x0013))
 
 _FIELD_NAMES = {
     "AFTER_MS": "after_ms",
+    "ACTUAL_AMOUNT": "actual_amount",
+    "AMOUNT": "amount",
+    "APPROVER": "approver",
+    "ASSIGNEES": "assignees",
+    "AT_MS": "at_ms",
+    "ATTRIBUTE": "attribute",
+    "ATTRIBUTES": "attributes",
+    "ATTRIBUTES_DELETE": "attributes_delete",
+    "ATTRIBUTES_MERGE": "attributes_merge",
     "BACKOFF": "backoff",
     "BASE_MS": "base_ms",
     "BLOCK": "block_ms",
     "CONSISTENT_PROJECTION": "consistent_projection",
     "CORRELATION_ID": "correlation_id",
     "COUNT": "count",
+    "CRON": "cron",
     "DELAY_MS": "delay_ms",
     "ERROR": "error",
+    "ERROR_CLASS": "error_class",
+    "ERROR_CLASSES": "error_classes",
     "ERROR_REF": "error_ref",
+    "EFFECT_KEY": "effect_key",
+    "EFFECT_TYPE": "effect_type",
+    "END_AT_MS": "end_at_ms",
     "EVENT": "event",
+    "EVERY_MS": "every_ms",
     "EXHAUSTED_TO": "exhausted_to",
+    "EXPIRES_AT_MS": "expires_at_ms",
     "EXPECT_STATE": "expect_state",
+    "EXTERNAL_ID": "external_id",
     "FENCING": "fencing_token",
     "FENCING_TOKEN": "fencing_token",
     "FAILURE": "failure",
+    "FAILURE_RATE_PCT": "failure_rate_pct",
     "FROM_EVENT": "from_event",
     "FROM_MS": "from_ms",
     "FROM_STATE": "from_state",
     "FROM_VERSION": "from_version",
     "FULL": "full",
+    "FAILURE_THRESHOLD": "failure_threshold",
+    "FLOW_ID": "flow_id",
+    "FIRE_AT_MS": "fire_at_ms",
     "GROUP": "group_id",
     "GROUP_ID": "group_id",
+    "GOVERNANCE_SCOPE": "governance_scope",
+    "HALF_OPEN_MAX_PROBES": "half_open_max_probes",
+    "HALF_OPEN_SUCCESS_THRESHOLD": "half_open_success_threshold",
     "HISTORY_HOT_MAX_EVENTS": "history_hot_max_events",
     "HISTORY_MAX_EVENTS": "history_max_events",
     "IDEMPOTENT": "idempotent",
@@ -287,20 +353,29 @@ _FIELD_NAMES = {
     "INITIAL_STATE": "initial_state",
     "ITEMS": "items",
     "JITTER_PCT": "jitter_pct",
+    "LATENCY_MS": "latency_ms",
+    "LATENCY_THRESHOLD_MS": "latency_threshold_ms",
     "LEASE_MS": "lease_ms",
     "LEASE_TOKEN": "lease_token",
     "LIMIT": "limit",
     "LOCAL_CACHE": "local_cache",
+    "MAX_FIRES": "max_fires",
     "MAX_ATTEMPTS": "max_attempts",
     "MAX_BYTES": "max_bytes",
     "MAX_MS": "max_ms",
     "MAX_RETRIES": "max_retries",
+    "MIN_CALLS": "min_calls",
     "NAME": "name",
     "NOW": "now_ms",
     "OLDER_THAN": "older_than_ms",
     "ON_CHILD_FAILED": "on_child_failed",
     "ON_PARENT_CLOSED": "on_parent_closed",
+    "OPEN_MS": "open_ms",
+    "OPERATION_DIGEST": "operation_digest",
     "OVERRIDE": "override",
+    "OVERLAP_POLICY": "overlap_policy",
+    "OVERLAP_RETRY_MS": "overlap_retry_ms",
+    "OVERWRITE": "overwrite",
     "OWNER_FLOW_ID": "owner_flow_id",
     "PARENT_FLOW_ID": "parent_id",
     "PARENT_ID": "parent_id",
@@ -308,8 +383,12 @@ _FIELD_NAMES = {
     "PAYLOAD": "payload",
     "PAYLOAD_MAX_BYTES": "payload_max_bytes",
     "PRIORITY": "priority",
+    "POLICY_HASH": "policy_hash",
+    "POLICY_VERSION": "policy_version",
     "REASON": "reason",
     "REASON_REF": "reason_ref",
+    "REQUESTED_BY": "requested_by",
+    "RESERVATION_ID": "reservation_id",
     "RECLAIM_EXPIRED": "reclaim_expired",
     "RECLAIM_RATIO": "reclaim_ratio",
     "RESULT": "result",
@@ -321,8 +400,12 @@ _FIELD_NAMES = {
     "RUN_AT": "run_at_ms",
     "RUN_AT_MS": "run_at_ms",
     "SIGNAL": "signal",
+    "SHARD_ID": "shard_id",
+    "SCOPE": "scope",
     "STATE": "state",
+    "STATUS": "status",
     "STATES": "states",
+    "START_AT_MS": "start_at_ms",
     "STEPS": "steps",
     "SUCCESS": "success",
     "TERMINAL_ONLY": "terminal_only",
@@ -331,14 +414,20 @@ _FIELD_NAMES = {
     "TO_MS": "to_ms",
     "TO_STATE": "to_state",
     "TO_VERSION": "to_version",
+    "TARGET": "target",
+    "TARGET_TYPE": "target_type",
     "TRANSITION_TO": "transition_to",
     "TTL": "ttl_ms",
     "TTL_MS": "ttl_ms",
+    "TIMEOUT_MS": "timeout_ms",
+    "TIMEZONE": "timezone",
     "TYPE": "type",
+    "USAGE": "usage",
     "VALUE_MAX_BYTES": "value_max_bytes",
     "VALUES": "values",
     "WAIT": "wait",
     "WAIT_STATE": "wait_state",
+    "WINDOW_MS": "window_ms",
     "WORKER": "worker",
 }
 
@@ -350,6 +439,7 @@ _BOOL_FIELDS = {
     "independent",
     "local_cache",
     "override",
+    "overwrite",
     "reclaim_expired",
     "rev",
     "terminal_only",
@@ -447,11 +537,7 @@ def _compact_pipeline_payload(
                 return None
             parts.append(_compact_binary(key))
             parts.append(_compact_binary(value))
-        elif opcode == _OPCODES["GET"]:
-            if set(command.payload) != {"key"}:
-                return None
-            parts.append(_compact_binary(key))
-        elif opcode == _OPCODES["SMEMBERS"]:
+        elif opcode == _OPCODES["GET"] or opcode == _OPCODES["SMEMBERS"]:
             if set(command.payload) != {"key"}:
                 return None
             parts.append(_compact_binary(key))
@@ -479,15 +565,7 @@ def _compact_pipeline_payload(
             if set(command.payload) != {"key"}:
                 return None
             parts.append(_compact_binary(key))
-        elif opcode == _OPCODES["SISMEMBER"]:
-            if set(command.payload) != {"key", "member"}:
-                return None
-            member = _maybe_bytes(command.payload.get("member"))
-            if member is None:
-                return None
-            parts.append(_compact_binary(key))
-            parts.append(_compact_binary(member))
-        elif opcode == _OPCODES["ZSCORE"]:
+        elif opcode == _OPCODES["SISMEMBER"] or opcode == _OPCODES["ZSCORE"]:
             if set(command.payload) != {"key", "member"}:
                 return None
             member = _maybe_bytes(command.payload.get("member"))
@@ -1357,10 +1435,12 @@ class ProtocolAdapter:
         timeout: float | None = 30.0,
         client_name: str | None = "ferricstore-python",
         compression: str = "none",
-        lanes: int = 16,
+        lanes: int = _DEFAULT_PROTOCOL_LANES,
         ssl_context: ssl.SSLContext | None = None,
         heartbeat_interval: float | None = 30.0,
         heartbeat_timeout: float | None = 30.0,
+        max_response_bytes: int | None = _DEFAULT_MAX_RESPONSE_BYTES,
+        max_decompressed_response_bytes: int | None = _DEFAULT_MAX_DECOMPRESSED_RESPONSE_BYTES,
     ) -> None:
         self.host = host
         self.port = port
@@ -1374,6 +1454,8 @@ class ProtocolAdapter:
         self.ssl_context = ssl_context
         self.heartbeat_interval = heartbeat_interval
         self.heartbeat_timeout = heartbeat_timeout
+        self.max_response_bytes = max_response_bytes
+        self.max_decompressed_response_bytes = max_decompressed_response_bytes
         self.client = self
         self._lock = threading.Lock()
         self._request_id = 0
@@ -1518,9 +1600,13 @@ class ProtocolAdapter:
         self._complete_batch_future(response_future, count, future)
         return future
 
-    def submit_flow_many_payload(self, command: str, payload: bytes, count: int) -> Future[list[Any]]:
+    def submit_flow_many_payload(
+        self, command: str, payload: bytes, count: int
+    ) -> Future[list[Any]]:
         if not isinstance(payload, bytes) or not payload:
-            raise InvalidCommandError("Flow many payload must be a non-empty compact binary payload")
+            raise InvalidCommandError(
+                "Flow many payload must be a non-empty compact binary payload"
+            )
         if count < 0:
             raise InvalidCommandError("Flow many payload count must be non-negative")
 
@@ -2070,12 +2156,22 @@ class ProtocolAdapter:
         payload: dict[str, Any] | bytes,
         flags: int = 0,
     ) -> ProtocolResponse:
+        trace_enabled = bool(flags & _FLAG_TRACE)
+        request_started_ns = time.perf_counter_ns() if trace_enabled else 0
         request_id, future = self._submit_request(opcode, lane_id, payload, flags)
+        wait_started_ns = time.perf_counter_ns() if trace_enabled else 0
 
         try:
             if self.timeout is None:
-                return future.result()
-            return future.result(timeout=self.timeout)
+                response = future.result()
+            else:
+                response = future.result(timeout=self.timeout)
+            if trace_enabled and response.trace is not None:
+                wait_done_ns = time.perf_counter_ns()
+                client_trace = response.trace.setdefault("client", {})
+                client_trace["future_wait_us"] = (wait_done_ns - wait_started_ns) // 1000
+                client_trace["request_total_us"] = (wait_done_ns - request_started_ns) // 1000
+            return response
         except FutureTimeoutError as exc:
             self._pending.pop(request_id, None)
             self._pending_traces.pop(request_id, None)
@@ -2088,18 +2184,28 @@ class ProtocolAdapter:
         payload: dict[str, Any] | bytes,
         flags: int = 0,
     ) -> tuple[int, Future[ProtocolResponse]]:
+        trace_enabled = bool(flags & _FLAG_TRACE)
+        submit_started_ns = time.perf_counter_ns() if trace_enabled else 0
         with self._lock:
+            lock_acquired_ns = time.perf_counter_ns() if trace_enabled else 0
             request_id = self._next_request_id()
             lane_id = self._next_lane_id(lane_id)
             future: Future[ProtocolResponse] = Future()
             self._pending[request_id] = future
-            trace_enabled = bool(flags & _FLAG_TRACE)
+            client_trace: dict[str, Any] | None = None
             if trace_enabled:
-                self._pending_traces[request_id] = {}
+                client_trace = {
+                    "request_lock_wait_us": (lock_acquired_ns - submit_started_ns) // 1000
+                }
+                self._pending_traces[request_id] = client_trace
             try:
                 trace = self._send(opcode, lane_id, request_id, payload, flags)
-                if trace_enabled and trace is not None:
-                    self._pending_traces[request_id].update(trace)
+                if trace_enabled and client_trace is not None:
+                    submit_done_ns = time.perf_counter_ns()
+                    if trace is not None:
+                        client_trace.update(trace)
+                    client_trace["submit_locked_us"] = (submit_done_ns - lock_acquired_ns) // 1000
+                    client_trace["submit_total_us"] = (submit_done_ns - submit_started_ns) // 1000
             except Exception:
                 self._pending.pop(request_id, None)
                 self._pending_traces.pop(request_id, None)
@@ -2160,8 +2266,10 @@ class ProtocolAdapter:
         if magic != _MAGIC or version != _RESPONSE_VERSION:
             raise FerricStoreError("invalid protocol response frame header")
 
+        self._check_response_size(body_len)
         body = self._recv_exact(body_len)
         chunks = [body]
+        total_body_len = body_len
         final_flags = flags
         while final_flags & _FLAG_MORE_CHUNKS:
             next_header = self._recv_exact(_HEADER.size)
@@ -2182,6 +2290,8 @@ class ProtocolAdapter:
                 or next_request_id != request_id
             ):
                 raise FerricStoreError("invalid protocol chunk continuation")
+            total_body_len += next_body_len
+            self._check_response_size(total_body_len)
             chunks.append(self._recv_exact(next_body_len))
             final_flags = next_flags
 
@@ -2190,6 +2300,7 @@ class ProtocolAdapter:
         decode_started_ns = read_done_ns
         if final_flags & _FLAG_COMPRESSED:
             body = zlib.decompress(body)
+            self._check_decompressed_response_size(len(body))
 
         if len(body) < _STATUS.size:
             raise FerricStoreError("protocol response body is too short")
@@ -2249,6 +2360,16 @@ class ProtocolAdapter:
             chunks.append(chunk)
             received += len(chunk)
         return b"".join(chunks)
+
+    def _check_response_size(self, size: int) -> None:
+        limit = self.max_response_bytes
+        if limit is not None and limit >= 0 and size > limit:
+            raise FerricStoreError("protocol response exceeds max_response_bytes")
+
+    def _check_decompressed_response_size(self, size: int) -> None:
+        limit = self.max_decompressed_response_bytes
+        if limit is not None and limit >= 0 and size > limit:
+            raise FerricStoreError("protocol response exceeds max_decompressed_response_bytes")
 
     def _require_socket(self) -> socket.socket | ssl.SSLSocket:
         if self._sock is None:
@@ -2353,7 +2474,9 @@ class ProtocolAdapterPool:
     def submit_pipeline_payload(self, payload: bytes, count: int) -> Future[list[Any]]:
         return self._next_adapter().submit_pipeline_payload(payload, count)
 
-    def submit_flow_many_payload(self, command: str, payload: bytes, count: int) -> Future[list[Any]]:
+    def submit_flow_many_payload(
+        self, command: str, payload: bytes, count: int
+    ) -> Future[list[Any]]:
         return self._next_adapter().submit_flow_many_payload(command, payload, count)
 
     def submit_flow_value_mget_payload(self, payload: bytes) -> Future[Any]:
@@ -2402,11 +2525,13 @@ class AsyncProtocolAdapter:
         timeout: float | None = 30.0,
         client_name: str | None = "ferricstore-python-async",
         compression: str = "none",
-        lanes: int = 16,
+        lanes: int = _DEFAULT_PROTOCOL_LANES,
         write_drain_bytes: int = 1_048_576,
         ssl_context: ssl.SSLContext | None = None,
         heartbeat_interval: float | None = 30.0,
         heartbeat_timeout: float | None = 30.0,
+        max_response_bytes: int | None = _DEFAULT_MAX_RESPONSE_BYTES,
+        max_decompressed_response_bytes: int | None = _DEFAULT_MAX_DECOMPRESSED_RESPONSE_BYTES,
     ) -> None:
         self.host = host
         self.port = port
@@ -2421,6 +2546,8 @@ class AsyncProtocolAdapter:
         self.ssl_context = ssl_context
         self.heartbeat_interval = heartbeat_interval
         self.heartbeat_timeout = heartbeat_timeout
+        self.max_response_bytes = max_response_bytes
+        self.max_decompressed_response_bytes = max_decompressed_response_bytes
         self.client = self
         self._connect_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
@@ -2693,7 +2820,14 @@ class AsyncProtocolAdapter:
                 self._pending.pop(request_id, None)
                 self._pending_traces.pop(request_id, None)
                 raise
-        return await future
+        try:
+            if self.timeout is None:
+                return await future
+            return await asyncio.wait_for(future, self.timeout)
+        except asyncio.TimeoutError as exc:
+            self._pending.pop(request_id, None)
+            self._pending_traces.pop(request_id, None)
+            raise FerricStoreError("protocol request timed out") from exc
 
     async def _reader_loop(self) -> None:
         try:
@@ -2748,8 +2882,10 @@ class AsyncProtocolAdapter:
         if magic != _MAGIC or version != _RESPONSE_VERSION:
             raise FerricStoreError("invalid protocol response frame header")
 
+        self._check_response_size(body_len)
         body = await self._recv_exact(body_len)
         chunks = [body]
+        total_body_len = body_len
         final_flags = flags
         while final_flags & _FLAG_MORE_CHUNKS:
             next_header = await self._recv_exact(_HEADER.size)
@@ -2770,6 +2906,8 @@ class AsyncProtocolAdapter:
                 or next_request_id != request_id
             ):
                 raise FerricStoreError("invalid protocol chunk continuation")
+            total_body_len += next_body_len
+            self._check_response_size(total_body_len)
             chunks.append(await self._recv_exact(next_body_len))
             final_flags = next_flags
 
@@ -2778,6 +2916,7 @@ class AsyncProtocolAdapter:
         decode_started_ns = read_done_ns
         if final_flags & _FLAG_COMPRESSED:
             body = zlib.decompress(body)
+            self._check_decompressed_response_size(len(body))
 
         if len(body) < _STATUS.size:
             raise FerricStoreError("protocol response body is too short")
@@ -2825,6 +2964,16 @@ class AsyncProtocolAdapter:
             return await reader.readexactly(size)
         except asyncio.IncompleteReadError as exc:
             raise FerricStoreError("protocol connection closed") from exc
+
+    def _check_response_size(self, size: int) -> None:
+        limit = self.max_response_bytes
+        if limit is not None and limit >= 0 and size > limit:
+            raise FerricStoreError("protocol response exceeds max_response_bytes")
+
+    def _check_decompressed_response_size(self, size: int) -> None:
+        limit = self.max_decompressed_response_bytes
+        if limit is not None and limit >= 0 and size > limit:
+            raise FerricStoreError("protocol response exceeds max_decompressed_response_bytes")
 
     def _require_reader(self) -> asyncio.StreamReader:
         if self._reader is None:
@@ -3573,7 +3722,10 @@ def _compact_flow_step_continue_payloads_from_raw(
     commands: list[tuple[Any, ...]],
 ) -> list[tuple[int, bytes, int]] | None:
     groups: list[
-        tuple[tuple[bytes, bytes, int, bytes | None], list[tuple[bytes, bytes | None, bytes, int, int]]]
+        tuple[
+            tuple[bytes, bytes, int, bytes | None],
+            list[tuple[bytes, bytes | None, bytes, int, int]],
+        ]
     ] = []
     current_key: tuple[bytes, bytes, int, bytes | None] | None = None
     current_items: list[tuple[bytes, bytes | None, bytes, int, int]] = []
@@ -4044,6 +4196,24 @@ def _compact_return_mode(value: Any) -> int | None:
         return 1
     if value in {"jobs_compact_state", "JOBS_COMPACT_STATE"}:
         return 2
+    if value in {
+        "jobs_compact_attrs",
+        "JOBS_COMPACT_ATTRS",
+        "jobs_compact_attributes",
+        "JOBS_COMPACT_ATTRIBUTES",
+    }:
+        return 3
+    if value in {
+        "jobs_compact_state_attrs",
+        "JOBS_COMPACT_STATE_ATTRS",
+        "jobs_compact_with_state_attrs",
+        "JOBS_COMPACT_WITH_STATE_ATTRS",
+        "jobs_compact_state_attributes",
+        "JOBS_COMPACT_STATE_ATTRIBUTES",
+        "jobs_compact_with_state_attributes",
+        "JOBS_COMPACT_WITH_STATE_ATTRIBUTES",
+    }:
+        return 4
     return None
 
 
@@ -4323,9 +4493,7 @@ def _try_decode_custom_kv_mget(data: bytes, offset: int = 0) -> list[bytes | Non
     return values
 
 
-def _try_decode_custom_kv_mget_fixed(
-    data: bytes, offset: int = 0
-) -> list[bytes | None] | None:
+def _try_decode_custom_kv_mget_fixed(data: bytes, offset: int = 0) -> list[bytes | None] | None:
     offset += 1
     data_len = len(data)
     if offset + 8 > data_len:
@@ -4479,6 +4647,19 @@ def _try_decode_custom_claim_jobs(data: bytes, offset: int = 0) -> list[list[Any
         offset += 1
         count = _read_u32(data, offset)
         offset += 4
+        for width in (6, 5, 4):
+            decoded = _try_decode_custom_claim_jobs_width(data, offset, count, width)
+            if decoded is not None:
+                return decoded
+        return None
+    except (IndexError, struct.error, FerricStoreError):
+        return None
+
+
+def _try_decode_custom_claim_jobs_width(
+    data: bytes, offset: int, count: int, width: int
+) -> list[list[Any]] | None:
+    try:
         items: list[list[Any] | None] = [None] * count
         for index in range(count):
             id_value, offset = _read_compact_binary(data, offset)
@@ -4487,7 +4668,19 @@ def _try_decode_custom_claim_jobs(data: bytes, offset: int = 0) -> list[list[Any
             _require_available(data, offset, 8)
             fencing = struct.unpack_from(">q", data, offset)[0]
             offset += 8
-            items[index] = [id_value, partition, lease, fencing]
+            row: list[Any] = [id_value, partition, lease, fencing]
+            if width == 5:
+                attrs, offset = _decode_value_at(data, offset)
+                if not isinstance(attrs, dict):
+                    return None
+                row.append(attrs)
+            elif width == 6:
+                run_state, offset = _read_compact_optional_binary(data, offset)
+                attrs, offset = _decode_value_at(data, offset)
+                if not isinstance(attrs, dict):
+                    return None
+                row.extend([run_state, attrs])
+            items[index] = row
         if offset != len(data):
             return None
         return cast(list[list[Any]], items)
@@ -4716,13 +4909,25 @@ def _try_decode_claim_jobs_compact(data: bytes, offset: int = 0) -> list[list[An
             offset += 1
             width = _read_u32(data, offset)
             offset += 4
-            if width != 4:
+            if width not in {4, 5, 6}:
                 return None
             id_value, offset = _read_tagged_binary(data, offset)
             partition, offset = _read_tagged_binary(data, offset)
             lease, offset = _read_tagged_binary(data, offset)
             fencing, offset = _read_tagged_i64(data, offset)
-            items.append([id_value, partition, lease, fencing])
+            row: list[Any] = [id_value, partition, lease, fencing]
+            if width == 5:
+                attrs, offset = _decode_value_at(data, offset)
+                if not isinstance(attrs, dict):
+                    return None
+                row.append(attrs)
+            elif width == 6:
+                run_state, offset = _read_compact_optional_binary(data, offset)
+                attrs, offset = _decode_value_at(data, offset)
+                if not isinstance(attrs, dict):
+                    return None
+                row.extend([run_state, attrs])
+            items.append(row)
         if offset != len(data):
             return None
         return items
@@ -5088,13 +5293,31 @@ def _build_flow_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolCo
         payload = {key: _require_arg(args, 0, name)}
         payload.update(_option_map(args[1:]))
         return ProtocolCommand(opcode, payload)
-    if name in {"FLOW.LIST", "FLOW.TERMINALS", "FLOW.FAILURES", "FLOW.INFO", "FLOW.STUCK"}:
+    if name in {
+        "FLOW.LIST",
+        "FLOW.STATS",
+        "FLOW.TERMINALS",
+        "FLOW.FAILURES",
+        "FLOW.INFO",
+        "FLOW.STUCK",
+    }:
         payload = {"type": _require_arg(args, 0, name)}
         payload.update(_option_map(args[1:]))
         if name == "FLOW.LIST":
             compact = _compact_flow_list_payload(payload)
             if compact is not None:
                 return ProtocolCommand(opcode, compact, flags=_FLAG_CUSTOM_PAYLOAD)
+        return ProtocolCommand(opcode, payload)
+    if name == "FLOW.ATTRIBUTES":
+        payload = {"type": _require_arg(args, 0, name)}
+        payload.update(_option_map(args[1:]))
+        return ProtocolCommand(opcode, payload)
+    if name == "FLOW.ATTRIBUTE_VALUES":
+        payload = {
+            "type": _require_arg(args, 0, name),
+            "attribute": _require_arg(args, 1, name),
+        }
+        payload.update(_option_map(args[2:]))
         return ProtocolCommand(opcode, payload)
     if name == "FLOW.VALUE.PUT":
         payload = {"value": _require_arg(args, 0, name)}
@@ -5112,6 +5335,52 @@ def _build_flow_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolCo
         payload = {"type": _require_arg(args, 0, name)}
         payload.update(_option_map(args[1:]))
         return ProtocolCommand(opcode, payload)
+    if name in {
+        "FLOW.SCHEDULE.CREATE",
+        "FLOW.SCHEDULE.GET",
+        "FLOW.SCHEDULE.FIRE",
+        "FLOW.SCHEDULE.PAUSE",
+        "FLOW.SCHEDULE.RESUME",
+        "FLOW.SCHEDULE.DELETE",
+        "FLOW.EFFECT.RESERVE",
+        "FLOW.EFFECT.CONFIRM",
+        "FLOW.EFFECT.FAIL",
+        "FLOW.EFFECT.COMPENSATE",
+        "FLOW.EFFECT.GET",
+        "FLOW.GOVERNANCE.LEDGER",
+        "FLOW.APPROVAL.REQUEST",
+        "FLOW.APPROVAL.APPROVE",
+        "FLOW.APPROVAL.REJECT",
+        "FLOW.APPROVAL.GET",
+    }:
+        payload = {"id": _require_arg(args, 0, name)}
+        payload.update(_option_map(args[1:]))
+        return ProtocolCommand(opcode, payload)
+    if name in {
+        "FLOW.CIRCUIT.OPEN",
+        "FLOW.CIRCUIT.CLOSE",
+        "FLOW.CIRCUIT.GET",
+        "FLOW.BUDGET.RESERVE",
+        "FLOW.BUDGET.COMMIT",
+        "FLOW.BUDGET.RELEASE",
+        "FLOW.BUDGET.GET",
+        "FLOW.LIMIT.LEASE",
+        "FLOW.LIMIT.SPEND",
+        "FLOW.LIMIT.RELEASE",
+        "FLOW.LIMIT.GET",
+    }:
+        payload = {"scope": _require_arg(args, 0, name)}
+        payload.update(_option_map(args[1:]))
+        return ProtocolCommand(opcode, payload)
+    if name in {
+        "FLOW.SCHEDULE.FIRE_DUE",
+        "FLOW.SCHEDULE.LIST",
+        "FLOW.APPROVAL.LIST",
+        "FLOW.GOVERNANCE.OVERVIEW",
+        "FLOW.BUDGET.LIST",
+        "FLOW.LIMIT.LIST",
+    }:
+        return ProtocolCommand(opcode, _option_map(args))
     if name == "FLOW.SPAWN_CHILDREN":
         return ProtocolCommand(opcode, _flow_spawn_children_payload(args))
     if name == "FLOW.RETENTION_CLEANUP":
@@ -5309,6 +5578,19 @@ def _option_map(args: tuple[Any, ...]) -> dict[str, Any]:
         if token in {"DROP_VALUE", "OVERRIDE_VALUE"}:
             list_field = "drop_values" if token == "DROP_VALUE" else "override_values"
             payload.setdefault(list_field, []).append(_text(_require_arg(args, idx + 1, token)))
+            idx += 2
+            continue
+        if token in {"ATTRIBUTE", "ATTRIBUTE_MERGE"}:
+            map_field = "attributes" if token == "ATTRIBUTE" else "attributes_merge"
+            name = _text(_require_arg(args, idx + 1, token))
+            value = _require_arg(args, idx + 2, token)
+            payload.setdefault(map_field, {})[name] = value
+            idx += 3
+            continue
+        if token == "ATTRIBUTE_DELETE":
+            payload.setdefault("attributes_delete", []).append(
+                _text(_require_arg(args, idx + 1, token))
+            )
             idx += 2
             continue
 
@@ -5619,11 +5901,7 @@ def _response_value(response: ProtocolResponse) -> Any:
 
 
 def _batch_item_value(item: Any) -> Any:
-    if isinstance(item, list) and len(item) == 2:
-        status = _status_text(item[0]) or "error"
-        value = item[1]
-        raw = item
-    elif isinstance(item, tuple) and len(item) == 2:
+    if (isinstance(item, list) and len(item) == 2) or (isinstance(item, tuple) and len(item) == 2):
         status = _status_text(item[0]) or "error"
         value = item[1]
         raw = item

@@ -4,6 +4,7 @@ import asyncio
 import socket
 import struct
 import threading
+import zlib
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
@@ -11,12 +12,12 @@ import pytest
 
 import ferricstore.protocol as protocol_module
 from ferricstore import AsyncFlowClient, AsyncProtocolAdapter, FlowClient, ProtocolAdapter
-from ferricstore.errors import InvalidCommandError
+from ferricstore.errors import FerricStoreError, InvalidCommandError
 from ferricstore.protocol import (
     _COMPACT_BINARY_LIST_LIST,
+    _COMPACT_FLOW_LIST_REQUEST,
     _COMPACT_FLOW_RECORD,
     _COMPACT_FLOW_RECORD_LIST,
-    _COMPACT_FLOW_LIST_REQUEST,
     _COMPACT_INTEGER_LIST,
     _COMPACT_PIPELINE_REQUEST,
     _COMPACT_PIPELINE_RESPONSE,
@@ -33,7 +34,7 @@ from ferricstore.protocol import (
     decode_value,
     encode_value,
 )
-from ferricstore.types import ChildSpec, ClaimedItem, CreateItem
+from ferricstore.types import ChildSpec, ClaimedFlow, CreateItem
 
 
 def test_protocol_value_codec_round_trips_binary_safe_nested_values():
@@ -141,6 +142,86 @@ def test_protocol_connect_uses_timeout_only_for_connect_not_socket_reads(monkeyp
 
     assert captured == {"address": ("127.0.0.1", 6388), "timeout": 7.5}
     assert fake_socket.timeouts == [None]
+
+    adapter.close()
+
+
+def test_protocol_adapter_defaults_to_latency_first_lanes(monkeypatch):
+    monkeypatch.setattr(ProtocolAdapter, "_connect", lambda self: None)
+
+    adapter = ProtocolAdapter("127.0.0.1", 6388, heartbeat_interval=None)
+
+    assert adapter.lanes == 8
+
+    adapter.close()
+
+
+def test_async_protocol_adapter_defaults_to_latency_first_lanes():
+    adapter = AsyncProtocolAdapter("127.0.0.1", 6388, heartbeat_interval=None)
+
+    assert adapter.lanes == 8
+
+
+def test_protocol_recv_response_rejects_body_before_large_allocation(monkeypatch):
+    monkeypatch.setattr(ProtocolAdapter, "_connect", lambda self: None)
+    header = struct.Struct(">4sBBIHQI")
+
+    class FakeSocket:
+        def __init__(self, data: bytes):
+            self.data = bytearray(data)
+
+        def recv(self, size: int) -> bytes:
+            chunk = bytes(self.data[:size])
+            del self.data[:size]
+            return chunk
+
+        def shutdown(self, *args):
+            pass
+
+        def close(self):
+            pass
+
+    frame = header.pack(b"FSNP", 0x81, 0, 1, 0x0101, 1, 11)
+    adapter = ProtocolAdapter(max_response_bytes=10, heartbeat_interval=None)
+    adapter._sock = FakeSocket(frame)
+
+    with pytest.raises(FerricStoreError, match="max_response_bytes"):
+        adapter._recv_response()
+
+    adapter.close()
+
+
+def test_protocol_recv_response_rejects_decompressed_body_over_limit(monkeypatch):
+    monkeypatch.setattr(ProtocolAdapter, "_connect", lambda self: None)
+    header = struct.Struct(">4sBBIHQI")
+    status = struct.Struct(">H")
+
+    class FakeSocket:
+        def __init__(self, data: bytes):
+            self.data = bytearray(data)
+
+        def recv(self, size: int) -> bytes:
+            chunk = bytes(self.data[:size])
+            del self.data[:size]
+            return chunk
+
+        def shutdown(self, *args):
+            pass
+
+        def close(self):
+            pass
+
+    body = zlib.compress(status.pack(0) + encode_value(b"x" * 32))
+    frame = header.pack(b"FSNP", 0x81, 0x08, 1, 0x0101, 1, len(body)) + body
+    adapter = ProtocolAdapter(
+        max_response_bytes=1024,
+        max_decompressed_response_bytes=16,
+        heartbeat_interval=None,
+    )
+    adapter._sock = FakeSocket(frame)
+
+    with pytest.raises(FerricStoreError, match="max_decompressed_response_bytes"):
+        adapter._recv_response()
 
     adapter.close()
 
@@ -375,7 +456,9 @@ def test_protocol_submit_mget_payload_sends_preencoded_direct_compact_bulk_frame
 
     adapter = ProtocolAdapter("127.0.0.1", 6388, lanes=16)
     adapter._sock = FakeSocket()
-    payload = bytes([_COMPACT_PIPELINE_REQUEST, 2]) + struct.pack(">I", 1) + struct.pack(">I", 1) + b"k"
+    payload = (
+        bytes([_COMPACT_PIPELINE_REQUEST, 2]) + struct.pack(">I", 1) + struct.pack(">I", 1) + b"k"
+    )
 
     future = adapter.submit_mget_payload(payload)
 
@@ -1075,7 +1158,9 @@ def test_protocol_execute_batch_compacts_flow_get_meta_without_partition(monkeyp
 
 
 def test_protocol_builds_flow_list_return_meta_payload():
-    command = build_protocol_command("FLOW.LIST", "email", "STATE", "queued", "COUNT", 10, "RETURN", "META")
+    command = build_protocol_command(
+        "FLOW.LIST", "email", "STATE", "queued", "COUNT", 10, "RETURN", "META"
+    )
 
     assert command.opcode == 0x020E
     assert command.flags == _FLAG_CUSTOM_PAYLOAD
@@ -1090,7 +1175,9 @@ def test_protocol_builds_flow_list_return_meta_payload():
 
 
 def test_protocol_keeps_generic_flow_list_payload_for_unsupported_filters():
-    command = build_protocol_command("FLOW.LIST", "email", "STATE", "queued", "COUNT", 10, "REV", True)
+    command = build_protocol_command(
+        "FLOW.LIST", "email", "STATE", "queued", "COUNT", 10, "REV", True
+    )
 
     assert command.opcode == 0x020E
     assert command.flags == 0
@@ -1099,6 +1186,26 @@ def test_protocol_keeps_generic_flow_list_payload_for_unsupported_filters():
         "state": "queued",
         "count": 10,
         "rev": True,
+    }
+
+
+def test_protocol_builds_flow_stats_with_attributes():
+    command = build_protocol_command(
+        "FLOW.STATS",
+        "email",
+        "STATE",
+        "queued",
+        "ATTRIBUTE",
+        "tenant",
+        "acme",
+    )
+
+    assert command.opcode == 0x022D
+    assert command.flags == 0
+    assert command.payload == {
+        "type": "email",
+        "state": "queued",
+        "attributes": {"tenant": "acme"},
     }
 
 
@@ -1341,8 +1448,58 @@ def test_protocol_decodes_compact_claim_jobs_as_pipeline_values():
         + struct.pack(">q", 42)
     )
 
-    assert _try_fast_response_value_at(0x000E, payload, 0) == [
-        [b"flow-1", b"part", b"lease-1", 42]
+    assert _try_fast_response_value_at(0x000E, payload, 0) == [[b"flow-1", b"part", b"lease-1", 42]]
+
+
+def test_protocol_decodes_typed_compact_claim_jobs_with_attributes():
+    def tagged_binary(value: bytes) -> bytes:
+        return b"\x04" + struct.pack(">I", len(value)) + value
+
+    attrs = encode_value({b"tenant": b"acme"})
+    payload = (
+        b"\x05"
+        + struct.pack(">I", 1)
+        + b"\x05"
+        + struct.pack(">I", 5)
+        + tagged_binary(b"flow-1")
+        + tagged_binary(b"part")
+        + tagged_binary(b"lease-1")
+        + b"\x03"
+        + struct.pack(">q", 42)
+        + attrs
+    )
+
+    assert protocol_module._try_decode_claim_jobs_compact(payload, 0) == [
+        [b"flow-1", b"part", b"lease-1", 42, {b"tenant": b"acme"}]
+    ]
+
+
+def test_protocol_decodes_typed_compact_claim_jobs_with_state_and_attributes():
+    def tagged_binary(value: bytes) -> bytes:
+        return b"\x04" + struct.pack(">I", len(value)) + value
+
+    def compact_optional_binary(value: bytes | None) -> bytes:
+        if value is None:
+            return struct.pack(">I", 0xFFFFFFFF)
+        return struct.pack(">I", len(value)) + value
+
+    attrs = encode_value({b"tenant": b"acme"})
+    payload = (
+        b"\x05"
+        + struct.pack(">I", 1)
+        + b"\x05"
+        + struct.pack(">I", 6)
+        + tagged_binary(b"flow-1")
+        + tagged_binary(b"part")
+        + tagged_binary(b"lease-1")
+        + b"\x03"
+        + struct.pack(">q", 42)
+        + compact_optional_binary(b"ready")
+        + attrs
+    )
+
+    assert protocol_module._try_decode_claim_jobs_compact(payload, 0) == [
+        [b"flow-1", b"part", b"lease-1", 42, b"ready", {b"tenant": b"acme"}]
     ]
 
 
@@ -1702,6 +1859,11 @@ def test_protocol_adapter_execute_command_with_trace_unwraps_value_and_timings()
     assert result["trace"]["client"]["socket_write_us"] >= 0
     assert result["trace"]["client"]["response_read_us"] >= 0
     assert result["trace"]["client"]["decode_us"] >= 0
+    assert result["trace"]["client"]["request_lock_wait_us"] >= 0
+    assert result["trace"]["client"]["submit_locked_us"] >= 0
+    assert result["trace"]["client"]["submit_total_us"] >= 0
+    assert result["trace"]["client"]["future_wait_us"] >= 0
+    assert result["trace"]["client"]["request_total_us"] >= 0
 
 
 def test_protocol_fast_decodes_custom_flow_claim_jobs():
@@ -1845,6 +2007,53 @@ def test_protocol_fast_decodes_custom_claim_jobs_from_frame_body_offset():
     )
 
     assert _try_fast_response_value_at(0x0203, body, 2) == [[b"f1", None, b"lease1", 7]]
+
+
+def test_protocol_fast_decodes_custom_claim_jobs_with_attributes():
+    def bin_field(value: bytes | None) -> bytes:
+        if value is None:
+            return struct.pack(">I", 0xFFFFFFFF)
+        return struct.pack(">I", len(value)) + value
+
+    attrs = b"\x06" + struct.pack(">I", 1) + bin_field(b"tenant") + b"\x04" + bin_field(b"acme")
+    body = (
+        struct.pack(">H", 0)
+        + b"\x80"
+        + struct.pack(">I", 1)
+        + bin_field(b"f1")
+        + bin_field(b"p1")
+        + bin_field(b"lease1")
+        + struct.pack(">q", 7)
+        + attrs
+    )
+
+    assert _try_fast_response_value_at(0x0203, body, 2) == [
+        [b"f1", b"p1", b"lease1", 7, {b"tenant": b"acme"}]
+    ]
+
+
+def test_protocol_fast_decodes_custom_claim_jobs_with_state_and_attributes():
+    def bin_field(value: bytes | None) -> bytes:
+        if value is None:
+            return struct.pack(">I", 0xFFFFFFFF)
+        return struct.pack(">I", len(value)) + value
+
+    attrs = b"\x06" + struct.pack(">I", 1) + bin_field(b"tenant") + b"\x04" + bin_field(b"acme")
+    body = (
+        struct.pack(">H", 0)
+        + b"\x80"
+        + struct.pack(">I", 1)
+        + bin_field(b"f1")
+        + bin_field(b"p1")
+        + bin_field(b"lease1")
+        + struct.pack(">q", 7)
+        + bin_field(b"ready")
+        + attrs
+    )
+
+    assert _try_fast_response_value_at(0x0203, body, 2) == [
+        [b"f1", b"p1", b"lease1", 7, b"ready", {b"tenant": b"acme"}]
+    ]
 
 
 def test_async_flow_client_from_protocol_url_uses_async_protocol_adapter_pool(monkeypatch):
@@ -2015,7 +2224,17 @@ def test_protocol_adapter_trace_command_returns_client_and_server_timings():
         "server_route_us": 2,
         "server_command_execute_us": 3,
     }
-    for key in ("encode_us", "socket_write_us", "response_read_us", "decode_us"):
+    for key in (
+        "request_lock_wait_us",
+        "encode_us",
+        "socket_write_us",
+        "submit_locked_us",
+        "submit_total_us",
+        "response_read_us",
+        "decode_us",
+        "future_wait_us",
+        "request_total_us",
+    ):
         assert isinstance(result["trace"]["client"][key], int)
         assert result["trace"]["client"][key] >= 0
 
@@ -2277,6 +2496,31 @@ def test_async_protocol_adapter_trace_command_returns_client_and_server_timings(
     }
     for key in ("encode_us", "socket_write_us", "response_read_us", "decode_us"):
         assert isinstance(result["trace"]["client"][key], int)
+
+
+def test_async_protocol_request_timeout_clears_pending():
+    async def run() -> None:
+        adapter = object.__new__(AsyncProtocolAdapter)
+        adapter.timeout = 0.01
+        adapter._write_lock = asyncio.Lock()
+        adapter._request_id = 0
+        adapter.lanes = 1
+        adapter._lane_cursor = 0
+        adapter._pending = {}
+        adapter._pending_traces = {}
+
+        async def fake_send(opcode, lane_id, request_id, payload, flags=0):
+            return None
+
+        adapter._send = fake_send
+
+        with pytest.raises(FerricStoreError, match="timed out"):
+            await adapter._request(0x0101, 1, {"key": "a"})
+
+        assert adapter._pending == {}
+        assert adapter._pending_traces == {}
+
+    asyncio.run(run())
 
 
 def test_async_protocol_adapter_sends_idle_heartbeat_ping():
@@ -2796,6 +3040,195 @@ def test_encodes_protocol_flow_value_and_retention_options():
     assert value_mget.flags == _FLAG_CUSTOM_PAYLOAD
     assert isinstance(value_mget.payload, bytes)
     assert value_mget.payload[0] == 0x9D
+
+
+def test_encodes_protocol_flow_schedule_governance_and_attribute_commands():
+    attrs = build_protocol_command(
+        "FLOW.ATTRIBUTES",
+        "order",
+        "STATE",
+        "queued",
+        "PARTITION",
+        "tenant-a",
+        "COUNT",
+        10,
+    )
+    assert attrs == ProtocolCommand(
+        opcode=0x022E,
+        payload={
+            "type": "order",
+            "state": "queued",
+            "partition_key": "tenant-a",
+            "count": 10,
+        },
+        lane_id=1,
+    )
+
+    values = build_protocol_command(
+        "FLOW.ATTRIBUTE_VALUES",
+        "order",
+        "tenant",
+        "STATE",
+        "queued",
+        "REV",
+        "true",
+    )
+    assert values == ProtocolCommand(
+        opcode=0x022F,
+        payload={"type": "order", "attribute": "tenant", "state": "queued", "rev": True},
+        lane_id=1,
+    )
+
+    schedule = build_protocol_command(
+        "FLOW.SCHEDULE.CREATE",
+        "daily-report",
+        "TARGET",
+        {"id": "flow-1", "type": "report", "state": "queued"},
+        "TIMEZONE",
+        "Asia/Jerusalem",
+        "OVERWRITE",
+        "true",
+    )
+    assert schedule.opcode == 0x0225
+    assert schedule.payload == {
+        "id": "daily-report",
+        "target": {"id": "flow-1", "type": "report", "state": "queued"},
+        "timezone": "Asia/Jerusalem",
+        "overwrite": True,
+    }
+
+    fire_due = build_protocol_command("FLOW.SCHEDULE.FIRE_DUE", "BLOCK", 1000, "LIMIT", 50)
+    assert fire_due == ProtocolCommand(
+        opcode=0x0228,
+        payload={"block_ms": 1000, "limit": 50},
+        lane_id=1,
+    )
+
+    approval = build_protocol_command(
+        "FLOW.APPROVAL.REQUEST",
+        "approval-1",
+        "FLOW_ID",
+        "flow-1",
+        "SCOPE",
+        "tenant-a",
+        "ASSIGNEES",
+        ["ops"],
+        "POLICY_HASH",
+        "hash",
+        "POLICY_VERSION",
+        2,
+        "TIMEOUT_MS",
+        30_000,
+    )
+    assert approval.opcode == 0x0246
+    assert approval.payload == {
+        "id": "approval-1",
+        "flow_id": "flow-1",
+        "scope": "tenant-a",
+        "assignees": ["ops"],
+        "policy_hash": "hash",
+        "policy_version": 2,
+        "timeout_ms": 30_000,
+    }
+
+    assert build_protocol_command(
+        "FLOW.EFFECT.RESERVE",
+        "flow-1",
+        "EFFECT_KEY",
+        "send-email",
+        "EFFECT_TYPE",
+        "email.send",
+        "OPERATION_DIGEST",
+        "digest",
+    ) == ProtocolCommand(
+        opcode=0x0240,
+        payload={
+            "id": "flow-1",
+            "effect_key": "send-email",
+            "effect_type": "email.send",
+            "operation_digest": "digest",
+        },
+        lane_id=1,
+    )
+
+    assert build_protocol_command(
+        "FLOW.EFFECT.CONFIRM",
+        "flow-1",
+        "EFFECT_KEY",
+        "send-email",
+        "LATENCY_MS",
+        42,
+    ) == ProtocolCommand(
+        opcode=0x0241,
+        payload={"id": "flow-1", "effect_key": "send-email", "latency_ms": 42},
+        lane_id=1,
+    )
+
+    assert build_protocol_command(
+        "FLOW.BUDGET.RESERVE",
+        "tenant-a",
+        "AMOUNT",
+        10,
+        "WINDOW_MS",
+        60_000,
+        "RESERVATION_ID",
+        "budget-res-1",
+    ) == ProtocolCommand(
+        opcode=0x024D,
+        payload={
+            "scope": "tenant-a",
+            "amount": 10,
+            "window_ms": 60_000,
+            "reservation_id": "budget-res-1",
+        },
+        lane_id=1,
+    )
+
+    assert build_protocol_command(
+        "FLOW.BUDGET.COMMIT",
+        "tenant-a",
+        "RESERVATION_ID",
+        "budget-res-1",
+        "ACTUAL_AMOUNT",
+        7,
+        "USAGE",
+        {"tokens": 7},
+    ) == ProtocolCommand(
+        opcode=0x0257,
+        payload={
+            "scope": "tenant-a",
+            "reservation_id": "budget-res-1",
+            "actual_amount": 7,
+            "usage": {"tokens": 7},
+        },
+        lane_id=1,
+    )
+
+    assert build_protocol_command(
+        "FLOW.BUDGET.RELEASE",
+        "tenant-a",
+        "RESERVATION_ID",
+        "budget-res-unused",
+    ) == ProtocolCommand(
+        opcode=0x0258,
+        payload={"scope": "tenant-a", "reservation_id": "budget-res-unused"},
+        lane_id=1,
+    )
+
+    assert build_protocol_command(
+        "FLOW.LIMIT.LEASE",
+        "tenant-a",
+        "SHARD_ID",
+        1,
+        "AMOUNT",
+        5,
+        "TTL_MS",
+        1000,
+    ) == ProtocolCommand(
+        opcode=0x024F,
+        payload={"scope": "tenant-a", "shard_id": 1, "amount": 5, "ttl_ms": 1000},
+        lane_id=1,
+    )
 
 
 def test_encodes_protocol_flow_signal_guards_and_transition():
@@ -3579,8 +4012,8 @@ def test_encodes_protocol_flow_claim_jobs_and_high_level_many_calls():
     client.complete_many(
         None,
         [
-            ClaimedItem("f1", b"lease1", 1, partition_key="p1"),
-            ClaimedItem("f2", b"lease2", 2, partition_key="p2"),
+            ClaimedFlow("f1", b"lease1", 1, partition_key="p1"),
+            ClaimedFlow("f2", b"lease2", 2, partition_key="p2"),
         ],
         now_ms=200,
         independent=True,
@@ -3594,8 +4027,8 @@ def test_protocol_complete_jobs_marks_terminal_local_only_for_partitioned_jobs()
     client = FlowClient(object())
     args = client._complete_jobs_args(
         [
-            ClaimedItem("f1", b"lease1", 1, partition_key="p1"),
-            ClaimedItem("f2", b"lease2", 2, partition_key="p2"),
+            ClaimedFlow("f1", b"lease1", 1, partition_key="p1"),
+            ClaimedFlow("f2", b"lease2", 2, partition_key="p2"),
         ],
         now_ms=200,
         independent=False,

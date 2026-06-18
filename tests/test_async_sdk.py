@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+import ferricstore.async_worker as async_worker_module
 from ferricstore import (
     AsyncFlowClient,
     AsyncQueueClient,
@@ -9,6 +10,8 @@ from ferricstore import (
     AsyncQueueFlowWorker,
     AsyncWorkflow,
     AsyncWorkflowClient,
+    AsyncWorkflowEffect,
+    BudgetPolicy,
     ExceptionPolicy,
     RetryPolicy,
     ValueConfig,
@@ -16,7 +19,7 @@ from ferricstore import (
     complete,
     transition,
 )
-from ferricstore.types import ClaimedItem
+from ferricstore.types import ClaimedFlow
 
 
 class FakeRedis:
@@ -26,6 +29,50 @@ class FakeRedis:
 
     async def execute_command(self, *args):
         self.calls.append(args)
+        if args[0] in {"FLOW.EFFECT.RESERVE", "FLOW.EFFECT.CONFIRM", "FLOW.EFFECT.FAIL"}:
+            status = {
+                "FLOW.EFFECT.RESERVE": b"reserved",
+                "FLOW.EFFECT.CONFIRM": b"confirmed",
+                "FLOW.EFFECT.FAIL": b"failed",
+            }[args[0]]
+            effect_key = args[args.index("EFFECT_KEY") + 1]
+            effect_type = (
+                args[args.index("EFFECT_TYPE") + 1] if "EFFECT_TYPE" in args else b"external"
+            )
+            return {
+                b"id": b"f1:effect",
+                b"flow_id": args[1].encode() if isinstance(args[1], str) else args[1],
+                b"effect_key": effect_key.encode() if isinstance(effect_key, str) else effect_key,
+                b"effect_type": effect_type.encode()
+                if isinstance(effect_type, str)
+                else effect_type,
+                b"status": status,
+                b"decision": b"allowed",
+            }
+        if args[0] in {"FLOW.BUDGET.RESERVE", "FLOW.BUDGET.COMMIT", "FLOW.BUDGET.RELEASE"}:
+            status = {
+                "FLOW.BUDGET.RESERVE": b"reserved",
+                "FLOW.BUDGET.COMMIT": b"committed",
+                "FLOW.BUDGET.RELEASE": b"released",
+            }[args[0]]
+            actual_amount = (
+                args[args.index("ACTUAL_AMOUNT") + 1] if "ACTUAL_AMOUNT" in args else None
+            )
+            return {
+                b"scope": args[1].encode() if isinstance(args[1], str) else args[1],
+                b"limit": 100,
+                b"window_ms": 60_000,
+                b"window_start_ms": 1_000,
+                b"used": actual_amount if actual_amount is not None else 10,
+                b"remaining": 90,
+                b"over_budget": False,
+                b"reservations_count": 1,
+                b"reservation_id": b"budget-res-1",
+                b"reserved_amount": 10,
+                b"actual_amount": actual_amount,
+                b"status": status,
+                b"overage_amount": 0,
+            }
         if args[0] == "FLOW.CLAIM_DUE":
             return [[b"f1", b"p1", b"lease", 7]]
         if args[0] in {"FLOW.COMPLETE_MANY", "FLOW.TRANSITION_MANY"}:
@@ -177,7 +224,7 @@ def test_async_queue_client_from_protocol_url_reuses_multiplexed_claim_client(mo
     worker = client.queue(type="email").worker()._build_worker(0)
 
     assert len(calls) == 1
-    assert calls[0][1] == {"max_connections": 4}
+    assert calls[0][1] == {"max_connections": 1}
     assert client.claim_flow is client.flow
     assert worker.client is client.flow
     assert worker.claim_client is client.flow
@@ -235,6 +282,7 @@ def test_async_queue_worker_config_does_not_resize_protocol_claim_pool(monkeypat
     )
 
     assert len(calls) == 1
+    assert calls[0][1] == {"max_connections": 1}
     assert worker.client is client.flow
     assert worker.claim_client is client.flow
 
@@ -338,6 +386,199 @@ def test_async_workflow_client_worker_and_value_config_are_inherited_and_overrid
     asyncio.run(run())
 
 
+def test_async_workflow_budget_policy_reserves_commits_and_stamps_attributes():
+    async def run():
+        redis = FakeRedis()
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(redis),
+            type="order",
+            states=["queued"],
+            initial_state="queued",
+            batch_size=1,
+        )
+
+        @workflow.state("queued", budget=BudgetPolicy(scope="tenant-a", amount=10, limit=100))
+        async def queued(_job):
+            return complete(result=b"ok")
+
+        result = await workflow.run_once()
+
+        assert result.applied == 1
+        assert redis.calls[1][:4] == ("FLOW.BUDGET.RESERVE", "tenant-a", "AMOUNT", 10)
+        assert redis.calls[2][:6] == (
+            "FLOW.BUDGET.COMMIT",
+            "tenant-a",
+            "RESERVATION_ID",
+            "budget-res-1",
+            "ACTUAL_AMOUNT",
+            10,
+        )
+        complete_call = redis.calls[3]
+        assert complete_call[0] == "FLOW.COMPLETE_MANY"
+        assert "governance_budget_scope" in complete_call
+        assert "governance_budget_status" in complete_call
+
+    asyncio.run(run())
+
+
+def test_async_workflow_context_budget_allows_explicit_actual_usage():
+    async def run():
+        redis = FakeRedis()
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(redis),
+            type="order",
+            states=["queued"],
+            initial_state="queued",
+            batch_size=1,
+        )
+
+        @workflow.state("queued")
+        async def queued(ctx):
+            async with ctx.budget("tenant-a", 10, limit=100) as budget:
+                await budget.commit(7, usage={"tokens": 7})
+            return transition("next")
+
+        result = await workflow.run_once()
+
+        assert result.applied == 1
+        assert redis.calls[1][:4] == ("FLOW.BUDGET.RESERVE", "tenant-a", "AMOUNT", 10)
+        assert redis.calls[2] == (
+            "FLOW.BUDGET.COMMIT",
+            "tenant-a",
+            "RESERVATION_ID",
+            "budget-res-1",
+            "ACTUAL_AMOUNT",
+            7,
+            "USAGE",
+            {"tokens": 7},
+        )
+        transition_call = redis.calls[3]
+        assert transition_call[0] == "FLOW.TRANSITION_MANY"
+        assert "governance_budget_actual_amount" in transition_call
+        assert 7 in transition_call
+
+    asyncio.run(run())
+
+
+def test_async_workflow_context_effect_decorator_reserves_and_confirms():
+    async def run():
+        redis = FakeRedis()
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(redis),
+            type="order",
+            states=["queued"],
+            initial_state="queued",
+            batch_size=1,
+        )
+
+        @workflow.state("queued")
+        async def queued(ctx):
+            effect = ctx.effect(
+                "charge",
+                "payment.charge",
+                operation_digest="charge:v1",
+                external_id=lambda result: result["id"],
+            )
+            assert isinstance(effect, AsyncWorkflowEffect)
+
+            @effect
+            async def charge():
+                return {"id": "ch_1"}
+
+            await charge()
+            return complete(result=b"ok")
+
+        result = await workflow.run_once()
+
+        assert result.applied == 1
+        reserve_call = redis.calls[1]
+        assert reserve_call[:4] == ("FLOW.EFFECT.RESERVE", "f1", "EFFECT_KEY", "charge")
+        assert reserve_call[reserve_call.index("EFFECT_TYPE") + 1] == "payment.charge"
+        assert reserve_call[reserve_call.index("OPERATION_DIGEST") + 1] == "charge:v1"
+        assert reserve_call[reserve_call.index("LEASE_TOKEN") + 1] == b"lease"
+        assert reserve_call[reserve_call.index("FENCING") + 1] == 7
+
+        confirm_call = redis.calls[2]
+        assert confirm_call[:4] == ("FLOW.EFFECT.CONFIRM", "f1", "EFFECT_KEY", "charge")
+        assert confirm_call[confirm_call.index("EXTERNAL_ID") + 1] == "ch_1"
+        assert isinstance(confirm_call[confirm_call.index("LATENCY_MS") + 1], int)
+
+    asyncio.run(run())
+
+
+def test_async_workflow_effect_auto_latency_starts_after_reserve(monkeypatch):
+    class FakeLoop:
+        def __init__(self) -> None:
+            self.ticks = iter([10.0, 10.25])
+
+        def time(self) -> float:
+            return next(self.ticks)
+
+    async def run():
+        redis = FakeRedis()
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(redis),
+            type="order",
+            states=["queued"],
+            initial_state="queued",
+            batch_size=1,
+        )
+        job = ClaimedFlow(
+            id="f1",
+            type="order",
+            state="queued",
+            partition_key="tenant-a",
+            lease_token=b"lease",
+            fencing_token=7,
+        )
+        ctx = async_worker_module.AsyncWorkflowContext(workflow, job, "queued")
+        effect = ctx.effect("charge", "payment.charge", operation_digest="charge:v1")
+
+        fake_loop = FakeLoop()
+        monkeypatch.setattr(async_worker_module.asyncio, "get_running_loop", lambda: fake_loop)
+
+        await effect.reserve()
+        await effect.confirm(external_id="ch_1")
+
+        confirm_call = redis.calls[1]
+        assert confirm_call[confirm_call.index("LATENCY_MS") + 1] == 250
+
+    asyncio.run(run())
+
+
+def test_async_workflow_context_effect_decorator_fails_on_exception():
+    async def run():
+        redis = FakeRedis()
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(redis),
+            type="order",
+            states=["queued"],
+            initial_state="queued",
+            batch_size=1,
+        )
+
+        @workflow.state("queued")
+        async def queued(ctx):
+            @ctx.effect("charge", "payment.charge", operation_digest="charge:v1")
+            async def boom():
+                raise RuntimeError("stripe down")
+
+            await boom()
+            return complete(result=b"ok")
+
+        result = await workflow.run_once()
+
+        assert result.applied == 1
+        assert redis.calls[1][0] == "FLOW.EFFECT.RESERVE"
+        fail_call = redis.calls[2]
+        assert fail_call[:4] == ("FLOW.EFFECT.FAIL", "f1", "EFFECT_KEY", "charge")
+        assert fail_call[fail_call.index("ERROR") + 1] == "stripe down"
+        assert fail_call[fail_call.index("REASON") + 1] == "RuntimeError"
+        assert isinstance(fail_call[fail_call.index("LATENCY_MS") + 1], int)
+
+    asyncio.run(run())
+
+
 def test_async_workflow_client_from_url_creates_bounded_command_and_claim_pools(monkeypatch):
     async def run():
         calls = []
@@ -365,6 +606,35 @@ def test_async_workflow_client_from_url_creates_bounded_command_and_claim_pools(
         ]
         assert workflow.client is client.flow
         assert workflow.claim_client is client.claim_flow
+
+    asyncio.run(run())
+
+
+def test_async_workflow_client_from_protocol_url_reuses_multiplexed_claim_client(monkeypatch):
+    async def run():
+        calls = []
+
+        def from_url(url, **kwargs):
+            client = AsyncFlowClient(FakeRedis())
+            client.url = url
+            client.kwargs = kwargs
+            calls.append((url, kwargs, client))
+            return client
+
+        monkeypatch.setattr(
+            "ferricstore.async_worker.AsyncFlowClient.from_url", staticmethod(from_url)
+        )
+
+        client = AsyncWorkflowClient.from_url(
+            "ferric://example:6388",
+            worker_config=WorkerConfig(workers=4),
+        )
+        workflow = client.workflow(type="order", states=["queued"], initial_state="queued")
+
+        assert len(calls) == 1
+        assert calls[0][1] == {"max_connections": 1}
+        assert workflow.client is client.flow
+        assert workflow.claim_client is client.flow
 
     asyncio.run(run())
 
@@ -425,7 +695,7 @@ def test_async_queue_worker_claims_and_completes():
         worker = AsyncQueueFlowWorker(client, type="email", state="queued", batch_size=10)
         seen = []
 
-        async def handler(job: ClaimedItem):
+        async def handler(job: ClaimedFlow):
             seen.append(job.id)
             return b"done"
 
@@ -446,7 +716,7 @@ def test_async_queue_worker_start_stop_join_tracks_stats():
         client = AsyncFlowClient(redis)
         worker = AsyncQueueFlowWorker(client, type="email", state="queued", idle_sleep_s=0.001)
 
-        async def handler(_job: ClaimedItem):
+        async def handler(_job: ClaimedFlow):
             worker.stop()
 
         worker.start(handler)
@@ -587,7 +857,7 @@ def test_async_queue_flow_on_error_fail_is_passed_to_worker():
             on_error="fail",
         )
 
-        async def handler(_job: ClaimedItem):
+        async def handler(_job: ClaimedFlow):
             raise RuntimeError("boom")
 
         result = await queue.run_once(handler)
@@ -669,7 +939,7 @@ def test_async_queue_worker_preserves_distinct_failure_messages():
             auto_partitions=False,
         )
 
-        async def handler(job: ClaimedItem):
+        async def handler(job: ClaimedFlow):
             raise RuntimeError(f"boom-{job.id}")
 
         result = await worker.run_once(handler)
@@ -705,11 +975,11 @@ def test_async_workflow_simple_api_batches_transition_and_complete():
         )
 
         @workflow.on("queued")
-        async def queued(_job: ClaimedItem):
+        async def queued(_job: ClaimedFlow):
             return transition("done")
 
         @workflow.on("done")
-        async def done(_job: ClaimedItem):
+        async def done(_job: ClaimedFlow):
             return complete(result=b"ok")
 
         await workflow.enqueue("f1")
@@ -755,11 +1025,11 @@ def test_async_workflow_blocking_claims_all_states_with_compact_state_return():
         )
 
         @workflow.on("queued")
-        async def queued(_job: ClaimedItem):
+        async def queued(_job: ClaimedFlow):
             return transition("done")
 
         @workflow.on("done")
-        async def done(_job: ClaimedItem):
+        async def done(_job: ClaimedFlow):
             return complete(result=b"ok")
 
         result = await workflow.run_once()
@@ -770,7 +1040,7 @@ def test_async_workflow_blocking_claims_all_states_with_compact_state_return():
         assert "STATE" not in claim
         assert claim[claim.index("RETURN") : claim.index("RETURN") + 2] == (
             "RETURN",
-            "JOBS_COMPACT_STATE",
+            "JOBS_COMPACT_STATE_ATTRS",
         )
         assert [call[0] for call in redis.calls[1:]] == [
             "FLOW.TRANSITION_MANY",
@@ -793,7 +1063,7 @@ def test_async_workflow_claims_all_priorities_by_default():
         )
 
         @workflow.on("queued")
-        async def queued(_job: ClaimedItem):
+        async def queued(_job: ClaimedFlow):
             return transition("queued", priority=5)
 
         await workflow.run_once(state="queued")
@@ -870,7 +1140,7 @@ def test_async_workflow_uses_separate_claim_client_when_provided():
     asyncio.run(run())
 
 
-def test_async_workflow_missing_handler_does_not_claim_jobs():
+def test_async_workflow_missing_handler_does_not_claim_flows():
     async def run():
         redis = FakeRedis()
         client = AsyncFlowClient(redis)
@@ -991,7 +1261,7 @@ def test_async_workflow_on_error_fail_uses_fail_many():
         )
 
         @workflow.on("queued")
-        async def queued(_job: ClaimedItem):
+        async def queued(_job: ClaimedFlow):
             raise RuntimeError("boom")
 
         result = await workflow.run_once(state="queued")
@@ -1014,7 +1284,7 @@ def test_async_workflow_state_alias_registers_handler_with_exception_policy():
         )
 
         @workflow.state("queued", exception_policy=ExceptionPolicy.FAIL)
-        async def queued(_job: ClaimedItem):
+        async def queued(_job: ClaimedFlow):
             return complete()
 
         assert "queued" in workflow.handlers
@@ -1037,7 +1307,7 @@ def test_async_workflow_loop_runs_one_claim_per_iteration_when_handler_stops():
         )
 
         @workflow.on("queued")
-        async def queued(_job: ClaimedItem):
+        async def queued(_job: ClaimedFlow):
             workflow.stop()
             return complete(result=b"ok")
 
@@ -1065,7 +1335,7 @@ def test_async_workflow_polls_with_blocking_claim_when_no_jobs_are_cached_locall
         )
 
         @workflow.on("queued")
-        async def queued(_job: ClaimedItem):
+        async def queued(_job: ClaimedFlow):
             return complete(result=b"ok")
 
         result = await workflow.run_once(state="queued")
