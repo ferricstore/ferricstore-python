@@ -100,9 +100,7 @@ class QueueLatencyRecorder:
 
         now_ns = time.perf_counter_ns()
         sampled = {
-            f"{run_id}:flow:{index}": now_ns
-            for index in indices
-            if index % self.sample_rate == 0
+            f"{run_id}:flow:{index}": now_ns for index in indices if index % self.sample_rate == 0
         }
         if not sampled:
             return
@@ -531,7 +529,9 @@ class BenchFlowClient:
 
         if auto_partition:
             partition_index = auto_partition_index_for_flow_id(flow_ids[0])
-            if any(auto_partition_index_for_flow_id(flow_id) != partition_index for flow_id in flow_ids):
+            if any(
+                auto_partition_index_for_flow_id(flow_id) != partition_index for flow_id in flow_ids
+            ):
                 return None
             partition_key = auto_partition_key_for_index(partition_index)
         else:
@@ -1557,7 +1557,11 @@ def run_queue_api_worker(
         claim_job_only,
     )
 
-    client = shared_client if shared_client is not None else FlowClient.from_url(url, **(client_kwargs or {}))
+    client = (
+        shared_client
+        if shared_client is not None
+        else FlowClient.from_url(url, **(client_kwargs or {}))
+    )
     partition_keys = None
     owned_partitions = None
     if not claim_any:

@@ -3,7 +3,9 @@ from concurrent.futures import Future
 from pathlib import Path
 
 
-_BENCH_PATH = Path(__file__).resolve().parents[1] / "examples" / "protocol_flow_commands_benchmark.py"
+_BENCH_PATH = (
+    Path(__file__).resolve().parents[1] / "examples" / "protocol_flow_commands_benchmark.py"
+)
 _SPEC = importlib.util.spec_from_file_location("protocol_flow_commands_benchmark", _BENCH_PATH)
 bench = importlib.util.module_from_spec(_SPEC)
 assert _SPEC.loader is not None
@@ -301,7 +303,12 @@ def test_protocol_flow_pipeline_duration_reads_cycle_over_setup_records():
     assert errors == 0
     assert len(latencies) == 1
     assert adapter.batches == [
-        [("FLOW.GET", "flow-0"), ("FLOW.GET", "flow-1"), ("FLOW.GET", "flow-2"), ("FLOW.GET", "flow-0")]
+        [
+            ("FLOW.GET", "flow-0"),
+            ("FLOW.GET", "flow-1"),
+            ("FLOW.GET", "flow-2"),
+            ("FLOW.GET", "flow-0"),
+        ]
     ]
 
 
@@ -391,7 +398,7 @@ def test_protocol_flow_start_and_claim_payload_batch_uses_compact_shape():
         batch_size=2,
         partitions=16,
         payload=b"payload",
-        job_only=True,
+        include_record=False,
     )
 
     assert payload is not None
@@ -479,7 +486,7 @@ def test_protocol_flow_pipeline_payload_collect_runner_returns_batch_results():
             batch_size=2,
             partitions=16,
             payload=b"payload",
-            job_only=True,
+            include_record=False,
         ),
     )
 
@@ -671,7 +678,9 @@ def test_protocol_flow_history_payload_batch_uses_compact_pipeline_shape():
 
 
 def test_protocol_flow_history_consistency_mode_can_be_explicit():
-    args = bench.parse_args(["--operation", "flow-history", "--flow-read-consistency", "consistent"])
+    args = bench.parse_args(
+        ["--operation", "flow-history", "--flow-read-consistency", "consistent"]
+    )
 
     assert args.flow_read_consistency == "consistent"
 
@@ -716,7 +725,11 @@ def test_protocol_flow_submit_batch_runner_counts_items_and_errors():
 
     assert completed == 5
     assert errors == 0
-    assert [command for command in adapter.commands] == [("MSET", 0, 2), ("MSET", 2, 2), ("MSET", 4, 1)]
+    assert [command for command in adapter.commands] == [
+        ("MSET", 0, 2),
+        ("MSET", 2, 2),
+        ("MSET", 4, 1),
+    ]
     assert len(latencies) == 3
 
 
@@ -957,7 +970,9 @@ def test_protocol_flow_value_mget_setup_uses_pipelined_value_puts():
         def submit_batch(self, commands):
             self.batches.append(commands)
             future = Future()
-            future.set_result([f"ref:{len(self.batches)}:{index}" for index, _ in enumerate(commands)])
+            future.set_result(
+                [f"ref:{len(self.batches)}:{index}" for index, _ in enumerate(commands)]
+            )
             return future
 
         def submit_command(self, *args):
@@ -1016,10 +1031,38 @@ def test_protocol_flow_value_put_duration_wraps_write_pool():
     assert len(latencies) == 1
     assert adapter.batches == [
         [
-            ("FLOW.VALUE.PUT", b"value", "NOW", adapter.batches[0][0][3], "RETURN", "OK_ON_SUCCESS"),
-            ("FLOW.VALUE.PUT", b"value", "NOW", adapter.batches[0][1][3], "RETURN", "OK_ON_SUCCESS"),
-            ("FLOW.VALUE.PUT", b"value", "NOW", adapter.batches[0][2][3], "RETURN", "OK_ON_SUCCESS"),
-            ("FLOW.VALUE.PUT", b"value", "NOW", adapter.batches[0][3][3], "RETURN", "OK_ON_SUCCESS"),
+            (
+                "FLOW.VALUE.PUT",
+                b"value",
+                "NOW",
+                adapter.batches[0][0][3],
+                "RETURN",
+                "OK_ON_SUCCESS",
+            ),
+            (
+                "FLOW.VALUE.PUT",
+                b"value",
+                "NOW",
+                adapter.batches[0][1][3],
+                "RETURN",
+                "OK_ON_SUCCESS",
+            ),
+            (
+                "FLOW.VALUE.PUT",
+                b"value",
+                "NOW",
+                adapter.batches[0][2][3],
+                "RETURN",
+                "OK_ON_SUCCESS",
+            ),
+            (
+                "FLOW.VALUE.PUT",
+                b"value",
+                "NOW",
+                adapter.batches[0][3][3],
+                "RETURN",
+                "OK_ON_SUCCESS",
+            ),
         ]
     ]
 

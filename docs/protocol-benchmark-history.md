@@ -16601,3 +16601,413 @@ Interpretation:
 - Next real product work is either:
   - profile WAL/Ra/apply p99 under target-rate load, then tune adaptive commit/apply batching, or
   - add a durable fused workflow-step primitive for server-side step chains so a 9-step no-op workflow does not require 10 client-driven durable command batches.
+
+## Restate latency public SDK profile controls
+
+Added reproducibility controls to `examples/protocol_restate_latency_benchmark.py` after clean-dir runs showed startup noise when the native listener was open before all Raft shards finished leader bootstrap.
+
+New options:
+
+```bash
+--profile restate-high-load
+--startup-settle-seconds 6
+```
+
+The `restate-high-load` profile keeps the benchmark on the public SDK `run_steps_many` path and applies the tuned high-load shape unless explicit values are supplied:
+
+```text
+steps=1: batch_size=180, inflight_batches=4
+steps=3: batch_size=500, inflight_batches=4
+steps=9: batch_size=500, inflight_batches=4
+```
+
+Latest clean source-server runs with fresh data dir, 16 shards, one native connection, 64 protocol lanes, and startup settle before measurement:
+
+```text
+1-step: workflows/sec ~50.1k, p50 13.13ms, p90 16.32ms, p99 21.32ms
+3-step: workflows/sec ~112.5k, p50 16.06ms, p90 17.56ms, p99 18.36ms
+9-step: workflows/sec ~103.6k, p50 17.59ms, p90 19.50ms, p99 20.62ms
+```
+
+Focused validation:
+
+```bash
+pytest tests/test_protocol_restate_latency_benchmark.py -q
+# 16 passed
+```
+
+## Restate latency readiness and correctness sampling
+
+Added optional benchmark proof controls so the Restate-style latency run can separate measurement from startup/readiness and correctness checks:
+
+```bash
+--readiness-probes N
+--verify-sample N
+```
+
+Behavior:
+
+```text
+readiness_probes: durable one-item FLOW.RUN_STEPS_MANY commands before warmup/measurement
+verify_sample: post-measurement FLOW.GET samples that assert terminal completed state and expected version floor
+```
+
+These controls run outside the timed measurement window and are reported in result JSON:
+
+```text
+readiness_probes
+readiness_completed
+verify_sample_requested
+verify_sample_checked
+verify_sample_errors
+```
+
+Recommended evidence run shape:
+
+```bash
+python examples/protocol_restate_latency_benchmark.py \
+  --url ferric://127.0.0.1:18388 \
+  --steps 3 \
+  --workflows 100000 \
+  --warmup-workflows 10000 \
+  --chain-submit-mode run-steps-many \
+  --profile restate-high-load \
+  --startup-settle-seconds 6 \
+  --readiness-probes 16 \
+  --verify-sample 32 \
+  --pretty
+```
+
+Focused validation:
+
+```bash
+pytest tests/test_protocol_restate_latency_benchmark.py -q
+# 19 passed
+```
+
+## Restate latency profile retune after proof runs
+
+Proof-shaped runs with readiness probes and post-run `FLOW.GET` verification showed that the earlier `steps=3` profile of `batch_size=500, inflight_batches=4` could produce unacceptable batch-level tail latency on this local machine, even though sampled state verification remained correct.
+
+Observed problematic 3-step proof run, fresh source server, 16 shards, one native connection, 64 lanes:
+
+```text
+batch=500, inflight=4
+workflows/sec ~47.4k
+p50 24.43ms, p90 80.56ms, p99 235.96ms
+verify_sample_errors 0
+```
+
+Retuned 3-step matrix sample on same server:
+
+```text
+batch=250, inflight=4
+workflows/sec ~38.6k
+p50 16.05ms, p90 60.77ms, p99 86.16ms
+verify_sample_errors 0
+```
+
+That shape beats Restate 3-step high-load thresholds for throughput and p50/p90/p99 latency in the sampled run. Updated `--profile restate-high-load` for `steps=3` to:
+
+```text
+batch_size=250, inflight_batches=4
+```
+
+1-step remains not proven against the full high-load target in the current evidence. Some tested shapes pass either throughput or p99, but not both p50/p99/throughput together. Do not claim full 1-step high-load victory yet.
+
+## Clean 1-step proof check
+
+Fresh source server, clean data dir, 16 shards, one native connection, 64 lanes, startup settle, readiness probes, and `FLOW.GET` sampling.
+
+Tested two 1-step shapes without continuing a destructive matrix on the same data dir:
+
+```text
+batch=250, inflight=1
+workflows/sec ~19.2k
+p50 11.35ms, p90 12.94ms, p99 64.28ms
+verify_sample_errors 0
+
+batch=100, inflight=8
+workflows/sec ~36.3k
+p50 17.85ms, p90 22.11ms, p99 117.68ms
+verify_sample_errors 0
+```
+
+Conclusion: 1-step is not yet proven against the full Restate high-load target (`rps >= 23.1k`, `p50 < 16ms`, `p99 < 40ms`). Current evidence shows correctness is intact, but batch/request tail latency needs another server-side or benchmark-shape optimization before claiming 1-step high-load victory.
+
+## 1-step target-rate proof and client allocation cut
+
+Added an auto-partition benchmark fast path for `run-steps-many` that passes plain flow ids directly to `FlowClient.run_steps_many` instead of building `WorkflowSpec` objects and per-item dicts before the public SDK call. This keeps the public SDK path but reduces benchmark-side allocation.
+
+Focused validation:
+
+```bash
+pytest tests/test_protocol_restate_latency_benchmark.py -q
+# 21 passed
+```
+
+Target-rate 1-step proof on clean source server, 16 shards, one native connection, 64 lanes, target `23131/s`, readiness probes and `FLOW.GET` verification:
+
+```text
+Before allocation cut, batch=250, inflight=2:
+workflows/sec ~22.7k, target ratio ~0.982
+p50 14.16ms, p90 19.16ms, p99 123.20ms
+verify_sample_errors 0
+
+Before allocation cut, batch=250, inflight=4:
+workflows/sec ~23.1k, target ratio ~0.999
+p50 12.80ms, p90 25.86ms, p99 125.35ms
+verify_sample_errors 0
+
+After allocation cut, batch=250, inflight=4 on already-loaded server:
+workflows/sec ~23.0k, target ratio ~0.992
+p50 32.84ms, p90 55.40ms, p99 128.58ms
+verify_sample_errors 0
+```
+
+Conclusion: the allocation cut is a code-quality/benchmark-overhead improvement, but current evidence says it does not solve 1-step high-load p99. The remaining issue is rare batch stalls under write load. Next useful step is stage timing/profiling for the 1-step `FLOW.RUN_STEPS_MANY` path or a lower-jitter async protocol runner.
+
+## 2026-06-14 - Rejected compact `FLOW.RUN_STEPS_MANY` request path
+
+Goal: reduce 1-step Restate-style latency by replacing the generic native map payload for `FLOW.RUN_STEPS_MANY` with a custom compact request body.
+
+Result: rejected. The compact request body was decoded in Elixir and regressed the benchmark versus the existing generic NIF body decode path.
+
+Baseline before experiment, 1-step target-rate shape (`batch=250`, `inflight=4`, `target_rps=23131`, 100k workflows, 16 shards, one native connection):
+
+```text
+workflows_per_sec: 23107.5
+p50: 13.08ms
+p90: 39.84ms
+p99: 115.48ms
+verify_sample_errors: 0
+```
+
+Compact request experiment samples:
+
+```text
+sample 1: workflows_per_sec 15971.5, p50 45.37ms, p99 187.12ms
+sample 2: workflows_per_sec 6977.3, p50 123.83ms, p99 401.99ms
+```
+
+Decision:
+
+```text
+Do not add an Elixir-decoded compact FLOW.RUN_STEPS_MANY request format.
+If we revisit compact RUN_STEPS_MANY, decode/build must happen in native/Rust or avoid extra Elixir binary parsing/allocation.
+```
+
+Validation after reverting rejected path:
+
+```text
+pytest tests/test_protocol.py::test_encodes_protocol_flow_run_steps_many tests/test_protocol_restate_latency_benchmark.py -q
+24 passed
+
+mix test apps/ferricstore_server/test/ferricstore_server/native/codec_test.exs apps/ferricstore_server/test/ferricstore_server/native/commands_test.exs
+150 tests, 0 failures
+```
+
+## 2026-06-14 Restate-style workflow latency profile correction
+
+### Benchmark profile semantics
+
+`examples/protocol_restate_latency_benchmark.py --profile restate-high-load` now applies the tuned public-SDK batch/in-flight shape and compares against Restate high-load targets, but it does not automatically set `--target-rps`.
+
+Reason:
+
+```text
+Restate high-load numbers are comparison targets/observed throughput, not a Python sleep-based input rate.
+Auto target pacing caused local sleep jitter to catch up in bursts, inflating Ra wait and p99 latency.
+Use --target-rps explicitly only when testing fixed-rate generator behavior.
+```
+
+### Clean source server
+
+```bash
+cd /Users/yoavgea/repos/ferricstore
+MIX_ENV=prod \
+FERRICSTORE_NATIVE_ENABLED=true \
+FERRICSTORE_NATIVE_TRACE_ENABLED=false \
+FERRICSTORE_SHARD_COUNT=16 \
+FERRICSTORE_DATA_DIR=/tmp/ferricstore-restate-3step-final/data \
+FERRICSTORE_PORT=18215 \
+FERRICSTORE_HEALTH_PORT=18216 \
+FERRICSTORE_NATIVE_PORT=19299 \
+mix run --no-halt
+```
+
+### Public SDK 3-step high-load run
+
+```bash
+cd /Users/yoavgea/repos/ferricstore-python
+PYTHONPATH=src python examples/protocol_restate_latency_benchmark.py \
+  --url ferric://127.0.0.1:19299 \
+  --profile restate-high-load \
+  --steps 3 \
+  --workflows 100000 \
+  --warmup-workflows 0 \
+  --chain-submit-mode run-steps-many \
+  --startup-settle-seconds 2 \
+  --readiness-probes 8 \
+  --verify-sample 32 \
+  --slow-wave-count 5 \
+  --slow-wave-min-ms 40 \
+  --pretty
+```
+
+Result:
+
+```text
+completed: 100000
+errors: 0
+verify_sample_errors: 0
+batch_size: 500
+inflight_batches: 4
+workflows_per_sec: 106885/s
+latency_p50_ms: 17.826
+latency_p90_ms: 21.761
+latency_p99_ms: 25.646
+latency_max_ms: 31.228
+beats_restate_high_load_all: true
+restate target: 16844/s, p50 58ms, p90 76ms, p99 98ms
+```
+
+Notes:
+
+```text
+This uses the public FlowClient.run_steps_many workflow surface over ferric://.
+Durability path remains WARaft + Bitcask; trace was disabled for the published sample.
+Trace diagnostics added in the same session showed slow fixed-rate runs were dominated by server_ra_wait_us, not Flow apply, Bitcask append, index mutation, or protocol encode/decode.
+```
+
+## 2026-06-14 Restate high-load profile final local validation
+
+Profile behavior:
+
+```text
+--profile restate-high-load chooses the public-SDK optimized mode by step count:
+  steps=1 -> run-steps-many-shard-local, batch=250, inflight=4, shard_local_submit_concurrency=8
+  steps=3 -> run-steps-many, batch=500, inflight=4
+  steps=9 -> run-steps-many, batch=500, inflight=1
+No automatic --target-rps pacing. Fixed-rate pacing is opt-in.
+```
+
+All runs below used:
+
+```text
+source FerricStore server
+MIX_ENV=prod
+FERRICSTORE_NATIVE_ENABLED=true
+FERRICSTORE_NATIVE_TRACE_ENABLED=false
+FERRICSTORE_SHARD_COUNT=16
+fresh data dir per run
+public FlowClient path over ferric://
+workflows=100000
+warmup_workflows=0
+readiness_probes=8
+verify_sample=32
+payload/result bytes=0
+```
+
+Final local samples:
+
+```text
+steps=1:
+  mode: run-steps-many-shard-local
+  batch: 250
+  inflight: 4
+  shard_local_submit_concurrency: 8
+  workflows_per_sec: 31839/s
+  p50: 3.212ms
+  p90: 5.469ms
+  p99: 18.833ms
+  max: 86.393ms
+  verify_sample_errors: 0
+  beats_restate_high_load_all: true
+  target: 23131/s, p50 16ms, p99 40ms
+
+steps=3:
+  mode: run-steps-many
+  batch: 500
+  inflight: 4
+  workflows_per_sec: 104696/s
+  p50: 18.081ms
+  p90: 23.659ms
+  p99: 27.017ms
+  max: 31.294ms
+  verify_sample_errors: 0
+  beats_restate_high_load_all: true
+  target: 16844/s, p50 58ms, p90 76ms, p99 98ms
+
+steps=9:
+  mode: run-steps-many
+  batch: 500
+  inflight: 1
+  workflows_per_sec: 32470/s
+  p50: 11.312ms
+  p90: 26.494ms
+  p99: 71.523ms
+  max: 76.730ms
+  verify_sample_errors: 0
+  beats_restate_high_load_all: true
+  target: 8571/s, p50 116ms, p99 163ms
+```
+
+Diagnostic note:
+
+```text
+Trace-enabled slow samples showed p99 spikes in fixed-rate runs were dominated by server_ra_wait_us. Flow apply, Bitcask append, index mutation, and protocol encode/decode were not the bottleneck. The final profile avoids Python fixed-rate catch-up bursts and uses per-shape batch/inflight settings that preserve durable WARaft + Bitcask writes.
+```
+
+## 2026-06-14 - Native GET 256B pipeline=10 latency preset retune
+
+Goal: compare closer to Dragonfly's documented `--pipeline=10` GET shape and reduce tail latency for small batches.
+
+Change:
+
+```text
+examples/protocol_kv_benchmark.py --preset get-latency
+request_mode: many
+pipeline: 10
+protocol_lanes: 8
+inflight_batches: 8
+prebuild_keys: true
+```
+
+Reason:
+
+```text
+The previous get-latency preset used request_mode=pipeline, protocol_lanes=1, inflight_batches=64, prebuild_keys=false.
+That shape measured Python/scheduler overhead more than server latency. Small batch latency improved by lowering queued in-flight work and using the compact many/MGET path with prebuilt keys.
+```
+
+Command:
+
+```bash
+PYTHONPATH=src python examples/protocol_kv_benchmark.py \
+  --url ferric://127.0.0.1:19670 \
+  --preset get-latency \
+  --value-bytes 256 \
+  --pretty
+```
+
+Result:
+
+```text
+GET 256B pipeline=10
+requests_per_sec: 526,508/s
+p50 batch: 0.149ms
+p95 batch: 0.197ms
+p99 batch: 0.227ms
+max batch: 3.117ms
+errors: 0
+client_cpu_percent: 125%
+```
+
+Interpretation:
+
+```text
+This is the low-latency one-client Python SDK shape, not the max-throughput shape.
+It trades deep batching throughput for much lower batch tail latency.
+For max aggregate GET throughput, keep get-throughput: pipeline=1000, lanes=64, inflight=64.
+```

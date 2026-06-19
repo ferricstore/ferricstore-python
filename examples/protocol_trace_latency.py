@@ -7,7 +7,7 @@ import uuid
 from collections import defaultdict
 from typing import Any
 
-from ferricstore import ClaimedItem
+from ferricstore import ClaimedFlow
 from ferricstore.protocol import ProtocolAdapterPool
 
 
@@ -116,7 +116,7 @@ def run_flow_once(
     if not jobs:
         raise RuntimeError(f"FLOW.CLAIM_DUE returned no jobs for {flow_id}")
 
-    job = ClaimedItem.from_resp(jobs[0])
+    job = ClaimedFlow.from_resp(jobs[0])
     complete_args: list[Any] = [
         "FLOW.COMPLETE",
         job.id,
@@ -137,7 +137,9 @@ def run_flow_once(
 
 def print_summary(title: str, samples: dict[str, list[int]]) -> None:
     print(f"\n## {title}")
-    print(f"{'stage':42} {'n':>6} {'avg_us':>10} {'p50_us':>10} {'p95_us':>10} {'p99_us':>10} {'max_us':>10}")
+    print(
+        f"{'stage':42} {'n':>6} {'avg_us':>10} {'p50_us':>10} {'p95_us':>10} {'p99_us':>10} {'max_us':>10}"
+    )
     print("-" * 104)
 
     keys = [key for key in STAGE_ORDER if key in samples]
@@ -156,7 +158,9 @@ def print_summary(title: str, samples: dict[str, list[int]]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sample FerricStore protocol per-stage latency trace")
+    parser = argparse.ArgumentParser(
+        description="Sample FerricStore protocol per-stage latency trace"
+    )
     parser.add_argument("--url", default="ferric://127.0.0.1:6388")
     parser.add_argument("--samples", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=10)
@@ -192,7 +196,9 @@ def main() -> None:
                     flow_id=f"trace-{run_id}-{index}",
                 )
                 if index >= args.warmup:
-                    by_command: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+                    by_command: dict[str, dict[str, list[int]]] = defaultdict(
+                        lambda: defaultdict(list)
+                    )
                     for command_label, command_result in traces:
                         record_trace(by_command[command_label], command_result["trace"])
                     for command_label, command_samples in by_command.items():
@@ -203,7 +209,9 @@ def main() -> None:
             if index >= args.warmup:
                 record_trace(samples, result["trace"])
 
-        print_summary(args.op.upper() if args.op != "flow" else "FLOW create/claim/complete", samples)
+        print_summary(
+            args.op.upper() if args.op != "flow" else "FLOW create/claim/complete", samples
+        )
     finally:
         adapter.close()
 

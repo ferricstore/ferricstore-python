@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from ferricstore import AsyncFlowClient, ClaimedItem, CreateItem
+from ferricstore import AsyncFlowClient, ClaimedFlow, CreateItem
 
 FLOW_TYPE = "dbos_python_sdk_async_bench"
 QUEUE_STATE = "queued"
@@ -428,7 +428,7 @@ async def run_worker(
                 drained_count += 1
         return drained_count
 
-    async def complete_batch(jobs: list[ClaimedItem]) -> int:
+    async def complete_batch(jobs: list[ClaimedFlow]) -> int:
         await client.complete_jobs(
             jobs,
             result=result,

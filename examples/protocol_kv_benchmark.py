@@ -34,27 +34,40 @@ _COMPACT_ZSCORE_PIPELINE_MODE = 29
 _COMPACT_HGETALL_PIPELINE_MODE = 30
 _COMPACT_SREM_PIPELINE_MODE = 31
 _COMPACT_ZREM_PIPELINE_MODE = 32
+
+# Named benchmark shapes. These are intentionally benchmark-only knobs, not SDK
+# defaults. SDK defaults stay latency-first and simple; these presets preserve
+# the measured shapes used when we publish or compare protocol numbers.
+KV_LATENCY_SHAPE = {
+    "request_mode": "many",
+    "pipeline": 10,
+    "clients": 1,
+    "threads": 1,
+    "inflight_batches": 8,
+    "protocol_lanes": 8,
+    "test_time": 30.0,
+    "prebuild_keys": True,
+}
+
+KV_THROUGHPUT_SHAPE = {
+    "request_mode": "many",
+    "pipeline": 1000,
+    "clients": 1,
+    "threads": 1,
+    "inflight_batches": 64,
+    "protocol_lanes": 64,
+    "test_time": 30.0,
+    "prebuild_keys": True,
+}
+
 PRESETS = {
     "get-latency": {
         "command": "get",
-        "request_mode": "pipeline",
-        "pipeline": 10,
-        "clients": 1,
-        "threads": 1,
-        "inflight_batches": 64,
-        "protocol_lanes": 1,
-        "test_time": 30.0,
+        **KV_LATENCY_SHAPE,
     },
     "get-throughput": {
         "command": "get",
-        "request_mode": "many",
-        "pipeline": 1000,
-        "clients": 1,
-        "threads": 1,
-        "inflight_batches": 64,
-        "protocol_lanes": 64,
-        "test_time": 30.0,
-        "prebuild_keys": True,
+        **KV_THROUGHPUT_SHAPE,
     },
     "get-balanced": {
         "command": "get",
@@ -91,14 +104,7 @@ PRESETS = {
     },
     "set-latency": {
         "command": "set",
-        "request_mode": "many",
-        "pipeline": 100,
-        "clients": 1,
-        "threads": 1,
-        "inflight_batches": 64,
-        "protocol_lanes": 64,
-        "test_time": 30.0,
-        "prebuild_keys": True,
+        **KV_LATENCY_SHAPE,
     },
     "mixed-throughput": {
         "command": "mixed",
@@ -768,7 +774,9 @@ def _run_thread(
                     and hasattr(adapter, "submit_pipeline_payload")
                 ):
                     if args.command == "get":
-                        payload = wire_key_only_payload_batch(wire_key_pool, sequence, batch_size, 2)
+                        payload = wire_key_only_payload_batch(
+                            wire_key_pool, sequence, batch_size, 2
+                        )
                     else:
                         payload = wire_key_value_payload_batch(
                             wire_key_pool, sequence, batch_size, wire_value, 0x80 | 1
@@ -780,8 +788,10 @@ def _run_thread(
                     pending_batches.append((started_ns, [future], batch_size))
                     continue
 
-                if wire_key_pool is not None and args.command == "hset" and hasattr(
-                    adapter, "submit_pipeline_payload"
+                if (
+                    wire_key_pool is not None
+                    and args.command == "hset"
+                    and hasattr(adapter, "submit_pipeline_payload")
                 ):
                     payload = wire_hset_payload_batch(
                         wire_key_pool, sequence, batch_size, wire_field, wire_value
@@ -793,8 +803,10 @@ def _run_thread(
                     pending_batches.append((started_ns, [future], batch_size))
                     continue
 
-                if wire_key_pool is not None and args.command in {"hgetall", "smembers"} and hasattr(
-                    adapter, "submit_pipeline_payload"
+                if (
+                    wire_key_pool is not None
+                    and args.command in {"hgetall", "smembers"}
+                    and hasattr(adapter, "submit_pipeline_payload")
                 ):
                     mode = (
                         _COMPACT_HGETALL_PIPELINE_MODE
@@ -809,8 +821,10 @@ def _run_thread(
                     pending_batches.append((started_ns, [future], batch_size))
                     continue
 
-                if wire_key_pool is not None and args.command == "hget" and hasattr(
-                    adapter, "submit_pipeline_payload"
+                if (
+                    wire_key_pool is not None
+                    and args.command == "hget"
+                    and hasattr(adapter, "submit_pipeline_payload")
                 ):
                     payload = wire_two_binary_payload_batch(
                         wire_key_pool, sequence, batch_size, _COMPACT_HGET_PIPELINE_MODE, wire_field
@@ -822,8 +836,10 @@ def _run_thread(
                     pending_batches.append((started_ns, [future], batch_size))
                     continue
 
-                if wire_key_pool is not None and args.command == "hmget" and hasattr(
-                    adapter, "submit_pipeline_payload"
+                if (
+                    wire_key_pool is not None
+                    and args.command == "hmget"
+                    and hasattr(adapter, "submit_pipeline_payload")
                 ):
                     payload = wire_hmget_payload_batch(
                         wire_key_pool,
@@ -838,8 +854,10 @@ def _run_thread(
                     pending_batches.append((started_ns, [future], batch_size))
                     continue
 
-                if wire_key_pool is not None and args.command in {"sismember", "zscore"} and hasattr(
-                    adapter, "submit_pipeline_payload"
+                if (
+                    wire_key_pool is not None
+                    and args.command in {"sismember", "zscore"}
+                    and hasattr(adapter, "submit_pipeline_payload")
                 ):
                     mode = (
                         _COMPACT_SISMEMBER_PIPELINE_MODE
@@ -856,8 +874,10 @@ def _run_thread(
                     pending_batches.append((started_ns, [future], batch_size))
                     continue
 
-                if wire_key_pool is not None and args.command in {"lrange", "zrange"} and hasattr(
-                    adapter, "submit_pipeline_payload"
+                if (
+                    wire_key_pool is not None
+                    and args.command in {"lrange", "zrange"}
+                    and hasattr(adapter, "submit_pipeline_payload")
                 ):
                     mode = (
                         _COMPACT_LRANGE_PIPELINE_MODE
@@ -880,13 +900,18 @@ def _run_thread(
                     pending_batches.append((started_ns, [future], batch_size))
                     continue
 
-                if wire_key_pool is not None and args.command in {
-                    "lpush",
-                    "rpush",
-                    "sadd",
-                    "srem",
-                    "zrem",
-                } and hasattr(adapter, "submit_pipeline_payload"):
+                if (
+                    wire_key_pool is not None
+                    and args.command
+                    in {
+                        "lpush",
+                        "rpush",
+                        "sadd",
+                        "srem",
+                        "zrem",
+                    }
+                    and hasattr(adapter, "submit_pipeline_payload")
+                ):
                     mode = {
                         "lpush": _COMPACT_LPUSH_PIPELINE_MODE,
                         "rpush": _COMPACT_RPUSH_PIPELINE_MODE,
@@ -904,8 +929,10 @@ def _run_thread(
                     pending_batches.append((started_ns, [future], batch_size))
                     continue
 
-                if wire_key_pool is not None and args.command == "zadd" and hasattr(
-                    adapter, "submit_pipeline_payload"
+                if (
+                    wire_key_pool is not None
+                    and args.command == "zadd"
+                    and hasattr(adapter, "submit_pipeline_payload")
                 ):
                     payload = wire_zadd_payload_batch(
                         wire_key_pool, sequence, batch_size, args.key_count, wire_value
@@ -918,8 +945,10 @@ def _run_thread(
                     continue
 
                 if args.request_mode == "many" and args.command in {"get", "set", "mixed"}:
-                    if wire_key_pool is not None and args.command == "get" and hasattr(
-                        adapter, "submit_mget_payload"
+                    if (
+                        wire_key_pool is not None
+                        and args.command == "get"
+                        and hasattr(adapter, "submit_mget_payload")
                     ):
                         payload = wire_key_payload_batch(wire_key_pool, sequence, batch_size)
                         sequence += batch_size
@@ -929,8 +958,10 @@ def _run_thread(
                         pending_batches.append((started_ns, [future], batch_size))
                         continue
 
-                    if wire_key_pool is not None and args.command == "set" and hasattr(
-                        adapter, "submit_mset_payload"
+                    if (
+                        wire_key_pool is not None
+                        and args.command == "set"
+                        and hasattr(adapter, "submit_mset_payload")
                     ):
                         payload = wire_key_value_payload_batch(
                             wire_key_pool, sequence, batch_size, wire_value

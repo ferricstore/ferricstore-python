@@ -289,7 +289,9 @@ def cancel_many_created_command(
     ]
     for offset in range(count):
         index = start + offset
-        args.extend([flow_id(run_id, index), partition_key(index // max(batch_size, 1), partitions), 0])
+        args.extend(
+            [flow_id(run_id, index), partition_key(index // max(batch_size, 1), partitions), 0]
+        )
     return tuple(args)
 
 
@@ -319,7 +321,14 @@ def transition_many_command(
     ]
     for offset in range(count):
         index = start + offset
-        args.extend([flow_id(run_id, index), partition_key(index // max(batch_size, 1), partitions), 0, None])
+        args.extend(
+            [
+                flow_id(run_id, index),
+                partition_key(index // max(batch_size, 1), partitions),
+                0,
+                None,
+            ]
+        )
     return tuple(args)
 
 
@@ -349,9 +358,7 @@ def transition_many_payload_batch(
         index = start + offset
         parts.append(compact_binary(flow_id_bytes(run_id, index)))
         parts.append(
-            compact_optional_binary(
-                partition_key(index // max(batch_size, 1), partitions).encode()
-            )
+            compact_optional_binary(partition_key(index // max(batch_size, 1), partitions).encode())
         )
         parts.append(_COMPACT_I64.pack(0))
         parts.append(compact_optional_binary(None))
@@ -430,9 +437,7 @@ def owned_value_put_payload_batch(
         parts.append(compact_binary(flow_id_bytes(run_id, index)))
         parts.append(name_fragment)
         parts.append(
-            compact_optional_binary(
-                partition_key(index // max(batch_size, 1), partitions).encode()
-            )
+            compact_optional_binary(partition_key(index // max(batch_size, 1), partitions).encode())
         )
         parts.append(_COMPACT_I64.pack(timestamp))
     return b"".join(parts)
@@ -483,9 +488,7 @@ def flow_get_payload_batch(
         index = (start + offset) % item_count
         parts.append(compact_binary(flow_id_bytes(run_id, index)))
         parts.append(
-            compact_optional_binary(
-                partition_key(index // max(batch_size, 1), partitions).encode()
-            )
+            compact_optional_binary(partition_key(index // max(batch_size, 1), partitions).encode())
         )
     return b"".join(parts)
 
@@ -542,9 +545,7 @@ def flow_history_payload_batch(
         index = (start + offset) % item_count
         parts.append(compact_binary(flow_id_bytes(run_id, index)))
         parts.append(
-            compact_optional_binary(
-                partition_key(index // max(batch_size, 1), partitions).encode()
-            )
+            compact_optional_binary(partition_key(index // max(batch_size, 1), partitions).encode())
         )
     return b"".join(parts)
 
@@ -619,9 +620,7 @@ def signal_payload_batch(
         index = start + offset
         parts.append(compact_binary(flow_id_bytes(run_id, index)))
         parts.append(
-            compact_optional_binary(
-                partition_key(index // max(batch_size, 1), partitions).encode()
-            )
+            compact_optional_binary(partition_key(index // max(batch_size, 1), partitions).encode())
         )
         parts.append(_COMPACT_I64.pack(timestamp))
     return b"".join(parts)
@@ -669,10 +668,15 @@ def start_and_claim_payload_batch(
     batch_size: int,
     partitions: int,
     payload: bytes,
-    job_only: bool,
+    job_only: bool | None = None,
+    include_record: bool | None = None,
 ) -> bytes | None:
     if count <= 0:
         return None
+
+    if include_record is not None:
+        job_only = not include_record
+    job_only = bool(job_only)
 
     mode = 13 if job_only else 12
     timestamp = now_ms()
@@ -688,9 +692,7 @@ def start_and_claim_payload_batch(
         index = start + offset
         parts.append(compact_binary(flow_id_bytes(run_id, index)))
         parts.append(
-            compact_optional_binary(
-                partition_key(index // max(batch_size, 1), partitions).encode()
-            )
+            compact_optional_binary(partition_key(index // max(batch_size, 1), partitions).encode())
         )
         parts.append(payload_fragment)
         parts.append(_COMPACT_I64.pack(timestamp))
@@ -754,10 +756,13 @@ def step_continue_payload_batch(
         record = records[start + offset]
         if isinstance(record, (tuple, list)) and len(record) >= 4:
             flow_id_value, partition_key_value, lease_token_value, fencing_token_value = record[:4]
-            partition_value = None if partition_key_value in (None, b"", "") else _as_bytes(partition_key_value)
+            partition_value = (
+                None if partition_key_value in (None, b"", "") else _as_bytes(partition_key_value)
+            )
         else:
             raw = {
-                key.decode() if isinstance(key, bytes) else key: value for key, value in record.items()
+                key.decode() if isinstance(key, bytes) else key: value
+                for key, value in record.items()
             }
             flow_id_value = raw["id"]
             partition_raw = raw["partition_key"]
@@ -952,7 +957,9 @@ def run_submit_value_mget_payload_batches(
             if payload is None:
                 issued += count
                 continue
-            pending.append((time.perf_counter(), adapter.submit_flow_value_mget_payload(payload), count))
+            pending.append(
+                (time.perf_counter(), adapter.submit_flow_value_mget_payload(payload), count)
+            )
             issued += count
 
         if not pending:
@@ -1285,7 +1292,9 @@ def run_submit_pipeline_payload_batches(
             if payload is None:
                 issued += count
                 continue
-            pending.append((time.perf_counter(), adapter.submit_pipeline_payload(payload, count), count))
+            pending.append(
+                (time.perf_counter(), adapter.submit_pipeline_payload(payload, count), count)
+            )
             issued += count
 
         if not pending:
@@ -1324,7 +1333,11 @@ def run_submit_pipeline_payload_batches_for_duration(
                 issued += batch_size
                 continue
             pending.append(
-                (time.perf_counter(), adapter.submit_pipeline_payload(payload, batch_size), batch_size)
+                (
+                    time.perf_counter(),
+                    adapter.submit_pipeline_payload(payload, batch_size),
+                    batch_size,
+                )
             )
             issued += batch_size
 
@@ -1399,7 +1412,9 @@ def run_submit_pipeline_payload_batches_collect(
                 issued += count
                 errors += count
                 continue
-            pending.append((time.perf_counter(), adapter.submit_pipeline_payload(payload, count), count))
+            pending.append(
+                (time.perf_counter(), adapter.submit_pipeline_payload(payload, count), count)
+            )
             issued += count
 
         if not pending:
@@ -1419,7 +1434,9 @@ def run_submit_pipeline_payload_batches_collect(
     return results, errors, latencies
 
 
-def setup_value_refs(adapter: Any, args: argparse.Namespace, value: bytes) -> tuple[list[str], int, list[float]]:
+def setup_value_refs(
+    adapter: Any, args: argparse.Namespace, value: bytes
+) -> tuple[list[str], int, list[float]]:
     raw_refs, errors, latencies = run_submit_pipeline_batches_collect(
         adapter,
         total_items=args.flows,
@@ -1444,7 +1461,9 @@ def cyclic_refs(refs: list[str], start: int, count: int) -> list[str]:
     return refs[offset:] + refs[:wrapped]
 
 
-def run_claim_due(adapter: Any, args: argparse.Namespace, flow_type: str) -> tuple[int, int, list[float]]:
+def run_claim_due(
+    adapter: Any, args: argparse.Namespace, flow_type: str
+) -> tuple[int, int, list[float]]:
     claimed = 0
     errors = 0
     empty = 0
@@ -1455,22 +1474,23 @@ def run_claim_due(adapter: Any, args: argparse.Namespace, flow_type: str) -> tup
 
     while claimed + errors < args.flows or pending:
         while (
-            claimed + errors + pending_limit < args.flows
-            and len(pending) < args.inflight_batches
+            claimed + errors + pending_limit < args.flows and len(pending) < args.inflight_batches
         ):
             limit = min(args.batch_size, args.flows - claimed - errors - pending_limit)
-            pending.append((
-                time.perf_counter(),
-                adapter.submit_command(
-                    *claim_due_command(
-                        flow_type=flow_type,
-                        worker=worker,
-                        partitions=args.partitions,
-                        batch_size=limit,
-                    )
-                ),
-                limit,
-            ))
+            pending.append(
+                (
+                    time.perf_counter(),
+                    adapter.submit_command(
+                        *claim_due_command(
+                            flow_type=flow_type,
+                            worker=worker,
+                            partitions=args.partitions,
+                            batch_size=limit,
+                        )
+                    ),
+                    limit,
+                )
+            )
             pending_limit += limit
 
         if not pending:
@@ -1532,7 +1552,9 @@ def run_claim_due_serial(
     return claimed, errors, latencies
 
 
-def run_value_mget(adapter: Any, args: argparse.Namespace, value: bytes) -> tuple[int, int, list[float], float]:
+def run_value_mget(
+    adapter: Any, args: argparse.Namespace, value: bytes
+) -> tuple[int, int, list[float], float]:
     setup_started = time.perf_counter()
     refs, setup_errors, _setup_latencies = setup_value_refs(adapter, args, value)
     setup_seconds = time.perf_counter() - setup_started
@@ -1541,14 +1563,18 @@ def run_value_mget(adapter: Any, args: argparse.Namespace, value: bytes) -> tupl
             f"value-mget setup wrote {len(refs)} / {args.flows} refs with {setup_errors} errors"
         )
 
-    if getattr(args, "prebuild_payloads", True) and hasattr(adapter, "submit_flow_value_mget_payload"):
+    if getattr(args, "prebuild_payloads", True) and hasattr(
+        adapter, "submit_flow_value_mget_payload"
+    ):
         if args.read_duration > 0:
             completed, errors, latencies = run_submit_value_mget_payload_batches_for_duration(
                 adapter,
                 duration_seconds=args.read_duration,
                 batch_size=args.batch_size,
                 inflight_batches=args.inflight_batches,
-                build=lambda start, count: value_mget_payload_batch(cyclic_refs(refs, start, count)),
+                build=lambda start, count: value_mget_payload_batch(
+                    cyclic_refs(refs, start, count)
+                ),
             )
         else:
             completed, errors, latencies = run_submit_value_mget_payload_batches(
@@ -1777,7 +1803,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             )
             measured_seconds = time.perf_counter() - started
         elif args.operation in {"value-put", "value-put-ok"}:
-            builder = value_put_ok_command if args.operation == "value-put-ok" else value_put_command
+            builder = (
+                value_put_ok_command if args.operation == "value-put-ok" else value_put_command
+            )
             started = time.perf_counter()
             completed, errors, latencies = run_value_put(adapter, args, payload, builder)
             measured_seconds = time.perf_counter() - started
@@ -2066,9 +2094,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 measured_seconds = time.perf_counter() - started
             elif args.operation == "cancel-many":
                 started = time.perf_counter()
-                completed, errors, latencies = run_cancel_many_created(
-                    adapter, args, run_id=run_id
-                )
+                completed, errors, latencies = run_cancel_many_created(adapter, args, run_id=run_id)
                 measured_seconds = time.perf_counter() - started
             elif args.operation == "claim-due":
                 started = time.perf_counter()

@@ -13,6 +13,9 @@ def test_protocol_dbos_wrapper_uses_ferric_url_and_protocol_defaults():
     args = bench.parse_args([])
     command = bench.build_command(args)
 
+    assert args.profile == "throughput"
+    assert bench.DBOS_PROTOCOL_THROUGHPUT_PROFILE["protocol_worker_connections"] == 1
+    assert bench.DBOS_PROTOCOL_THROUGHPUT_PROFILE["protocol_lanes"] == 32
     assert command[0].endswith("python") or "python" in command[0]
     assert "dbos_style_benchmark.py" in command[1]
     assert "--url" in command

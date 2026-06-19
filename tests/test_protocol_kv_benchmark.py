@@ -36,14 +36,14 @@ def test_protocol_kv_preset_applies_measured_native_shape():
 
     assert args.preset == "get-latency"
     assert args.command == "get"
-    assert args.request_mode == "pipeline"
+    assert args.request_mode == "many"
     assert args.pipeline == 10
     assert args.clients == 1
     assert args.threads == 1
-    assert args.inflight_batches == 64
-    assert args.protocol_lanes == 1
+    assert args.inflight_batches == 8
+    assert args.protocol_lanes == 8
     assert args.test_time == 30.0
-    assert args.prebuild_keys is False
+    assert args.prebuild_keys is True
 
 
 def test_protocol_kv_preset_allows_explicit_overrides():
@@ -100,9 +100,9 @@ def test_protocol_kv_set_latency_preset_uses_small_durable_batches():
 
     assert args.command == "set"
     assert args.request_mode == "many"
-    assert args.pipeline == 100
-    assert args.protocol_lanes == 64
-    assert args.inflight_batches == 64
+    assert args.pipeline == 10
+    assert args.protocol_lanes == 8
+    assert args.inflight_batches == 8
     assert args.prebuild_keys is True
 
 
@@ -1097,9 +1097,7 @@ def test_protocol_kv_many_mode_uses_preencoded_mset_payload_when_available(monke
             raise AssertionError(f"generic submit_command should not be used: {command!r}")
 
         def submit_mset_same_value(self, keys, value):
-            raise AssertionError(
-                f"submit_mset_same_value should not be used: {keys!r} {value!r}"
-            )
+            raise AssertionError(f"submit_mset_same_value should not be used: {keys!r} {value!r}")
 
         def submit_mset_payload(self, payload):
             self.payloads.append(payload)

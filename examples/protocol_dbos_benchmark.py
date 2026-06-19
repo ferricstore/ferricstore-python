@@ -9,38 +9,166 @@ EXAMPLES_DIR = Path(__file__).resolve().parent
 DBOS_SCRIPT = EXAMPLES_DIR / "dbos_style_benchmark.py"
 DEFAULT_URL = "ferric://127.0.0.1:6388"
 
+DBOS_PROTOCOL_THROUGHPUT_PROFILE = {
+    "flows": 1_000_000,
+    "workers": 16,
+    "producers": 4,
+    "partitions": 16,
+    "server_shards": 16,
+    "claim_batch_size": 500,
+    "claim_partition_batch_size": 16,
+    "claim_drain_batches": 2,
+    "create_batch_size": 500,
+    "complete_async_depth": 4,
+    "fuse_complete_claim": False,
+    "retention_ttl_ms": 0,
+    "protocol_worker_connections": 1,
+    "protocol_lanes": 32,
+    "protocol_create_inflight_batches": 2,
+    "producer_max_pending_credits": 0,
+    "producer_target_queue_latency_ms": 75.0,
+    "producer_min_rate_per_sec": 50_000.0,
+    "producer_max_rate_per_sec": 0.0,
+    "transport": "many",
+    "queued_shape": "live",
+    "worker_api": "queue",
+    "worker_mode": "polling",
+    "partition_mode": "auto",
+    "claim_job_only": True,
+    "reclaim_expired": False,
+}
+
+PROFILES = {
+    "throughput": DBOS_PROTOCOL_THROUGHPUT_PROFILE,
+}
+
+
+def profile_default(profile: str, key: str):
+    return PROFILES[profile][key]
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    default_profile = "throughput"
     parser = argparse.ArgumentParser(
         description="Run the DBOS-style queued workflow benchmark over ferric:// protocol transport"
     )
+    parser.add_argument(
+        "--profile",
+        choices=tuple(PROFILES),
+        default=default_profile,
+        help="Named benchmark argument set. Defaults to the measured protocol throughput shape.",
+    )
     parser.add_argument("--url", default=DEFAULT_URL)
-    parser.add_argument("--flows", type=int, default=1_000_000)
-    parser.add_argument("--workers", type=int, default=16)
-    parser.add_argument("--producers", type=int, default=4)
-    parser.add_argument("--partitions", type=int, default=16)
-    parser.add_argument("--server-shards", type=int, default=16)
-    parser.add_argument("--claim-batch-size", type=int, default=500)
-    parser.add_argument("--claim-partition-batch-size", type=int, default=16)
-    parser.add_argument("--claim-drain-batches", type=int, default=2)
-    parser.add_argument("--create-batch-size", type=int, default=500)
-    parser.add_argument("--complete-async-depth", type=int, default=4)
-    parser.add_argument("--fuse-complete-claim", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--retention-ttl-ms", type=int, default=0)
-    parser.add_argument("--protocol-worker-connections", type=int, default=1)
-    parser.add_argument("--protocol-lanes", type=int, default=32)
-    parser.add_argument("--protocol-create-inflight-batches", type=int, default=2)
-    parser.add_argument("--producer-max-pending-credits", type=int, default=0)
-    parser.add_argument("--producer-target-queue-latency-ms", type=float, default=75.0)
-    parser.add_argument("--producer-min-rate-per-sec", type=float, default=50000.0)
-    parser.add_argument("--producer-max-rate-per-sec", type=float, default=0.0)
-    parser.add_argument("--transport", choices=("many", "pipeline", "autobatch"), default="many")
-    parser.add_argument("--queued-shape", choices=("live", "preloaded"), default="live")
-    parser.add_argument("--worker-api", choices=("queue", "lowlevel"), default="queue")
-    parser.add_argument("--worker-mode", choices=("polling", "blocking"), default="polling")
-    parser.add_argument("--partition-mode", choices=("auto", "explicit"), default="auto")
-    parser.add_argument("--claim-job-only", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--reclaim-expired", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--flows", type=int, default=profile_default(default_profile, "flows"))
+    parser.add_argument("--workers", type=int, default=profile_default(default_profile, "workers"))
+    parser.add_argument(
+        "--producers", type=int, default=profile_default(default_profile, "producers")
+    )
+    parser.add_argument(
+        "--partitions", type=int, default=profile_default(default_profile, "partitions")
+    )
+    parser.add_argument(
+        "--server-shards", type=int, default=profile_default(default_profile, "server_shards")
+    )
+    parser.add_argument(
+        "--claim-batch-size", type=int, default=profile_default(default_profile, "claim_batch_size")
+    )
+    parser.add_argument(
+        "--claim-partition-batch-size",
+        type=int,
+        default=profile_default(default_profile, "claim_partition_batch_size"),
+    )
+    parser.add_argument(
+        "--claim-drain-batches",
+        type=int,
+        default=profile_default(default_profile, "claim_drain_batches"),
+    )
+    parser.add_argument(
+        "--create-batch-size",
+        type=int,
+        default=profile_default(default_profile, "create_batch_size"),
+    )
+    parser.add_argument(
+        "--complete-async-depth",
+        type=int,
+        default=profile_default(default_profile, "complete_async_depth"),
+    )
+    parser.add_argument(
+        "--fuse-complete-claim",
+        action=argparse.BooleanOptionalAction,
+        default=profile_default(default_profile, "fuse_complete_claim"),
+    )
+    parser.add_argument(
+        "--retention-ttl-ms", type=int, default=profile_default(default_profile, "retention_ttl_ms")
+    )
+    parser.add_argument(
+        "--protocol-worker-connections",
+        type=int,
+        default=profile_default(default_profile, "protocol_worker_connections"),
+    )
+    parser.add_argument(
+        "--protocol-lanes", type=int, default=profile_default(default_profile, "protocol_lanes")
+    )
+    parser.add_argument(
+        "--protocol-create-inflight-batches",
+        type=int,
+        default=profile_default(default_profile, "protocol_create_inflight_batches"),
+    )
+    parser.add_argument(
+        "--producer-max-pending-credits",
+        type=int,
+        default=profile_default(default_profile, "producer_max_pending_credits"),
+    )
+    parser.add_argument(
+        "--producer-target-queue-latency-ms",
+        type=float,
+        default=profile_default(default_profile, "producer_target_queue_latency_ms"),
+    )
+    parser.add_argument(
+        "--producer-min-rate-per-sec",
+        type=float,
+        default=profile_default(default_profile, "producer_min_rate_per_sec"),
+    )
+    parser.add_argument(
+        "--producer-max-rate-per-sec",
+        type=float,
+        default=profile_default(default_profile, "producer_max_rate_per_sec"),
+    )
+    parser.add_argument(
+        "--transport",
+        choices=("many", "pipeline", "autobatch"),
+        default=profile_default(default_profile, "transport"),
+    )
+    parser.add_argument(
+        "--queued-shape",
+        choices=("live", "preloaded"),
+        default=profile_default(default_profile, "queued_shape"),
+    )
+    parser.add_argument(
+        "--worker-api",
+        choices=("queue", "lowlevel"),
+        default=profile_default(default_profile, "worker_api"),
+    )
+    parser.add_argument(
+        "--worker-mode",
+        choices=("polling", "blocking"),
+        default=profile_default(default_profile, "worker_mode"),
+    )
+    parser.add_argument(
+        "--partition-mode",
+        choices=("auto", "explicit"),
+        default=profile_default(default_profile, "partition_mode"),
+    )
+    parser.add_argument(
+        "--claim-job-only",
+        action=argparse.BooleanOptionalAction,
+        default=profile_default(default_profile, "claim_job_only"),
+    )
+    parser.add_argument(
+        "--reclaim-expired",
+        action=argparse.BooleanOptionalAction,
+        default=profile_default(default_profile, "reclaim_expired"),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("extra", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)

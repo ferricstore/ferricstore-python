@@ -40,7 +40,7 @@ Lower-latency GET/SET shapes:
 ```bash
 python examples/protocol_kv_benchmark.py \
   --url ferric://127.0.0.1:6388 \
-  --preset get-low-latency
+  --preset get-latency
 ```
 
 ```bash
@@ -57,6 +57,23 @@ python examples/protocol_dbos_benchmark.py \
   --flows 1000000 \
   --server-shards 16
 ```
+
+Restate-style workflow latency benchmark over the protocol transport:
+
+```bash
+python examples/protocol_restate_latency_benchmark.py \
+  --url ferric://127.0.0.1:6388 \
+  --profile restate-high-load \
+  --steps 3 \
+  --workflows 100000 \
+  --verify-sample 32
+```
+
+`--profile restate-high-load` applies the tuned public-SDK batch/in-flight
+shape, chooses the optimized chain submit mode for the selected step count, and
+compares against Restate published high-load targets. It does not pace requests
+by default; use `--target-rps` only when intentionally testing a fixed-rate load
+generator.
 
 Canonical high-throughput local queue run:
 

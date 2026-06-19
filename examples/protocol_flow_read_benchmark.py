@@ -110,7 +110,9 @@ def flow_get_command(
     return command
 
 
-def flow_value_mget_command(refs: list[Any], sequence: int, count: int, max_bytes: int) -> tuple[Any, ...]:
+def flow_value_mget_command(
+    refs: list[Any], sequence: int, count: int, max_bytes: int
+) -> tuple[Any, ...]:
     selected = [refs[(sequence + item) % len(refs)] for item in range(count)]
     return ("FLOW.VALUE.MGET", *selected, "MAX_BYTES", max_bytes)
 
@@ -126,14 +128,18 @@ def wait_some(pending: list[tuple[int, Future[Any], int]]) -> tuple[int, list[fl
     return expected_items, [elapsed_ms]
 
 
-def warmup_flows(adapter: ProtocolAdapter, args: argparse.Namespace, flow_type: str, payload: bytes) -> float:
+def warmup_flows(
+    adapter: ProtocolAdapter, args: argparse.Namespace, flow_type: str, payload: bytes
+) -> float:
     start_time = time.perf_counter()
     pending: list[Future[Any]] = []
 
     for start in range(0, args.flows, args.create_batch_size):
         end = min(start + args.create_batch_size, args.flows)
         pending.append(
-            adapter.submit_batch(create_commands(flow_type, start, end, payload, args.partition_key))
+            adapter.submit_batch(
+                create_commands(flow_type, start, end, payload, args.partition_key)
+            )
         )
 
         if len(pending) >= args.inflight_batches:
@@ -155,7 +161,9 @@ def warmup_value_refs(
     for start in range(0, args.flows, args.create_batch_size):
         end = min(start + args.create_batch_size, args.flows)
         pending.append(
-            adapter.submit_batch(value_put_commands(flow_type, start, end, payload, args.partition_key))
+            adapter.submit_batch(
+                value_put_commands(flow_type, start, end, payload, args.partition_key)
+            )
         )
 
         if len(pending) >= args.inflight_batches:
@@ -199,7 +207,9 @@ def run_batched_flow_get(
                 args.mode, flow_type, sequence, args.read_batch_size, args.flows, args.partition_key
             )
             sequence += args.read_batch_size
-            pending.append((time.perf_counter_ns(), adapter.submit_batch(commands), args.read_batch_size))
+            pending.append(
+                (time.perf_counter_ns(), adapter.submit_batch(commands), args.read_batch_size)
+            )
 
         completed, latencies = wait_some(pending)
         requests += completed
@@ -220,9 +230,13 @@ def run_flow_value_mget(
 
     while time.perf_counter() < deadline or pending:
         while time.perf_counter() < deadline and len(pending) < args.inflight_batches:
-            command = flow_value_mget_command(refs, sequence, args.read_batch_size, args.value_max_bytes)
+            command = flow_value_mget_command(
+                refs, sequence, args.read_batch_size, args.value_max_bytes
+            )
             sequence += args.read_batch_size
-            pending.append((time.perf_counter_ns(), adapter.submit_command(*command), args.read_batch_size))
+            pending.append(
+                (time.perf_counter_ns(), adapter.submit_command(*command), args.read_batch_size)
+            )
 
         completed, latencies = wait_some(pending)
         requests += 1
@@ -232,7 +246,9 @@ def run_flow_value_mget(
     return benchmark_result(args, requests, values, latencies_ms)
 
 
-def run_flow_list_meta(adapter: ProtocolAdapter, args: argparse.Namespace, flow_type: str) -> dict[str, Any]:
+def run_flow_list_meta(
+    adapter: ProtocolAdapter, args: argparse.Namespace, flow_type: str
+) -> dict[str, Any]:
     deadline = time.perf_counter() + args.test_time
     requests = 0
     records = 0
