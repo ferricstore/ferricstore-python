@@ -1459,7 +1459,7 @@ class AsyncFlowClient:
         count: int | None = None,
         attributes: dict[str, Any] | None = None,
         consistent_projection: bool | None = None,
-    ) -> ScheduleResult:
+    ) -> dict[str, Any]:
         args: builtins.list[Any] = ["FLOW.STATS", type]
         _append(args, "STATE", state)
         _append(args, "COUNT", count)
@@ -1884,7 +1884,7 @@ class AsyncFlowClient:
         idempotency_key: str | None = None,
         governance_scope: str | None = None,
         now_ms: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> EffectResult:
         args: builtins.list[Any] = ["FLOW.EFFECT.RESERVE", id]
         _append(args, "EFFECT_KEY", effect_key)
         _append(args, "EFFECT_TYPE", effect_type)

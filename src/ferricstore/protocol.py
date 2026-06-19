@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, replace
+from functools import partial
 from typing import Any, cast
 from urllib.parse import unquote, urlparse
 
@@ -686,11 +687,12 @@ def _compact_flow_get_pipeline_payload(
         if flow_id is None:
             return None
 
-        partition_key = None
+        partition_key: bytes | None = None
         if "partition_key" in command.payload:
-            partition_key = _optional_bytes(command.payload.get("partition_key"))
-            if partition_key is None and command.payload.get("partition_key") is not None:
+            partition_value = _optional_bytes(command.payload.get("partition_key"))
+            if partition_value is False:
                 return None
+            partition_key = cast(bytes | None, partition_value)
             has_partition = has_partition or partition_key is not None
 
         items.append((flow_id, partition_key))
@@ -885,9 +887,10 @@ def _compact_flow_get_pipeline_payload_from_raw(
             value = command[option_index + 1]
 
             if option in {"PARTITION", "PARTITION_KEY"}:
-                partition_key = _optional_bytes(value)
-                if partition_key is None and value is not None:
+                partition_value = _optional_bytes(value)
+                if partition_value is False:
                     return None
+                partition_key = cast(bytes | None, partition_value)
                 has_partition = has_partition or partition_key is not None
             elif option == "RETURN":
                 normalized_return = _text(value).lower()
@@ -1743,7 +1746,7 @@ class ProtocolAdapter:
                         future.set_result(results)
 
             for index, item in enumerate(item_futures):
-                item.add_done_callback(lambda source, index=index: complete_items(index, source))
+                item.add_done_callback(partial(complete_items, index))
             return future
 
         response_future = self._submit_pipeline_request(protocol_commands, values_only=True)
@@ -1806,9 +1809,7 @@ class ProtocolAdapter:
                         future.set_result(merged)
 
         for index, (response_future, count) in enumerate(pending):
-            response_future.add_done_callback(
-                lambda source, index=index, count=count: complete(index, source, count)
-            )
+            response_future.add_done_callback(partial(complete, index, count=count))
 
     def _complete_batch_future(
         self,
@@ -3174,9 +3175,10 @@ def _compact_flow_create_many_payload(payload: dict[str, Any]) -> bytes | None:
     return_mode = _compact_create_many_return_mode(payload.get("return"))
     if return_mode is None:
         return None
-    partition_key = _optional_bytes(payload.get("partition_key"))
-    if partition_key is False:
+    partition_value = _optional_bytes(payload.get("partition_key"))
+    if partition_value is False:
         return None
+    partition_key = cast(bytes | None, partition_value)
     mixed = partition_key is None and all(
         isinstance(item, list) and len(item) == 3 for item in items
     )
@@ -3327,9 +3329,10 @@ def _compact_flow_claimed_many_payload(
         if return_mode_text.upper() != "OK_ON_SUCCESS":
             return None
         request_kind = ok_request_kind
-    partition_key = _optional_bytes(payload.get("partition_key"))
-    if partition_key is False:
+    partition_value = _optional_bytes(payload.get("partition_key"))
+    if partition_value is False:
         return None
+    partition_key = cast(bytes | None, partition_value)
 
     pack_u32 = _COMPACT_U32.pack
     pack_i64 = _COMPACT_I64.pack
@@ -3755,9 +3758,7 @@ def _compact_flow_step_continue_payloads_from_raw(
             current_key = key
             current_items = []
 
-        current_items.append(
-            (flow_id, cast(bytes | None, partition_key), lease_token, fencing_token, now_ms)
-        )
+        current_items.append((flow_id, partition_key, lease_token, fencing_token, now_ms))
 
     if current_key is not None:
         groups.append((current_key, current_items))
@@ -3880,8 +3881,6 @@ def _compact_flow_start_and_claim_payloads_from_raw(
             or flow_type is None
             or initial_state is None
             or worker is None
-            or partition_key is False
-            or item_payload is False
             or not isinstance(lease_ms, int)
             or not isinstance(now_ms, int)
         ):
@@ -3895,9 +3894,7 @@ def _compact_flow_start_and_claim_payloads_from_raw(
             current_key = key
             current_items = []
 
-        current_items.append(
-            (flow_id, cast(bytes | None, partition_key), cast(bytes | None, item_payload), now_ms)
-        )
+        current_items.append((flow_id, partition_key, item_payload, now_ms))
 
     if current_key is not None:
         groups.append((current_key, current_items))
@@ -3981,8 +3978,8 @@ def _parse_compact_flow_start_and_claim_raw(
         flow_type,
         initial_state,
         worker,
-        partition_key,
-        item_payload,
+        cast(bytes | None, partition_key),
+        cast(bytes | None, item_payload),
         lease_ms,
         now_ms,
         jobs_compact,
@@ -4393,26 +4390,26 @@ def _try_decode_custom_pipeline_response(data: bytes, offset: int = 0) -> list[l
                 if present == 0:
                     values.append(["ok", None])
                 elif present == 1:
-                    value, offset = _read_compact_binary(data, offset)
-                    values.append(["ok", value])
+                    binary_value, offset = _read_compact_binary(data, offset)
+                    values.append(["ok", binary_value])
                 elif present == 2:
-                    value, offset = _read_custom_flow_record(data, offset)
-                    values.append(["ok", value])
+                    record_value, offset = _read_custom_flow_record(data, offset)
+                    values.append(["ok", record_value])
                 elif present == 3:
-                    value, offset = _read_custom_flow_record_list(data, offset)
-                    values.append(["ok", value])
+                    record_list_value, offset = _read_custom_flow_record_list(data, offset)
+                    values.append(["ok", record_list_value])
                 elif present == 4:
-                    value, offset = _read_custom_claim_job(data, offset)
-                    values.append(["ok", value])
+                    claim_value, offset = _read_custom_claim_job(data, offset)
+                    values.append(["ok", claim_value])
                 elif present == 5:
-                    value, offset = _read_custom_flow_value_ref(data, offset)
-                    values.append(["ok", value])
+                    ref_value, offset = _read_custom_flow_value_ref(data, offset)
+                    values.append(["ok", ref_value])
                 elif present == 6:
-                    value, offset = _read_custom_binary_list(data, offset)
-                    values.append(["ok", value])
+                    binary_list_value, offset = _read_custom_binary_list(data, offset)
+                    values.append(["ok", binary_list_value])
                 elif present == 7:
-                    value, offset = _read_custom_binary_map(data, offset)
-                    values.append(["ok", value])
+                    binary_map_value, offset = _read_custom_binary_map(data, offset)
+                    values.append(["ok", binary_map_value])
                 else:
                     return None
             elif status_code in (1, 2):
@@ -4875,20 +4872,20 @@ def _decode_value_at(data: bytes, offset: int) -> tuple[Any, int]:
     if tag == 5:
         count = _read_u32(data, offset)
         offset += 4
-        values = []
+        list_values = []
         for _ in range(count):
             value, offset = _decode_value_at(data, offset)
-            values.append(value)
-        return values, offset
+            list_values.append(value)
+        return list_values, offset
     if tag == 6:
         count = _read_u32(data, offset)
         offset += 4
-        values: dict[bytes, Any] = {}
+        map_values: dict[bytes, Any] = {}
         for _ in range(count):
             key, offset = _read_compact_binary(data, offset)
             value, offset = _decode_value_at(data, offset)
-            values[key] = value
-        return values, offset
+            map_values[key] = value
+        return map_values, offset
     if tag == 7:
         _require_available(data, offset, 8)
         return struct.unpack_from(">d", data, offset)[0], offset + 8
@@ -5904,7 +5901,7 @@ def _batch_item_value(item: Any) -> Any:
     if (isinstance(item, list) and len(item) == 2) or (isinstance(item, tuple) and len(item) == 2):
         status = _status_text(item[0]) or "error"
         value = item[1]
-        raw = item
+        raw: Any = item
     else:
         if not isinstance(item, dict):
             raise FerricStoreError("protocol PIPELINE item is not a map or status pair", raw=item)

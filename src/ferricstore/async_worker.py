@@ -2038,7 +2038,7 @@ class AsyncWorkflow:
             return outcome
         merged = dict(outcome.attributes_merge or {})
         merged.update(attributes)
-        return cast(Transition | Complete | Retry | Fail, replace(outcome, attributes_merge=merged))
+        return replace(outcome, attributes_merge=merged)
 
     async def _apply_uniform(
         self,

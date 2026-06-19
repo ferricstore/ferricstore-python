@@ -1873,10 +1873,10 @@ class Workflow:
         if not isinstance(outcome, (Transition, Complete, Retry, Fail)):
             outcome = complete(result=outcome)
         if not attributes:
-            return outcome
+            return cast(Outcome, outcome)
         merged = dict(outcome.attributes_merge or {})
         merged.update(attributes)
-        return replace(outcome, attributes_merge=merged)
+        return cast(Outcome, replace(outcome, attributes_merge=merged))
 
     def _exception_outcome(
         self,

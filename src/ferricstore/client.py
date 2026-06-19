@@ -156,7 +156,8 @@ def _resolve_include_record(include_record: bool | None, job_only: bool | None) 
 
 
 def _claim_return_mode_unsupported(exc: FerricStoreError) -> bool:
-    return "flow claim return must be records, jobs, or jobs_compact" in exc.message.lower()
+    message = f"{exc.message} {exc.raw or ''}".lower()
+    return "flow claim return must be records, jobs, or jobs_compact" in message
 
 
 def _claim_return_compat_args(args: builtins.list[Any]) -> builtins.list[Any] | None:
@@ -745,7 +746,7 @@ class FlowClient:
         _append_encoded(args, "RESULT", self.codec, result)
         _append(args, "RETENTION_TTL_MS", retention_ttl_ms)
         args.extend(["ITEMS", self._run_steps_many_items(items, partition_key)])
-        return _flow_return(self.executor.execute_command(*args))
+        return cast(bytes, _flow_return(self.executor.execute_command(*args)))
 
     @staticmethod
     def _run_steps_many_items(
@@ -819,13 +820,13 @@ class FlowClient:
             )
 
         if any(item.partition_key is not None for item in items):
-            grouped: dict[str, builtins.list[tuple[int, CreateItem]]] = {}
+            mixed_grouped: dict[str, builtins.list[tuple[int, CreateItem]]] = {}
             for idx, item in enumerate(items):
                 group_key = item.partition_key or _auto_partition_key_for_id(item.id)
-                grouped.setdefault(group_key, []).append((idx, item))
+                mixed_grouped.setdefault(group_key, []).append((idx, item))
 
-            results: builtins.list[Any] = [None] * len(items)
-            for group_key, indexed_items in grouped.items():
+            mixed_results: builtins.list[Any] = [None] * len(items)
+            for group_key, indexed_items in mixed_grouped.items():
                 group_items = [item for _idx, item in indexed_items]
                 response = self.create_many(
                     group_key,
@@ -848,15 +849,15 @@ class FlowClient:
                     _expand_many_response(response, len(indexed_items)),
                     strict=False,
                 ):
-                    results[idx] = item_result
-            return results
+                    mixed_results[idx] = item_result
+            return mixed_results
 
-        grouped: dict[str, builtins.list[tuple[int, CreateItem]]] = {}
+        bucket_grouped: dict[str, builtins.list[tuple[int, CreateItem]]] = {}
         for idx, item in enumerate(items):
-            grouped.setdefault(_auto_partition_key_for_id(item.id), []).append((idx, item))
+            bucket_grouped.setdefault(_auto_partition_key_for_id(item.id), []).append((idx, item))
 
-        results: builtins.list[Any] = [None] * len(items)
-        for bucket, indexed_items in grouped.items():
+        bucket_results: builtins.list[Any] = [None] * len(items)
+        for bucket, indexed_items in bucket_grouped.items():
             group_items = [item for _idx, item in indexed_items]
             response = self.create_many(
                 bucket,
@@ -879,8 +880,8 @@ class FlowClient:
                 _expand_many_response(response, len(indexed_items)),
                 strict=False,
             ):
-                results[idx] = item_result
-        return results
+                bucket_results[idx] = item_result
+        return bucket_results
 
     def _create_many_args(
         self,
@@ -2371,7 +2372,7 @@ class FlowClient:
         count: int | None = None,
         attributes: dict[str, Any] | None = None,
         consistent_projection: bool | None = None,
-    ) -> ScheduleResult:
+    ) -> dict[str, Any]:
         args: builtins.list[Any] = ["FLOW.STATS", type]
         _append(args, "STATE", state)
         _append(args, "COUNT", count)
@@ -2647,7 +2648,7 @@ class FlowClient:
         overwrite: bool | None = None,
         now_ms: int | None = None,
         extra_options: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> ScheduleResult:
         """Create or replace a durable Flow schedule."""
 
         args: builtins.list[Any] = ["FLOW.SCHEDULE.CREATE", id]
