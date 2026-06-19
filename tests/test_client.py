@@ -14,7 +14,7 @@ from ferricstore import (
     StaleLeaseError,
 )
 from ferricstore.backpressure import BackpressureController
-from ferricstore.errors import classify_server_error
+from ferricstore.errors import FerricStoreError, classify_server_error
 from ferricstore.types import (
     ApprovalResult,
     ChildSpec,
@@ -176,6 +176,18 @@ class FakeRedis:
         except Exception as exc:
             future.set_exception(exc)
         return future
+
+
+class RejectRichClaimReturnRedis(FakeRedis):
+    def execute_command(self, *args):
+        if (
+            args[:1] == ("FLOW.CLAIM_DUE",)
+            and "RETURN" in args
+            and args[args.index("RETURN") + 1] == "JOBS_COMPACT_ATTRS"
+        ):
+            self.calls.append(args)
+            raise FerricStoreError("flow claim return must be records, jobs, or jobs_compact")
+        return super().execute_command(*args)
 
 
 class FakeBatchRedis(FakeRedis):
@@ -1371,6 +1383,17 @@ def test_claim_due_accepts_legacy_job_only_alias():
 
     assert isinstance(jobs[0], ClaimedFlow)
     assert redis.calls[0][-2:] == ("RETURN", "JOBS_COMPACT_ATTRS")
+
+
+def test_claim_due_falls_back_when_server_rejects_attribute_return_mode():
+    redis = RejectRichClaimReturnRedis()
+    client = FlowClient(redis)
+
+    jobs = client.claim_flows("order", state="queued", worker="worker-1")
+
+    assert isinstance(jobs[0], ClaimedFlow)
+    assert redis.calls[0][redis.calls[0].index("RETURN") + 1] == "JOBS_COMPACT_ATTRS"
+    assert redis.calls[1][redis.calls[1].index("RETURN") + 1] == "JOBS_COMPACT"
 
 
 def test_claim_due_rejects_conflicting_include_record_and_job_only():

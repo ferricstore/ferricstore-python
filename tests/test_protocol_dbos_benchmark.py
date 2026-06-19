@@ -1,7 +1,6 @@
 import importlib.util
 from pathlib import Path
 
-
 _BENCH_PATH = Path(__file__).resolve().parents[1] / "examples" / "protocol_dbos_benchmark.py"
 _SPEC = importlib.util.spec_from_file_location("protocol_dbos_benchmark", _BENCH_PATH)
 bench = importlib.util.module_from_spec(_SPEC)

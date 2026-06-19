@@ -2,7 +2,6 @@ import importlib.util
 from concurrent.futures import Future
 from pathlib import Path
 
-
 _BENCH_PATH = (
     Path(__file__).resolve().parents[1] / "examples" / "protocol_flow_commands_benchmark.py"
 )
@@ -725,7 +724,7 @@ def test_protocol_flow_submit_batch_runner_counts_items_and_errors():
 
     assert completed == 5
     assert errors == 0
-    assert [command for command in adapter.commands] == [
+    assert list(adapter.commands) == [
         ("MSET", 0, 2),
         ("MSET", 2, 2),
         ("MSET", 4, 1),

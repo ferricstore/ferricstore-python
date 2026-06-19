@@ -1,6 +1,6 @@
 import importlib.util
-from concurrent.futures import Future
 from argparse import Namespace
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 

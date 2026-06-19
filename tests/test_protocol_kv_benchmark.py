@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 
-
 _BENCH_PATH = Path(__file__).resolve().parents[1] / "examples" / "protocol_kv_benchmark.py"
 _SPEC = importlib.util.spec_from_file_location("protocol_kv_benchmark", _BENCH_PATH)
 bench = importlib.util.module_from_spec(_SPEC)

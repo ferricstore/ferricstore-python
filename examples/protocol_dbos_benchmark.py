@@ -4,7 +4,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 EXAMPLES_DIR = Path(__file__).resolve().parent
 DBOS_SCRIPT = EXAMPLES_DIR / "dbos_style_benchmark.py"
 DEFAULT_URL = "ferric://127.0.0.1:6388"

@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 from ferricstore.adapters import RedisAdapter, RedisCommandExecutor
 from ferricstore.backpressure import BackpressureController, BackpressurePolicy
 from ferricstore.codecs import Codec, RawCodec
-from ferricstore.errors import OverloadedError, map_exception
+from ferricstore.errors import FerricStoreError, OverloadedError, map_exception
 from ferricstore.types import (
     ApprovalResult,
     BudgetResult,
@@ -153,6 +153,24 @@ def _resolve_include_record(include_record: bool | None, job_only: bool | None) 
     if include_record is not None and include_record != legacy_include_record:
         raise ValueError("include_record and job_only cannot disagree")
     return legacy_include_record
+
+
+def _claim_return_mode_unsupported(exc: FerricStoreError) -> bool:
+    return "flow claim return must be records, jobs, or jobs_compact" in exc.message.lower()
+
+
+def _claim_return_compat_args(args: builtins.list[Any]) -> builtins.list[Any] | None:
+    try:
+        return_index = args.index("RETURN")
+    except ValueError:
+        return None
+
+    if return_index + 1 >= len(args) or args[return_index + 1] != "JOBS_COMPACT_ATTRS":
+        return None
+
+    compat_args = list(args)
+    compat_args[return_index + 1] = "JOBS_COMPACT"
+    return compat_args
 
 
 def _append_named_counts(
@@ -1163,7 +1181,7 @@ class FlowClient:
             include_state=include_state,
             include_attributes=include_attributes,
         )
-        return self._decode_claim_due_response(self.executor.execute_command(*args), include_record)
+        return self._decode_claim_due_response(self._execute_claim_command(args), include_record)
 
     def claim_due_future(
         self,
@@ -1303,6 +1321,15 @@ class FlowClient:
         _append_bool(args, "RECLAIM_EXPIRED", reclaim_expired)
         _append(args, "RECLAIM_RATIO", reclaim_ratio)
         return args
+
+    def _execute_claim_command(self, args: builtins.list[Any]) -> Any:
+        try:
+            return self.executor.execute_command(*args)
+        except FerricStoreError as exc:
+            compat_args = _claim_return_compat_args(args)
+            if compat_args is not None and _claim_return_mode_unsupported(exc):
+                return self.executor.execute_command(*compat_args)
+            raise
 
     def _decode_claim_due_response(
         self,
@@ -1452,7 +1479,7 @@ class FlowClient:
             _append(args, "RETURN", "JOBS_COMPACT_ATTRS" if include_attributes else "JOBS_COMPACT")
         _append_payload_read(args, payload, payload_max_bytes)
         _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
-        response = self.executor.execute_command(*args)
+        response = self._execute_claim_command(args)
         return self._decode_claim_due_response(response, include_record)
 
     def extend_lease(

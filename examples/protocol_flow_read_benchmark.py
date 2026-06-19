@@ -49,7 +49,7 @@ def create_commands(
             payload,
         )
         if partition_key is not None:
-            command = command[:6] + ("PARTITION", partition_key) + command[6:]
+            command = (*command[:6], "PARTITION", partition_key, *command[6:])
         commands.append(command)
 
     return commands

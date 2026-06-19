@@ -915,9 +915,9 @@ def run_flow_list_reads(
     *,
     clock: Callable[[], float] | None = None,
 ) -> tuple[int, int, list[float]]:
-    build = lambda _start, count: flow_list_command(
-        flow_type, count, return_meta=args.operation == "flow-list-meta"
-    )
+    def build(_start: int, count: int) -> tuple[Any, ...]:
+        return flow_list_command(flow_type, count, return_meta=args.operation == "flow-list-meta")
+
     if args.read_duration > 0:
         return run_submit_command_batches_for_duration(
             adapter,
@@ -1613,11 +1613,14 @@ def run_value_put(
 ) -> tuple[int, int, list[float]]:
     if getattr(args, "prebuild_payloads", True) and hasattr(adapter, "submit_pipeline_payload"):
         return_ok = builder is value_put_ok_command
-        build_payload = lambda _start, count: shared_value_put_payload_batch(
-            value=value,
-            count=count,
-            return_ok=return_ok,
-        )
+
+        def build_payload(_start: int, count: int) -> bytes:
+            return shared_value_put_payload_batch(
+                value=value,
+                count=count,
+                return_ok=return_ok,
+            )
+
         if args.read_duration > 0:
             return run_submit_pipeline_payload_batches_for_duration(
                 adapter,
@@ -1717,7 +1720,8 @@ def run_step(
     setup_seconds = time.perf_counter() - setup_started
     if setup_errors or len(started_records) != args.flows:
         raise RuntimeError(
-            f"step setup started {len(started_records)} / {args.flows} records with {setup_errors} errors"
+            "step setup started "
+            f"{len(started_records)} / {args.flows} records with {setup_errors} errors"
         )
 
     if getattr(args, "prebuild_payloads", True) and hasattr(adapter, "submit_pipeline_payload"):
@@ -1910,15 +1914,18 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 if getattr(args, "prebuild_payloads", True) and hasattr(
                     adapter, "submit_pipeline_payload"
                 ):
-                    build_payload = lambda start, count: flow_get_payload_batch(
-                        run_id=run_id,
-                        start=start,
-                        count=count,
-                        item_count=args.flows,
-                        batch_size=setup_batch_size,
-                        partitions=args.partitions,
-                        return_meta=args.operation == "flow-get-meta",
-                    )
+
+                    def build_payload(start: int, count: int) -> bytes:
+                        return flow_get_payload_batch(
+                            run_id=run_id,
+                            start=start,
+                            count=count,
+                            item_count=args.flows,
+                            batch_size=setup_batch_size,
+                            partitions=args.partitions,
+                            return_meta=args.operation == "flow-get-meta",
+                        )
+
                     if args.read_duration > 0:
                         completed, errors, latencies = (
                             run_submit_pipeline_payload_batches_for_duration(
@@ -1959,28 +1966,34 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                         ),
                     )
             else:
-                build_flow_history = lambda index: flow_history_command(
-                    run_id,
-                    index,
-                    setup_batch_size,
-                    args.partitions,
-                    consistent_projection=args.flow_read_consistency == "consistent",
-                    include_cold=args.flow_history_include_cold,
-                )
+
+                def build_flow_history(index: int) -> tuple[Any, ...]:
+                    return flow_history_command(
+                        run_id,
+                        index,
+                        setup_batch_size,
+                        args.partitions,
+                        consistent_projection=args.flow_read_consistency == "consistent",
+                        include_cold=args.flow_history_include_cold,
+                    )
+
                 if getattr(args, "prebuild_payloads", True) and hasattr(
                     adapter, "submit_pipeline_payload"
                 ):
-                    build_history_payload = lambda start, count: flow_history_payload_batch(
-                        run_id=run_id,
-                        start=start,
-                        count=count,
-                        item_count=args.flows,
-                        batch_size=setup_batch_size,
-                        partitions=args.partitions,
-                        history_count=10,
-                        include_cold=args.flow_history_include_cold,
-                        consistent_projection=args.flow_read_consistency == "consistent",
-                    )
+
+                    def build_history_payload(start: int, count: int) -> bytes:
+                        return flow_history_payload_batch(
+                            run_id=run_id,
+                            start=start,
+                            count=count,
+                            item_count=args.flows,
+                            batch_size=setup_batch_size,
+                            partitions=args.partitions,
+                            history_count=10,
+                            include_cold=args.flow_history_include_cold,
+                            consistent_projection=args.flow_read_consistency == "consistent",
+                        )
+
                     if args.read_duration > 0:
                         completed, errors, latencies = (
                             run_submit_pipeline_payload_batches_for_duration(
@@ -2218,13 +2231,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--flow-history-include-cold",
         action="store_true",
-        help="Include LMDB/cold history in FLOW.HISTORY benchmark. Default is hot recent history only.",
+        help=(
+            "Include LMDB/cold history in FLOW.HISTORY benchmark. "
+            "Default is hot recent history only."
+        ),
     )
     parser.add_argument(
         "--claim-mode",
         choices=("multiplexed", "serial"),
         default="multiplexed",
-        help="FLOW.CLAIM_DUE benchmark mode. Multiplexed uses native lanes; serial matches a blocking pull loop.",
+        help=(
+            "FLOW.CLAIM_DUE benchmark mode. Multiplexed uses native lanes; "
+            "serial matches a blocking pull loop."
+        ),
     )
     parser.add_argument("--flow-type-prefix", default="protocol_flow_bench")
     parser.add_argument("--run-id", default=None)

@@ -196,10 +196,11 @@ class AdaptiveProducerBackpressure:
                 self._limited_batches += 1
             elif low_pressure and self._rate_per_sec is not None:
                 next_rate = self._rate_per_sec * self.increase_ratio
-                if self.max_rate_per_sec > 0 and next_rate >= self.max_rate_per_sec:
-                    self._rate_per_sec = None
-                    self._tokens = 0.0
-                elif self.max_rate_per_sec == 0 and next_rate >= self._unlimited_release_rate():
+                reached_cap = self.max_rate_per_sec > 0 and next_rate >= self.max_rate_per_sec
+                reached_unlimited = (
+                    self.max_rate_per_sec == 0 and next_rate >= self._unlimited_release_rate()
+                )
+                if reached_cap or reached_unlimited:
                     self._rate_per_sec = None
                     self._tokens = 0.0
                 else:

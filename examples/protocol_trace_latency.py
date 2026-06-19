@@ -10,7 +10,6 @@ from typing import Any
 from ferricstore import ClaimedFlow
 from ferricstore.protocol import ProtocolAdapterPool
 
-
 STAGE_ORDER = [
     "client.encode_us",
     "client.socket_write_us",
@@ -138,7 +137,8 @@ def run_flow_once(
 def print_summary(title: str, samples: dict[str, list[int]]) -> None:
     print(f"\n## {title}")
     print(
-        f"{'stage':42} {'n':>6} {'avg_us':>10} {'p50_us':>10} {'p95_us':>10} {'p99_us':>10} {'max_us':>10}"
+        f"{'stage':42} {'n':>6} {'avg_us':>10} {'p50_us':>10} "
+        f"{'p95_us':>10} {'p99_us':>10} {'max_us':>10}"
     )
     print("-" * 104)
 
@@ -184,10 +184,8 @@ def main() -> None:
         for index in range(total):
             if args.op == "set":
                 result = run_set(adapter, f"{key}:{index}", value)
-                label = "SET"
             elif args.op == "get":
                 result = run_get(adapter, key)
-                label = "GET"
             else:
                 traces = run_flow_once(
                     adapter,

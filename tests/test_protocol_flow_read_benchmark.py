@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-
 _BENCH_PATH = Path(__file__).resolve().parents[1] / "examples" / "protocol_flow_read_benchmark.py"
 _SPEC = importlib.util.spec_from_file_location("protocol_flow_read_benchmark", _BENCH_PATH)
 assert _SPEC is not None

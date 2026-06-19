@@ -6,9 +6,10 @@ import math
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from ferricstore.async_worker import (
     _auto_partition_index_for_id,
@@ -783,9 +784,9 @@ def make_trace_recorder(args: argparse.Namespace) -> Callable[[dict[str, Any]], 
     def record(sample: dict[str, Any]) -> None:
         if sample["latency_ms"] < float(getattr(args, "trace_min_ms", 0.0) or 0.0):
             return
-        lock = getattr(args, "_trace_lock")
+        lock = args._trace_lock
         with lock:
-            getattr(args, "_trace_samples").append(sample)
+            args._trace_samples.append(sample)
 
     return record
 
@@ -1349,7 +1350,9 @@ def apply_profile_defaults(args: argparse.Namespace) -> argparse.Namespace:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="FerricFlow native direct-step benchmark shaped like Restate workflow latency tests"
+        description=(
+            "FerricFlow native direct-step benchmark shaped like Restate workflow latency tests"
+        )
     )
     parser.add_argument("--url", default=DEFAULT_URL)
     parser.add_argument("--workflows", type=int, default=latency_default("workflows"))
