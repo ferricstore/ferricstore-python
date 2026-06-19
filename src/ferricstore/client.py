@@ -166,7 +166,12 @@ def _claim_return_compat_args(args: builtins.list[Any]) -> builtins.list[Any] | 
     except ValueError:
         return None
 
-    if return_index + 1 >= len(args) or args[return_index + 1] != "JOBS_COMPACT_ATTRS":
+    rich_return_modes = {
+        "JOBS_COMPACT_ATTRS",
+        "JOBS_COMPACT_STATE",
+        "JOBS_COMPACT_STATE_ATTRS",
+    }
+    if return_index + 1 >= len(args) or args[return_index + 1] not in rich_return_modes:
         return None
 
     compat_args = list(args)

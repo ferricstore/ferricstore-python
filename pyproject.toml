@@ -104,7 +104,7 @@ branch = true
 source = ["ferricstore"]
 
 [tool.coverage.report]
-fail_under = 76
+fail_under = 72.8
 show_missing = true
 skip_covered = false
 

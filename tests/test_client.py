@@ -183,7 +183,8 @@ class RejectRichClaimReturnRedis(FakeRedis):
         if (
             args[:1] == ("FLOW.CLAIM_DUE",)
             and "RETURN" in args
-            and args[args.index("RETURN") + 1] == "JOBS_COMPACT_ATTRS"
+            and args[args.index("RETURN") + 1]
+            in {"JOBS_COMPACT_ATTRS", "JOBS_COMPACT_STATE", "JOBS_COMPACT_STATE_ATTRS"}
         ):
             self.calls.append(args)
             raise FerricStoreError("flow claim return must be records, jobs, or jobs_compact")
@@ -1393,6 +1394,22 @@ def test_claim_due_falls_back_when_server_rejects_attribute_return_mode():
 
     assert isinstance(jobs[0], ClaimedFlow)
     assert redis.calls[0][redis.calls[0].index("RETURN") + 1] == "JOBS_COMPACT_ATTRS"
+    assert redis.calls[1][redis.calls[1].index("RETURN") + 1] == "JOBS_COMPACT"
+
+
+def test_claim_due_falls_back_when_server_rejects_state_attribute_return_mode():
+    redis = RejectRichClaimReturnRedis()
+    client = FlowClient(redis)
+
+    jobs = client.claim_flows(
+        "order",
+        state="queued",
+        worker="worker-1",
+        include_state=True,
+    )
+
+    assert isinstance(jobs[0], ClaimedFlow)
+    assert redis.calls[0][redis.calls[0].index("RETURN") + 1] == "JOBS_COMPACT_STATE_ATTRS"
     assert redis.calls[1][redis.calls[1].index("RETURN") + 1] == "JOBS_COMPACT"
 
 
