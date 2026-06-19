@@ -10,7 +10,7 @@ import pytest
 
 from ferricstore import (
     ChildSpec,
-    ClaimedItem,
+    ClaimedFlow,
     CreateItem,
     FencedItem,
     FlowClient,
@@ -61,7 +61,7 @@ def _event_id(event: Any) -> str:
     return _text(event_id)
 
 
-def _fenced(job: ClaimedItem) -> FencedItem:
+def _fenced(job: ClaimedFlow) -> FencedItem:
     return FencedItem(
         id=job.id,
         fencing_token=job.fencing_token,
@@ -80,8 +80,8 @@ def _claim_one(
     now_ms: int | None = None,
     lease_ms: int = 30_000,
     include_state: bool = False,
-) -> ClaimedItem:
-    jobs = client.claim_jobs(
+) -> ClaimedFlow:
+    jobs = client.claim_flows(
         flow_type,
         state=state,
         worker=worker,
@@ -105,7 +105,7 @@ def _create_and_claim(
     state: str = "queued",
     now_ms: int | None = None,
     lease_ms: int = 30_000,
-) -> tuple[str, str, ClaimedItem]:
+) -> tuple[str, str, ClaimedFlow]:
     flow_id = f"py-sdk:{name}:{suffix}"
     partition = f"{flow_id}:partition"
     client.create(
@@ -553,7 +553,7 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
             run_at_ms=now,
             idempotent=True,
         )
-        batch_jobs = client.claim_jobs(
+        batch_jobs = client.claim_flows(
             flow_type,
             state="batch",
             worker="py-sdk-batch-worker",
@@ -655,7 +655,7 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
             now_ms=now,
             run_at_ms=now,
         )
-        many_jobs = client.claim_jobs(
+        many_jobs = client.claim_flows(
             flow_type,
             state="many-transition",
             worker="py-sdk-many-worker",
@@ -672,7 +672,7 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
             items=[_fenced(job) for job in many_jobs],
             now_ms=now,
         )
-        many_complete = client.claim_jobs(
+        many_complete = client.claim_flows(
             flow_type,
             state="many-complete",
             worker="py-sdk-many-worker",
@@ -695,7 +695,7 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
             now_ms=now,
             run_at_ms=now,
         )
-        retry_many_jobs = client.claim_jobs(
+        retry_many_jobs = client.claim_flows(
             flow_type,
             state="retry-many",
             worker="py-sdk-retry-many-worker",
@@ -712,7 +712,7 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
             run_at_ms=now,
             now_ms=now,
         )
-        retry_many_again = client.claim_jobs(
+        retry_many_again = client.claim_flows(
             flow_type,
             state="retry-many",
             worker="py-sdk-retry-many-worker",
@@ -751,11 +751,11 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
             limit=1,
             now_ms=2_000,
             lease_ms=30_000,
-            job_only=True,
+            include_record=False,
         )
         assert len(reclaimed) == 1
         assert reclaimed[0].id == reclaim_id
-        assert isinstance(reclaimed[0], ClaimedItem)
+        assert isinstance(reclaimed[0], ClaimedFlow)
         assert client.complete(
             reclaimed[0].id,
             lease_token=reclaimed[0].lease_token,

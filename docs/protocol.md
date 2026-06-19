@@ -41,6 +41,21 @@ queue = QueueClient.from_url("ferric://127.0.0.1:6388")
 workflow = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 ```
 
+## Defaults
+
+The protocol SDK defaults are latency-first:
+
+- `ferric://` queue and workflow clients use one multiplexed command connection by default.
+- A protocol connection uses 8 request lanes by default.
+- Worker claim traffic reuses the same multiplexed protocol connection by default.
+
+For throughput benchmarks or very high concurrency, override explicitly:
+
+```python
+queue = QueueClient.from_url("ferric://127.0.0.1:6388", max_connections=2)
+client = FlowClient.from_url("ferric://127.0.0.1:6388", lanes=64)
+```
+
 ## Benchmark usage
 
 Run the protocol SET/GET benchmark after starting FerricStore with the protocol
@@ -65,7 +80,7 @@ For lower GET latency:
 ```bash
 python examples/protocol_kv_benchmark.py \
   --url ferric://127.0.0.1:6388 \
-  --preset get-low-latency
+  --preset get-latency
 ```
 
 Run the DBOS-style queued workflow benchmark over the protocol transport:

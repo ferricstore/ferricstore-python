@@ -20,23 +20,20 @@ Use this shape for normal services:
 | Queue workloads | `QueueClient.queue(...)`. |
 | State machines | `WorkflowClient.workflow(...)` / `AsyncWorkflowClient.workflow(...)` with explicit states. |
 | Hot producers | `queue.enqueue_many(...)` or `queue.enqueue(...)`, both ack-only by default. |
-| Hot workers | `claim_jobs` / worker APIs with compact claim responses. |
+| Hot workers | `claim_due(..., include_record=False)` / worker APIs with compact claim responses. |
 | Payload-heavy flows | Named values and `value_max_bytes` caps. |
 | Recovery | Keep expired-lease reclaim enabled unless you deliberately run a separate recovery path. |
 
 ## Client construction
 
-The SDK defaults to `redis-py` with RESP3 and raw byte responses:
+Use the FerricStore protocol transport for new services:
 
 ```python
 from ferricstore import ExceptionPolicy, RetryPolicy, ValueConfig, WorkerConfig, WorkflowClient
 
 client = WorkflowClient.from_url(
-    "redis://ferricstore.service:6379/0",
-    socket_connect_timeout=2,
-    socket_timeout=10,
-    health_check_interval=30,
-    max_connections=128,
+    "ferric://ferricstore.service:6388",
+    timeout=10,
     retry_policy=RetryPolicy(max_retries=10, backoff="exponential", base_ms=500, max_ms=60_000),
     worker_config=WorkerConfig(
         batch_size=1000,
@@ -53,11 +50,8 @@ For async services:
 from ferricstore import AsyncWorkflowClient
 
 client = AsyncWorkflowClient.from_url(
-    "redis://ferricstore.service:6379/0",
-    socket_connect_timeout=2,
-    socket_timeout=10,
-    health_check_interval=30,
-    max_connections=128,
+    "ferric://ferricstore.service:6388",
+    timeout=10,
 )
 ```
 
@@ -65,23 +59,31 @@ Guidance:
 
 | Setting | Production rule |
 | --- | --- |
-| RESP protocol | Keep RESP3. Flow records use maps. |
-| `decode_responses` | Keep `False`. The SDK decodes Flow fields itself. |
+| Protocol transport | Prefer `ferric://` / `ferrics://` for new SDK services. |
+| Protocol connections | Default is one multiplexed connection. Keep it unless profiling shows socket/client saturation. |
+| Protocol lanes | Default is 8 request lanes. Raise only for measured throughput workloads. |
 | Timeouts | Set connect and command timeouts explicitly. |
-| Pool size | Size for concurrent producers, workers, and async completion depth. |
 | Async client | One async client per event loop is the simple safe default. |
 | Sync client | One client per process/service component is usually enough; use multiple clients for isolated pools. |
 
-If you use TLS, auth, ACL users, or Sentinel/proxy options, pass the same
-`redis-py` keyword arguments through `from_url(...)`.
+RESP/Redis URLs are still supported for compatibility. If you use
+`redis://` / `rediss://`, keep RESP3 and raw byte responses:
+
+```python
+redis.Redis.from_url(url, protocol=3, decode_responses=False)
+```
+
+For RESP URLs, pass normal `redis-py` TLS, auth, ACL, Sentinel/proxy, and pool
+options through `from_url(...)`.
 
 Connection sizing defaults:
 
 | Runtime | Starting point |
 | --- | --- |
-| Sync queue workers | Leave `command_connections` / `claim_connections` unset, or use roughly `command_connections=max(8, concurrency*2)` and `claim_connections=concurrency`. |
-| Async workers | Start with `max_connections` near `workers + apply_async_depth + producer concurrency`. |
-| Web/API producers | Size for concurrent request handlers plus retry bursts. |
+| Protocol queue/workflow workers | Leave `command_connections` / `claim_connections` unset. Claim traffic reuses the same multiplexed connection. |
+| Protocol high-throughput services | Try `max_connections=2` or higher `lanes` only after measuring. |
+| RESP queue workers | Size Redis pools for concurrent producers, workers, and async completion depth. |
+| Web/API producers | Bound local concurrency and retries; do not create a client per request. |
 | Dedicated benchmark clients | Use a larger pool only when the benchmark is intentionally driving many in-flight batches. |
 
 ## Web server and worker split
@@ -107,12 +109,9 @@ from ferricstore import ExceptionPolicy, JsonCodec, QueueClient, RetryPolicy, Va
 
 def queue_client() -> QueueClient:
     return QueueClient.from_url(
-        "redis://ferricstore.service:6379/0",
+        "ferric://ferricstore.service:6388",
         codec=JsonCodec(),
-        socket_connect_timeout=2,
-        socket_timeout=10,
-        health_check_interval=30,
-        max_connections=128,
+        timeout=10,
         retry_policy=RetryPolicy(
             max_retries=10,
             backoff="exponential",
@@ -199,7 +198,7 @@ Start with explicit state workers:
 from ferricstore import QueueClient
 
 
-client = QueueClient.from_url("redis://ferricstore.service:6379/0")
+client = QueueClient.from_url("ferric://ferricstore.service:6388")
 emails = client.queue(type="email")
 worker = emails.worker(
     state="queued",
@@ -237,7 +236,7 @@ Long timers:
 
 - Use `run_at_ms` / retries for delayed work; do not keep sleeping workers or app timers.
 - FerricStore may hibernate far-future due flows out of hot RAM and indexes.
-- Normal `claim_due`, `claim_jobs`, queue workers, and workflow workers still claim hibernated flows when due.
+- Normal `claim_due`, queue workers, and workflow workers still claim hibernated flows when due.
 - Prefer explicit `state` / `states` workers for hot paths; omit state only for workers that truly handle any state.
 
 ## Idempotency and side effects
@@ -270,7 +269,7 @@ systems too.
 
 ## Reclaim and crash recovery
 
-`claim_jobs` and workers leave `reclaim_expired` unset by default, so the server
+Lean worker claims and workers leave `reclaim_expired` unset by default, so the server
 default applies. That is the right production default because expired running
 leases should become claimable again.
 
@@ -289,7 +288,7 @@ If you run a dedicated recovery process, use `client.reclaim(...)` with clear
 limits and observability:
 
 ```python
-expired = client.reclaim("email", worker="reaper-1", limit=100, job_only=True)
+expired = client.reclaim("email", worker="reaper-1", limit=100, include_record=False)
 ```
 
 ## Partitioning
@@ -442,7 +441,8 @@ Give normal application workers only the command categories they need.
 
 Before calling a Python SDK service production-ready:
 
-- RESP3/raw bytes connection is configured.
+- `ferric://` or `ferrics://` protocol connection is configured for new services.
+- RESP3/raw bytes is configured only when using Redis-compatible `redis://` URLs.
 - Connect and command timeouts are set.
 - Connection pool size matches worker/producers.
 - Handler p99 is below `lease_ms` with margin, or leases are extended.

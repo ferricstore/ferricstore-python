@@ -19,6 +19,7 @@ APIs, and access to normal FerricStore commands.
 | See complete production-style examples | [Use Case Examples](use-cases.md) |
 | Configure retries, workers, values, and pools | [Configuration](configuration.md) |
 | Store payloads, named values, and value refs correctly | [Data in Workflows](data.md) |
+| Add budgets, approvals, effects, limits, and circuits | [Governance](governance.md) |
 | Use FastAPI, serverless, or a separate worker service | [Web and Serverless Usage](web.md) |
 | Copy production patterns | [Patterns and Recipes](patterns.md) |
 | Debug common problems | [Troubleshooting](troubleshooting.md) |
@@ -28,7 +29,8 @@ APIs, and access to normal FerricStore commands.
 
 | Area | Docs |
 | --- | --- |
-| Low-level Flow commands | [Client API](client.md) |
+| Low-level Flow, schedule, governance, and admin commands | [Client API](client.md) |
+| Governance concepts and examples | [Governance](governance.md) |
 | Queue and workflow APIs | [Workflow and Queue APIs](workflow.md) |
 | Worker loops | [Worker](worker.md) |
 | Payload codecs | [Payload Codecs](codecs.md) |
@@ -52,10 +54,8 @@ For queue-like work:
 from ferricstore import QueueClient
 
 client = QueueClient.from_url(
-    "redis://127.0.0.1:6379/0",
-    socket_connect_timeout=2,
-    socket_timeout=10,
-    health_check_interval=30,
+    "ferric://127.0.0.1:6388",
+    timeout=10,
 )
 
 emails = client.queue(type="email")
@@ -67,7 +67,7 @@ For explicit state machines:
 ```python
 from ferricstore import WorkflowClient, complete, transition
 
-client = WorkflowClient.from_url("redis://127.0.0.1:6379/0")
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 order = client.workflow(
     type="order",
     initial_state="created",

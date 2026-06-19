@@ -4,8 +4,8 @@ Python SDK for FerricStore and FerricFlow.
 
 Status: public alpha `0.1.1`. APIs may change before `1.0`, but the SDK is
 tested against command construction, queue/workflow handlers, leases, retries,
-history, named values, idempotent create, worker loops, async flows, and local
-FerricStore integration scenarios.
+history, indexed attributes, named values, idempotent create, worker loops,
+async flows, and local FerricStore integration scenarios.
 
 FerricFlow keeps each workflow or job's state and history in one durable place. It
 is an explicit durable state pipeline, not a hidden deterministic replay engine:
@@ -39,7 +39,7 @@ pip install -e ".[dev]"
 
 ### 2. Start FerricStore
 
-Use a local FerricStore server with the Redis-compatible port enabled:
+Use a local FerricStore server with the FerricStore protocol listener enabled:
 
 ```bash
 ferricstore start
@@ -49,26 +49,43 @@ If you are running from the FerricStore source repo, use that repo's documented
 server command. The SDK examples assume:
 
 ```text
-redis://127.0.0.1:6379/0
+ferric://127.0.0.1:6388
 ```
 
 ### 3. Create a durable queue item
 
 ```python
-from ferricstore import QueueClient
+from ferricstore import FlowClient, QueueClient
 
-client = QueueClient.from_url("redis://127.0.0.1:6379/0")
+client = QueueClient.from_url("ferric://127.0.0.1:6388")
 emails = client.queue(type="email")
 
 emails.enqueue("email-1", payload=b"welcome:user-1", idempotent=True)
 ```
+
+Use `attributes` for small indexed metadata you want to filter/count later:
+
+```python
+emails.enqueue(
+    "email-2",
+    payload=b"welcome:user-2",
+    attributes={"tenant": "acme", "campaign": "summer"},
+    idempotent=True,
+)
+
+flow = FlowClient.from_url("ferric://127.0.0.1:6388")
+records = flow.list("email", attributes={"tenant": "acme"})
+stats = flow.stats("email", attributes={"tenant": "acme"})
+```
+
+Attributes are not payload bytes. Use named values/value refs for large data.
 
 ### 4. Run a queue worker
 
 ```python
 from ferricstore import QueueClient
 
-client = QueueClient.from_url("redis://127.0.0.1:6379/0")
+client = QueueClient.from_url("ferric://127.0.0.1:6388")
 emails = client.queue(type="email")
 
 
@@ -89,7 +106,7 @@ Use workflows when one durable flow moves through named states.
 ```python
 from ferricstore import WorkflowClient, complete, transition
 
-client = WorkflowClient.from_url("redis://127.0.0.1:6379/0")
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 order = client.workflow(
     type="order",
     initial_state="created",
@@ -180,6 +197,9 @@ requested values, not history replay.
 - `QueueClient` / `AsyncQueueClient` for durable queues.
 - `WorkflowClient` / `AsyncWorkflowClient` for explicit durable state machines.
 - `FlowClient` / `AsyncFlowClient` for advanced command-level control.
+- `ScheduleResult`, `EffectResult`, `ApprovalResult`, `CircuitBreakerStatus`,
+  `BudgetResult`, and `GovernanceOverview` for typed admin/governance responses
+  with dict fallback.
 - `RetryPolicy`, `WorkerConfig`, `ValueConfig`, and `ExceptionPolicy` for runtime defaults.
 - `RawCodec` by default, `JsonCodec` when you want JSON payloads.
 - `client.command(...)` as the Redis/FerricStore escape hatch.
@@ -193,7 +213,7 @@ from ferricstore import AsyncQueueClient
 
 
 async def main():
-    client = AsyncQueueClient.from_url("redis://127.0.0.1:6379/0")
+    client = AsyncQueueClient.from_url("ferric://127.0.0.1:6388")
     emails = client.queue(type="email")
 
     async def handler(job):
@@ -214,8 +234,10 @@ to claim and complete work.
 web/serverless producer -> FerricStore -> worker service
 ```
 
-Before production, configure timeouts, connection pools, lease duration,
-backpressure behavior, graceful shutdown, and value hydration caps.
+Before production, configure timeouts, lease duration, backpressure behavior,
+graceful shutdown, and value hydration caps. The `ferric://` transport defaults
+to one multiplexed connection with 8 request lanes; only raise connection or
+lane counts after profiling shows client-side saturation.
 
 ## Docs
 

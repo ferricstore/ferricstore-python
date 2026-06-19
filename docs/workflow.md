@@ -118,6 +118,71 @@ payment.start(
 `Workflow` subclasses remain supported for framework-style codebases, but
 `WorkflowClient.workflow(...)` is the primary SDK style.
 
+## Governance budgets in workflows
+
+Use `BudgetPolicy` when a state should reserve capacity before it runs and
+settle the reservation automatically when the handler succeeds.
+
+```python
+from ferricstore import BudgetPolicy, WorkflowClient, complete
+
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
+workflow = client.workflow(type="agent", initial_state="call_model")
+
+@workflow.state(
+    "call_model",
+    budget=BudgetPolicy(scope=lambda ctx: f"tenant:{ctx.partition_key}", amount=10_000),
+)
+def call_model(ctx):
+    result = call_llm(ctx.payload)
+    return complete(result=result)
+```
+
+When the state completes, the SDK stamps budget attributes such as
+`governance_budget_scope`, `governance_budget_status`, and
+`governance_budget_overage_amount` onto the Flow mutation. They appear in Flow
+history and attribute search after normal projection catch-up.
+
+Use `ctx.budget(...)` when actual usage is only known after the operation:
+
+```python
+@workflow.state("call_model")
+def call_model(ctx):
+    with ctx.budget("tenant:acme", 10_000, limit=1_000_000) as budget:
+        result = call_llm(ctx.payload)
+        budget.commit(result.tokens, usage={"tokens": result.tokens})
+    return complete(result=result.text)
+```
+
+If the handler raises, the context manager releases the unused reservation.
+For async workflows, use `async with ctx.budget(...)`.
+
+Use `ctx.effect(...)` when a state performs an external side effect and you
+want effect fencing plus circuit-breaker accounting around that call:
+
+```python
+@workflow.state("charge")
+def charge(ctx):
+    @ctx.effect(
+        "stripe-charge",
+        "payment.charge",
+        operation_digest=f"stripe:{ctx.id}:v1",
+        external_id=lambda result: result["charge_id"],
+    )
+    def call_stripe():
+        return stripe.charge(ctx.value("order"))
+
+    result = call_stripe()
+    return complete(result=result)
+```
+
+The SDK reserves before `call_stripe`, confirms on success, and fails the
+effect on exception. Circuit policies attached to the effect type can deny the
+reservation before the external call happens.
+
+For effect fencing, human approvals, distributed limits, circuits, telemetry,
+and denial error shapes, see [Governance](governance.md).
+
 ## Async APIs
 
 Use async APIs when your application already runs on `asyncio`.

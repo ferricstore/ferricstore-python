@@ -3,7 +3,7 @@ from concurrent.futures import Future
 import pytest
 
 from ferricstore import ExceptionPolicy, QueueClient, RetryPolicy, ValueConfig, WorkerConfig
-from ferricstore.types import ClaimedItem, resolve_worker_connection_counts
+from ferricstore.types import ClaimedFlow, resolve_worker_connection_counts
 from ferricstore.worker import QueueFlowWorker, QueueFlowWorkerResult
 
 
@@ -16,7 +16,7 @@ class FakeFlowClient:
         self.failed = []
         self.policies = []
 
-    def claim_jobs(self, type, **kwargs):
+    def claim_flows(self, type, **kwargs):
         self.claim_calls.append((type, kwargs))
         if not self.responses:
             return []
@@ -62,7 +62,7 @@ class FusedFakeFlowClient(FakeFlowClient):
         super().__init__(responses)
         self.complete_claim_calls = []
 
-    def complete_jobs_and_claim_jobs(self, jobs, **kwargs):
+    def complete_flows_and_claim_flows(self, jobs, **kwargs):
         self.complete_claim_calls.append((list(jobs), kwargs))
         if not self.responses:
             return []
@@ -70,7 +70,7 @@ class FusedFakeFlowClient(FakeFlowClient):
 
 
 class AsyncFusedFakeFlowClient(FusedFakeFlowClient):
-    def submit_complete_jobs_and_claim_jobs(self, jobs, **kwargs):
+    def submit_complete_flows_and_claim_flows(self, jobs, **kwargs):
         self.complete_claim_calls.append((list(jobs), kwargs))
         complete_future = Future()
         claim_future = Future()
@@ -85,7 +85,7 @@ class FakeFutureClaimFlowClient(FakeFlowClient):
         self.future_responses = list(futures)
         self.future_claim_calls = []
 
-    def claim_jobs_future(self, type, **kwargs):
+    def claim_flows_future(self, type, **kwargs):
         self.future_claim_calls.append((type, kwargs))
         if not self.future_responses:
             future = Future()
@@ -144,8 +144,8 @@ def test_flow_worker_drains_same_partition_group_while_batches_are_full():
 
 
 def test_flow_worker_fuses_complete_and_next_claim_on_sync_hot_path():
-    first = ClaimedItem("f1", b"lease-1", 1, partition_key="p1")
-    second = ClaimedItem("f2", b"lease-2", 2, partition_key="p1")
+    first = ClaimedFlow("f1", b"lease-1", 1, partition_key="p1")
+    second = ClaimedFlow("f2", b"lease-2", 2, partition_key="p1")
     client = FusedFakeFlowClient([[first], [second]])
     worker = QueueFlowWorker(
         client,
@@ -174,8 +174,8 @@ def test_flow_worker_fuses_complete_and_next_claim_on_sync_hot_path():
 
 
 def test_flow_worker_async_fuses_complete_and_next_claim_without_completion_thread():
-    first = ClaimedItem("f1", b"lease-1", 1, partition_key="p1")
-    second = ClaimedItem("f2", b"lease-2", 2, partition_key="p1")
+    first = ClaimedFlow("f1", b"lease-1", 1, partition_key="p1")
+    second = ClaimedFlow("f2", b"lease-2", 2, partition_key="p1")
     client = AsyncFusedFakeFlowClient([[first], [second]])
     worker = QueueFlowWorker(
         client,
@@ -203,8 +203,8 @@ def test_flow_worker_async_fuses_complete_and_next_claim_without_completion_thre
 
 
 def test_flow_worker_async_fusion_can_use_separate_protocol_claim_client():
-    first = ClaimedItem("f1", b"lease-1", 1, partition_key="p1")
-    second = ClaimedItem("f2", b"lease-2", 2, partition_key="p1")
+    first = ClaimedFlow("f1", b"lease-1", 1, partition_key="p1")
+    second = ClaimedFlow("f2", b"lease-2", 2, partition_key="p1")
     command_client = FakeFlowClient([])
     claim_client = AsyncFusedFakeFlowClient([[first], [second]])
     worker = QueueFlowWorker(
@@ -333,7 +333,7 @@ def test_flow_worker_protocol_wake_hints_subscribes_to_claim_filter():
 
 
 def test_flow_worker_prefetches_blocking_claims_with_protocol_future_client():
-    job = ClaimedItem("flow-1", b"lease-1", 1, partition_key="bucket-0")
+    job = ClaimedFlow("flow-1", b"lease-1", 1, partition_key="bucket-0")
     first = Future()
     first.set_result([job])
     second = Future()
@@ -668,8 +668,8 @@ def test_flow_worker_resets_running_after_loop_exception():
 
 def test_flow_worker_preserves_distinct_failure_messages_in_batch_retry():
     jobs = [
-        ClaimedItem("f1", b"lease-1", 1, partition_key="p1"),
-        ClaimedItem("f2", b"lease-2", 2, partition_key="p1"),
+        ClaimedFlow("f1", b"lease-1", 1, partition_key="p1"),
+        ClaimedFlow("f2", b"lease-2", 2, partition_key="p1"),
     ]
     client = FakeFlowClient([jobs])
     worker = QueueFlowWorker(
@@ -779,7 +779,7 @@ def test_queue_client_from_protocol_url_reuses_multiplexed_claim_client(monkeypa
     worker = queue_client.queue(type="email").worker()
 
     assert len(calls) == 1
-    assert calls[0][1] == {"max_connections": 3}
+    assert calls[0][1] == {"max_connections": 1}
     assert queue_client.claim_flow is queue_client.flow
     assert worker.client is queue_client.flow
     assert worker.claim_client is queue_client.flow
@@ -805,7 +805,7 @@ def test_flow_worker_from_protocol_url_reuses_multiplexed_claim_client(monkeypat
     )
 
     assert len(calls) == 1
-    assert calls[0][1] == {"max_connections": 2}
+    assert calls[0][1] == {"max_connections": 1}
     assert worker.claim_client is worker.client
 
 
@@ -853,8 +853,31 @@ def test_queue_worker_config_does_not_resize_protocol_claim_pool(monkeypatch):
     ).worker()
 
     assert len(calls) == 1
+    assert calls[0][1] == {"max_connections": 1}
     assert worker.client is queue_client.flow
     assert worker.claim_client is queue_client.flow
+
+
+def test_protocol_queue_client_respects_explicit_command_connections(monkeypatch):
+    calls = []
+
+    def from_url(url, **kwargs):
+        client = FakeFlowClient([])
+        client.url = url
+        client.kwargs = kwargs
+        calls.append((url, kwargs, client))
+        return client
+
+    monkeypatch.setattr("ferricstore.worker.FlowClient.from_url", staticmethod(from_url))
+
+    queue_client = QueueClient.from_url(
+        "ferric://example:6388",
+        worker_config=WorkerConfig(workers=16, command_connections=3),
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1] == {"max_connections": 3}
+    assert queue_client.claim_flow is queue_client.flow
 
 
 def test_queue_client_close_does_not_close_externally_owned_clients():

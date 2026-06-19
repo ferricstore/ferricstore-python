@@ -2,9 +2,11 @@
 
 This guide covers the public Python SDK surface and when to use each layer.
 
-FerricStore speaks Redis-compatible RESP. The SDK gives typed helpers for
-FerricFlow and FerricStore protocol commands, while still letting you call any
-normal Redis command through one passthrough method.
+FerricStore supports the `ferric://` protocol transport and Redis-compatible
+RESP. New SDK services should start with `ferric://`: it defaults to one
+multiplexed connection with 8 request lanes. The SDK gives typed helpers for
+FerricFlow and FerricStore commands, while still letting you call normal
+Redis-compatible commands through one passthrough method.
 
 If you are new, start with [Quickstart](quickstart.md). If you need
 production-style examples for sagas, IoT fanout, AI orchestration, human
@@ -19,7 +21,7 @@ approval, webhooks, or batch fanout, read [Use Case Examples](use-cases.md).
 | Async high-level workflows | `AsyncWorkflowClient` |
 | Async high-level queues | `AsyncQueueClient` |
 | Low-level Flow commands | `FlowClient` |
-| Queue/workflow support types | `CreateItem`, `ClaimedItem`, `FencedItem`, `ChildSpec`, `RetryPolicy`, `WorkerConfig`, `ValueConfig`, `ExceptionPolicy`, `FlowRecord` |
+| Queue/workflow support types | `CreateItem`, `ClaimedFlow`, `FencedItem`, `ChildSpec`, `RetryPolicy`, `WorkerConfig`, `ValueConfig`, `ExceptionPolicy`, `FlowRecord` |
 | Protocol FerricStore commands | `cas`, `lock`, `ratelimit_add`, `fetch_or_compute`, `key_info`, cluster/admin helpers |
 | Normal Redis commands | `client.command(...)` |
 | Payload codecs | `RawCodec`, `JsonCodec` |
@@ -49,10 +51,11 @@ Create a client:
 ```python
 from ferricstore import WorkflowClient
 
-client = WorkflowClient.from_url("redis://127.0.0.1:6379/0")
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 ```
 
-`from_url` uses `redis-py` with RESP3 and raw byte responses:
+For `ferric://`, `from_url` uses the FerricStore protocol adapter. For
+`redis://`, it uses `redis-py` with RESP3 and raw byte responses:
 
 ```python
 redis.Redis.from_url(url, protocol=3, decode_responses=False)
@@ -63,7 +66,7 @@ Use JSON payloads when you want language-neutral structured values:
 ```python
 from ferricstore import JsonCodec, WorkflowClient
 
-client = WorkflowClient.from_url("redis://127.0.0.1:6379/0", codec=JsonCodec())
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388", codec=JsonCodec())
 ```
 
 The default `RawCodec` accepts `bytes`, `bytearray`, `str`, or `None` and returns
@@ -95,7 +98,7 @@ inherit them, and explicit `.queue(...)`, `.workflow(...)`, `.worker(...)`, or
 from ferricstore import ExceptionPolicy, RetryPolicy, ValueConfig, WorkerConfig, WorkflowClient
 
 client = WorkflowClient.from_url(
-    "redis://127.0.0.1:6379/0",
+    "ferric://127.0.0.1:6388",
     retry_policy=RetryPolicy(max_retries=10, backoff="exponential"),
     worker_config=WorkerConfig(
         batch_size=100,
@@ -105,6 +108,11 @@ client = WorkflowClient.from_url(
     value_config=ValueConfig(value_max_bytes=64 * 1024),
 )
 ```
+
+These are service defaults, not benchmark flags. Throughput benchmarks use
+explicit profiles in `examples/protocol_kv_benchmark.py`,
+`examples/protocol_dbos_benchmark.py`, and
+`examples/protocol_restate_latency_benchmark.py`.
 
 ## Normal Redis commands
 
@@ -329,16 +337,26 @@ jobs = client.claim_due(
 | `payload` | Hydrated only when requested by claim options. |
 | `values` | Named values hydrated only when requested. |
 
-Use `claim_jobs` for the compact queue hot path when the worker only needs job
-ids and tokens:
+Use `include_record=False` for the compact queue hot path when the worker only
+needs claim metadata:
 
 ```python
-jobs = client.claim_jobs("order", state="queued", worker="worker-1", limit=100)
+claims = client.claim_due(
+    "order",
+    state="queued",
+    worker="worker-1",
+    limit=100,
+    include_record=False,
+)
 ```
 
+Compact claims include indexed `attributes` by default so workers can route or
+branch without an extra `get`. Use `include_attributes=False` when a very hot
+path only needs ids, lease tokens, and fencing tokens.
+
 Long timers use the same claim path. FerricStore may hibernate far-future
-`run_at_ms` flows to keep hot RAM/indexes small; `claim_due`, `claim_jobs`, and
-the worker APIs still promote and claim those flows normally once they are due.
+`run_at_ms` flows to keep hot RAM/indexes small; `claim_due` and the worker APIs
+still promote and claim those flows normally once they are due.
 
 ### Complete, retry, fail, cancel
 
@@ -401,14 +419,14 @@ client.transition(
 
 ### Batch mutations
 
-Use `ClaimedItem` for lease-token commands:
+Use `ClaimedFlow` for lease-token commands:
 
 ```python
-from ferricstore import ClaimedItem
+from ferricstore import ClaimedFlow
 
 items = [
-    ClaimedItem(job.id, job.lease_token, job.fencing_token, partition_key=job.partition_key)
-    for job in jobs
+    ClaimedFlow(claim.id, claim.lease_token, claim.fencing_token, partition_key=claim.partition_key)
+    for claim in claims
 ]
 
 client.complete_many(None, items, result=b"ok", independent=True)
@@ -468,7 +486,7 @@ stuck = client.stuck("order", older_than_ms=300_000, count=100)
 from ferricstore import RetryPolicy, WorkflowClient
 
 client = WorkflowClient.from_url(
-    "redis://127.0.0.1:6379/0",
+    "ferric://127.0.0.1:6388",
     retry_policy=RetryPolicy(max_retries=5, backoff="exponential", base_ms=100, max_ms=5_000),
 )
 workflow = client.workflow(type="order", initial_state="queued")
@@ -477,6 +495,37 @@ workflow.install_policy()
 policy = client.policy_get("order")
 client.retention_cleanup(limit=10_000)
 ```
+
+## Indexed attributes
+
+Use attributes for small metadata that should be queryable without reading
+payload or named values:
+
+```python
+client.create(
+    "order-1",
+    type="order",
+    payload=b"small routing bytes",
+    attributes={"tenant": "acme", "region": "us"},
+)
+
+client.transition(
+    job.id,
+    from_state="created",
+    to_state="charged",
+    lease_token=job.lease_token,
+    fencing_token=job.fencing_token,
+    attributes_merge={"phase": "charge"},
+)
+
+records = client.list("order", attributes={"tenant": "acme"})
+stats = client.stats("order", attributes={"tenant": "acme"})
+```
+
+Keep attributes small and stable: tenant, region, campaign, device group, model,
+or customer-visible status. Use named values/value refs for large bytes.
+Attribute queries use FerricFlow's async projection; use
+`consistent_projection=True` for admin/debug reads that must wait for catch-up.
 
 ## Named values and value refs
 
@@ -550,7 +599,7 @@ Use `QueueClient` when each item is one durable unit of work.
 ```python
 from ferricstore import QueueClient
 
-client = QueueClient.from_url("redis://127.0.0.1:6379/0")
+client = QueueClient.from_url("ferric://127.0.0.1:6388")
 emails = client.queue(type="email")
 
 emails.enqueue("email-1", payload=b"welcome:user-1")
@@ -570,7 +619,7 @@ Use `WorkflowClient` when the app is an explicit durable state machine.
 ```python
 from ferricstore import WorkflowClient, complete, fail, retry, transition
 
-client = WorkflowClient.from_url("redis://127.0.0.1:6379/0")
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 order = client.workflow(
     type="order",
     initial_state="created",
@@ -703,7 +752,7 @@ Use these tools:
 ```python
 from ferricstore import QueueClient
 
-client = QueueClient.from_url("redis://127.0.0.1:6379/0")
+client = QueueClient.from_url("ferric://127.0.0.1:6388")
 emails = client.queue(type="email")
 
 emails.enqueue("email-1", payload=b"welcome")
@@ -715,7 +764,7 @@ emails.worker(concurrency=100, batch_size=1000).run(lambda job: send_email(job.i
 ```python
 from ferricstore import WorkflowClient, complete, transition
 
-client = WorkflowClient.from_url("redis://127.0.0.1:6379/0")
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 signup = client.workflow(type="signup", initial_state="created")
 
 @signup.state("created")

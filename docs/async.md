@@ -20,7 +20,7 @@ from ferricstore import AsyncQueueClient
 
 
 async def main():
-    client = AsyncQueueClient.from_url("redis://127.0.0.1:6379/0")
+    client = AsyncQueueClient.from_url("ferric://127.0.0.1:6388")
     emails = client.queue(type="email")
 
     async def send_email(job):
@@ -41,7 +41,7 @@ from ferricstore import AsyncWorkflowClient, complete, transition
 
 
 async def main():
-    client = AsyncWorkflowClient.from_url("redis://127.0.0.1:6379/0")
+    client = AsyncWorkflowClient.from_url("ferric://127.0.0.1:6388")
     order = client.workflow(type="order", states=["created", "charged"], initial_state="created")
 
     @order.state("created")
@@ -63,13 +63,14 @@ asyncio.run(main())
 
 ## Async producers
 
-For async web apps, create one client per event loop.
+For async web apps, create one client per event loop. With `ferric://`, the
+default is one multiplexed protocol connection with 8 request lanes.
 
 ```python
 from ferricstore import AsyncQueueClient
 
 
-client = AsyncQueueClient.from_url("redis://ferricstore.service:6379/0", max_connections=128)
+client = AsyncQueueClient.from_url("ferric://ferricstore.service:6388", timeout=10)
 emails = client.queue(type="email")
 
 
@@ -84,7 +85,8 @@ async def create_email(req: dict):
 | Mistake | Fix |
 | --- | --- |
 | Using sync client in async route | Use `AsyncQueueClient` / `AsyncWorkflowClient`. |
-| Too small connection pool | Increase `max_connections`. |
+| Protocol client saturation | Increase `lanes` first; use `max_connections` only after measuring. |
+| RESP pool saturation | Increase `max_connections`. |
 | Unbounded handler concurrency | Set `WorkerConfig(concurrency=...)`. |
 | Claiming values the handler does not need | Use explicit `claim_values`. |
 | Running worker in serverless handler | Enqueue in serverless, run worker elsewhere. |

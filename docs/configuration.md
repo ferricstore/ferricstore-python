@@ -8,11 +8,8 @@ The high-level clients are the normal place to put production defaults:
 from ferricstore import ExceptionPolicy, QueueClient, RetryPolicy, ValueConfig, WorkerConfig
 
 client = QueueClient.from_url(
-    "redis://ferricstore.service:6379/0",
-    socket_connect_timeout=2,
-    socket_timeout=10,
-    health_check_interval=30,
-    max_connections=32,
+    "ferric://ferricstore.service:6388",
+    timeout=10,
     retry_policy=RetryPolicy(
         max_retries=10,
         backoff="exponential",
@@ -30,6 +27,18 @@ client = QueueClient.from_url(
     value_config=ValueConfig(value_max_bytes=64 * 1024),
 )
 ```
+
+For `ferric://`, the SDK defaults are latency-first:
+
+```text
+one TCP connection
+8 multiplexed request lanes
+claim traffic reuses the same protocol connection
+```
+
+Only override `max_connections`, `lanes`, `command_connections`, or
+`claim_connections` after profiling shows the client socket or Python process is
+the bottleneck.
 
 ## Inheritance
 
@@ -125,6 +134,8 @@ Support matrix:
 | --- | --- | --- | --- | --- |
 | `workers` | No | No | Yes | Yes |
 | `concurrency` | Yes | No | Yes | Yes |
+| `command_connections` | Advanced | Advanced | Advanced | Advanced |
+| `claim_connections` | RESP claim pool | RESP claim pool | RESP claim pool | RESP claim pool |
 | `batch_size` | Yes | Yes | Yes | Yes |
 | `lease_ms` | Yes | State-level for workflow handlers | No | No |
 | `priority` | Yes | Yes | No | Yes |
@@ -210,8 +221,20 @@ invoice = job.value("invoice_pdf", local_cache=True)
 
 ## Connection options
 
-All high-level `from_url(...)` methods pass unknown keyword arguments to
-`redis-py`.
+For `ferric://` / `ferrics://`, high-level `from_url(...)` methods pass protocol
+options to the FerricStore protocol adapter:
+
+```python
+client = QueueClient.from_url(
+    "ferrics://app_user:secret@ferricstore.service:6389",
+    timeout=10,
+    max_connections=1,
+    lanes=8,
+)
+```
+
+For `redis://` / `rediss://`, high-level `from_url(...)` methods pass unknown
+keyword arguments to `redis-py`:
 
 ```python
 client = QueueClient.from_url(
