@@ -2384,17 +2384,23 @@ def test_async_protocol_adapter_allows_multiple_inflight_requests():
             reader: asyncio.StreamReader,
             writer: asyncio.StreamWriter,
         ) -> None:
-            startup_opcode, startup_lane, startup_id, _startup_payload = await recv_frame(reader)
-            writer.write(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
-            await writer.drain()
+            try:
+                startup_opcode, startup_lane, startup_id, _startup_payload = await recv_frame(
+                    reader
+                )
+                writer.write(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
+                await writer.drain()
 
-            first_opcode, first_lane, first_id, _first_payload = await recv_frame(reader)
-            second_opcode, second_lane, second_id, _second_payload = await recv_frame(reader)
-            received.extend([(first_opcode, first_lane), (second_opcode, second_lane)])
+                first_opcode, first_lane, first_id, _first_payload = await recv_frame(reader)
+                second_opcode, second_lane, second_id, _second_payload = await recv_frame(reader)
+                received.extend([(first_opcode, first_lane), (second_opcode, second_lane)])
 
-            writer.write(response(first_opcode, first_lane, first_id, b"one"))
-            writer.write(response(second_opcode, second_lane, second_id, b"two"))
-            await writer.drain()
+                writer.write(response(first_opcode, first_lane, first_id, b"one"))
+                writer.write(response(second_opcode, second_lane, second_id, b"two"))
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
 
         server = await asyncio.start_server(handle, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
@@ -2443,36 +2449,40 @@ def test_async_protocol_adapter_trace_command_returns_client_and_server_timings(
             reader: asyncio.StreamReader,
             writer: asyncio.StreamWriter,
         ) -> None:
-            (
-                startup_opcode,
-                startup_lane,
-                startup_id,
-                startup_flags,
-                _startup_payload,
-            ) = await recv_frame(reader)
-            assert startup_flags == 0
-            writer.write(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
-            await writer.drain()
+            try:
+                (
+                    startup_opcode,
+                    startup_lane,
+                    startup_id,
+                    startup_flags,
+                    _startup_payload,
+                ) = await recv_frame(reader)
+                assert startup_flags == 0
+                writer.write(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
+                await writer.drain()
 
-            opcode, lane, request_id, flags, _payload = await recv_frame(reader)
-            assert flags & trace_flag == trace_flag
-            writer.write(
-                response(
-                    opcode,
-                    lane,
-                    request_id,
-                    {
-                        "value": b"async-value",
-                        "trace": {
-                            "server_decode_us": 4,
-                            "server_route_us": 5,
-                            "server_command_execute_us": 6,
+                opcode, lane, request_id, flags, _payload = await recv_frame(reader)
+                assert flags & trace_flag == trace_flag
+                writer.write(
+                    response(
+                        opcode,
+                        lane,
+                        request_id,
+                        {
+                            "value": b"async-value",
+                            "trace": {
+                                "server_decode_us": 4,
+                                "server_route_us": 5,
+                                "server_command_execute_us": 6,
+                            },
                         },
-                    },
-                    flags=trace_flag,
+                        flags=trace_flag,
+                    )
                 )
-            )
-            await writer.drain()
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
 
         server = await asyncio.start_server(handle, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
@@ -2548,18 +2558,22 @@ def test_async_protocol_adapter_sends_idle_heartbeat_ping():
             reader: asyncio.StreamReader,
             writer: asyncio.StreamWriter,
         ) -> None:
-            startup_opcode, startup_lane, startup_id, startup_payload = await recv_frame(reader)
-            received.append((startup_opcode, startup_lane, startup_payload))
-            writer.write(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
-            await writer.drain()
+            try:
+                startup_opcode, startup_lane, startup_id, startup_payload = await recv_frame(reader)
+                received.append((startup_opcode, startup_lane, startup_payload))
+                writer.write(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
+                await writer.drain()
 
-            ping_opcode, ping_lane, ping_id, ping_payload = await asyncio.wait_for(
-                recv_frame(reader),
-                timeout=1.0,
-            )
-            received.append((ping_opcode, ping_lane, ping_payload))
-            writer.write(response(ping_opcode, ping_lane, ping_id, "PONG"))
-            await writer.drain()
+                ping_opcode, ping_lane, ping_id, ping_payload = await asyncio.wait_for(
+                    recv_frame(reader),
+                    timeout=1.0,
+                )
+                received.append((ping_opcode, ping_lane, ping_payload))
+                writer.write(response(ping_opcode, ping_lane, ping_id, "PONG"))
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
 
         server = await asyncio.start_server(handle, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
