@@ -15,6 +15,7 @@ from ferricstore import (
     FencedItem,
     FlowClient,
     JsonCodec,
+    RetryPolicy,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -41,6 +42,11 @@ def _uses_protocol_transport() -> bool:
 def _skip_protocol_transport(reason: str) -> None:
     if _uses_protocol_transport():
         pytest.skip(reason)
+
+
+def _require_protocol_transport() -> None:
+    if not _uses_protocol_transport():
+        pytest.skip("native protocol coverage runs with FERRICSTORE_URL=ferric://...")
 
 
 def _suffix() -> str:
@@ -520,6 +526,415 @@ def test_real_ferricstore_raw_store_command_families() -> None:
         client.close()
 
 
+def test_real_ferricstore_native_protocol_store_and_admin_surface() -> None:
+    _require_protocol_transport()
+
+    client = _client()
+    suffix = _suffix()
+    prefix = f"py-sdk:native-store:{suffix}:"
+    keys: list[str] = []
+
+    def key(name: str) -> str:
+        value = f"{prefix}{name}"
+        keys.append(value)
+        return value
+
+    try:
+        string_key = key("string")
+        second_key = key("string2")
+        third_key = key("string3")
+        assert client.command("PING") in (b"PONG", "PONG", True)
+        assert _ok(client.command("CLIENT.SETNAME", f"py-sdk-native-{suffix}"))
+        assert client.command("CLIENT.INFO") is not None
+        assert _ok(client.command("SET", string_key, "abc", "PX", 60_000))
+        assert client.command("GET", string_key) in (b"abc", "abc")
+        assert _ok(client.command("MSET", second_key, "2", third_key, "3"))
+        mget = client.command("MGET", second_key, third_key, key("missing"))
+        assert mget[:2] in ([b"2", b"3"], ["2", "3"])
+        assert client.command("DEL", third_key) >= 0
+
+        pipeline_results = (
+            client.pipeline()
+            .command("SET", key("pipe"), "piped")
+            .command("GET", key("pipe"))
+            .execute()
+        )
+        assert pipeline_results[-1] in (b"piped", "piped")
+
+        hash_key = key("hash")
+        assert client.command("HSET", hash_key, "field", "value", "count", "1") >= 1
+        assert client.command("HGET", hash_key, "field") in (b"value", "value")
+        assert client.command("HMGET", hash_key, "field", "none")[0] in (b"value", "value")
+        assert client.command("HGETALL", hash_key)
+
+        list_key = key("list")
+        assert client.command("LPUSH", list_key, "b", "a") == 2
+        assert client.command("RPUSH", list_key, "c") == 3
+        assert client.command("LRANGE", list_key, 0, -1)
+        assert client.command("LPOP", list_key) in (b"a", "a")
+        assert client.command("RPOP", list_key) in (b"c", "c")
+
+        set_key = key("set")
+        assert client.command("SADD", set_key, "a", "b") == 2
+        assert client.command("SISMEMBER", set_key, "a") == 1
+        assert client.command("SMEMBERS", set_key)
+        assert client.command("SREM", set_key, "b") == 1
+
+        zset_key = key("zset")
+        assert client.command("ZADD", zset_key, 1, "a", 2, "b") == 2
+        assert client.command("ZSCORE", zset_key, "a") is not None
+        assert client.command("ZRANGE", zset_key, 0, -1)
+        assert client.command("ZREM", zset_key, "b") == 1
+
+        cas_key = key("cas")
+        assert _ok(client.command("SET", cas_key, client.codec.encode("old")))
+        assert client.cas(cas_key, "old", "new") is True
+        assert _decode(client, client.command("GET", cas_key)) == "new"
+
+        lock_key = key("lock")
+        assert client.lock(lock_key, "owner-a", 30_000) is True
+        assert client.extend_lock(lock_key, "owner-a", 30_000) == 1
+        assert client.unlock(lock_key, "owner-a") == 1
+
+        rate = client.ratelimit_add(key("rate"), window_ms=60_000, max=5, count=2)
+        assert rate.count >= 1
+        assert rate.remaining >= 0
+
+        cache_key = key("cache")
+        first = client.fetch_or_compute(cache_key, ttl_ms=60_000, hint="native-integration")
+        assert first.should_compute
+        assert client.fetch_or_compute_result(cache_key, {"computed": True}, ttl_ms=60_000)
+        cached = client.fetch_or_compute(cache_key, ttl_ms=60_000)
+        assert cached.hit
+        assert cached.value == {"computed": True}
+
+        error_cache_key = key("cache-error")
+        first_error = client.fetch_or_compute(error_cache_key, ttl_ms=60_000)
+        assert first_error.should_compute
+        assert client.fetch_or_compute_error(error_cache_key, "boom")
+
+        info = client.key_info(string_key)
+        assert info.raw
+        assert isinstance(client.cluster_health(), dict)
+        assert isinstance(client.cluster_stats(), dict)
+        assert isinstance(client.cluster_keyslot(string_key), int)
+        assert client.cluster_slots() is not None
+        assert isinstance(client.cluster_status(), dict)
+        assert client.cluster_role() is not None
+        assert client.ferricstore_config("GET", "*") is not None
+        assert isinstance(client.ferricstore_metrics(), dict)
+        assert isinstance(client.ferricstore_hotness(), dict)
+        assert client.ferricstore_blobgc() is not None
+    finally:
+        with suppress(Exception):
+            if keys:
+                client.command("DEL", *keys)
+        client.close()
+
+
+def test_real_ferricstore_native_protocol_flow_admin_surface() -> None:
+    _require_protocol_transport()
+
+    client = _client()
+    suffix = _suffix()
+    flow_type = f"py-sdk-native-admin-{suffix}"
+    now = int(time.time() * 1000)
+    partition = f"py-sdk:native-admin:{suffix}:partition"
+
+    try:
+        assert client.install_policy(
+            flow_type,
+            retry=RetryPolicy(max_retries=2, base_ms=10, max_ms=100, jitter_pct=0),
+        )
+        assert isinstance(client.policy_get(flow_type), dict)
+
+        attr_id = f"py-sdk:native-attr:{suffix}"
+        client.create(
+            attr_id,
+            type=flow_type,
+            state="attr",
+            partition_key=partition,
+            attributes={"tenant": "acme", "tier": "gold"},
+            now_ms=now,
+            run_at_ms=now,
+            idempotent=True,
+        )
+        assert client.list(
+            flow_type,
+            state="attr",
+            partition_key=partition,
+            attributes={"tenant": "acme"},
+            consistent_projection=True,
+        )
+        assert isinstance(
+            client.stats(
+                flow_type,
+                state="attr",
+                partition_key=partition,
+                attributes={"tenant": "acme"},
+                consistent_projection=True,
+            ),
+            dict,
+        )
+        assert isinstance(
+            client.attributes(
+                flow_type,
+                state="attr",
+                partition_key=partition,
+                consistent_projection=True,
+            ),
+            list,
+        )
+        assert isinstance(
+            client.attribute_values(
+                flow_type,
+                "tenant",
+                state="attr",
+                partition_key=partition,
+                consistent_projection=True,
+            ),
+            list,
+        )
+
+        started_id = f"py-sdk:native-start:{suffix}"
+        started = client.start_and_claim(
+            started_id,
+            type=flow_type,
+            initial_state="step-a",
+            worker="py-sdk-native-step-worker",
+            partition_key=partition,
+            payload={"step": "a"},
+            now_ms=now,
+        )
+        assert started.id == started_id
+        continued = client.step_continue(
+            started.id,
+            lease_token=started.lease_token,
+            fencing_token=started.fencing_token,
+            from_state="step-a",
+            to_state="step-b",
+            partition_key=partition,
+            worker="py-sdk-native-step-worker",
+            payload={"step": "b"},
+            return_job=True,
+            now_ms=now + 1,
+        )
+        assert continued.id == started_id
+        assert client.complete(
+            continued.id,
+            lease_token=continued.lease_token,
+            fencing_token=continued.fencing_token,
+            partition_key=partition,
+            result={"done": True},
+            now_ms=now + 2,
+        )
+
+        assert client.run_steps_many(
+            [CreateItem(f"py-sdk:native-run-steps:{suffix}:a", {"n": 1})],
+            type=flow_type,
+            states=["queued", "done"],
+            worker="py-sdk-native-run-worker",
+            partition_key=partition,
+            now_ms=now,
+            result={"done": True},
+        )
+
+        schedule_id = f"py-sdk:native-schedule:{suffix}"
+        scheduled_flow_id = f"py-sdk:native-scheduled-flow:{suffix}"
+        schedule_target = {
+            "id": scheduled_flow_id,
+            "type": flow_type,
+            "state": "scheduled",
+            "partition_key": partition,
+            "payload": {"scheduled": True},
+        }
+        assert client.schedule_create(
+            schedule_id,
+            target=schedule_target,
+            kind="one_shot",
+            at_ms=now + 60_000,
+            overwrite=True,
+            now_ms=now,
+        )
+        assert client.schedule_get(schedule_id) is not None
+        assert client.schedule_pause(schedule_id, now_ms=now + 1)
+        assert client.schedule_resume(schedule_id, now_ms=now + 2)
+        assert isinstance(client.schedule_list(count=10), list)
+        delete_schedule_id = f"py-sdk:native-schedule-delete:{suffix}"
+        assert client.schedule_create(
+            delete_schedule_id,
+            target={**schedule_target, "id": f"{scheduled_flow_id}:delete"},
+            kind="one_shot",
+            at_ms=now + 120_000,
+            overwrite=True,
+            now_ms=now,
+        )
+        assert client.schedule_delete(delete_schedule_id, now_ms=now + 3)
+        assert client.schedule_fire(schedule_id, now_ms=now + 3)
+        assert client.schedule_fire_due(now_ms=now + 4, limit=1) is not None
+
+        gov_flow_id, gov_partition, gov_job = _create_and_claim(
+            client, flow_type, suffix, "native-governance", now_ms=now
+        )
+        effect_key = "send-email"
+        reserved = client.effect_reserve(
+            gov_flow_id,
+            effect_key,
+            "email.send",
+            partition_key=gov_partition,
+            lease_token=gov_job.lease_token,
+            fencing_token=gov_job.fencing_token,
+            operation_digest="digest-1",
+            idempotency_key=f"idem:{suffix}",
+            now_ms=now + 10,
+        )
+        assert reserved is not None
+        assert client.effect_confirm(
+            gov_flow_id,
+            effect_key,
+            partition_key=gov_partition,
+            lease_token=gov_job.lease_token,
+            fencing_token=gov_job.fencing_token,
+            external_id="mail-1",
+            latency_ms=12,
+            now_ms=now + 11,
+        )
+        assert client.effect_get(gov_flow_id, effect_key, partition_key=gov_partition) is not None
+        compensated_effect_key = "send-push"
+        assert client.effect_reserve(
+            gov_flow_id,
+            compensated_effect_key,
+            "push.send",
+            partition_key=gov_partition,
+            lease_token=gov_job.lease_token,
+            fencing_token=gov_job.fencing_token,
+            operation_digest="digest-1b",
+            idempotency_key=f"idem:{suffix}:compensate",
+            now_ms=now + 12,
+        )
+        assert client.effect_compensate(
+            gov_flow_id,
+            compensated_effect_key,
+            partition_key=gov_partition,
+            lease_token=gov_job.lease_token,
+            fencing_token=gov_job.fencing_token,
+            reason="rollback",
+            now_ms=now + 13,
+        )
+        failed_effect_key = "send-sms"
+        assert client.effect_reserve(
+            gov_flow_id,
+            failed_effect_key,
+            "sms.send",
+            partition_key=gov_partition,
+            lease_token=gov_job.lease_token,
+            fencing_token=gov_job.fencing_token,
+            operation_digest="digest-2",
+            idempotency_key=f"idem:{suffix}:fail",
+            now_ms=now + 14,
+        )
+        assert client.effect_fail(
+            gov_flow_id,
+            failed_effect_key,
+            partition_key=gov_partition,
+            lease_token=gov_job.lease_token,
+            fencing_token=gov_job.fencing_token,
+            reason="provider-error",
+            latency_ms=20,
+            now_ms=now + 15,
+        )
+        assert isinstance(client.governance_ledger(gov_flow_id, partition_key=gov_partition), list)
+
+        approval_id = f"py-sdk:native-approval:{suffix}"
+        approval = client.approval_request(
+            approval_id,
+            flow_id=gov_flow_id,
+            scope=f"approval:{suffix}",
+            reason="manual check",
+            requested_by="integration",
+            assignees=["ops"],
+            now_ms=now + 15,
+        )
+        assert approval is not None
+        assert client.approval_get(approval_id) is not None
+        assert isinstance(client.approval_list(scope=f"approval:{suffix}", limit=10), list)
+        assert client.approval_approve(
+            approval_id,
+            approver="ops",
+            reason="ok",
+            now_ms=now + 16,
+        )
+        rejected_id = f"py-sdk:native-approval-reject:{suffix}"
+        assert client.approval_request(
+            rejected_id,
+            flow_id=gov_flow_id,
+            scope=f"approval:{suffix}",
+            reason="manual reject",
+            requested_by="integration",
+            now_ms=now + 17,
+        )
+        assert client.approval_reject(
+            rejected_id,
+            approver="ops",
+            reason="no",
+            now_ms=now + 18,
+        )
+
+        circuit_scope = f"circuit:{suffix}"
+        assert client.circuit_open(circuit_scope, open_ms=1_000, now_ms=now + 19)
+        assert client.circuit_get(circuit_scope) is not None
+        assert client.circuit_close(circuit_scope, now_ms=now + 20)
+
+        budget_scope = f"budget:{suffix}"
+        assert client.budget_reserve(
+            budget_scope,
+            5,
+            limit=100,
+            window_ms=60_000,
+            reservation_id=f"reservation:{suffix}:commit",
+            now_ms=now + 21,
+        )
+        assert client.budget_commit(
+            budget_scope,
+            f"reservation:{suffix}:commit",
+            4,
+            usage={"tokens": 4},
+            now_ms=now + 22,
+        )
+        assert client.budget_reserve(
+            budget_scope,
+            3,
+            limit=100,
+            window_ms=60_000,
+            reservation_id=f"reservation:{suffix}:release",
+            now_ms=now + 23,
+        )
+        assert client.budget_release(
+            budget_scope,
+            f"reservation:{suffix}:release",
+            now_ms=now + 24,
+        )
+        assert client.budget_get(budget_scope) is not None
+        assert isinstance(client.budget_list(scope=budget_scope, limit=10), list)
+
+        limit_scope = f"limit:{suffix}"
+        assert client.limit_lease(
+            limit_scope,
+            shard_id=0,
+            amount=5,
+            ttl_ms=30_000,
+            limit=10,
+            now_ms=now + 25,
+        )
+        assert client.limit_spend(limit_scope, shard_id=0, amount=2, now_ms=now + 26)
+        assert client.limit_release(limit_scope, shard_id=0, amount=1)
+        assert client.limit_get(limit_scope, now_ms=now + 27) is not None
+        assert isinstance(client.limit_list(scope=limit_scope, limit=10, now_ms=now + 28), list)
+        assert isinstance(client.governance_overview(limit=10), object)
+    finally:
+        client.close()
+
+
 def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
     client = _client()
     suffix = _suffix()
@@ -534,6 +949,8 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
         )
         value_ref = _field(value_response, "ref")
         assert value_ref is not None
+        if _uses_protocol_transport():
+            assert client.value_mget([value_ref]) == [{"shared": True}]
 
         signal_id = f"py-sdk:signal:{suffix}"
         signal_partition = f"{signal_id}:partition"
@@ -740,6 +1157,26 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
         )
         assert len(retry_many_again) == 2
         assert client.fail_many(retry_many_partition, retry_many_again, error={"done": True})
+
+        cancel_many_partition = f"py-sdk:cancel-many:{suffix}:partition"
+        cancel_many_ids = [
+            f"py-sdk:cancel-many:{suffix}:a",
+            f"py-sdk:cancel-many:{suffix}:b",
+        ]
+        assert client.create_many(
+            cancel_many_partition,
+            [CreateItem(flow_id) for flow_id in cancel_many_ids],
+            type=flow_type,
+            state="cancel-many",
+            now_ms=now,
+            run_at_ms=now,
+        )
+        assert client.cancel_many(
+            cancel_many_partition,
+            [FencedItem(flow_id, 0) for flow_id in cancel_many_ids],
+            reason={"cancel": "many"},
+            now_ms=now,
+        )
 
         reclaim_id = f"py-sdk:reclaim:{suffix}"
         reclaim_partition = f"{reclaim_id}:partition"

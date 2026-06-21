@@ -2708,9 +2708,10 @@ class FlowClient:
     def schedule_delete(self, id: str, *, now_ms: int | None = None) -> ScheduleResult:
         args: builtins.list[Any] = ["FLOW.SCHEDULE.DELETE", id]
         _append(args, "NOW", now_ms)
-        return ScheduleResult.from_resp(
-            cast(dict[str, Any], _normalize_admin_response(self.executor.execute_command(*args)))
-        )
+        response = _normalize_admin_response(self.executor.execute_command(*args))
+        if _ok_response(response):
+            return ScheduleResult(id=id, status="deleted", raw={"id": id, "status": "deleted"})
+        return ScheduleResult.from_resp(cast(dict[str, Any], response))
 
     def schedule_fire_due(
         self,

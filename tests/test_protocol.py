@@ -3098,6 +3098,8 @@ def test_encodes_protocol_flow_schedule_governance_and_attribute_commands():
         "daily-report",
         "TARGET",
         {"id": "flow-1", "type": "report", "state": "queued"},
+        "KIND",
+        "one_shot",
         "TIMEZONE",
         "Asia/Jerusalem",
         "OVERWRITE",
@@ -3107,6 +3109,7 @@ def test_encodes_protocol_flow_schedule_governance_and_attribute_commands():
     assert schedule.payload == {
         "id": "daily-report",
         "target": {"id": "flow-1", "type": "report", "state": "queued"},
+        "kind": "one_shot",
         "timezone": "Asia/Jerusalem",
         "overwrite": True,
     }

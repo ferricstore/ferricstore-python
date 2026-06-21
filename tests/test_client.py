@@ -3033,6 +3033,13 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     assert schedules[0]["status"] == "active"
     assert redis.calls[-1] == ("FLOW.SCHEDULE.LIST", "TARGET_TYPE", "flow")
 
+    redis.responses.append("OK")
+    deleted = client.schedule_delete("daily-report", now_ms=200)
+    assert isinstance(deleted, ScheduleResult)
+    assert deleted.id == "daily-report"
+    assert deleted.status == "deleted"
+    assert redis.calls[-1] == ("FLOW.SCHEDULE.DELETE", "daily-report", "NOW", 200)
+
     effect = client.effect_reserve(
         "flow-1",
         "send-email",

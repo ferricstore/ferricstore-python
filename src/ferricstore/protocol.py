@@ -354,6 +354,7 @@ _FIELD_NAMES = {
     "INITIAL_STATE": "initial_state",
     "ITEMS": "items",
     "JITTER_PCT": "jitter_pct",
+    "KIND": "kind",
     "LATENCY_MS": "latency_ms",
     "LATENCY_THRESHOLD_MS": "latency_threshold_ms",
     "LEASE_MS": "lease_ms",
