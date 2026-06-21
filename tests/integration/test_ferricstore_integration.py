@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 import uuid
 from contextlib import suppress
@@ -1333,3 +1334,77 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
         assert isinstance(client.retention_cleanup(limit=10), dict)
     finally:
         client.close()
+
+
+def test_real_ferricstore_native_protocol_named_session_and_data_structure_surface() -> None:
+    _require_protocol_transport()
+
+    client = _client()
+    producer = _client()
+    suffix = _suffix()
+    keys: list[str] = []
+
+    def key(name: str) -> str:
+        value = f"py-sdk:native-named:{suffix}:{name}"
+        keys.append(value)
+        return value
+
+    try:
+        kv_key = key("kv")
+        assert _ok(client.kv_set(kv_key, {"answer": 42}))
+        assert client.kv_get(kv_key) == {"answer": 42}
+
+        hash_key = key("hash")
+        assert client.hset(hash_key, {"field": {"nested": True}}) == 1
+        assert client.hget(hash_key, "field") == {"nested": True}
+
+        list_key = key("list")
+        assert client.rpush(list_key, {"job": 1}) == 1
+        assert _decode(client, client.lpop(list_key)) == {"job": 1}
+
+        set_key = key("set")
+        assert client.sadd(set_key, "a", "b") == 2
+        assert client.sismember(set_key, "a") == 1
+
+        zset_key = key("zset")
+        assert client.zadd(zset_key, {"a": 1.5}) == 1
+        assert client.zscore(zset_key, "a") is not None
+
+        stream_key = key("stream")
+        assert client.xadd(stream_key, {"field": {"ok": True}})
+        assert client.xlen(stream_key) == 1
+
+        tx_key = key("tx")
+        with client.transaction() as tx:
+            assert tx.kv_set(tx_key, {"tx": True}) in {"QUEUED", b"QUEUED"}
+        assert client.kv_get(tx_key) == {"tx": True}
+
+        blocking_key = key("blocking")
+        holder: dict[str, Any] = {}
+
+        def blocking_pop() -> None:
+            holder["result"] = client.blpop(blocking_key, timeout=3)
+
+        thread = threading.Thread(target=blocking_pop)
+        thread.start()
+        time.sleep(0.05)
+        assert producer.rpush(blocking_key, {"work": 1}) == 1
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert _decode(client, holder["result"][1]) == {"work": 1}
+
+        channel = key("channel")
+        pubsub = client.pubsub_session()
+        pubsub.subscribe(channel)
+        assert producer.publish(channel, {"event": 1}) >= 1
+        message = pubsub.get_message(timeout=3)
+        assert message is not None
+        assert message.channel == channel
+        assert message.message == {"event": 1}
+        pubsub.close()
+    finally:
+        with suppress(Exception):
+            if keys:
+                client.delete(*keys)
+        client.close()
+        producer.close()

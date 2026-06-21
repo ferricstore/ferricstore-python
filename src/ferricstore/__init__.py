@@ -4,7 +4,12 @@ from ferricstore.adapters import (
     RedisAdapter,
     RedisCommandExecutor,
 )
-from ferricstore.async_client import AsyncCommandPipeline, AsyncFlowClient
+from ferricstore.async_client import (
+    AsyncCommandPipeline,
+    AsyncFlowClient,
+    AsyncPubSubSession,
+    AsyncTransactionSession,
+)
 from ferricstore.async_worker import (
     AsyncQueue,
     AsyncQueueClient,
@@ -20,7 +25,13 @@ from ferricstore.async_worker import (
     AsyncQueueFlow as AsyncQueueFlow,
 )
 from ferricstore.backpressure import BackpressurePolicy
-from ferricstore.client import AutobatchFlowClient, CommandPipeline, FlowClient
+from ferricstore.client import (
+    AutobatchFlowClient,
+    CommandPipeline,
+    FlowClient,
+    PubSubSession,
+    TransactionSession,
+)
 from ferricstore.codecs import Codec, JsonCodec, RawCodec
 from ferricstore.errors import (
     FerricStoreError,
@@ -56,6 +67,7 @@ from ferricstore.types import (
     FlowRecord,
     GovernanceOverview,
     KeyInfo,
+    PubSubMessage,
     RateLimitResult,
     RetryPolicy,
     ScheduleResult,
@@ -101,6 +113,7 @@ __all__ = [
     "ApprovalResult",
     "AsyncCommandPipeline",
     "AsyncFlowClient",
+    "AsyncPubSubSession",
     "AsyncProtocolAdapter",
     "AsyncProtocolPipeline",
     "AsyncQueue",
@@ -108,6 +121,7 @@ __all__ = [
     "AsyncQueueWorker",
     "AsyncRedisAdapter",
     "AsyncRedisCommandExecutor",
+    "AsyncTransactionSession",
     "AsyncWorkflow",
     "AsyncWorkflowBudget",
     "AsyncWorkflowClient",
@@ -147,6 +161,8 @@ __all__ = [
     "ProtocolAdapter",
     "ProtocolCommand",
     "ProtocolPipeline",
+    "PubSubMessage",
+    "PubSubSession",
     "Queue",
     "QueueClient",
     "QueueWorker",
@@ -160,6 +176,7 @@ __all__ = [
     "ScheduleResult",
     "StaleLeaseError",
     "Transition",
+    "TransactionSession",
     "ValueConfig",
     "Worker",
     "WorkerConfig",

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import builtins
 import inspect
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any, cast
 from urllib.parse import urlparse
 
@@ -34,6 +34,7 @@ from ferricstore.client import (
 )
 from ferricstore.codecs import Codec, RawCodec
 from ferricstore.errors import OverloadedError, map_exception
+from ferricstore.redis_commands import AsyncRedisCommandsMixin
 from ferricstore.types import (
     ApprovalResult,
     BudgetResult,
@@ -47,6 +48,7 @@ from ferricstore.types import (
     FlowRecord,
     GovernanceOverview,
     KeyInfo,
+    PubSubMessage,
     RateLimitResult,
     RetryPolicy,
     ScheduleResult,
@@ -115,7 +117,82 @@ class AsyncCommandPipeline:
         return self.results
 
 
-class AsyncFlowClient:
+class AsyncPubSubSession:
+    """High-level async native Pub/Sub session."""
+
+    def __init__(self, client: AsyncFlowClient) -> None:
+        self.client = client
+
+    async def subscribe(self, *channels: str) -> Any:
+        return await self.client.subscribe(*channels)
+
+    async def unsubscribe(self, *channels: str) -> Any:
+        return await self.client.unsubscribe(*channels)
+
+    async def psubscribe(self, *patterns: str) -> Any:
+        return await self.client.psubscribe(*patterns)
+
+    async def punsubscribe(self, *patterns: str) -> Any:
+        return await self.client.punsubscribe(*patterns)
+
+    async def get_message(
+        self,
+        *,
+        timeout: float | None = None,
+        decode: bool = True,
+    ) -> PubSubMessage | None:
+        event = await self.client.wait_event(timeout=timeout)
+        if event is None:
+            return None
+        decoder = self.client.codec.decode if decode else None
+        return PubSubMessage.from_event(event, decode=decoder)
+
+    async def listen(
+        self,
+        *,
+        timeout: float | None = None,
+        decode: bool = True,
+    ) -> AsyncIterator[PubSubMessage]:
+        while True:
+            message = await self.get_message(timeout=timeout, decode=decode)
+            if message is None:
+                return
+            yield message
+
+    async def close(self) -> None:
+        await self.unsubscribe()
+        await self.punsubscribe()
+
+
+class AsyncTransactionSession:
+    """Async transaction context around native MULTI/EXEC/DISCARD."""
+
+    def __init__(self, client: AsyncFlowClient) -> None:
+        self.client = client
+        self.closed = False
+
+    async def __aenter__(self) -> AsyncFlowClient:
+        await self.client.multi()
+        return self.client
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self.closed:
+            return
+        if exc_type is None:
+            await self.execute()
+        else:
+            await self.discard()
+
+    async def execute(self) -> Any:
+        self.closed = True
+        return await self.client.transaction_exec()
+
+    async def discard(self) -> Any:
+        self.closed = True
+        return await self.client.discard()
+
+
+class AsyncFlowClient(AsyncRedisCommandsMixin):
     """True async FerricFlow client over `redis.asyncio` or any async executor."""
 
     def __init__(
@@ -188,6 +265,21 @@ class AsyncFlowClient:
 
     def pipeline(self) -> AsyncCommandPipeline:
         return AsyncCommandPipeline(self)
+
+    def transaction(self) -> AsyncTransactionSession:
+        return AsyncTransactionSession(self)
+
+    def pubsub_session(self) -> AsyncPubSubSession:
+        return AsyncPubSubSession(self)
+
+    async def wait_event(self, timeout: float | None = None) -> Any | None:
+        wait_event = getattr(self.executor, "wait_event", None)
+        if not callable(wait_event):
+            return None
+        result = wait_event(timeout=timeout)
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
     async def subscribe(self, *channels: str) -> Any:
         return await self.command("SUBSCRIBE", *channels)

@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import zlib
 
 import pytest
@@ -23,6 +24,7 @@ from ferricstore.types import (
     GovernanceOverview,
     ScheduleResult,
 )
+from ferricstore.redis_commands import RedisCommandsMixin
 
 
 class FakeAsyncRedis:
@@ -363,12 +365,88 @@ def test_async_session_and_blocking_helpers_are_named_commands():
         assert redis.calls[-1] == ("SUBSCRIBE", "jobs")
         assert await client.multi() == "OK"
         assert redis.calls[-1] == ("MULTI",)
-        assert await client.command("SET", "k", "v") == "QUEUED"
-        assert redis.calls[-1] == ("COMMAND_EXEC", "SET", "k", "v")
+        assert await client.set("k", "v") == "QUEUED"
+        assert redis.calls[-1] == ("COMMAND_EXEC", "SET", "k", b"v")
         assert await client.transaction_exec() == ["OK"]
         assert redis.calls[-1] == ("EXEC",)
         assert await client.blpop("queue", timeout=1) == [b"queue", b"job"]
         assert redis.calls[-1] == ("BLPOP", "queue", 1)
+
+    run(main())
+
+
+def test_async_redis_command_helper_parity_with_sync_mixin():
+    sync_methods = {
+        name
+        for name, value in RedisCommandsMixin.__dict__.items()
+        if callable(value) and not name.startswith("_")
+    }
+    missing = sorted(name for name in sync_methods if not hasattr(AsyncFlowClient, name))
+
+    assert missing == []
+    for name in sync_methods - {"command"}:
+        assert inspect.iscoroutinefunction(getattr(AsyncFlowClient, name)), name
+
+
+def test_async_redis_command_helpers_are_codec_aware_and_easy_to_use():
+    async def main():
+        redis = FakeAsyncRedis()
+        client = AsyncFlowClient(redis, codec=JsonCodec())
+        redis.responses.extend(["OK", b'{"answer":42}', [b'{"a":1}', None]])
+
+        assert await client.kv_set("kv", {"answer": 42}, px=100, nx=True) == "OK"
+        assert redis.calls[-1] == ("SET", "kv", b'{"answer":42}', "PX", 100, "NX")
+        assert await client.kv_get("kv") == {"answer": 42}
+        assert redis.calls[-1] == ("GET", "kv")
+        assert await client.kv_mget("a", "missing") == [{"a": 1}, None]
+        assert redis.calls[-1] == ("MGET", "a", "missing")
+
+    run(main())
+
+
+def test_async_pubsub_session_decodes_native_events_without_raw_command_usage():
+    async def main():
+        class EventRedis(FakeAsyncRedis):
+            def __init__(self):
+                super().__init__()
+                self.events = [
+                    {
+                        b"kind": b"message",
+                        b"channel": b"jobs",
+                        b"message": b'{"job":1}',
+                    }
+                ]
+
+            async def wait_event(self, timeout=None):
+                return self.events.pop(0) if self.events else None
+
+        client = AsyncFlowClient(EventRedis(), codec=JsonCodec())
+        pubsub = client.pubsub_session()
+
+        message = await pubsub.get_message(timeout=0.01)
+
+        assert message is not None
+        assert message.kind == "message"
+        assert message.channel == "jobs"
+        assert message.message == {"job": 1}
+
+    run(main())
+
+
+def test_async_transaction_context_uses_named_helpers_inside_multi():
+    async def main():
+        redis = FakeAsyncRedis()
+        client = AsyncFlowClient(redis)
+        redis.responses.extend(["OK", "QUEUED", ["OK"]])
+
+        async with client.transaction() as tx:
+            assert await tx.set("k", "v") == "QUEUED"
+
+        assert redis.calls == [
+            ("MULTI",),
+            ("COMMAND_EXEC", "SET", "k", b"v"),
+            ("EXEC",),
+        ]
 
     run(main())
 

@@ -6,7 +6,7 @@ import contextlib
 import threading
 import time
 import zlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, cast
@@ -30,6 +30,7 @@ from ferricstore.types import (
     FlowRecord,
     GovernanceOverview,
     KeyInfo,
+    PubSubMessage,
     RateLimitResult,
     RetryPolicy,
     ScheduleResult,
@@ -394,6 +395,86 @@ class CommandPipeline:
         return self.results
 
 
+class PubSubSession:
+    """High-level native Pub/Sub session.
+
+    This is the user-facing API for native pushed Pub/Sub messages. It keeps
+    ``command(...)`` available as an escape hatch, but normal code should use
+    ``client.pubsub_session()`` and ``get_message``/``listen``.
+    """
+
+    def __init__(self, client: FlowClient) -> None:
+        self.client = client
+
+    def subscribe(self, *channels: str) -> Any:
+        return self.client.subscribe(*channels)
+
+    def unsubscribe(self, *channels: str) -> Any:
+        return self.client.unsubscribe(*channels)
+
+    def psubscribe(self, *patterns: str) -> Any:
+        return self.client.psubscribe(*patterns)
+
+    def punsubscribe(self, *patterns: str) -> Any:
+        return self.client.punsubscribe(*patterns)
+
+    def get_message(
+        self,
+        *,
+        timeout: float | None = None,
+        decode: bool = True,
+    ) -> PubSubMessage | None:
+        event = self.client.wait_event(timeout=timeout)
+        if event is None:
+            return None
+        decoder = self.client.codec.decode if decode else None
+        return PubSubMessage.from_event(event, decode=decoder)
+
+    def listen(
+        self,
+        *,
+        timeout: float | None = None,
+        decode: bool = True,
+    ) -> Iterator[PubSubMessage]:
+        while True:
+            message = self.get_message(timeout=timeout, decode=decode)
+            if message is None:
+                return
+            yield message
+
+    def close(self) -> None:
+        self.unsubscribe()
+        self.punsubscribe()
+
+
+class TransactionSession:
+    """Small transaction context around native MULTI/EXEC/DISCARD."""
+
+    def __init__(self, client: FlowClient) -> None:
+        self.client = client
+        self.closed = False
+
+    def __enter__(self) -> FlowClient:
+        self.client.multi()
+        return self.client
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self.closed:
+            return
+        if exc_type is None:
+            self.execute()
+        else:
+            self.discard()
+
+    def execute(self) -> Any:
+        self.closed = True
+        return self.client.transaction_exec()
+
+    def discard(self) -> Any:
+        self.closed = True
+        return self.client.discard()
+
+
 class FlowClient(RedisCommandsMixin):
     """FerricFlow client over Redis/FerricStore commands."""
 
@@ -459,6 +540,12 @@ class FlowClient(RedisCommandsMixin):
 
     def pipeline(self) -> CommandPipeline:
         return CommandPipeline(self)
+
+    def transaction(self) -> TransactionSession:
+        return TransactionSession(self)
+
+    def pubsub_session(self) -> PubSubSession:
+        return PubSubSession(self)
 
     def close(self) -> None:
         close = getattr(self.executor, "close", None)

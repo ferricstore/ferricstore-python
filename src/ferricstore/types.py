@@ -221,6 +221,63 @@ def _raw_map(value: dict[Any, Any]) -> dict[str, Any]:
 
 
 @dataclass(frozen=True, slots=True)
+class PubSubMessage:
+    """Typed native Pub/Sub event delivered by ``PubSubSession``.
+
+    ``message`` is decoded by the client codec by default. Use
+    ``get_message(decode=False)`` when the application wants the raw bytes.
+    """
+
+    kind: str
+    channel: str
+    message: Any
+    pattern: str | None = None
+    raw: dict[str, Any] | None = None
+
+    @classmethod
+    def from_event(
+        cls,
+        value: Any,
+        *,
+        decode: Callable[[Any], Any] | None = None,
+    ) -> PubSubMessage:
+        if not isinstance(value, dict):
+            return cls(kind="event", channel="", message=value, raw={"event": value})
+
+        raw = _raw_map(value)
+        message = _get(value, "message")
+        if decode is not None and message is not None:
+            message = decode(message)
+
+        return cls(
+            kind=_str(raw.get("kind"), "message"),
+            channel=_str(raw.get("channel")),
+            message=message,
+            pattern=_optional_str(raw.get("pattern")),
+            raw=raw,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        data = {
+            "kind": self.kind,
+            "channel": self.channel,
+            "message": self.message,
+        }
+        if self.pattern is not None:
+            data["pattern"] = self.pattern
+        return data
+
+    def __getitem__(self, key: str) -> Any:
+        return self.to_dict()[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.to_dict().get(key, default)
+
+    def items(self) -> Iterator[tuple[str, Any]]:
+        return iter(self.to_dict().items())
+
+
+@dataclass(frozen=True, slots=True)
 class EffectResult(_MappingResult):
     """Typed response for Flow effect governance commands."""
 

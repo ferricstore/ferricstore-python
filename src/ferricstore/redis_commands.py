@@ -423,3 +423,687 @@ class RedisCommandsMixin:
     def memory(self, subcommand: str, *args: Any) -> Any: return self.command("MEMORY", subcommand, *args)
     def config(self, subcommand: str, *args: Any) -> Any: return self.command("CONFIG", subcommand, *args)
     def select(self, db: int) -> Any: return self.command("SELECT", db)
+
+
+class AsyncRedisCommandsMixin:
+    """Async convenience methods for Redis-compatible FerricStore commands.
+
+Kept structurally aligned with RedisCommandsMixin so async SDK users do not need raw command(...)."""
+    codec: Codec
+
+    async def command(self, *args: Any) -> Any:
+        raise NotImplementedError
+
+    async def ping(self, message: Any | None=None) -> Any:
+        return await self.command('PING', message) if message is not None else await self.command('PING')
+
+    async def echo(self, message: Any) -> Any:
+        return await self.command('ECHO', message)
+
+    async def get(self, key: str, *, decode: bool=True) -> Any:
+        value = await self.command('GET', key)
+        return self.codec.decode(value) if decode else value
+
+    async def set(self, key: str, value: Any, **kwargs: Any) -> Any:
+        return await self.command(*_set_args(self.codec, key, value, **kwargs))
+
+    async def delete(self, *keys: str) -> int:
+        return int(await self.command('DEL', *keys))
+
+    async def kv_get(self, key: str, *, decode: bool=True) -> Any:
+        value = await self.command('GET', key)
+        return self.codec.decode(value) if decode else value
+
+    async def kv_set(self, key: str, value: Any, **kwargs: Any) -> Any:
+        return await self.command(*_set_args(self.codec, key, value, **kwargs))
+
+    async def kv_delete(self, *keys: str) -> int:
+        return int(await self.command('DEL', *keys))
+
+    async def exists(self, *keys: str) -> int:
+        return int(await self.command('EXISTS', *keys))
+
+    async def mget(self, *keys: str, decode: bool=True) -> builtins.list[Any]:
+        values = list(await self.command('MGET', *keys))
+        return [self.codec.decode(value) if decode else value for value in values]
+
+    async def mset(self, mapping: dict[str, Any], *, encode: bool=True) -> Any:
+        args: builtins.list[Any] = ['MSET']
+        for key, value in mapping.items():
+            args.extend([key, self.codec.encode(value) if encode else value])
+        return await self.command(*args)
+
+    async def kv_mget(self, *keys: str, decode: bool=True) -> builtins.list[Any]:
+        values = list(await self.command('MGET', *keys))
+        return [self.codec.decode(value) if decode else value for value in values]
+
+    async def kv_mset(self, mapping: dict[str, Any], *, encode: bool=True) -> Any:
+        args: builtins.list[Any] = ['MSET']
+        for key, value in mapping.items():
+            args.extend([key, self.codec.encode(value) if encode else value])
+        return await self.command(*args)
+
+    async def incr(self, key: str) -> int:
+        return int(await self.command('INCR', key))
+
+    async def decr(self, key: str) -> int:
+        return int(await self.command('DECR', key))
+
+    async def incrby(self, key: str, amount: int) -> int:
+        return int(await self.command('INCRBY', key, amount))
+
+    async def decrby(self, key: str, amount: int) -> int:
+        return int(await self.command('DECRBY', key, amount))
+
+    async def incrbyfloat(self, key: str, amount: float) -> Any:
+        return await self.command('INCRBYFLOAT', key, amount)
+
+    async def append(self, key: str, value: Any, *, encode: bool=True) -> int:
+        return int(await self.command('APPEND', key, self.codec.encode(value) if encode else value))
+
+    async def strlen(self, key: str) -> int:
+        return int(await self.command('STRLEN', key))
+
+    async def getdel(self, key: str, *, decode: bool=True) -> Any:
+        value = await self.command('GETDEL', key)
+        return self.codec.decode(value) if decode else value
+
+    async def getex(self, key: str, *, decode: bool=True, **kwargs: Any) -> Any:
+        value = await self.command(*_getex_args(key, **kwargs))
+        return self.codec.decode(value) if decode else value
+
+    async def setnx(self, key: str, value: Any, *, encode: bool=True) -> int:
+        return int(await self.command('SETNX', key, self.codec.encode(value) if encode else value))
+
+    async def setex(self, key: str, seconds: int, value: Any, *, encode: bool=True) -> Any:
+        return await self.command('SETEX', key, seconds, self.codec.encode(value) if encode else value)
+
+    async def psetex(self, key: str, ms: int, value: Any, *, encode: bool=True) -> Any:
+        return await self.command('PSETEX', key, ms, self.codec.encode(value) if encode else value)
+
+    async def getrange(self, key: str, start: int, end: int) -> Any:
+        return await self.command('GETRANGE', key, start, end)
+
+    async def setrange(self, key: str, offset: int, value: Any, *, encode: bool=True) -> int:
+        return int(await self.command('SETRANGE', key, offset, self.codec.encode(value) if encode else value))
+
+    async def msetnx(self, mapping: dict[str, Any], *, encode: bool=True) -> int:
+        args: builtins.list[Any] = ['MSETNX']
+        for key, value in mapping.items():
+            args.extend([key, self.codec.encode(value) if encode else value])
+        return int(await self.command(*args))
+
+    async def expire(self, key: str, seconds: int, **kwargs: Any) -> int:
+        return int(await self.command(*_expire_args('EXPIRE', key, seconds, **kwargs)))
+
+    async def pexpire(self, key: str, ms: int, **kwargs: Any) -> int:
+        return int(await self.command(*_expire_args('PEXPIRE', key, ms, **kwargs)))
+
+    async def expireat(self, key: str, unix_seconds: int, **kwargs: Any) -> int:
+        return int(await self.command(*_expire_args('EXPIREAT', key, unix_seconds, **kwargs)))
+
+    async def pexpireat(self, key: str, unix_ms: int, **kwargs: Any) -> int:
+        return int(await self.command(*_expire_args('PEXPIREAT', key, unix_ms, **kwargs)))
+
+    async def ttl(self, key: str) -> int:
+        return int(await self.command('TTL', key))
+
+    async def pttl(self, key: str) -> int:
+        return int(await self.command('PTTL', key))
+
+    async def persist(self, key: str) -> int:
+        return int(await self.command('PERSIST', key))
+
+    async def expiretime(self, key: str) -> int:
+        return int(await self.command('EXPIRETIME', key))
+
+    async def pexpiretime(self, key: str) -> int:
+        return int(await self.command('PEXPIRETIME', key))
+
+    async def type(self, key: str) -> Any:
+        return await self.command('TYPE', key)
+
+    async def unlink(self, *keys: str) -> int:
+        return int(await self.command('UNLINK', *keys))
+
+    async def rename(self, key: str, new_key: str) -> Any:
+        return await self.command('RENAME', key, new_key)
+
+    async def renamenx(self, key: str, new_key: str) -> int:
+        return int(await self.command('RENAMENX', key, new_key))
+
+    async def copy(self, source: str, destination: str, *args: Any) -> int:
+        return int(await self.command('COPY', source, destination, *args))
+
+    async def randomkey(self) -> Any:
+        return await self.command('RANDOMKEY')
+
+    async def scan(self, cursor: int=0, *args: Any) -> Any:
+        return await self.command('SCAN', cursor, *args)
+
+    async def object(self, subcommand: str, *args: Any) -> Any:
+        return await self.command('OBJECT', subcommand, *args)
+
+    async def hset(self, key: str, mapping: dict[str, Any] | None=None, **fields: Any) -> int:
+        data = dict(mapping or {})
+        data.update(fields)
+        args: builtins.list[Any] = ['HSET', key]
+        for field, value in data.items():
+            args.extend([field, self.codec.encode(value)])
+        return int(await self.command(*args))
+
+    async def hget(self, key: str, field: str, *, decode: bool=True) -> Any:
+        value = await self.command('HGET', key, field)
+        return self.codec.decode(value) if decode else value
+
+    async def hmget(self, key: str, *fields: str, decode: bool=True) -> builtins.list[Any]:
+        values = list(await self.command('HMGET', key, *fields))
+        return [self.codec.decode(value) if decode else value for value in values]
+
+    async def hgetall(self, key: str, *, decode: bool=True) -> dict[Any, Any]:
+        raw = await self.command('HGETALL', key)
+        if isinstance(raw, dict):
+            return {k: self.codec.decode(v) if decode else v for k, v in raw.items()}
+        items = list(raw or [])
+        return {items[i]: self.codec.decode(items[i + 1]) if decode else items[i + 1] for i in range(0, len(items), 2)}
+
+    async def hdel(self, key: str, *fields: str) -> int:
+        return int(await self.command('HDEL', key, *fields))
+
+    async def hexists(self, key: str, field: str) -> int:
+        return int(await self.command('HEXISTS', key, field))
+
+    async def hkeys(self, key: str) -> Any:
+        return await self.command('HKEYS', key)
+
+    async def hvals(self, key: str, *, decode: bool=True) -> builtins.list[Any]:
+        values = list(await self.command('HVALS', key))
+        return [self.codec.decode(value) if decode else value for value in values]
+
+    async def hlen(self, key: str) -> int:
+        return int(await self.command('HLEN', key))
+
+    async def hincrby(self, key: str, field: str, amount: int) -> int:
+        return int(await self.command('HINCRBY', key, field, amount))
+
+    async def hincrbyfloat(self, key: str, field: str, amount: float) -> Any:
+        return await self.command('HINCRBYFLOAT', key, field, amount)
+
+    async def hsetnx(self, key: str, field: str, value: Any, *, encode: bool=True) -> int:
+        return int(await self.command('HSETNX', key, field, self.codec.encode(value) if encode else value))
+
+    async def hstrlen(self, key: str, field: str) -> int:
+        return int(await self.command('HSTRLEN', key, field))
+
+    async def hrandfield(self, key: str, *args: Any) -> Any:
+        return await self.command('HRANDFIELD', key, *args)
+
+    async def hscan(self, key: str, cursor: int=0, *args: Any) -> Any:
+        return await self.command('HSCAN', key, cursor, *args)
+
+    async def httl(self, key: str, *fields: str) -> Any:
+        return await self.command('HTTL', key, 'FIELDS', len(fields), *fields)
+
+    async def hpttl(self, key: str, *fields: str) -> Any:
+        return await self.command('HPTTL', key, 'FIELDS', len(fields), *fields)
+
+    async def hpersist(self, key: str, *fields: str) -> Any:
+        return await self.command('HPERSIST', key, 'FIELDS', len(fields), *fields)
+
+    async def hexpire(self, key: str, seconds: int, *fields: str) -> Any:
+        return await self.command('HEXPIRE', key, seconds, 'FIELDS', len(fields), *fields)
+
+    async def hpexpire(self, key: str, ms: int, *fields: str) -> Any:
+        return await self.command('HPEXPIRE', key, ms, 'FIELDS', len(fields), *fields)
+
+    async def hexpiretime(self, key: str, *fields: str) -> Any:
+        return await self.command('HEXPIRETIME', key, 'FIELDS', len(fields), *fields)
+
+    async def hgetdel(self, key: str, *fields: str) -> Any:
+        return await self.command('HGETDEL', key, 'FIELDS', len(fields), *fields)
+
+    async def hgetex(self, key: str, *args: Any) -> Any:
+        return await self.command('HGETEX', key, *args)
+
+    async def hsetex(self, key: str, *args: Any) -> Any:
+        return await self.command('HSETEX', key, *args)
+
+    async def lpush(self, key: str, *values: Any, encode: bool=True) -> int:
+        return int(await self.command('LPUSH', key, *[self.codec.encode(v) if encode else v for v in values]))
+
+    async def rpush(self, key: str, *values: Any, encode: bool=True) -> int:
+        return int(await self.command('RPUSH', key, *[self.codec.encode(v) if encode else v for v in values]))
+
+    async def lpop(self, key: str, count: int | None=None) -> Any:
+        return await self.command('LPOP', key, *([] if count is None else [count]))
+
+    async def rpop(self, key: str, count: int | None=None) -> Any:
+        return await self.command('RPOP', key, *([] if count is None else [count]))
+
+    async def lrange(self, key: str, start: int, stop: int) -> Any:
+        return await self.command('LRANGE', key, start, stop)
+
+    async def llen(self, key: str) -> int:
+        return int(await self.command('LLEN', key))
+
+    async def lindex(self, key: str, index: int) -> Any:
+        return await self.command('LINDEX', key, index)
+
+    async def lset(self, key: str, index: int, value: Any, *, encode: bool=True) -> Any:
+        return await self.command('LSET', key, index, self.codec.encode(value) if encode else value)
+
+    async def lrem(self, key: str, count: int, value: Any, *, encode: bool=True) -> int:
+        return int(await self.command('LREM', key, count, self.codec.encode(value) if encode else value))
+
+    async def ltrim(self, key: str, start: int, stop: int) -> Any:
+        return await self.command('LTRIM', key, start, stop)
+
+    async def lpos(self, key: str, value: Any, *args: Any, encode: bool=True) -> Any:
+        return await self.command('LPOS', key, self.codec.encode(value) if encode else value, *args)
+
+    async def linsert(self, key: str, where: str, pivot: Any, value: Any, *, encode: bool=True) -> int:
+        return int(await self.command('LINSERT', key, where, self.codec.encode(pivot) if encode else pivot, self.codec.encode(value) if encode else value))
+
+    async def lmove(self, source: str, destination: str, wherefrom: str, whereto: str) -> Any:
+        return await self.command('LMOVE', source, destination, wherefrom, whereto)
+
+    async def blpop(self, *keys: str, timeout: float | int=0) -> Any:
+        return await self.command('BLPOP', *keys, timeout)
+
+    async def brpop(self, *keys: str, timeout: float | int=0) -> Any:
+        return await self.command('BRPOP', *keys, timeout)
+
+    async def blmove(self, source: str, destination: str, wherefrom: str, whereto: str, timeout: float | int=0) -> Any:
+        return await self.command('BLMOVE', source, destination, wherefrom, whereto, timeout)
+
+    async def blmpop(self, timeout: float | int, keys: builtins.list[str], direction: str, *, count: int | None=None) -> Any:
+        args: builtins.list[Any] = ['BLMPOP', timeout, len(keys), *keys, direction]
+        if count is not None:
+            args.extend(['COUNT', count])
+        return await self.command(*args)
+
+    async def lpushx(self, key: str, *values: Any, encode: bool=True) -> int:
+        return int(await self.command('LPUSHX', key, *[self.codec.encode(v) if encode else v for v in values]))
+
+    async def rpushx(self, key: str, *values: Any, encode: bool=True) -> int:
+        return int(await self.command('RPUSHX', key, *[self.codec.encode(v) if encode else v for v in values]))
+
+    async def rpoplpush(self, source: str, destination: str) -> Any:
+        return await self.command('RPOPLPUSH', source, destination)
+
+    async def sadd(self, key: str, *members: Any, encode: bool=True) -> int:
+        return int(await self.command('SADD', key, *[self.codec.encode(m) if encode else m for m in members]))
+
+    async def srem(self, key: str, *members: Any, encode: bool=True) -> int:
+        return int(await self.command('SREM', key, *[self.codec.encode(m) if encode else m for m in members]))
+
+    async def smembers(self, key: str) -> Any:
+        return await self.command('SMEMBERS', key)
+
+    async def sismember(self, key: str, member: Any, *, encode: bool=True) -> int:
+        return int(await self.command('SISMEMBER', key, self.codec.encode(member) if encode else member))
+
+    async def smismember(self, key: str, *members: Any, encode: bool=True) -> Any:
+        return await self.command('SMISMEMBER', key, *[self.codec.encode(m) if encode else m for m in members])
+
+    async def scard(self, key: str) -> int:
+        return int(await self.command('SCARD', key))
+
+    async def sinter(self, *keys: str) -> Any:
+        return await self.command('SINTER', *keys)
+
+    async def sunion(self, *keys: str) -> Any:
+        return await self.command('SUNION', *keys)
+
+    async def sdiff(self, *keys: str) -> Any:
+        return await self.command('SDIFF', *keys)
+
+    async def sdiffstore(self, destination: str, *keys: str) -> int:
+        return int(await self.command('SDIFFSTORE', destination, *keys))
+
+    async def sinterstore(self, destination: str, *keys: str) -> int:
+        return int(await self.command('SINTERSTORE', destination, *keys))
+
+    async def sunionstore(self, destination: str, *keys: str) -> int:
+        return int(await self.command('SUNIONSTORE', destination, *keys))
+
+    async def sintercard(self, *args: Any) -> int:
+        return int(await self.command('SINTERCARD', *args))
+
+    async def srandmember(self, key: str, count: int | None=None) -> Any:
+        return await self.command('SRANDMEMBER', key, *([] if count is None else [count]))
+
+    async def spop(self, key: str, count: int | None=None) -> Any:
+        return await self.command('SPOP', key, *([] if count is None else [count]))
+
+    async def smove(self, source: str, destination: str, member: Any, *, encode: bool=True) -> int:
+        return int(await self.command('SMOVE', source, destination, self.codec.encode(member) if encode else member))
+
+    async def sscan(self, key: str, cursor: int=0, *args: Any) -> Any:
+        return await self.command('SSCAN', key, cursor, *args)
+
+    async def zadd(self, key: str, mapping: dict[Any, float]) -> int:
+        args: builtins.list[Any] = ['ZADD', key]
+        for member, score in mapping.items():
+            args.extend([score, member])
+        return int(await self.command(*args))
+
+    async def zrem(self, key: str, *members: Any) -> int:
+        return int(await self.command('ZREM', key, *members))
+
+    async def zscore(self, key: str, member: Any) -> Any:
+        return await self.command('ZSCORE', key, member)
+
+    async def zrange(self, key: str, start: int, stop: int, *args: Any) -> Any:
+        return await self.command('ZRANGE', key, start, stop, *args)
+
+    async def zrevrange(self, key: str, start: int, stop: int, *args: Any) -> Any:
+        return await self.command('ZREVRANGE', key, start, stop, *args)
+
+    async def zcard(self, key: str) -> int:
+        return int(await self.command('ZCARD', key))
+
+    async def zincrby(self, key: str, amount: float, member: Any) -> Any:
+        return await self.command('ZINCRBY', key, amount, member)
+
+    async def zcount(self, key: str, min: Any, max: Any) -> int:
+        return int(await self.command('ZCOUNT', key, min, max))
+
+    async def zrank(self, key: str, member: Any) -> Any:
+        return await self.command('ZRANK', key, member)
+
+    async def zrevrank(self, key: str, member: Any) -> Any:
+        return await self.command('ZREVRANK', key, member)
+
+    async def zmscore(self, key: str, *members: Any) -> Any:
+        return await self.command('ZMSCORE', key, *members)
+
+    async def zpopmin(self, key: str, count: int | None=None) -> Any:
+        return await self.command('ZPOPMIN', key, *([] if count is None else [count]))
+
+    async def zpopmax(self, key: str, count: int | None=None) -> Any:
+        return await self.command('ZPOPMAX', key, *([] if count is None else [count]))
+
+    async def zrandmember(self, key: str, *args: Any) -> Any:
+        return await self.command('ZRANDMEMBER', key, *args)
+
+    async def zscan(self, key: str, cursor: int=0, *args: Any) -> Any:
+        return await self.command('ZSCAN', key, cursor, *args)
+
+    async def zrangebyscore(self, key: str, min: Any, max: Any, *args: Any) -> Any:
+        return await self.command('ZRANGEBYSCORE', key, min, max, *args)
+
+    async def zrevrangebyscore(self, key: str, max: Any, min: Any, *args: Any) -> Any:
+        return await self.command('ZREVRANGEBYSCORE', key, max, min, *args)
+
+    async def setbit(self, key: str, offset: int, value: int) -> int:
+        return int(await self.command('SETBIT', key, offset, value))
+
+    async def getbit(self, key: str, offset: int) -> int:
+        return int(await self.command('GETBIT', key, offset))
+
+    async def bitcount(self, key: str, *args: Any) -> int:
+        return int(await self.command('BITCOUNT', key, *args))
+
+    async def bitpos(self, key: str, bit: int, *args: Any) -> int:
+        return int(await self.command('BITPOS', key, bit, *args))
+
+    async def bitop(self, operation: str, destkey: str, *keys: str) -> int:
+        return int(await self.command('BITOP', operation, destkey, *keys))
+
+    async def pfadd(self, key: str, *elements: Any) -> int:
+        return int(await self.command('PFADD', key, *elements))
+
+    async def pfcount(self, *keys: str) -> int:
+        return int(await self.command('PFCOUNT', *keys))
+
+    async def pfmerge(self, destkey: str, *sourcekeys: str) -> Any:
+        return await self.command('PFMERGE', destkey, *sourcekeys)
+
+    async def geoadd(self, key: str, *longitude_latitude_member: Any) -> int:
+        return int(await self.command('GEOADD', key, *longitude_latitude_member))
+
+    async def geopos(self, key: str, *members: Any) -> Any:
+        return await self.command('GEOPOS', key, *members)
+
+    async def geodist(self, key: str, member1: Any, member2: Any, unit: str | None=None) -> Any:
+        return await self.command('GEODIST', key, member1, member2, *([] if unit is None else [unit]))
+
+    async def geohash(self, key: str, *members: Any) -> Any:
+        return await self.command('GEOHASH', key, *members)
+
+    async def geosearch(self, key: str, *args: Any) -> Any:
+        return await self.command('GEOSEARCH', key, *args)
+
+    async def geosearchstore(self, destination: str, source: str, *args: Any) -> Any:
+        return await self.command('GEOSEARCHSTORE', destination, source, *args)
+
+    async def xadd(self, key: str, fields: dict[str, Any], *, id: str='*', encode: bool=True, **opts: Any) -> Any:
+        args: builtins.list[Any] = ['XADD', key]
+        if 'maxlen' in opts:
+            args.extend(['MAXLEN', opts['maxlen']])
+        if 'minid' in opts:
+            args.extend(['MINID', opts['minid']])
+        args.append(id)
+        for field, value in fields.items():
+            args.extend([field, self.codec.encode(value) if encode else value])
+        return await self.command(*args)
+
+    async def xlen(self, key: str) -> int:
+        return int(await self.command('XLEN', key))
+
+    async def xrange(self, key: str, start: str='-', end: str='+', *args: Any) -> Any:
+        return await self.command('XRANGE', key, start, end, *args)
+
+    async def xrevrange(self, key: str, end: str='+', start: str='-', *args: Any) -> Any:
+        return await self.command('XREVRANGE', key, end, start, *args)
+
+    async def xread(self, streams: dict[str, str], *, count: int | None=None, block_ms: int | None=None) -> Any:
+        return await self.command(*_xread_args('XREAD', streams, count=count, block_ms=block_ms))
+
+    async def xtrim(self, key: str, *args: Any) -> Any:
+        return await self.command('XTRIM', key, *args)
+
+    async def xdel(self, key: str, *ids: str) -> int:
+        return int(await self.command('XDEL', key, *ids))
+
+    async def xinfo(self, subcommand: str, key: str, *args: Any) -> Any:
+        return await self.command('XINFO', subcommand, key, *args)
+
+    async def xgroup(self, subcommand: str, key: str, group: str, *args: Any) -> Any:
+        return await self.command('XGROUP', subcommand, key, group, *args)
+
+    async def xreadgroup(self, group: str, consumer: str, streams: dict[str, str], *, count: int | None=None, block_ms: int | None=None) -> Any:
+        return await self.command(*_xread_args('XREADGROUP', streams, count=count, block_ms=block_ms, group=group, consumer=consumer))
+
+    async def xack(self, key: str, group: str, *ids: str) -> int:
+        return int(await self.command('XACK', key, group, *ids))
+
+    async def publish(self, channel: str, message: Any, *, encode: bool=True) -> int:
+        return int(await self.command('PUBLISH', channel, self.codec.encode(message) if encode else message))
+
+    async def subscribe(self, *channels: str) -> Any:
+        return await self.command('SUBSCRIBE', *channels)
+
+    async def unsubscribe(self, *channels: str) -> Any:
+        return await self.command('UNSUBSCRIBE', *channels)
+
+    async def psubscribe(self, *patterns: str) -> Any:
+        return await self.command('PSUBSCRIBE', *patterns)
+
+    async def punsubscribe(self, *patterns: str) -> Any:
+        return await self.command('PUNSUBSCRIBE', *patterns)
+
+    async def pubsub(self, subcommand: str, *args: Any) -> Any:
+        return await self.command('PUBSUB', subcommand, *args)
+
+    async def multi(self) -> Any:
+        return await self.command('MULTI')
+
+    async def transaction_exec(self) -> Any:
+        return await self.command('EXEC')
+
+    async def discard(self) -> Any:
+        return await self.command('DISCARD')
+
+    async def watch(self, *keys: str) -> Any:
+        return await self.command('WATCH', *keys)
+
+    async def unwatch(self) -> Any:
+        return await self.command('UNWATCH')
+
+    async def bf_reserve(self, key: str, error_rate: float, capacity: int, *args: Any) -> Any:
+        return await self.command('BF.RESERVE', key, error_rate, capacity, *args)
+
+    async def bf_add(self, key: str, item: Any) -> int:
+        return int(await self.command('BF.ADD', key, item))
+
+    async def bf_madd(self, key: str, *items: Any) -> Any:
+        return await self.command('BF.MADD', key, *items)
+
+    async def bf_exists(self, key: str, item: Any) -> int:
+        return int(await self.command('BF.EXISTS', key, item))
+
+    async def bf_mexists(self, key: str, *items: Any) -> Any:
+        return await self.command('BF.MEXISTS', key, *items)
+
+    async def bf_card(self, key: str) -> int:
+        return int(await self.command('BF.CARD', key))
+
+    async def bf_info(self, key: str) -> Any:
+        return await self.command('BF.INFO', key)
+
+    async def cf_reserve(self, key: str, capacity: int, *args: Any) -> Any:
+        return await self.command('CF.RESERVE', key, capacity, *args)
+
+    async def cf_add(self, key: str, item: Any) -> int:
+        return int(await self.command('CF.ADD', key, item))
+
+    async def cf_addnx(self, key: str, item: Any) -> int:
+        return int(await self.command('CF.ADDNX', key, item))
+
+    async def cf_del(self, key: str, item: Any) -> int:
+        return int(await self.command('CF.DEL', key, item))
+
+    async def cf_exists(self, key: str, item: Any) -> int:
+        return int(await self.command('CF.EXISTS', key, item))
+
+    async def cf_mexists(self, key: str, *items: Any) -> Any:
+        return await self.command('CF.MEXISTS', key, *items)
+
+    async def cf_count(self, key: str, item: Any) -> int:
+        return int(await self.command('CF.COUNT', key, item))
+
+    async def cf_info(self, key: str) -> Any:
+        return await self.command('CF.INFO', key)
+
+    async def cms_initbydim(self, key: str, width: int, depth: int) -> Any:
+        return await self.command('CMS.INITBYDIM', key, width, depth)
+
+    async def cms_initbyprob(self, key: str, error: float, probability: float) -> Any:
+        return await self.command('CMS.INITBYPROB', key, error, probability)
+
+    async def cms_incrby(self, key: str, *item_increment_pairs: Any) -> Any:
+        return await self.command('CMS.INCRBY', key, *item_increment_pairs)
+
+    async def cms_query(self, key: str, *items: Any) -> Any:
+        return await self.command('CMS.QUERY', key, *items)
+
+    async def cms_merge(self, dest: str, *args: Any) -> Any:
+        return await self.command('CMS.MERGE', dest, *args)
+
+    async def cms_info(self, key: str) -> Any:
+        return await self.command('CMS.INFO', key)
+
+    async def topk_reserve(self, key: str, k: int, *args: Any) -> Any:
+        return await self.command('TOPK.RESERVE', key, k, *args)
+
+    async def topk_add(self, key: str, *items: Any) -> Any:
+        return await self.command('TOPK.ADD', key, *items)
+
+    async def topk_incrby(self, key: str, *item_increment_pairs: Any) -> Any:
+        return await self.command('TOPK.INCRBY', key, *item_increment_pairs)
+
+    async def topk_query(self, key: str, *items: Any) -> Any:
+        return await self.command('TOPK.QUERY', key, *items)
+
+    async def topk_list(self, key: str, *args: Any) -> Any:
+        return await self.command('TOPK.LIST', key, *args)
+
+    async def topk_count(self, key: str, *items: Any) -> Any:
+        return await self.command('TOPK.COUNT', key, *items)
+
+    async def topk_info(self, key: str) -> Any:
+        return await self.command('TOPK.INFO', key)
+
+    async def tdigest_create(self, key: str, *args: Any) -> Any:
+        return await self.command('TDIGEST.CREATE', key, *args)
+
+    async def tdigest_add(self, key: str, *values: float) -> Any:
+        return await self.command('TDIGEST.ADD', key, *values)
+
+    async def tdigest_reset(self, key: str) -> Any:
+        return await self.command('TDIGEST.RESET', key)
+
+    async def tdigest_quantile(self, key: str, *quantiles: float) -> Any:
+        return await self.command('TDIGEST.QUANTILE', key, *quantiles)
+
+    async def tdigest_cdf(self, key: str, *values: float) -> Any:
+        return await self.command('TDIGEST.CDF', key, *values)
+
+    async def tdigest_rank(self, key: str, *values: float) -> Any:
+        return await self.command('TDIGEST.RANK', key, *values)
+
+    async def tdigest_revrank(self, key: str, *values: float) -> Any:
+        return await self.command('TDIGEST.REVRANK', key, *values)
+
+    async def tdigest_byrank(self, key: str, *ranks: int) -> Any:
+        return await self.command('TDIGEST.BYRANK', key, *ranks)
+
+    async def tdigest_byrevrank(self, key: str, *ranks: int) -> Any:
+        return await self.command('TDIGEST.BYREVRANK', key, *ranks)
+
+    async def tdigest_trimmed_mean(self, key: str, low: float, high: float) -> Any:
+        return await self.command('TDIGEST.TRIMMED_MEAN', key, low, high)
+
+    async def tdigest_min(self, key: str) -> Any:
+        return await self.command('TDIGEST.MIN', key)
+
+    async def tdigest_max(self, key: str) -> Any:
+        return await self.command('TDIGEST.MAX', key)
+
+    async def tdigest_info(self, key: str) -> Any:
+        return await self.command('TDIGEST.INFO', key)
+
+    async def tdigest_merge(self, destination: str, numkeys: int, *args: Any) -> Any:
+        return await self.command('TDIGEST.MERGE', destination, numkeys, *args)
+
+    async def dbsize(self) -> int:
+        return int(await self.command('DBSIZE'))
+
+    async def keys(self, pattern: str='*') -> Any:
+        return await self.command('KEYS', pattern)
+
+    async def flushdb(self) -> Any:
+        return await self.command('FLUSHDB')
+
+    async def flushall(self) -> Any:
+        return await self.command('FLUSHALL')
+
+    async def info(self, section: str | None=None) -> Any:
+        return await self.command('INFO', *([] if section is None else [section]))
+
+    async def command_info(self, *names: str) -> Any:
+        return await self.command('COMMAND', 'INFO', *names)
+
+    async def slowlog(self, subcommand: str, *args: Any) -> Any:
+        return await self.command('SLOWLOG', subcommand, *args)
+
+    async def memory(self, subcommand: str, *args: Any) -> Any:
+        return await self.command('MEMORY', subcommand, *args)
+
+    async def config(self, subcommand: str, *args: Any) -> Any:
+        return await self.command('CONFIG', subcommand, *args)
+
+    async def select(self, db: int) -> Any:
+        return await self.command('SELECT', db)

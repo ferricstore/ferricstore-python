@@ -2589,6 +2589,7 @@ class AsyncProtocolAdapter:
         self._pending: dict[int, asyncio.Future[ProtocolResponse]] = {}
         self._pending_traces: dict[int, dict[str, Any]] = {}
         self._events: list[Any] = []
+        self._events_cv = asyncio.Condition()
         self._queued_write_bytes = 0
         self._last_activity = time.monotonic()
 
@@ -2613,6 +2614,22 @@ class AsyncProtocolAdapter:
     @property
     def events(self) -> list[Any]:
         return list(self._events)
+
+    async def wait_event(self, timeout: float | None = None) -> Any | None:
+        async with self._events_cv:
+            if not self._events:
+                if timeout == 0.0:
+                    return None
+                try:
+                    if timeout is None:
+                        await self._events_cv.wait()
+                    else:
+                        await asyncio.wait_for(self._events_cv.wait(), timeout)
+                except asyncio.TimeoutError:
+                    return None
+            if not self._events:
+                return None
+            return self._events.pop(0)
 
     async def close(self) -> None:
         writer = self._writer
@@ -2864,7 +2881,9 @@ class AsyncProtocolAdapter:
                 response = await self._recv_response()
                 self._last_activity = time.monotonic()
                 if response.request_id == 0:
-                    self._events.append(response.value)
+                    async with self._events_cv:
+                        self._events.append(response.value)
+                        self._events_cv.notify_all()
                     continue
                 future = self._pending.pop(response.request_id, None)
                 if future is not None and not future.done():
@@ -2896,7 +2915,9 @@ class AsyncProtocolAdapter:
             if response.request_id == request_id:
                 return response
             if response.request_id == 0:
-                self._events.append(response.value)
+                async with self._events_cv:
+                    self._events.append(response.value)
+                    self._events_cv.notify_all()
                 continue
             raise FerricStoreError(
                 "protocol response request_id mismatch: "
@@ -3058,6 +3079,23 @@ class AsyncProtocolAdapterPool:
         for adapter in self.adapters:
             events.extend(adapter.events)
         return events
+
+    async def wait_event(self, timeout: float | None = None) -> Any | None:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            for adapter in self.adapters:
+                event = await adapter.wait_event(timeout=0.0)
+                if event is not None:
+                    return event
+            if timeout == 0.0:
+                return None
+            wait_for = 0.05
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                wait_for = min(wait_for, remaining)
+            await asyncio.sleep(wait_for)
 
     async def close(self) -> None:
         await asyncio.gather(*(adapter.close() for adapter in self.adapters))

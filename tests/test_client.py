@@ -624,6 +624,47 @@ def test_redis_command_helpers_cover_native_session_and_blocking_commands():
     assert redis.calls[-1] == ("BLMPOP", 3, 1, "queue", "LEFT", "COUNT", 2)
 
 
+def test_pubsub_session_decodes_native_events_without_raw_command_usage():
+    class EventRedis(FakeRedis):
+        def __init__(self):
+            super().__init__()
+            self.events = [
+                {
+                    b"kind": b"message",
+                    b"channel": b"jobs",
+                    b"message": b'{"job":1}',
+                }
+            ]
+
+        def wait_event(self, timeout=None):
+            return self.events.pop(0) if self.events else None
+
+    client = FlowClient(EventRedis(), codec=JsonCodec())
+    pubsub = client.pubsub_session()
+
+    message = pubsub.get_message(timeout=0.01)
+
+    assert message is not None
+    assert message.kind == "message"
+    assert message.channel == "jobs"
+    assert message.message == {"job": 1}
+
+
+def test_transaction_context_uses_named_helpers_inside_multi():
+    redis = FakeRedis()
+    client = FlowClient(redis)
+    redis.responses.extend(["OK", "QUEUED", ["OK"]])
+
+    with client.transaction() as tx:
+        assert tx.kv_set("k", "v") == "QUEUED"
+
+    assert redis.calls == [
+        ("MULTI",),
+        ("COMMAND_EXEC", "SET", "k", b"v"),
+        ("EXEC",),
+    ]
+
+
 def test_signal_builds_flow_signal_command_with_guards_and_values():
     redis = AckRedis()
     client = FlowClient(redis)
