@@ -25,9 +25,22 @@ pytestmark = pytest.mark.skipif(
 
 def _client() -> FlowClient:
     return FlowClient.from_url(
-        os.environ.get("FERRICSTORE_URL", "redis://127.0.0.1:6379/0"),
+        _integration_url(),
         codec=JsonCodec(),
     )
+
+
+def _integration_url() -> str:
+    return os.environ.get("FERRICSTORE_URL", "redis://127.0.0.1:6379/0")
+
+
+def _uses_protocol_transport() -> bool:
+    return _integration_url().startswith("ferric://")
+
+
+def _skip_protocol_transport(reason: str) -> None:
+    if _uses_protocol_transport():
+        pytest.skip(reason)
 
 
 def _suffix() -> str:
@@ -184,6 +197,8 @@ def test_real_ferricstore_command_and_flow_cycle() -> None:
 
 
 def test_real_ferricstore_protocol_helpers_and_diagnostics() -> None:
+    _skip_protocol_transport("generic RESP diagnostics are covered by redis:// integration")
+
     client = _client()
     suffix = _suffix()
     prefix = f"py-sdk:protocol:{suffix}:"
@@ -246,6 +261,8 @@ def test_real_ferricstore_protocol_helpers_and_diagnostics() -> None:
 
 
 def test_real_ferricstore_raw_store_command_families() -> None:
+    _skip_protocol_transport("raw RESP command families are covered by redis:// integration")
+
     client = _client()
     suffix = _suffix()
     prefix = f"py-sdk:store:{suffix}:"

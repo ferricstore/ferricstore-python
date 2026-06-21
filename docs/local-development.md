@@ -27,15 +27,17 @@ Or with a direct Docker command:
 ```bash
 docker run --name ferricstore-dev \
   -p 6379:6379 \
+  -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore-dev-data:/data \
-  ghcr.io/ferricstore/ferricstore:0.4.1
+  ghcr.io/ferricstore/ferricstore:0.5.1
 ```
 
 This starts one local FerricStore server on:
 
 ```text
 redis://127.0.0.1:6379/0
+ferric://127.0.0.1:6388
 ```
 
 If you built the server image locally, replace the image name:
@@ -43,6 +45,7 @@ If you built the server image locally, replace the image name:
 ```bash
 docker run --name ferricstore-dev \
   -p 6379:6379 \
+  -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore-dev-data:/data \
   your-local-image:tag
@@ -69,6 +72,7 @@ Run the integration test against the Compose server:
 
 ```bash
 FERRICSTORE_INTEGRATION=1 pytest tests/integration
+FERRICSTORE_INTEGRATION=1 FERRICSTORE_URL=ferric://127.0.0.1:6388 pytest tests/integration
 ```
 
 ## Stop local services
