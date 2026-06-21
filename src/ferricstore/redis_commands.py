@@ -272,6 +272,13 @@ class RedisCommandsMixin:
     def lpos(self, key: str, value: Any, *args: Any, encode: bool = True) -> Any: return self.command("LPOS", key, self.codec.encode(value) if encode else value, *args)
     def linsert(self, key: str, where: str, pivot: Any, value: Any, *, encode: bool = True) -> int: return int(self.command("LINSERT", key, where, self.codec.encode(pivot) if encode else pivot, self.codec.encode(value) if encode else value))
     def lmove(self, source: str, destination: str, wherefrom: str, whereto: str) -> Any: return self.command("LMOVE", source, destination, wherefrom, whereto)
+    def blpop(self, *keys: str, timeout: float | int = 0) -> Any: return self.command("BLPOP", *keys, timeout)
+    def brpop(self, *keys: str, timeout: float | int = 0) -> Any: return self.command("BRPOP", *keys, timeout)
+    def blmove(self, source: str, destination: str, wherefrom: str, whereto: str, timeout: float | int = 0) -> Any: return self.command("BLMOVE", source, destination, wherefrom, whereto, timeout)
+    def blmpop(self, timeout: float | int, keys: builtins.list[str], direction: str, *, count: int | None = None) -> Any:
+        args: builtins.list[Any] = ["BLMPOP", timeout, len(keys), *keys, direction]
+        if count is not None: args.extend(["COUNT", count])
+        return self.command(*args)
     def lpushx(self, key: str, *values: Any, encode: bool = True) -> int: return int(self.command("LPUSHX", key, *[self.codec.encode(v) if encode else v for v in values]))
     def rpushx(self, key: str, *values: Any, encode: bool = True) -> int: return int(self.command("RPUSHX", key, *[self.codec.encode(v) if encode else v for v in values]))
     def rpoplpush(self, source: str, destination: str) -> Any: return self.command("RPOPLPUSH", source, destination)
@@ -351,7 +358,17 @@ class RedisCommandsMixin:
     def xack(self, key: str, group: str, *ids: str) -> int: return int(self.command("XACK", key, group, *ids))
 
     def publish(self, channel: str, message: Any, *, encode: bool = True) -> int: return int(self.command("PUBLISH", channel, self.codec.encode(message) if encode else message))
+    def subscribe(self, *channels: str) -> Any: return self.command("SUBSCRIBE", *channels)
+    def unsubscribe(self, *channels: str) -> Any: return self.command("UNSUBSCRIBE", *channels)
+    def psubscribe(self, *patterns: str) -> Any: return self.command("PSUBSCRIBE", *patterns)
+    def punsubscribe(self, *patterns: str) -> Any: return self.command("PUNSUBSCRIBE", *patterns)
     def pubsub(self, subcommand: str, *args: Any) -> Any: return self.command("PUBSUB", subcommand, *args)
+
+    def multi(self) -> Any: return self.command("MULTI")
+    def transaction_exec(self) -> Any: return self.command("EXEC")
+    def discard(self) -> Any: return self.command("DISCARD")
+    def watch(self, *keys: str) -> Any: return self.command("WATCH", *keys)
+    def unwatch(self) -> Any: return self.command("UNWATCH")
 
     def bf_reserve(self, key: str, error_rate: float, capacity: int, *args: Any) -> Any: return self.command("BF.RESERVE", key, error_rate, capacity, *args)
     def bf_add(self, key: str, item: Any) -> int: return int(self.command("BF.ADD", key, item))
@@ -406,4 +423,3 @@ class RedisCommandsMixin:
     def memory(self, subcommand: str, *args: Any) -> Any: return self.command("MEMORY", subcommand, *args)
     def config(self, subcommand: str, *args: Any) -> Any: return self.command("CONFIG", subcommand, *args)
     def select(self, db: int) -> Any: return self.command("SELECT", db)
-

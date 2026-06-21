@@ -589,6 +589,41 @@ def test_redis_command_helpers_cover_non_flow_command_families():
     assert redis.calls[-1] == ("DBSIZE",)
 
 
+def test_redis_command_helpers_cover_native_session_and_blocking_commands():
+    redis = FakeRedis()
+    client = FlowClient(redis)
+
+    redis.responses.extend(
+        [
+            [["subscribe", "jobs", 1]],
+            [["unsubscribe", "jobs", 0]],
+            "OK",
+            "QUEUED",
+            ["OK"],
+            [b"queue", b"job"],
+            [b"dst-job"],
+            [b"queue", [b"a", b"b"]],
+        ]
+    )
+
+    assert client.subscribe("jobs") == [["subscribe", "jobs", 1]]
+    assert redis.calls[-1] == ("SUBSCRIBE", "jobs")
+    assert client.unsubscribe("jobs") == [["unsubscribe", "jobs", 0]]
+    assert redis.calls[-1] == ("UNSUBSCRIBE", "jobs")
+    assert client.multi() == "OK"
+    assert redis.calls[-1] == ("MULTI",)
+    assert client.set("k", "v") == "QUEUED"
+    assert redis.calls[-1] == ("COMMAND_EXEC", "SET", "k", b"v")
+    assert client.transaction_exec() == ["OK"]
+    assert redis.calls[-1] == ("EXEC",)
+    assert client.blpop("queue", timeout=1) == [b"queue", b"job"]
+    assert redis.calls[-1] == ("BLPOP", "queue", 1)
+    assert client.blmove("queue", "dst", "LEFT", "RIGHT", timeout=2) == [b"dst-job"]
+    assert redis.calls[-1] == ("BLMOVE", "queue", "dst", "LEFT", "RIGHT", 2)
+    assert client.blmpop(3, ["queue"], "LEFT", count=2) == [b"queue", [b"a", b"b"]]
+    assert redis.calls[-1] == ("BLMPOP", 3, 1, "queue", "LEFT", "COUNT", 2)
+
+
 def test_signal_builds_flow_signal_command_with_guards_and_values():
     redis = AckRedis()
     client = FlowClient(redis)

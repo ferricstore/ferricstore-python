@@ -339,6 +339,40 @@ def test_async_command_pipeline_maps_protocol_redis_pipeline_errors():
     run(main())
 
 
+def test_async_session_and_blocking_helpers_are_named_commands():
+    async def main():
+        class RedisExecutor:
+            def __init__(self):
+                self.calls = []
+                self.responses = [
+                    [["subscribe", "jobs", 1]],
+                    "OK",
+                    "QUEUED",
+                    ["OK"],
+                    [b"queue", b"job"],
+                ]
+
+            async def execute_command(self, *args):
+                self.calls.append(args)
+                return self.responses.pop(0)
+
+        redis = RedisExecutor()
+        client = AsyncFlowClient(redis)
+
+        assert await client.subscribe("jobs") == [["subscribe", "jobs", 1]]
+        assert redis.calls[-1] == ("SUBSCRIBE", "jobs")
+        assert await client.multi() == "OK"
+        assert redis.calls[-1] == ("MULTI",)
+        assert await client.command("SET", "k", "v") == "QUEUED"
+        assert redis.calls[-1] == ("COMMAND_EXEC", "SET", "k", "v")
+        assert await client.transaction_exec() == ["OK"]
+        assert redis.calls[-1] == ("EXEC",)
+        assert await client.blpop("queue", timeout=1) == [b"queue", b"job"]
+        assert redis.calls[-1] == ("BLPOP", "queue", 1)
+
+    run(main())
+
+
 def test_async_direct_command_errors_are_typed():
     async def main():
         class ErrorRedis:

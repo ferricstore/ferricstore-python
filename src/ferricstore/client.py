@@ -407,6 +407,7 @@ class FlowClient(RedisCommandsMixin):
         self.executor = _ErrorMappingExecutor(executor)
         self.codec = codec or RawCodec()
         self.backpressure = BackpressureController(backpressure)
+        self._transaction_mode = False
 
     @classmethod
     def from_url(
@@ -436,7 +437,25 @@ class FlowClient(RedisCommandsMixin):
         return AutobatchFlowClient(self, max_batch=max_batch, max_delay_ms=max_delay_ms)
 
     def command(self, *args: Any) -> Any:
-        return self.executor.execute_command(*args)
+        if not args:
+            return self.executor.execute_command(*args)
+
+        name = str(args[0]).upper()
+        tx_control = name in {"MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH"}
+
+        try:
+            if self._transaction_mode and not tx_control:
+                result = self.executor.execute_command("COMMAND_EXEC", args[0], *args[1:])
+            else:
+                result = self.executor.execute_command(*args)
+        finally:
+            if name in {"EXEC", "DISCARD"}:
+                self._transaction_mode = False
+
+        if name == "MULTI":
+            self._transaction_mode = True
+
+        return result
 
     def pipeline(self) -> CommandPipeline:
         return CommandPipeline(self)

@@ -295,6 +295,23 @@ _OPCODES = {
 }
 
 _CONTROL_OPCODES = set(range(0x0001, 0x0013))
+_STATEFUL_COMMAND_EXEC = {
+    "BLMOVE",
+    "BLMPOP",
+    "BLPOP",
+    "BRPOP",
+    "DISCARD",
+    "EXEC",
+    "MULTI",
+    "PSUBSCRIBE",
+    "PUNSUBSCRIBE",
+    "SUBSCRIBE",
+    "UNSUBSCRIBE",
+    "UNWATCH",
+    "WATCH",
+    "XREAD",
+    "XREADGROUP",
+}
 
 _FIELD_NAMES = {
     "AFTER_MS": "after_ms",
@@ -476,8 +493,16 @@ def _pipeline_frame_supported(commands: list[ProtocolCommand]) -> bool:
         command.opcode not in _CONTROL_OPCODES
         and command.flags == 0
         and isinstance(command.payload, dict)
+        and not _stateful_command_exec(command)
         for command in commands
     )
+
+
+def _stateful_command_exec(command: ProtocolCommand) -> bool:
+    if command.opcode != _OP_COMMAND_EXEC or not isinstance(command.payload, dict):
+        return False
+    name = command.payload.get("command")
+    return isinstance(name, str) and name.upper() in _STATEFUL_COMMAND_EXEC
 
 
 def _compact_pipeline_payload(
@@ -3081,6 +3106,10 @@ def build_protocol_command(*args: Any) -> ProtocolCommand:
     name = _command_name(args[0])
     if name not in _OPCODES:
         return ProtocolCommand(_OP_COMMAND_EXEC, {"command": name, "args": list(args[1:])}, 1)
+
+    if name == "COMMAND_EXEC":
+        raw_name = _command_name(_require_arg(args, 1, name))
+        return ProtocolCommand(_OP_COMMAND_EXEC, {"command": raw_name, "args": list(args[2:])}, 1)
 
     if name in {
         "GET",

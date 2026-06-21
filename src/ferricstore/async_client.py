@@ -133,6 +133,7 @@ class AsyncFlowClient:
         self.executor = _AsyncErrorMappingExecutor(executor)
         self.codec = codec or RawCodec()
         self.backpressure = BackpressureController(backpressure)
+        self._transaction_mode = False
 
     @classmethod
     def from_url(
@@ -165,10 +166,84 @@ class AsyncFlowClient:
                 await result
 
     async def command(self, *args: Any) -> Any:
-        return await self.executor.execute_command(*args)
+        if not args:
+            return await self.executor.execute_command(*args)
+
+        name = str(args[0]).upper()
+        tx_control = name in {"MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH"}
+
+        try:
+            if self._transaction_mode and not tx_control:
+                result = await self.executor.execute_command("COMMAND_EXEC", args[0], *args[1:])
+            else:
+                result = await self.executor.execute_command(*args)
+        finally:
+            if name in {"EXEC", "DISCARD"}:
+                self._transaction_mode = False
+
+        if name == "MULTI":
+            self._transaction_mode = True
+
+        return result
 
     def pipeline(self) -> AsyncCommandPipeline:
         return AsyncCommandPipeline(self)
+
+    async def subscribe(self, *channels: str) -> Any:
+        return await self.command("SUBSCRIBE", *channels)
+
+    async def unsubscribe(self, *channels: str) -> Any:
+        return await self.command("UNSUBSCRIBE", *channels)
+
+    async def psubscribe(self, *patterns: str) -> Any:
+        return await self.command("PSUBSCRIBE", *patterns)
+
+    async def punsubscribe(self, *patterns: str) -> Any:
+        return await self.command("PUNSUBSCRIBE", *patterns)
+
+    async def multi(self) -> Any:
+        return await self.command("MULTI")
+
+    async def transaction_exec(self) -> Any:
+        return await self.command("EXEC")
+
+    async def discard(self) -> Any:
+        return await self.command("DISCARD")
+
+    async def watch(self, *keys: str) -> Any:
+        return await self.command("WATCH", *keys)
+
+    async def unwatch(self) -> Any:
+        return await self.command("UNWATCH")
+
+    async def blpop(self, *keys: str, timeout: float | int = 0) -> Any:
+        return await self.command("BLPOP", *keys, timeout)
+
+    async def brpop(self, *keys: str, timeout: float | int = 0) -> Any:
+        return await self.command("BRPOP", *keys, timeout)
+
+    async def blmove(
+        self,
+        source: str,
+        destination: str,
+        wherefrom: str,
+        whereto: str,
+        timeout: float | int = 0,
+    ) -> Any:
+        return await self.command("BLMOVE", source, destination, wherefrom, whereto, timeout)
+
+    async def blmpop(
+        self,
+        timeout: float | int,
+        keys: builtins.list[str],
+        direction: str,
+        *,
+        count: int | None = None,
+    ) -> Any:
+        args: builtins.list[Any] = ["BLMPOP", timeout, len(keys), *keys, direction]
+        if count is not None:
+            args.extend(["COUNT", count])
+        return await self.command(*args)
 
     async def cas(self, key: str, expected: Any, value: Any, *, ex: int | None = None) -> bool:
         args: builtins.list[Any] = [

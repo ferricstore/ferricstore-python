@@ -556,11 +556,39 @@ def test_protocol_unknown_command_uses_native_command_exec_fallback():
     }
 
 
+def test_protocol_explicit_command_exec_forces_raw_command_envelope():
+    command = build_protocol_command("COMMAND_EXEC", "SET", "k", "v")
+
+    assert command.opcode == 0x0100
+    assert command.payload == {"command": "SET", "args": ["k", "v"]}
+
+
 def test_protocol_module_command_uses_native_command_exec_fallback():
     command = build_protocol_command("BF.ADD", "bf-1", "member-1")
 
     assert command.opcode == 0x0100
     assert command.payload == {"command": "BF.ADD", "args": ["bf-1", "member-1"]}
+
+
+def test_protocol_stateful_command_exec_is_not_wrapped_in_pipeline_frame():
+    commands = [
+        build_protocol_command("MULTI"),
+        build_protocol_command("SET", "k", "v"),
+        build_protocol_command("EXEC"),
+    ]
+
+    assert protocol_module._pipeline_frame_supported(commands) is False
+
+    commands = [
+        build_protocol_command("SUBSCRIBE", "jobs"),
+        build_protocol_command("UNSUBSCRIBE", "jobs"),
+    ]
+
+    assert protocol_module._pipeline_frame_supported(commands) is False
+
+    commands = [build_protocol_command("BLPOP", "jobs", 1)]
+
+    assert protocol_module._pipeline_frame_supported(commands) is False
 
 
 def test_protocol_control_metadata_builders():
