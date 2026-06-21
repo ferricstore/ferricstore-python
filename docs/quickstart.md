@@ -132,7 +132,7 @@ thread executors unless you have a specific reason.
 | Durable queue | `QueueClient` / `AsyncQueueClient` |
 | Explicit state machine | `WorkflowClient` / `AsyncWorkflowClient` |
 | Custom command control | `FlowClient` / `AsyncFlowClient` |
-| Normal Redis command | `client.command(...)` |
+| Data-structure command | `client.command(...)` |
 | Fanout/children | `spawn_children` or workflow `job.flow.spawn_children(...)` |
 | Large optional data | named values and `value_mget` |
 

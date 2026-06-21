@@ -143,7 +143,7 @@ def test_create_flows_waits_on_adaptive_backpressure(monkeypatch):
     monkeypatch.setattr(bench, "BenchFlowClient", FakeBenchFlowClient)
 
     result = bench.create_flows(
-        url="redis://127.0.0.1:7379",
+        url="ferric://127.0.0.1:6388",
         run_id="run",
         flow_type="email",
         indices=[0, 1, 2, 3],
@@ -198,7 +198,7 @@ def test_create_flows_waits_on_pending_claim_credits(monkeypatch):
     monkeypatch.setattr(bench, "BenchFlowClient", FakeBenchFlowClient)
 
     result = bench.create_flows(
-        url="redis://127.0.0.1:7379",
+        url="ferric://127.0.0.1:6388",
         run_id="run",
         flow_type="email",
         indices=[0, 1, 2, 3],
@@ -394,7 +394,7 @@ def test_bench_flow_client_uses_enqueue_many_for_explicit_partition_items(monkey
 def test_protocol_url_detection_accepts_ferric_scheme():
     assert bench.is_protocol_url("ferric://127.0.0.1:6388")
     assert bench.is_protocol_url("ferrics://example:6388")
-    assert not bench.is_protocol_url("redis://127.0.0.1:6379")
+    assert not bench.is_protocol_url("http://127.0.0.1:6388")
 
 
 def test_protocol_queue_default_uses_internal_worker_lanes():
@@ -411,8 +411,8 @@ def test_protocol_queue_default_uses_internal_worker_lanes():
     )
     assert (
         bench.protocol_queue_worker_lanes(
-            url="redis://127.0.0.1:6379",
-            worker_api="queue",
+            url="ferric://127.0.0.1:6388",
+            worker_api="lowlevel",
             workers=1,
             claim_any=False,
             partitions=16,
@@ -461,9 +461,17 @@ def test_queue_api_passes_claim_drain_batches_to_worker(monkeypatch):
     monkeypatch.setattr(bench, "create_flows", fake_create_flows)
     monkeypatch.setattr(bench, "run_queue_api_worker", fake_queue_worker)
 
+    class FakeSharedClient:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        bench.FlowClient, "from_url", staticmethod(lambda *_args, **_kwargs: FakeSharedClient())
+    )
+
     result = bench.run_queued_throughput(
         Namespace(
-            url="redis://127.0.0.1:7379",
+            url="ferric://127.0.0.1:6388",
             queued_shape="live",
             flows=4,
             workers=2,
@@ -551,9 +559,17 @@ def test_lowlevel_blocking_auto_many_enables_wake_coordinator(monkeypatch):
     monkeypatch.setattr(bench, "create_flows", fake_create_flows)
     monkeypatch.setattr(bench, "run_claim_worker", fake_worker)
 
+    class FakeSharedClient:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        bench.FlowClient, "from_url", staticmethod(lambda *_args, **_kwargs: FakeSharedClient())
+    )
+
     result = bench.run_queued_throughput(
         Namespace(
-            url="redis://127.0.0.1:7379",
+            url="ferric://127.0.0.1:6388",
             queued_shape="live",
             flows=8,
             workers=2,
@@ -640,9 +656,17 @@ def test_queue_api_auto_many_enables_wake_coordinator(monkeypatch):
     monkeypatch.setattr(bench, "create_flows", fake_create_flows)
     monkeypatch.setattr(bench, "run_queue_api_worker", fake_queue_worker)
 
+    class FakeSharedClient:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        bench.FlowClient, "from_url", staticmethod(lambda *_args, **_kwargs: FakeSharedClient())
+    )
+
     result = bench.run_queued_throughput(
         Namespace(
-            url="redis://127.0.0.1:7379",
+            url="ferric://127.0.0.1:6388",
             queued_shape="live",
             flows=8,
             workers=2,
@@ -797,7 +821,7 @@ def test_queue_api_worker_caps_wake_credit_by_capacity_and_drain_batches(monkeyp
     coordinator.notify_partition(0, 2_000)
 
     result = bench.run_queue_api_worker(
-        url="redis://127.0.0.1:7379",
+        url="ferric://127.0.0.1:6388",
         run_id="run",
         flow_type="email",
         worker_index=0,
@@ -888,7 +912,7 @@ def test_queue_api_worker_avoids_fallback_scan_while_waiting_for_wake_credit(mon
     monkeypatch.setattr(bench, "QueueFlowWorker", FakeWorker)
 
     result = bench.run_queue_api_worker(
-        url="redis://127.0.0.1:7379",
+        url="ferric://127.0.0.1:6388",
         run_id="run",
         flow_type="email",
         worker_index=0,
@@ -973,7 +997,7 @@ def test_lowlevel_blocking_worker_claims_partition_batches(monkeypatch):
     monkeypatch.setattr(bench, "BenchFlowClient", FakeBenchFlowClient)
 
     result = bench.run_claim_worker(
-        url="redis://127.0.0.1:7379",
+        url="ferric://127.0.0.1:6388",
         run_id="run",
         flow_type="email",
         worker_index=0,
@@ -1062,7 +1086,7 @@ def test_lowlevel_auto_worker_claim_pages_stay_on_one_server_shard(monkeypatch):
     monkeypatch.setattr(bench, "BenchFlowClient", FakeBenchFlowClient)
 
     bench.run_claim_worker(
-        url="redis://127.0.0.1:7379",
+        url="ferric://127.0.0.1:6388",
         run_id="run",
         flow_type="email",
         worker_index=0,
@@ -1156,7 +1180,7 @@ def test_lowlevel_worker_scans_owned_partitions_before_drain_block(monkeypatch):
     monkeypatch.setattr(bench, "BenchFlowClient", FakeBenchFlowClient)
 
     bench.run_claim_worker(
-        url="redis://127.0.0.1:7379",
+        url="ferric://127.0.0.1:6388",
         run_id="run",
         flow_type="email",
         worker_index=0,
@@ -1262,7 +1286,7 @@ def test_lowlevel_worker_does_not_block_while_producers_are_active(monkeypatch):
     monkeypatch.setattr(bench, "BenchFlowClient", FakeBenchFlowClient)
 
     bench.run_claim_worker(
-        url="redis://127.0.0.1:7379",
+        url="ferric://127.0.0.1:6388",
         run_id="run",
         flow_type="email",
         worker_index=0,

@@ -350,9 +350,9 @@ def benchmark_partition_key(
     return partition_for(partition_index, partitions, run_id)
 
 
-class BufferedRedisExecutor:
-    def __init__(self, redis_client) -> None:
-        self.redis_client = redis_client
+class BufferedCommandExecutor:
+    def __init__(self, command_client) -> None:
+        self.command_client = command_client
         self.commands: list[tuple] = []
         self.flushes = 0
         self.commands_sent = 0
@@ -368,7 +368,7 @@ class BufferedRedisExecutor:
 
         commands = self.commands
         self.commands = []
-        pipe = self.redis_client.pipeline(transaction=False)
+        pipe = self.command_client.pipeline(transaction=False)
         for command in commands:
             pipe.execute_command(*command)
 
@@ -393,12 +393,14 @@ class BenchFlowClient:
         self.transport = transport
         base = base_client or FlowClient.from_url(url, **(client_kwargs or {}))
         self.read_client = base
-        self.redis_client = getattr(base.executor, "client", None)
+        self.command_client = getattr(base.executor, "client", None)
         self.autobatch_client = None
         if transport == "pipeline":
-            if self.redis_client is None:
-                raise RuntimeError("pipeline transport requires RedisAdapter")
-            self.executor = BufferedRedisExecutor(self.redis_client)
+            if self.command_client is None:
+                raise RuntimeError(
+                    "pipeline transport requires a native protocol executor with pipeline support"
+                )
+            self.executor = BufferedCommandExecutor(self.command_client)
             self.client = FlowClient(self.executor)
             return
         if transport == "autobatch":
@@ -2414,7 +2416,7 @@ def run_serial_latency(args: argparse.Namespace) -> dict[str, float | int | str]
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url", default="redis://127.0.0.1:6379/0")
+    parser.add_argument("--url", default="ferric://127.0.0.1:6388")
     parser.add_argument("--mode", choices=("queued", "serial-latency"), default="queued")
     parser.add_argument("--queued-shape", choices=("live", "preloaded"), default="live")
 

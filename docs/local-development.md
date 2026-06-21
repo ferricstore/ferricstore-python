@@ -36,7 +36,6 @@ docker run --name ferricstore-dev \
 This starts one local FerricStore server on:
 
 ```text
-redis://127.0.0.1:6379/0
 ferric://127.0.0.1:6388
 ```
 
@@ -65,7 +64,7 @@ python examples/protocol_commands.py
 pytest
 ```
 
-Unit tests use fake Redis executors and do not require the server. Integration
+Unit tests use fake command executors and do not require the server. Integration
 or benchmark runs need a local FerricStore server.
 
 Run the integration test against the Compose server:

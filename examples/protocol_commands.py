@@ -4,7 +4,7 @@ from ferricstore import FlowClient
 
 
 def main() -> None:
-    client = FlowClient.from_url("redis://127.0.0.1:6379/0")
+    client = FlowClient.from_url("ferric://127.0.0.1:6388")
 
     if client.lock("lock:report:42", "worker-1", ttl_ms=30_000):
         try:
@@ -20,8 +20,8 @@ def main() -> None:
     limit = client.ratelimit_add("rl:user:42", window_ms=1_000, max=10)
     print("allowed", limit.allowed, "remaining", limit.remaining)
 
-    client.command("SET", "normal:redis:key", "value")
-    print(client.command("GET", "normal:redis:key"))
+    client.command("SET", "normal:data:key", "value")
+    print(client.command("GET", "normal:data:key"))
 
 
 if __name__ == "__main__":

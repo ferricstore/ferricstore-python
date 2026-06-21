@@ -75,7 +75,7 @@ def test_flow_client_from_protocol_url_uses_protocol_adapter_pool(monkeypatch):
     assert created == {"url": "ferric://localhost:6388", "kwargs": {"timeout": 1.0}}
 
 
-def test_protocol_from_url_ignores_redis_only_kwargs(monkeypatch):
+def test_protocol_from_url_ignores_compatibility_only_kwargs(monkeypatch):
     captured = {}
 
     def fake_init(self, host, port, **kwargs):

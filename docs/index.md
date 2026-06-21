@@ -34,7 +34,7 @@ APIs, and access to normal FerricStore commands.
 | Queue and workflow APIs | [Workflow and Queue APIs](workflow.md) |
 | Worker loops | [Worker](worker.md) |
 | Payload codecs | [Payload Codecs](codecs.md) |
-| Redis adapters and pools | [Redis Adapters](adapters.md) |
+| Command executors | [Command Executors](adapters.md) |
 | Async APIs | [Async APIs](async.md) |
 | Children and fanout | [Children and Fanout](children.md) |
 | Retry and errors | [Retry and Errors](retry.md) |
@@ -107,7 +107,7 @@ That means:
 
 Before using the SDK in production:
 
-- Set Redis connect and command timeouts.
+- Set FerricStore connect and command timeouts.
 - Size connection pools for producers and workers.
 - Use explicit worker `state` or `states`.
 - Make handlers idempotent.

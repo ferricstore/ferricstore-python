@@ -2,7 +2,7 @@ from ferricstore import CreateItem, QueueClient
 
 
 def main() -> None:
-    client = QueueClient.from_url("redis://127.0.0.1:6379/0")
+    client = QueueClient.from_url("ferric://127.0.0.1:6388")
     emails = client.queue(type="email")
 
     emails.enqueue_many(

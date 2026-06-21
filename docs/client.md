@@ -7,8 +7,10 @@ page when you need exact command-level control.
 ```python
 from ferricstore import FlowClient
 
-client = FlowClient.from_url("redis://127.0.0.1:6379/0")
+client = FlowClient.from_url("ferric://127.0.0.1:6388")
 ```
+
+The SDK only opens FerricStore native protocol connections from URLs. Use `ferric://` for plaintext development and `ferrics://` for TLS deployments.
 
 ## Parity
 
@@ -27,11 +29,7 @@ client = FlowClient.from_url("redis://127.0.0.1:6379/0")
 | Governance | `effect_reserve`, `effect_confirm`, `effect_fail`, `effect_compensate`, `effect_get`, `governance_ledger`, `approval_request`, `approval_approve`, `approval_reject`, `approval_get`, `approval_list`, `governance_overview`, `circuit_open`, `circuit_close`, `circuit_get`, `budget_reserve`, `budget_commit`, `budget_release`, `budget_get`, `budget_list`, `limit_lease`, `limit_spend`, `limit_release`, `limit_get`, `limit_list` |
 | Policy/cleanup | `install_policy`, `policy_get`, `retention_cleanup` |
 
-`from_url` uses `redis-py` with RESP3:
-
-```python
-redis.Redis.from_url(url, protocol=3, decode_responses=False)
-```
+`from_url` uses the native FerricStore protocol adapter.
 
 ## `create`
 
@@ -656,8 +654,7 @@ summary = client.retention_cleanup(limit=1_000)
 
 ## FerricStore protocol commands
 
-`FlowClient` also exposes FerricStore commands that are not part of vanilla
-Redis.
+`FlowClient` also exposes FerricStore commands that are FerricStore-specific higher-level operations.
 
 ```python
 client.cas("k", b"old", b"new", ex=60)
@@ -713,9 +710,9 @@ client.ferricstore_metrics()
 client.ferricstore_blobgc("RUN")
 ```
 
-## Normal Redis command passthrough
+## Command passthrough
 
-Use `command` for any Redis-compatible command that does not need a typed SDK
+Use `command` for any FerricStore data-structure command that does not need a typed SDK
 wrapper.
 
 ```python
@@ -726,4 +723,4 @@ client.command("ZADD", "scores", 10, "a")
 ```
 
 This is the intended escape hatch. FerricStore-specific APIs are typed; generic
-Redis remains available without turning the SDK into a full Redis client.
+Low-level commands remain available without turning the SDK into a large wrapper surface.

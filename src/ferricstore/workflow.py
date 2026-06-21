@@ -2079,7 +2079,6 @@ class WorkflowClient:
         command_max_connections = (
             1
             if isinstance(client, str)
-            and _is_protocol_url(client)
             and (worker_config is None or worker_config.command_connections is None)
             else command_pool_size
         )
@@ -2094,10 +2093,7 @@ class WorkflowClient:
             else client
         )
         if claim_client is None:
-            if isinstance(client, str) and not _is_protocol_url(client):
-                self.claim_flow = FlowClient.from_url(client, max_connections=claim_pool_size)
-            else:
-                self.claim_flow = self.flow
+            self.claim_flow = self.flow
         else:
             self.claim_flow = (
                 FlowClient.from_url(claim_client, max_connections=claim_pool_size)
@@ -2108,10 +2104,8 @@ class WorkflowClient:
         self.worker_config = worker_config
         self.value_config = value_config or ValueConfig()
         self._owns_flow = _owns_clients or isinstance(client, str)
-        self._owns_claim_flow = (
-            (_owns_clients and self.claim_flow is not self.flow)
-            or isinstance(claim_client, str)
-            or (claim_client is None and isinstance(client, str) and not _is_protocol_url(client))
+        self._owns_claim_flow = (_owns_clients and self.claim_flow is not self.flow) or isinstance(
+            claim_client, str
         )
 
     @classmethod
@@ -2124,64 +2118,33 @@ class WorkflowClient:
         value_config: ValueConfig | None = None,
         **kwargs: Any,
     ) -> WorkflowClient:
-        command_pool_size, claim_pool_size = resolve_worker_connection_counts(
+        command_pool_size, _claim_pool_size = resolve_worker_connection_counts(
             worker_config=worker_config,
             default_workers=1,
         )
         command_kwargs = dict(kwargs)
-        if _is_protocol_url(url) and (
-            worker_config is None or worker_config.command_connections is None
-        ):
+        if worker_config is None or worker_config.command_connections is None:
             command_kwargs.setdefault("max_connections", 1)
         else:
             command_kwargs.setdefault("max_connections", command_pool_size)
-        claim_kwargs = dict(kwargs)
-        claim_kwargs["max_connections"] = claim_pool_size
-        if _is_protocol_url(url):
-            instance = cls(
-                FlowClient.from_url(url, **command_kwargs),
-                retry_policy=retry_policy,
-                worker_config=worker_config,
-                value_config=value_config,
-                _owns_clients=True,
-            )
-        else:
-            instance = cls(
-                FlowClient.from_url(url, **command_kwargs),
-                claim_client=FlowClient.from_url(url, **claim_kwargs),
-                retry_policy=retry_policy,
-                worker_config=worker_config,
-                value_config=value_config,
-                _owns_clients=True,
-            )
+        instance = cls(
+            FlowClient.from_url(url, **command_kwargs),
+            retry_policy=retry_policy,
+            worker_config=worker_config,
+            value_config=value_config,
+            _owns_clients=True,
+        )
         instance._url = url
         instance._base_url_kwargs = dict(kwargs)
         instance._claim_client_explicit = False
-        instance._claim_pool_size = claim_pool_size
+        instance._claim_pool_size = 1
         return instance
 
     def _claim_flow_for_worker_config(
         self,
         worker_config: WorkerConfig | None,
     ) -> FlowClient:
-        if (
-            self._claim_client_explicit
-            or self._url is None
-            or worker_config is None
-            or _is_protocol_url(self._url)
-        ):
-            return self.claim_flow
-        _, claim_pool_size = resolve_worker_connection_counts(
-            worker_config=worker_config,
-            default_workers=1,
-        )
-        if claim_pool_size == self._claim_pool_size:
-            return self.claim_flow
-        claim_kwargs = dict(self._base_url_kwargs)
-        claim_kwargs["max_connections"] = claim_pool_size
-        claim_flow = FlowClient.from_url(self._url, **claim_kwargs)
-        self._owned_extra_claim_flows.append(claim_flow)
-        return claim_flow
+        return self.claim_flow
 
     def workflow(
         self,

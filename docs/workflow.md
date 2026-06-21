@@ -23,7 +23,7 @@ Use `QueueClient` for queue workloads.
 ```python
 from ferricstore import QueueClient
 
-client = QueueClient.from_url("redis://127.0.0.1:6379/0")
+client = QueueClient.from_url("ferric://127.0.0.1:6388")
 emails = client.queue(type="email")
 
 emails.enqueue("email-1", payload=b"welcome")
@@ -85,7 +85,7 @@ Use `WorkflowClient` for explicit state-machine logic.
 ```python
 from ferricstore import WorkflowClient, complete, fail, retry, transition
 
-client = WorkflowClient.from_url("redis://127.0.0.1:6379/0")
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 payment = client.workflow(
     type="payment",
     initial_state="created",
@@ -190,7 +190,7 @@ Use async APIs when your application already runs on `asyncio`.
 ```python
 from ferricstore import AsyncQueueClient
 
-client = AsyncQueueClient.from_url("redis://127.0.0.1:6379/0")
+client = AsyncQueueClient.from_url("ferric://127.0.0.1:6388")
 emails = client.queue(type="email")
 
 worker = emails.worker(
@@ -204,7 +204,7 @@ For state machines, use `AsyncWorkflowClient`:
 ```python
 from ferricstore import AsyncWorkflowClient, complete, transition
 
-client = AsyncWorkflowClient.from_url("redis://127.0.0.1:6379/0")
+client = AsyncWorkflowClient.from_url("ferric://127.0.0.1:6388")
 workflow = client.workflow(
     type="order",
     states=["created", "charged"],

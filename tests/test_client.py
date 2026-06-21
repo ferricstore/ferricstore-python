@@ -14,7 +14,7 @@ from ferricstore import (
     StaleLeaseError,
 )
 from ferricstore.backpressure import BackpressureController
-from ferricstore.errors import FerricStoreError, classify_server_error
+from ferricstore.errors import FerricStoreError, classify_server_error, map_exception
 from ferricstore.types import (
     ApprovalResult,
     ChildSpec,
@@ -26,13 +26,14 @@ from ferricstore.types import (
     FlowRecord,
     GovernanceOverview,
     KeyInfo,
+    PubSubMessage,
     RateLimitResult,
     RetryPolicy,
     ScheduleResult,
 )
 
 
-class FakeRedis:
+class FakeExecutor:
     def __init__(self):
         self.calls = []
         self.responses = []
@@ -178,7 +179,7 @@ class FakeRedis:
         return future
 
 
-class RejectRichClaimReturnRedis(FakeRedis):
+class RejectRichClaimReturnExecutor(FakeExecutor):
     def execute_command(self, *args):
         if (
             args[:1] == ("FLOW.CLAIM_DUE",)
@@ -191,7 +192,7 @@ class RejectRichClaimReturnRedis(FakeRedis):
         return super().execute_command(*args)
 
 
-class FakeBatchRedis(FakeRedis):
+class FakeBatchExecutor(FakeExecutor):
     def __init__(self):
         super().__init__()
         self.batches = []
@@ -204,7 +205,7 @@ class FakeBatchRedis(FakeRedis):
         ]
 
 
-class FakeSubmitCommandsRedis(FakeRedis):
+class FakeSubmitCommandsExecutor(FakeExecutor):
     def __init__(self):
         super().__init__()
         self.submitted = []
@@ -218,7 +219,7 @@ class FakeSubmitCommandsRedis(FakeRedis):
         return [complete, claim]
 
 
-class CloseRedis(FakeRedis):
+class CloseExecutor(FakeExecutor):
     def __init__(self):
         super().__init__()
         self.closed = False
@@ -227,13 +228,13 @@ class CloseRedis(FakeRedis):
         self.closed = True
 
 
-class AckRedis(FakeRedis):
+class AckExecutor(FakeExecutor):
     def execute_command(self, *args):
         self.calls.append(args)
         return b"OK"
 
 
-class OverloadThenAckRedis(FakeRedis):
+class OverloadThenAckExecutor(FakeExecutor):
     def __init__(self, overloads: int):
         super().__init__()
         self.overloads = overloads
@@ -246,7 +247,7 @@ class OverloadThenAckRedis(FakeRedis):
         return b"OK"
 
 
-class PerItemAckRedis(FakeRedis):
+class PerItemAckExecutor(FakeExecutor):
     def execute_command(self, *args):
         self.calls.append(args)
         command = args[0]
@@ -271,7 +272,7 @@ class PerItemAckRedis(FakeRedis):
         return b"OK"
 
 
-class BlockingRedis(PerItemAckRedis):
+class BlockingExecutor(PerItemAckExecutor):
     def __init__(self):
         super().__init__()
         self.entered = threading.Event()
@@ -290,7 +291,7 @@ class BlockingRedis(PerItemAckRedis):
         return b"OK"
 
 
-class ClaimThenAckRedis(FakeRedis):
+class ClaimThenAckExecutor(FakeExecutor):
     def execute_command(self, *args):
         self.calls.append(args)
         command = args[0]
@@ -327,7 +328,7 @@ class ClaimThenAckRedis(FakeRedis):
         return b"OK"
 
 
-class CreateAckThenGetRedis(FakeRedis):
+class CreateAckThenGetExecutor(FakeExecutor):
     def execute_command(self, *args):
         self.calls.append(args)
         if args[0] == "FLOW.CREATE":
@@ -350,8 +351,8 @@ def test_claimed_item_top_level_alias_remains_available():
 
 
 def test_create_builds_flow_create_command():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     record = client.create(
         "f1",
@@ -364,7 +365,7 @@ def test_create_builds_flow_create_command():
     )
 
     assert record.id == "f1"
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CREATE",
         "f1",
         "TYPE",
@@ -383,8 +384,8 @@ def test_create_builds_flow_create_command():
 
 
 def test_create_can_return_ack_without_followup_get():
-    redis = AckRedis()
-    client = FlowClient(redis)
+    executor = AckExecutor()
+    client = FlowClient(executor)
 
     result = client.create(
         "f1",
@@ -396,44 +397,44 @@ def test_create_can_return_ack_without_followup_get():
     )
 
     assert result == b"OK"
-    assert len(redis.calls) == 1
+    assert len(executor.calls) == 1
 
 
 def test_create_honors_zero_now_ms():
-    redis = AckRedis()
-    client = FlowClient(redis)
+    executor = AckExecutor()
+    client = FlowClient(executor)
 
     client.create("f-zero", type="order", now_ms=0, return_record=False)
 
-    call = redis.calls[0]
+    call = executor.calls[0]
     assert call[call.index("NOW") + 1] == 0
     assert call[call.index("RUN_AT") + 1] == 0
 
 
 def test_flow_client_close_forwards_to_executor():
-    redis = CloseRedis()
-    client = FlowClient(redis)
+    executor = CloseExecutor()
+    client = FlowClient(executor)
 
     client.close()
 
-    assert redis.closed is True
+    assert executor.closed is True
 
 
 def test_create_ack_followup_get_uses_auto_partition_when_partition_omitted():
-    redis = CreateAckThenGetRedis()
-    client = FlowClient(redis)
+    executor = CreateAckThenGetExecutor()
+    client = FlowClient(executor)
     expected_partition = f"__flow_auto__:{zlib.crc32(b'f-auto') % 256}"
 
     record = client.create("f-auto", type="order", payload=b"hello", now_ms=100, return_record=True)
 
     assert record.id == "f-auto"
-    assert redis.calls[1][:2] == ("FLOW.GET", "f-auto")
-    assert redis.calls[1][redis.calls[1].index("PARTITION") + 1] == expected_partition
+    assert executor.calls[1][:2] == ("FLOW.GET", "f-auto")
+    assert executor.calls[1][executor.calls[1].index("PARTITION") + 1] == expected_partition
 
 
 def test_create_can_attach_named_values_and_refs():
-    redis = AckRedis()
-    client = FlowClient(redis)
+    executor = AckExecutor()
+    client = FlowClient(executor)
 
     result = client.create(
         "f1",
@@ -446,7 +447,7 @@ def test_create_can_attach_named_values_and_refs():
     )
 
     assert result == b"OK"
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CREATE",
         "f1",
         "TYPE",
@@ -469,11 +470,11 @@ def test_create_can_attach_named_values_and_refs():
 
 
 def test_create_and_transition_can_attach_attributes():
-    redis = AckRedis()
-    client = FlowClient(redis)
+    executor = AckExecutor()
+    client = FlowClient(executor)
 
     assert client.create("f1", type="order", attributes={"tenant": "acme"}, now_ms=100) == b"OK"
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.CREATE",
         "f1",
         "TYPE",
@@ -502,7 +503,7 @@ def test_create_and_transition_can_attach_attributes():
         )
         == b"OK"
     )
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.TRANSITION",
         "f1",
         "queued",
@@ -523,32 +524,32 @@ def test_create_and_transition_can_attach_attributes():
     )
 
 
-def test_redis_command_helpers_are_codec_aware_and_easy_to_use():
-    redis = FakeRedis()
-    client = FlowClient(redis, codec=JsonCodec())
+def test_data_command_helpers_are_codec_aware_and_easy_to_use():
+    executor = FakeExecutor()
+    client = FlowClient(executor, codec=JsonCodec())
 
-    redis.responses.append("OK")
+    executor.responses.append("OK")
     assert client.kv_set("kv", {"answer": 42}, px=100, nx=True) == "OK"
-    assert redis.calls[-1] == ("SET", "kv", b'{"answer":42}', "PX", 100, "NX")
+    assert executor.calls[-1] == ("SET", "kv", b'{"answer":42}', "PX", 100, "NX")
 
-    redis.responses.append(b'{"answer":42}')
+    executor.responses.append(b'{"answer":42}')
     assert client.kv_get("kv") == {"answer": 42}
-    assert redis.calls[-1] == ("GET", "kv")
+    assert executor.calls[-1] == ("GET", "kv")
 
-    redis.responses.append([b'{"a":1}', None])
+    executor.responses.append([b'{"a":1}', None])
     assert client.kv_mget("a", "missing") == [{"a": 1}, None]
-    assert redis.calls[-1] == ("MGET", "a", "missing")
+    assert executor.calls[-1] == ("MGET", "a", "missing")
 
-    redis.responses.append("OK")
+    executor.responses.append("OK")
     assert client.kv_mset({"a": {"n": 1}, "b": {"n": 2}}) == "OK"
-    assert redis.calls[-1] == ("MSET", "a", b'{"n":1}', "b", b'{"n":2}')
+    assert executor.calls[-1] == ("MSET", "a", b'{"n":1}', "b", b'{"n":2}')
 
 
-def test_redis_command_helpers_cover_non_flow_command_families():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+def test_data_command_helpers_cover_non_flow_command_families():
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
-    redis.responses.extend(
+    executor.responses.extend(
         [
             1,
             1,
@@ -566,34 +567,34 @@ def test_redis_command_helpers_cover_non_flow_command_families():
     )
 
     assert client.incr("counter") == 1
-    assert redis.calls[-1] == ("INCR", "counter")
+    assert executor.calls[-1] == ("INCR", "counter")
     assert client.expire("counter", 60, nx=True) == 1
-    assert redis.calls[-1] == ("EXPIRE", "counter", 60, "NX")
+    assert executor.calls[-1] == ("EXPIRE", "counter", 60, "NX")
     assert client.hset("hash", {"field": "value"}) == 10
-    assert redis.calls[-1] == ("HSET", "hash", "field", b"value")
+    assert executor.calls[-1] == ("HSET", "hash", "field", b"value")
     assert client.sadd("set", "a", "b") == 2
-    assert redis.calls[-1] == ("SADD", "set", b"a", b"b")
+    assert executor.calls[-1] == ("SADD", "set", b"a", b"b")
     assert client.xadd("stream", {"field": "value"}) == b"stream-id"
-    assert redis.calls[-1] == ("XADD", "stream", "*", "field", b"value")
+    assert executor.calls[-1] == ("XADD", "stream", "*", "field", b"value")
     assert client.xlen("stream") == 1
-    assert redis.calls[-1] == ("XLEN", "stream")
+    assert executor.calls[-1] == ("XLEN", "stream")
     assert client.bf_reserve("bf", 0.01, 100) == "OK"
-    assert redis.calls[-1] == ("BF.RESERVE", "bf", 0.01, 100)
+    assert executor.calls[-1] == ("BF.RESERVE", "bf", 0.01, 100)
     assert client.bf_add("bf", "member") == 1
-    assert redis.calls[-1] == ("BF.ADD", "bf", "member")
+    assert executor.calls[-1] == ("BF.ADD", "bf", "member")
     assert client.pfadd("hll", "a", "b") == 1
-    assert redis.calls[-1] == ("PFADD", "hll", "a", "b")
+    assert executor.calls[-1] == ("PFADD", "hll", "a", "b")
     assert client.publish("channel", "message") == 1
-    assert redis.calls[-1] == ("PUBLISH", "channel", b"message")
+    assert executor.calls[-1] == ("PUBLISH", "channel", b"message")
     assert client.dbsize() == 1
-    assert redis.calls[-1] == ("DBSIZE",)
+    assert executor.calls[-1] == ("DBSIZE",)
 
 
-def test_redis_command_helpers_cover_native_session_and_blocking_commands():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+def test_data_command_helpers_cover_native_session_and_blocking_commands():
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
-    redis.responses.extend(
+    executor.responses.extend(
         [
             [["subscribe", "jobs", 1]],
             [["unsubscribe", "jobs", 0]],
@@ -607,25 +608,25 @@ def test_redis_command_helpers_cover_native_session_and_blocking_commands():
     )
 
     assert client.subscribe("jobs") == [["subscribe", "jobs", 1]]
-    assert redis.calls[-1] == ("SUBSCRIBE", "jobs")
+    assert executor.calls[-1] == ("SUBSCRIBE", "jobs")
     assert client.unsubscribe("jobs") == [["unsubscribe", "jobs", 0]]
-    assert redis.calls[-1] == ("UNSUBSCRIBE", "jobs")
+    assert executor.calls[-1] == ("UNSUBSCRIBE", "jobs")
     assert client.multi() == "OK"
-    assert redis.calls[-1] == ("MULTI",)
+    assert executor.calls[-1] == ("MULTI",)
     assert client.set("k", "v") == "QUEUED"
-    assert redis.calls[-1] == ("COMMAND_EXEC", "SET", "k", b"v")
+    assert executor.calls[-1] == ("COMMAND_EXEC", "SET", "k", b"v")
     assert client.transaction_exec() == ["OK"]
-    assert redis.calls[-1] == ("EXEC",)
+    assert executor.calls[-1] == ("EXEC",)
     assert client.blpop("queue", timeout=1) == [b"queue", b"job"]
-    assert redis.calls[-1] == ("BLPOP", "queue", 1)
+    assert executor.calls[-1] == ("BLPOP", "queue", 1)
     assert client.blmove("queue", "dst", "LEFT", "RIGHT", timeout=2) == [b"dst-job"]
-    assert redis.calls[-1] == ("BLMOVE", "queue", "dst", "LEFT", "RIGHT", 2)
+    assert executor.calls[-1] == ("BLMOVE", "queue", "dst", "LEFT", "RIGHT", 2)
     assert client.blmpop(3, ["queue"], "LEFT", count=2) == [b"queue", [b"a", b"b"]]
-    assert redis.calls[-1] == ("BLMPOP", 3, 1, "queue", "LEFT", "COUNT", 2)
+    assert executor.calls[-1] == ("BLMPOP", 3, 1, "queue", "LEFT", "COUNT", 2)
 
 
 def test_pubsub_session_decodes_native_events_without_raw_command_usage():
-    class EventRedis(FakeRedis):
+    class EventExecutor(FakeExecutor):
         def __init__(self):
             super().__init__()
             self.events = [
@@ -639,7 +640,7 @@ def test_pubsub_session_decodes_native_events_without_raw_command_usage():
         def wait_event(self, timeout=None):
             return self.events.pop(0) if self.events else None
 
-    client = FlowClient(EventRedis(), codec=JsonCodec())
+    client = FlowClient(EventExecutor(), codec=JsonCodec())
     pubsub = client.pubsub_session()
 
     message = pubsub.get_message(timeout=0.01)
@@ -650,15 +651,56 @@ def test_pubsub_session_decodes_native_events_without_raw_command_usage():
     assert message.message == {"job": 1}
 
 
+def test_pubsub_session_decodes_nested_native_pubsub_event():
+    class EventExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.events = [
+                {
+                    b"event": b"PUBSUB_MESSAGE",
+                    b"payload": {
+                        b"kind": b"message",
+                        b"channel": b"jobs",
+                        b"message": b'{"job":1}',
+                    },
+                    b"at_ms": 123,
+                }
+            ]
+
+        def wait_event(self, timeout=None):
+            return self.events.pop(0) if self.events else None
+
+    client = FlowClient(EventExecutor(), codec=JsonCodec())
+
+    message = client.pubsub_session().get_message(timeout=0.01)
+
+    assert message is not None
+    assert message.kind == "message"
+    assert message.channel == "jobs"
+    assert message.message == {"job": 1}
+
+
+def test_pubsub_session_decodes_push_array_event_shapes():
+    message = PubSubMessage.from_event(
+        [b"pmessage", b"jobs:*", b"jobs:1", b'{"job":1}'],
+        decode=JsonCodec().decode,
+    )
+
+    assert message.kind == "pmessage"
+    assert message.pattern == "jobs:*"
+    assert message.channel == "jobs:1"
+    assert message.message == {"job": 1}
+
+
 def test_transaction_context_uses_named_helpers_inside_multi():
-    redis = FakeRedis()
-    client = FlowClient(redis)
-    redis.responses.extend(["OK", "QUEUED", ["OK"]])
+    executor = FakeExecutor()
+    client = FlowClient(executor)
+    executor.responses.extend(["OK", "QUEUED", ["OK"]])
 
     with client.transaction() as tx:
         assert tx.kv_set("k", "v") == "QUEUED"
 
-    assert redis.calls == [
+    assert executor.calls == [
         ("MULTI",),
         ("COMMAND_EXEC", "SET", "k", b"v"),
         ("EXEC",),
@@ -666,8 +708,8 @@ def test_transaction_context_uses_named_helpers_inside_multi():
 
 
 def test_signal_builds_flow_signal_command_with_guards_and_values():
-    redis = AckRedis()
-    client = FlowClient(redis)
+    executor = AckExecutor()
+    client = FlowClient(executor)
 
     result = client.signal(
         "f1",
@@ -686,7 +728,7 @@ def test_signal_builds_flow_signal_command_with_guards_and_values():
     )
 
     assert result == b"OK"
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.SIGNAL",
         "f1",
         "SIGNAL",
@@ -721,8 +763,8 @@ def test_signal_builds_flow_signal_command_with_guards_and_values():
 
 
 def test_enqueue_uses_ack_only_create_by_default():
-    redis = AckRedis()
-    client = FlowClient(redis)
+    executor = AckExecutor()
+    client = FlowClient(executor)
 
     result = client.enqueue(
         "f1",
@@ -733,7 +775,7 @@ def test_enqueue_uses_ack_only_create_by_default():
     )
 
     assert result == b"OK"
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CREATE",
         "f1",
         "TYPE",
@@ -754,8 +796,8 @@ def test_enqueue_uses_ack_only_create_by_default():
 
 
 def test_enqueue_passes_retention_ttl_ms():
-    redis = AckRedis()
-    client = FlowClient(redis)
+    executor = AckExecutor()
+    client = FlowClient(executor)
 
     result = client.enqueue(
         "f1",
@@ -766,34 +808,34 @@ def test_enqueue_passes_retention_ttl_ms():
     )
 
     assert result == b"OK"
-    assert "RETENTION_TTL_MS" in redis.calls[0]
-    assert redis.calls[0][redis.calls[0].index("RETENTION_TTL_MS") + 1] == 300_000
+    assert "RETENTION_TTL_MS" in executor.calls[0]
+    assert executor.calls[0][executor.calls[0].index("RETENTION_TTL_MS") + 1] == 300_000
 
 
 def test_enqueue_retries_server_overload_with_backpressure():
-    redis = OverloadThenAckRedis(overloads=2)
+    executor = OverloadThenAckExecutor(overloads=2)
     client = FlowClient(
-        redis,
+        executor,
         backpressure=BackpressurePolicy(base_delay_ms=0, max_delay_ms=0, jitter=0),
     )
 
     result = client.enqueue("f1", type="order", payload=b"hello", now_ms=100)
 
     assert result == b"OK"
-    assert len(redis.calls) == 3
+    assert len(executor.calls) == 3
 
 
 def test_enqueue_default_backpressure_retries_until_server_recovers():
-    redis = OverloadThenAckRedis(overloads=12)
+    executor = OverloadThenAckExecutor(overloads=12)
     client = FlowClient(
-        redis,
+        executor,
         backpressure=BackpressurePolicy(base_delay_ms=0, max_delay_ms=0, jitter=0),
     )
 
     result = client.enqueue("f1", type="order", payload=b"hello", now_ms=100)
 
     assert result == b"OK"
-    assert len(redis.calls) == 13
+    assert len(executor.calls) == 13
 
 
 def test_backpressure_delay_saturates_without_overflow():
@@ -815,6 +857,45 @@ def test_overload_error_parses_retry_after_hint():
     assert error.reason == "rss_pressure"
 
 
+@pytest.mark.parametrize(
+    ("message", "code"),
+    [
+        ("ERR flow already exists", "flow_already_exists"),
+        ("ERR wrong state: queued", "flow_wrong_state"),
+        ("ERR stale flow lease", "stale_lease"),
+        ("ERR flow does not exist", "flow_not_found"),
+        ("ERR lock is held", "lock_held"),
+        ("ERR caller is not the lock owner", "lock_not_owned"),
+        ("ERR wrong number of arguments", "invalid_command"),
+        ("ERR unknown failure", "ferricstore_error"),
+    ],
+)
+def test_server_error_classification_codes(message, code):
+    raw = RuntimeError(message)
+
+    error = classify_server_error(message, raw=raw)
+
+    assert error.code == code
+    assert error.raw is raw
+
+
+def test_map_exception_preserves_known_errors_and_maps_server_errors():
+    known = FerricStoreError("known")
+    assert map_exception(known) is known
+
+    class ResponseError(Exception):
+        pass
+
+    mapped = map_exception(ResponseError("ERR syntax error"))
+    assert mapped.code == "invalid_command"
+
+    wrong_type = map_exception(RuntimeError("WRONGTYPE key has wrong type"))
+    assert wrong_type.code == "ferricstore_error"
+
+    local = ValueError("local failure")
+    assert map_exception(local) is local
+
+
 def test_backpressure_uses_retry_after_hint_and_shares_block():
     policy = BackpressurePolicy(
         base_delay_ms=0,
@@ -829,30 +910,58 @@ def test_backpressure_uses_retry_after_hint_and_shares_block():
     assert producer_b._wait_delay() > 0
 
 
+def test_backpressure_disabled_never_waits_or_retries():
+    controller = BackpressureController(
+        BackpressurePolicy(enabled=False, base_delay_ms=1, max_delay_ms=1, shared=False)
+    )
+
+    assert controller._wait_delay() == 0
+    assert controller.can_retry(0) is False
+    assert controller._record_overload_delay(0, retry_after_ms=1000) == 0
+
+    controller.record_overload(0, retry_after_ms=1000)
+    controller.record_success()
+
+
+def test_backpressure_success_decays_consecutive_overload_count():
+    controller = BackpressureController(
+        BackpressurePolicy(base_delay_ms=0, max_delay_ms=0, jitter=0, shared=False)
+    )
+
+    controller.record_overload(0)
+    assert controller._state.consecutive_overloads == 1
+
+    controller.record_success()
+    assert controller._state.consecutive_overloads == 0
+
+    controller.record_success()
+    assert controller._state.consecutive_overloads == 0
+
+
 def test_enqueue_stops_after_backpressure_retry_budget():
-    redis = OverloadThenAckRedis(overloads=2)
+    executor = OverloadThenAckExecutor(overloads=2)
     client = FlowClient(
-        redis,
+        executor,
         backpressure=BackpressurePolicy(max_retries=1, base_delay_ms=0, max_delay_ms=0, jitter=0),
     )
 
     with pytest.raises(OverloadedError):
         client.enqueue("f1", type="order", payload=b"hello", now_ms=100)
 
-    assert len(redis.calls) == 2
+    assert len(executor.calls) == 2
 
 
 def test_enqueue_many_groups_no_partition_items_by_auto_bucket():
-    redis = PerItemAckRedis()
-    client = FlowClient(redis)
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor)
     items = [CreateItem(f"flow-{idx}", b"payload") for idx in range(64)]
 
     results = client.enqueue_many(items, type="order", now_ms=100)
 
     assert results == [b"OK"] * len(items)
-    assert len(redis.calls) > 1
+    assert len(executor.calls) > 1
 
-    for call in redis.calls:
+    for call in executor.calls:
         bucket = call[1]
         assert isinstance(bucket, str)
         assert bucket.startswith("__flow_auto__:")
@@ -864,8 +973,8 @@ def test_enqueue_many_groups_no_partition_items_by_auto_bucket():
 
 
 def test_enqueue_many_groups_per_item_partition_keys_without_mixed_frame():
-    redis = PerItemAckRedis()
-    client = FlowClient(redis)
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor)
     items = [
         CreateItem("flow-0", b"payload", partition_key="tenant:a"),
         CreateItem("flow-1", b"payload", partition_key="tenant:b"),
@@ -876,14 +985,14 @@ def test_enqueue_many_groups_per_item_partition_keys_without_mixed_frame():
     results = client.enqueue_many(items, type="order", now_ms=100)
 
     assert results == [b"OK"] * len(items)
-    assert len(redis.calls) == 3
-    partitions = [call[1] for call in redis.calls]
+    assert len(executor.calls) == 3
+    partitions = [call[1] for call in executor.calls]
     assert "MIXED" not in partitions
     assert "tenant:a" in partitions
     assert "tenant:b" in partitions
     assert f"__flow_auto__:{zlib.crc32(b'flow-3') % 256}" in partitions
 
-    by_partition = {call[1]: call for call in redis.calls}
+    by_partition = {call[1]: call for call in executor.calls}
     tenant_a_items = by_partition["tenant:a"][by_partition["tenant:a"].index("ITEMS") + 1 :]
     assert tenant_a_items[0::2] == ("flow-0", "flow-2")
 
@@ -935,8 +1044,8 @@ def test_submit_create_many_uses_executor_submit_command():
 
 
 def test_enqueue_many_passes_retention_ttl_ms_to_auto_bucket_batches():
-    redis = PerItemAckRedis()
-    client = FlowClient(redis)
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor)
 
     results = client.enqueue_many(
         [CreateItem(f"flow-{idx}", b"payload") for idx in range(16)],
@@ -946,15 +1055,15 @@ def test_enqueue_many_passes_retention_ttl_ms_to_auto_bucket_batches():
     )
 
     assert results == [b"OK"] * 16
-    assert redis.calls
-    for call in redis.calls:
+    assert executor.calls
+    for call in executor.calls:
         assert "RETENTION_TTL_MS" in call
         assert call[call.index("RETENTION_TTL_MS") + 1] == 300_000
 
 
 def test_direct_many_methods_noop_on_empty_inputs():
-    redis = PerItemAckRedis()
-    client = FlowClient(redis)
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor)
 
     assert client.create_many("tenant:1", [], type="order") == []
     assert client.complete_many("tenant:1", []) == []
@@ -970,12 +1079,12 @@ def test_direct_many_methods_noop_on_empty_inputs():
     assert client.retry_many("tenant:1", []) == []
     assert client.fail_many("tenant:1", []) == []
     assert client.cancel_many("tenant:1", []) == []
-    assert redis.calls == []
+    assert executor.calls == []
 
 
 def test_autobatch_groups_no_partition_creates_by_auto_bucket():
-    redis = PerItemAckRedis()
-    client = FlowClient(redis).autobatch(max_batch=64, max_delay_ms=0)
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor).autobatch(max_batch=64, max_delay_ms=0)
 
     futures = [
         client.create_async(
@@ -990,7 +1099,7 @@ def test_autobatch_groups_no_partition_creates_by_auto_bucket():
     client.flush()
 
     assert [future.result() for future in futures] == [b"OK"] * len(futures)
-    for call in redis.calls:
+    for call in executor.calls:
         if call[0] != "FLOW.CREATE_MANY":
             continue
         bucket = call[1]
@@ -1004,8 +1113,8 @@ def test_autobatch_groups_no_partition_creates_by_auto_bucket():
 
 
 def test_claim_due_decodes_resp3_maps_and_payload():
-    redis = FakeRedis()
-    client = FlowClient(redis, codec=JsonCodec())
+    executor = FakeExecutor()
+    client = FlowClient(executor, codec=JsonCodec())
 
     records = client.claim_due(
         "order",
@@ -1022,8 +1131,8 @@ def test_claim_due_decodes_resp3_maps_and_payload():
 
 
 def test_claim_due_can_target_priority():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     jobs = client.claim_due(
         "order",
@@ -1037,7 +1146,7 @@ def test_claim_due_can_target_priority():
     )
 
     assert jobs[0].id == "f1"
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CLAIM_DUE",
         "order",
         "STATE",
@@ -1060,8 +1169,8 @@ def test_claim_due_can_target_priority():
 
 
 def test_claim_due_omits_now_when_not_supplied():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.claim_due(
         "order",
@@ -1071,12 +1180,12 @@ def test_claim_due_omits_now_when_not_supplied():
         limit=10,
     )
 
-    assert "NOW" not in redis.calls[0]
+    assert "NOW" not in executor.calls[0]
 
 
 def test_claim_due_sends_block_when_supplied():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.claim_flows(
         "order",
@@ -1087,13 +1196,13 @@ def test_claim_due_sends_block_when_supplied():
         block_ms=5000,
     )
 
-    assert "BLOCK" in redis.calls[0]
-    assert redis.calls[0][redis.calls[0].index("BLOCK") + 1] == 5000
+    assert "BLOCK" in executor.calls[0]
+    assert executor.calls[0][executor.calls[0].index("BLOCK") + 1] == 5000
 
 
 def test_claim_due_omits_state_when_none():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.claim_due(
         "order",
@@ -1104,7 +1213,7 @@ def test_claim_due_omits_state_when_none():
         now_ms=100,
     )
 
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CLAIM_DUE",
         "order",
         "WORKER",
@@ -1123,8 +1232,8 @@ def test_claim_due_omits_state_when_none():
 
 
 def test_claim_due_can_target_multiple_states():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.claim_due(
         "order",
@@ -1136,7 +1245,7 @@ def test_claim_due_can_target_multiple_states():
         now_ms=100,
     )
 
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CLAIM_DUE",
         "order",
         "STATE",
@@ -1159,8 +1268,8 @@ def test_claim_due_can_target_multiple_states():
 
 
 def test_claim_due_can_request_selected_named_values():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     records = client.claim_due(
         "order",
@@ -1174,7 +1283,7 @@ def test_claim_due_can_request_selected_named_values():
 
     assert records[0].values == {"order": b"order-bytes"}
     assert records[0].value_refs == {"order": {"ref": "ref-order"}}
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CLAIM_DUE",
         "order",
         "STATE",
@@ -1197,8 +1306,8 @@ def test_claim_due_can_request_selected_named_values():
 
 
 def test_complete_many_can_attach_named_values_and_refs():
-    redis = PerItemAckRedis()
-    client = FlowClient(redis)
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor)
 
     result = client.complete_many(
         "tenant:1",
@@ -1211,7 +1320,7 @@ def test_complete_many_can_attach_named_values_and_refs():
         independent=True,
     )
 
-    call = redis.calls[0]
+    call = executor.calls[0]
     assert result == [b"OK"]
     assert call[0] == "FLOW.COMPLETE_MANY"
     assert call[call.index("VALUE") : call.index("VALUE") + 3] == (
@@ -1236,8 +1345,8 @@ def test_complete_many_can_attach_named_values_and_refs():
 
 
 def test_complete_many_can_return_ok_on_success():
-    redis = PerItemAckRedis()
-    client = FlowClient(redis)
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor)
 
     result = client.complete_many(
         "tenant:1",
@@ -1248,21 +1357,21 @@ def test_complete_many_can_return_ok_on_success():
     )
 
     assert result == [b"OK"]
-    assert "RETURN" in redis.calls[0]
-    assert "OK_ON_SUCCESS" in redis.calls[0]
+    assert "RETURN" in executor.calls[0]
+    assert "OK_ON_SUCCESS" in executor.calls[0]
 
 
 def test_claim_due_rejects_state_and_states_together():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     with pytest.raises(ValueError, match="state and states are mutually exclusive"):
         client.claim_due("order", state="queued", states=["retry"], worker="worker-1")
 
 
 def test_value_put_named_options_and_value_mget_decode_values():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     response = client.value_put(
         b"order-v1",
@@ -1276,7 +1385,7 @@ def test_value_put_named_options_and_value_mget_decode_values():
 
     assert response == {b"ref": b"v1"}
     assert values == ["ref-a", "ref-b"]
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.VALUE.PUT",
         b"order-v1",
         "NOW",
@@ -1290,31 +1399,31 @@ def test_value_put_named_options_and_value_mget_decode_values():
         "OVERRIDE",
         "true",
     )
-    assert redis.calls[1] == ("FLOW.VALUE.MGET", "ref-a", "ref-b")
+    assert executor.calls[1] == ("FLOW.VALUE.MGET", "ref-a", "ref-b")
 
 
 def test_value_mget_normalizes_omission_metadata_recursively():
-    redis = FakeRedis()
-    client = FlowClient(redis)
-    redis.responses = [
+    executor = FakeExecutor()
+    client = FlowClient(executor)
+    executor.responses = [
         [{b"ref": b"ref-a", b"omitted": True, b"size": 123, b"nested": {b"k": b"v"}}]
     ]
 
     values = client.value_mget(["ref-a"], max_bytes=10)
 
     assert values == [{"ref": "ref-a", "omitted": True, "size": 123, "nested": {"k": "v"}}]
-    assert redis.calls[-1] == ("FLOW.VALUE.MGET", "ref-a", "MAX_BYTES", 10)
+    assert executor.calls[-1] == ("FLOW.VALUE.MGET", "ref-a", "MAX_BYTES", 10)
 
 
 def test_get_can_request_selected_named_values():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     record = client.get("f1", partition_key="tenant:1", values=["order"], value_max_bytes=1024)
 
     assert record is not None
     assert record.values == {"order": b"order-bytes"}
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.GET",
         "f1",
         "PARTITION",
@@ -1327,8 +1436,8 @@ def test_get_can_request_selected_named_values():
 
 
 def test_transition_and_terminal_commands_can_mutate_named_values():
-    redis = AckRedis()
-    client = FlowClient(redis)
+    executor = AckExecutor()
+    client = FlowClient(executor)
 
     transition_result = client.transition(
         "f1",
@@ -1355,7 +1464,7 @@ def test_transition_and_terminal_commands_can_mutate_named_values():
 
     assert transition_result == b"OK"
     assert complete_result == b"OK"
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.TRANSITION",
         "f1",
         "running",
@@ -1378,7 +1487,7 @@ def test_transition_and_terminal_commands_can_mutate_named_values():
         "OVERRIDE_VALUE",
         "payment",
     )
-    assert redis.calls[1] == (
+    assert executor.calls[1] == (
         "FLOW.COMPLETE",
         "f1",
         b"lease-2",
@@ -1395,8 +1504,8 @@ def test_transition_and_terminal_commands_can_mutate_named_values():
 
 
 def test_run_steps_many_sends_fused_deterministic_step_command():
-    redis = AckRedis()
-    client = FlowClient(redis)
+    executor = AckExecutor()
+    client = FlowClient(executor)
 
     result = client.run_steps_many(
         [
@@ -1416,7 +1525,7 @@ def test_run_steps_many_sends_fused_deterministic_step_command():
     )
 
     assert result == b"OK"
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.RUN_STEPS_MANY",
         "TYPE",
         "order",
@@ -1444,11 +1553,11 @@ def test_run_steps_many_sends_fused_deterministic_step_command():
 
 
 def test_run_steps_many_can_use_step_count_and_rejects_ambiguous_state_shape():
-    redis = AckRedis()
-    client = FlowClient(redis)
+    executor = AckExecutor()
+    client = FlowClient(executor)
 
     assert client.run_steps_many(["f1"], type="order", steps=3, worker="worker-1", now_ms=123)
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.RUN_STEPS_MANY",
         "TYPE",
         "order",
@@ -1472,8 +1581,8 @@ def test_run_steps_many_can_use_step_count_and_rejects_ambiguous_state_shape():
 
 
 def test_claim_due_can_return_claimed_flow_items():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     jobs = client.claim_due(
         "order",
@@ -1490,7 +1599,7 @@ def test_claim_due_can_return_claimed_flow_items():
     assert jobs[0].lease_token == b"lease"
     assert jobs[0].fencing_token == 7
     assert jobs[0].attributes == {"tenant": "acme"}
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CLAIM_DUE",
         "order",
         "STATE",
@@ -1511,8 +1620,8 @@ def test_claim_due_can_return_claimed_flow_items():
 
 
 def test_claim_due_accepts_legacy_job_only_alias():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     jobs = client.claim_due(
         "order",
@@ -1525,23 +1634,23 @@ def test_claim_due_accepts_legacy_job_only_alias():
     )
 
     assert isinstance(jobs[0], ClaimedFlow)
-    assert redis.calls[0][-2:] == ("RETURN", "JOBS_COMPACT_ATTRS")
+    assert executor.calls[0][-2:] == ("RETURN", "JOBS_COMPACT_ATTRS")
 
 
 def test_claim_due_falls_back_when_server_rejects_attribute_return_mode():
-    redis = RejectRichClaimReturnRedis()
-    client = FlowClient(redis)
+    executor = RejectRichClaimReturnExecutor()
+    client = FlowClient(executor)
 
     jobs = client.claim_flows("order", state="queued", worker="worker-1")
 
     assert isinstance(jobs[0], ClaimedFlow)
-    assert redis.calls[0][redis.calls[0].index("RETURN") + 1] == "JOBS_COMPACT_ATTRS"
-    assert redis.calls[1][redis.calls[1].index("RETURN") + 1] == "JOBS_COMPACT"
+    assert executor.calls[0][executor.calls[0].index("RETURN") + 1] == "JOBS_COMPACT_ATTRS"
+    assert executor.calls[1][executor.calls[1].index("RETURN") + 1] == "JOBS_COMPACT"
 
 
 def test_claim_due_falls_back_when_server_rejects_state_attribute_return_mode():
-    redis = RejectRichClaimReturnRedis()
-    client = FlowClient(redis)
+    executor = RejectRichClaimReturnExecutor()
+    client = FlowClient(executor)
 
     jobs = client.claim_flows(
         "order",
@@ -1551,13 +1660,13 @@ def test_claim_due_falls_back_when_server_rejects_state_attribute_return_mode():
     )
 
     assert isinstance(jobs[0], ClaimedFlow)
-    assert redis.calls[0][redis.calls[0].index("RETURN") + 1] == "JOBS_COMPACT_STATE_ATTRS"
-    assert redis.calls[1][redis.calls[1].index("RETURN") + 1] == "JOBS_COMPACT"
+    assert executor.calls[0][executor.calls[0].index("RETURN") + 1] == "JOBS_COMPACT_STATE_ATTRS"
+    assert executor.calls[1][executor.calls[1].index("RETURN") + 1] == "JOBS_COMPACT"
 
 
 def test_claim_due_rejects_conflicting_include_record_and_job_only():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     with pytest.raises(ValueError, match="include_record and job_only"):
         client.claim_due(
@@ -1568,12 +1677,12 @@ def test_claim_due_rejects_conflicting_include_record_and_job_only():
             job_only=False,
         )
 
-    assert redis.calls == []
+    assert executor.calls == []
 
 
 def test_claim_due_claimed_flow_can_omit_attributes():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.claim_due(
         "order",
@@ -1586,13 +1695,13 @@ def test_claim_due_claimed_flow_can_omit_attributes():
         include_attributes=False,
     )
 
-    assert redis.calls[0][-2:] == ("RETURN", "JOBS_COMPACT")
+    assert executor.calls[0][-2:] == ("RETURN", "JOBS_COMPACT")
 
 
 def test_claim_flows_can_request_compact_state_items():
-    redis = FakeRedis()
-    redis.responses.append([[b"f1", b"tenant:1", b"lease", 7, b"ready", {b"tenant": b"acme"}]])
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    executor.responses.append([[b"f1", b"tenant:1", b"lease", 7, b"ready", {b"tenant": b"acme"}]])
+    client = FlowClient(executor)
 
     jobs = client.claim_flows(
         "order",
@@ -1613,7 +1722,7 @@ def test_claim_flows_can_request_compact_state_items():
             attributes={"tenant": "acme"},
         )
     ]
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CLAIM_DUE",
         "order",
         "WORKER",
@@ -1634,9 +1743,9 @@ def test_claim_flows_can_request_compact_state_items():
 
 
 def test_claim_flows_future_uses_protocol_submit_and_decodes_items():
-    redis = FakeRedis()
-    redis.responses.append([[b"f1", b"tenant:1", b"lease", 7, {b"tenant": b"acme"}]])
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    executor.responses.append([[b"f1", b"tenant:1", b"lease", 7, {b"tenant": b"acme"}]])
+    client = FlowClient(executor)
 
     future = client.claim_flows_future(
         "order",
@@ -1655,7 +1764,7 @@ def test_claim_flows_future_uses_protocol_submit_and_decodes_items():
             attributes={"tenant": "acme"},
         )
     ]
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CLAIM_DUE",
         "order",
         "WORKER",
@@ -1676,8 +1785,8 @@ def test_claim_flows_future_uses_protocol_submit_and_decodes_items():
 
 
 def test_claim_due_can_scan_multiple_partitions():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.claim_due(
         "order",
@@ -1689,7 +1798,7 @@ def test_claim_due_can_scan_multiple_partitions():
         include_record=False,
     )
 
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CLAIM_DUE",
         "order",
         "STATE",
@@ -1712,8 +1821,8 @@ def test_claim_due_can_scan_multiple_partitions():
 
 
 def test_claim_flows_can_scan_multiple_partitions():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.claim_flows(
         "order",
@@ -1724,7 +1833,7 @@ def test_claim_flows_can_scan_multiple_partitions():
         now_ms=100,
     )
 
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CLAIM_DUE",
         "order",
         "STATE",
@@ -1749,8 +1858,8 @@ def test_claim_flows_can_scan_multiple_partitions():
 
 
 def test_claim_flows_only_sends_reclaim_expired_when_explicit():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.claim_flows(
         "order",
@@ -1760,7 +1869,7 @@ def test_claim_flows_only_sends_reclaim_expired_when_explicit():
         reclaim_expired=False,
     )
 
-    call = redis.calls[0]
+    call = executor.calls[0]
     assert call[call.index("RECLAIM_EXPIRED") : call.index("RECLAIM_EXPIRED") + 2] == (
         "RECLAIM_EXPIRED",
         "false",
@@ -1768,8 +1877,8 @@ def test_claim_flows_only_sends_reclaim_expired_when_explicit():
 
 
 def test_claim_flows_and_complete_jobs_hide_hot_path_options():
-    redis = ClaimThenAckRedis()
-    client = FlowClient(redis)
+    executor = ClaimThenAckExecutor()
+    client = FlowClient(executor)
 
     jobs = client.claim_flows(
         "order",
@@ -1783,7 +1892,7 @@ def test_claim_flows_and_complete_jobs_hide_hot_path_options():
 
     assert isinstance(jobs[0], ClaimedFlow)
     assert result == [b"OK"]
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CLAIM_DUE",
         "order",
         "STATE",
@@ -1803,7 +1912,7 @@ def test_claim_flows_and_complete_jobs_hide_hot_path_options():
         "RETURN",
         "JOBS_COMPACT_ATTRS",
     )
-    assert redis.calls[1] == (
+    assert executor.calls[1] == (
         "FLOW.COMPLETE_MANY",
         "tenant:1",
         "NOW",
@@ -1820,8 +1929,8 @@ def test_claim_flows_and_complete_jobs_hide_hot_path_options():
 
 
 def test_complete_flows_and_claim_flows_batches_ack_then_next_claim():
-    redis = FakeBatchRedis()
-    client = FlowClient(redis)
+    executor = FakeBatchExecutor()
+    client = FlowClient(executor)
 
     next_jobs = client.complete_flows_and_claim_flows(
         [ClaimedFlow("f1", b"lease-1", 7, partition_key="tenant:1")],
@@ -1845,8 +1954,8 @@ def test_complete_flows_and_claim_flows_batches_ack_then_next_claim():
             fencing_token=8,
         )
     ]
-    assert redis.calls == []
-    assert redis.batches == [
+    assert executor.calls == []
+    assert executor.batches == [
         [
             (
                 "FLOW.COMPLETE_MANY",
@@ -1889,8 +1998,8 @@ def test_complete_flows_and_claim_flows_batches_ack_then_next_claim():
 
 
 def test_submit_complete_flows_and_claim_flows_returns_independent_futures():
-    redis = FakeSubmitCommandsRedis()
-    client = FlowClient(redis)
+    executor = FakeSubmitCommandsExecutor()
+    client = FlowClient(executor)
 
     submitted = client.submit_complete_flows_and_claim_flows(
         [ClaimedFlow("f1", b"lease-1", 7, partition_key="tenant:1")],
@@ -1916,13 +2025,13 @@ def test_submit_complete_flows_and_claim_flows_returns_independent_futures():
             fencing_token=8,
         )
     ]
-    assert redis.submitted[0][0][0] == "FLOW.COMPLETE_MANY"
-    assert redis.submitted[0][1][0] == "FLOW.CLAIM_DUE"
+    assert executor.submitted[0][0][0] == "FLOW.COMPLETE_MANY"
+    assert executor.submitted[0][1][0] == "FLOW.CLAIM_DUE"
 
 
 def test_reclaim_exposes_claim_due_response_options_and_partitions():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     result = client.reclaim(
         "order",
@@ -1938,7 +2047,7 @@ def test_reclaim_exposes_claim_due_response_options_and_partitions():
     )
 
     assert isinstance(result[0], ClaimedFlow)
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.RECLAIM",
         "order",
         "WORKER",
@@ -1966,18 +2075,18 @@ def test_reclaim_exposes_claim_due_response_options_and_partitions():
 
 
 def test_reclaim_rejects_non_running_state_alias():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     with pytest.raises(ValueError, match=r"FLOW\.RECLAIM only supports running"):
         client.reclaim("order", state="queued", worker="worker-1")
 
-    assert redis.calls == []
+    assert executor.calls == []
 
 
 def test_flow_worker_runs_hot_path_with_minimal_developer_code():
-    redis = ClaimThenAckRedis()
-    client = FlowClient(redis)
+    executor = ClaimThenAckExecutor()
+    client = FlowClient(executor)
     seen = []
     worker = QueueFlowWorker(
         client,
@@ -1993,27 +2102,27 @@ def test_flow_worker_runs_hot_path_with_minimal_developer_code():
     assert seen == ["f1"]
     assert result.claimed == 1
     assert result.completed == 1
-    assert redis.calls[0][:3] == ("FLOW.CLAIM_DUE", "order", "STATE")
-    assert "RETURN" in redis.calls[0]
-    assert redis.calls[0][redis.calls[0].index("RETURN") + 1] == "JOBS_COMPACT_ATTRS"
-    assert redis.calls[1][0] == "FLOW.COMPLETE_MANY"
+    assert executor.calls[0][:3] == ("FLOW.CLAIM_DUE", "order", "STATE")
+    assert "RETURN" in executor.calls[0]
+    assert executor.calls[0][executor.calls[0].index("RETURN") + 1] == "JOBS_COMPACT_ATTRS"
+    assert executor.calls[1][0] == "FLOW.COMPLETE_MANY"
 
 
 def test_flow_worker_omitted_state_means_any_state():
-    redis = ClaimThenAckRedis()
-    client = FlowClient(redis)
+    executor = ClaimThenAckExecutor()
+    client = FlowClient(executor)
     worker = QueueFlowWorker(client, type="order", worker="worker-1")
 
     worker.run_once(lambda _job: None)
     worker.close()
 
-    assert "STATE" not in redis.calls[0]
-    assert redis.calls[0][0] == "FLOW.CLAIM_DUE"
+    assert "STATE" not in executor.calls[0]
+    assert executor.calls[0][0] == "FLOW.CLAIM_DUE"
 
 
 def test_flow_worker_supports_multi_state_claims():
-    redis = ClaimThenAckRedis()
-    client = FlowClient(redis)
+    executor = ClaimThenAckExecutor()
+    client = FlowClient(executor)
     worker = QueueFlowWorker(
         client,
         type="order",
@@ -2024,7 +2133,7 @@ def test_flow_worker_supports_multi_state_claims():
     worker.run_once(lambda _job: None)
     worker.close()
 
-    assert redis.calls[0][:6] == (
+    assert executor.calls[0][:6] == (
         "FLOW.CLAIM_DUE",
         "order",
         "STATE",
@@ -2035,8 +2144,8 @@ def test_flow_worker_supports_multi_state_claims():
 
 
 def test_flow_worker_can_claim_named_values_without_compact_return():
-    redis = ClaimThenAckRedis()
-    client = FlowClient(redis)
+    executor = ClaimThenAckExecutor()
+    client = FlowClient(executor)
     seen = []
     worker = QueueFlowWorker(
         client,
@@ -2053,7 +2162,7 @@ def test_flow_worker_can_claim_named_values_without_compact_return():
     assert seen == [b"order-bytes"]
     assert result.claimed == 1
     assert result.completed == 1
-    claim = redis.calls[0]
+    claim = executor.calls[0]
     assert "RETURN" not in claim
     assert claim[claim.index("VALUE") : claim.index("VALUE") + 2] == ("VALUE", "order")
     assert claim[claim.index("VALUE_MAX_BYTES") : claim.index("VALUE_MAX_BYTES") + 2] == (
@@ -2063,8 +2172,8 @@ def test_flow_worker_can_claim_named_values_without_compact_return():
 
 
 def test_json_codec_omits_none_optional_values_on_singular_writes():
-    redis = AckRedis()
-    client = FlowClient(redis, codec=JsonCodec())
+    executor = AckExecutor()
+    client = FlowClient(executor, codec=JsonCodec())
 
     client.create("create-none", type="order", now_ms=100, return_record=False)
     client.transition(
@@ -2098,15 +2207,15 @@ def test_json_codec_omits_none_optional_values_on_singular_writes():
         return_record=False,
     )
 
-    for call in redis.calls:
+    for call in executor.calls:
         assert "PAYLOAD" not in call
         assert "RESULT" not in call
         assert "ERROR" not in call
 
 
 def test_spawn_children_mixed_uses_one_mixed_marker():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.spawn_children(
         "parent-1",
@@ -2118,9 +2227,9 @@ def test_spawn_children_mixed_uses_one_mixed_marker():
         group_id="g1",
     )
 
-    assert redis.calls[0].count("MIXED") == 1
-    items_idx = redis.calls[0].index("ITEMS")
-    assert redis.calls[0][items_idx:] == (
+    assert executor.calls[0].count("MIXED") == 1
+    items_idx = executor.calls[0].index("ITEMS")
+    assert executor.calls[0][items_idx:] == (
         "ITEMS",
         "MIXED",
         "c1",
@@ -2135,8 +2244,8 @@ def test_spawn_children_mixed_uses_one_mixed_marker():
 
 
 def test_create_many_mixed_builds_items():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.create_many(
         None,
@@ -2149,7 +2258,7 @@ def test_create_many_mixed_builds_items():
         now_ms=100,
     )
 
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CREATE_MANY",
         "MIXED",
         "TYPE",
@@ -2171,8 +2280,8 @@ def test_create_many_mixed_builds_items():
 
 
 def test_create_many_mixed_allows_auto_partition_items():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.create_many(
         None,
@@ -2185,7 +2294,7 @@ def test_create_many_mixed_allows_auto_partition_items():
         now_ms=100,
     )
 
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CREATE_MANY",
         "MIXED",
         "TYPE",
@@ -2212,8 +2321,8 @@ def test_create_many_mixed_allows_auto_partition_items():
 
 
 def test_create_many_without_partition_uses_auto_wire_shape():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.create_many(
         None,
@@ -2227,7 +2336,7 @@ def test_create_many_without_partition_uses_auto_wire_shape():
         independent=True,
     )
 
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CREATE_MANY",
         "AUTO",
         "TYPE",
@@ -2249,8 +2358,8 @@ def test_create_many_without_partition_uses_auto_wire_shape():
 
 
 def test_create_many_can_attach_shared_attributes():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.create_many(
         "tenant:1",
@@ -2261,7 +2370,7 @@ def test_create_many_can_attach_shared_attributes():
         attributes={"tenant": "acme", "campaign": "spring"},
     )
 
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CREATE_MANY",
         "tenant:1",
         "TYPE",
@@ -2287,8 +2396,8 @@ def test_create_many_can_attach_shared_attributes():
 
 
 def test_create_many_reuses_identical_item_attributes_as_shared_attributes():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.create_many(
         "tenant:1",
@@ -2300,7 +2409,7 @@ def test_create_many_reuses_identical_item_attributes_as_shared_attributes():
         now_ms=100,
     )
 
-    call = redis.calls[0]
+    call = executor.calls[0]
     assert call[call.index("ATTRIBUTE") : call.index("ATTRIBUTE") + 3] == (
         "ATTRIBUTE",
         "tenant",
@@ -2309,8 +2418,8 @@ def test_create_many_reuses_identical_item_attributes_as_shared_attributes():
 
 
 def test_create_many_rejects_mixed_item_attributes_instead_of_dropping_them():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     with pytest.raises(ValueError, match="shared attributes"):
         client.create_many(
@@ -2323,12 +2432,12 @@ def test_create_many_rejects_mixed_item_attributes_instead_of_dropping_them():
             now_ms=100,
         )
 
-    assert redis.calls == []
+    assert executor.calls == []
 
 
 def test_create_many_uses_extended_items_for_per_item_named_values():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.create_many(
         None,
@@ -2342,7 +2451,7 @@ def test_create_many_uses_extended_items_for_per_item_named_values():
         values={"shared": b"shared-bytes"},
     )
 
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.CREATE_MANY",
         "MIXED",
         "TYPE",
@@ -2377,8 +2486,8 @@ def test_create_many_uses_extended_items_for_per_item_named_values():
 
 
 def test_spawn_children_uses_extended_items_for_per_child_named_values():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.spawn_children(
         "parent-1",
@@ -2394,7 +2503,7 @@ def test_spawn_children_uses_extended_items_for_per_child_named_values():
         now_ms=100,
     )
 
-    assert redis.calls[0] == (
+    assert executor.calls[0] == (
         "FLOW.SPAWN_CHILDREN",
         "parent-1",
         "GROUP",
@@ -2431,8 +2540,8 @@ def test_spawn_children_uses_extended_items_for_per_child_named_values():
 
 
 def test_spawn_children_exposes_parent_guards_and_child_policies():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.spawn_children(
         "parent-1",
@@ -2447,7 +2556,7 @@ def test_spawn_children_exposes_parent_guards_and_child_policies():
         failure="failed",
     )
 
-    call = redis.calls[0]
+    call = executor.calls[0]
     assert call[call.index("FROM_STATE") + 1] == "running"
     assert call[call.index("WAIT_STATE") + 1] == "waiting_children"
     assert call[call.index("ON_CHILD_FAILED") + 1] == "ignore"
@@ -2457,8 +2566,8 @@ def test_spawn_children_exposes_parent_guards_and_child_policies():
 
 
 def test_create_many_allows_ok_response():
-    redis = AckRedis()
-    client = FlowClient(redis)
+    executor = AckExecutor()
+    client = FlowClient(executor)
 
     result = client.create_many(
         None,
@@ -2472,8 +2581,8 @@ def test_create_many_allows_ok_response():
 
 
 def test_many_commands_reject_items_from_different_explicit_partition():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     with pytest.raises(ValueError, match="partition_key"):
         client.create_many("p1", [CreateItem("f1", b"p", partition_key="p2")], type="order")
@@ -2484,12 +2593,12 @@ def test_many_commands_reject_items_from_different_explicit_partition():
     with pytest.raises(ValueError, match="partition_key"):
         client.cancel_many("p1", [FencedItem("f1", 3, partition_key="p2")])
 
-    assert redis.calls == []
+    assert executor.calls == []
 
 
 def test_many_commands_support_independent_option():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
     claimed = ClaimedFlow("f1", b"lease", 3, partition_key="p1")
     fenced = FencedItem("f1", 4, b"lease", partition_key="p1")
 
@@ -2500,12 +2609,12 @@ def test_many_commands_support_independent_option():
         now_ms=100,
         independent=True,
     )
-    assert "INDEPENDENT" in redis.calls[-1]
-    assert redis.calls[-1][redis.calls[-1].index("INDEPENDENT") + 1] == "true"
+    assert "INDEPENDENT" in executor.calls[-1]
+    assert executor.calls[-1][executor.calls[-1].index("INDEPENDENT") + 1] == "true"
 
     client.complete_many(None, [claimed], result=b"ok", now_ms=101, independent=True)
-    assert "INDEPENDENT" in redis.calls[-1]
-    assert redis.calls[-1][redis.calls[-1].index("INDEPENDENT") + 1] == "true"
+    assert "INDEPENDENT" in executor.calls[-1]
+    assert executor.calls[-1][executor.calls[-1].index("INDEPENDENT") + 1] == "true"
 
     client.transition_many(
         None,
@@ -2515,25 +2624,25 @@ def test_many_commands_support_independent_option():
         now_ms=102,
         independent=True,
     )
-    assert "INDEPENDENT" in redis.calls[-1]
-    assert redis.calls[-1][redis.calls[-1].index("INDEPENDENT") + 1] == "true"
+    assert "INDEPENDENT" in executor.calls[-1]
+    assert executor.calls[-1][executor.calls[-1].index("INDEPENDENT") + 1] == "true"
 
     client.retry_many(None, [claimed], error=b"err", now_ms=103, independent=True)
-    assert "INDEPENDENT" in redis.calls[-1]
-    assert redis.calls[-1][redis.calls[-1].index("INDEPENDENT") + 1] == "true"
+    assert "INDEPENDENT" in executor.calls[-1]
+    assert executor.calls[-1][executor.calls[-1].index("INDEPENDENT") + 1] == "true"
 
     client.fail_many(None, [claimed], error=b"err", now_ms=104, independent=True)
-    assert "INDEPENDENT" in redis.calls[-1]
-    assert redis.calls[-1][redis.calls[-1].index("INDEPENDENT") + 1] == "true"
+    assert "INDEPENDENT" in executor.calls[-1]
+    assert executor.calls[-1][executor.calls[-1].index("INDEPENDENT") + 1] == "true"
 
     client.cancel_many(None, [fenced], reason=b"stop", now_ms=105, independent=True)
-    assert "INDEPENDENT" in redis.calls[-1]
-    assert redis.calls[-1][redis.calls[-1].index("INDEPENDENT") + 1] == "true"
+    assert "INDEPENDENT" in executor.calls[-1]
+    assert executor.calls[-1][executor.calls[-1].index("INDEPENDENT") + 1] == "true"
 
 
 def test_autobatch_create_uses_create_many_independent_for_ack_calls():
-    redis = PerItemAckRedis()
-    client = FlowClient(redis).autobatch(max_batch=10, max_delay_ms=5)
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor).autobatch(max_batch=10, max_delay_ms=5)
     results = [None, None, None]
 
     threads = [
@@ -2557,14 +2666,14 @@ def test_autobatch_create_uses_create_many_independent_for_ack_calls():
     client.close()
 
     assert results == [b"OK", b"OK", b"OK"]
-    assert redis.calls[0][0] == "FLOW.CREATE_MANY"
-    assert redis.calls[0][1] == "MIXED"
-    assert "INDEPENDENT" in redis.calls[0]
+    assert executor.calls[0][0] == "FLOW.CREATE_MANY"
+    assert executor.calls[0][1] == "MIXED"
+    assert "INDEPENDENT" in executor.calls[0]
 
 
 def test_autobatch_close_timeout_does_not_hang():
-    redis = BlockingRedis()
-    client = FlowClient(redis).autobatch(max_batch=10, max_delay_ms=0)
+    executor = BlockingExecutor()
+    client = FlowClient(executor).autobatch(max_batch=10, max_delay_ms=0)
 
     future = client.create_async(
         "f1",
@@ -2573,19 +2682,19 @@ def test_autobatch_close_timeout_does_not_hang():
         partition_key="p1",
         return_record=False,
     )
-    assert redis.entered.wait(1)
+    assert executor.entered.wait(1)
 
     with pytest.raises(TimeoutError):
         client.close(timeout=0.01)
 
-    redis.release.set()
+    executor.release.set()
     assert future.result(timeout=1) == b"OK"
     client.close(timeout=1)
 
 
 def test_autobatch_complete_uses_complete_many_independent_for_ack_calls():
-    redis = PerItemAckRedis()
-    client = FlowClient(redis).autobatch(max_batch=10, max_delay_ms=5)
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor).autobatch(max_batch=10, max_delay_ms=5)
     results = [None, None, None]
 
     threads = [
@@ -2611,14 +2720,14 @@ def test_autobatch_complete_uses_complete_many_independent_for_ack_calls():
     client.close()
 
     assert results == [b"OK", b"OK", b"OK"]
-    assert redis.calls[0][0] == "FLOW.COMPLETE_MANY"
-    assert redis.calls[0][1] == "MIXED"
-    assert "INDEPENDENT" in redis.calls[0]
+    assert executor.calls[0][0] == "FLOW.COMPLETE_MANY"
+    assert executor.calls[0][1] == "MIXED"
+    assert "INDEPENDENT" in executor.calls[0]
 
 
 def test_autobatch_create_preserves_per_item_named_values():
-    redis = PerItemAckRedis()
-    client = FlowClient(redis).autobatch(max_batch=10, max_delay_ms=5)
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor).autobatch(max_batch=10, max_delay_ms=5)
     results = [None, None]
 
     threads = [
@@ -2644,7 +2753,7 @@ def test_autobatch_create_preserves_per_item_named_values():
     client.close()
 
     assert results == [b"OK", b"OK"]
-    call = redis.calls[0]
+    call = executor.calls[0]
     assert call[0] == "FLOW.CREATE_MANY"
     assert "ITEMS_EXT" in call
     assert b"o0" in call
@@ -2654,8 +2763,8 @@ def test_autobatch_create_preserves_per_item_named_values():
 
 
 def test_autobatch_terminal_mutations_preserve_named_values():
-    redis = PerItemAckRedis()
-    client = FlowClient(redis).autobatch(max_batch=10, max_delay_ms=5)
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor).autobatch(max_batch=10, max_delay_ms=5)
     results = [None, None]
 
     threads = [
@@ -2685,7 +2794,7 @@ def test_autobatch_terminal_mutations_preserve_named_values():
     client.close()
 
     assert results == [b"OK", b"OK"]
-    call = redis.calls[0]
+    call = executor.calls[0]
     assert call[0] == "FLOW.COMPLETE_MANY"
     assert call[call.index("VALUE") : call.index("VALUE") + 3] == (
         "VALUE",
@@ -2708,8 +2817,8 @@ def test_autobatch_terminal_mutations_preserve_named_values():
 
 
 def test_autobatch_falls_back_only_when_record_response_is_required():
-    redis = FakeRedis()
-    client = FlowClient(redis).autobatch(max_batch=10, max_delay_ms=5)
+    executor = FakeExecutor()
+    client = FlowClient(executor).autobatch(max_batch=10, max_delay_ms=5)
 
     record = client.create("f1", type="order", return_record=True)
     ack = client.create("f2", type="order", return_record=False)
@@ -2717,14 +2826,14 @@ def test_autobatch_falls_back_only_when_record_response_is_required():
 
     assert record.id == "f1"
     assert isinstance(ack, FlowRecord)
-    assert redis.calls[0][0] == "FLOW.CREATE"
-    assert redis.calls[1][0] == "FLOW.CREATE_MANY"
-    assert redis.calls[1][1].startswith("__flow_auto__:")
+    assert executor.calls[0][0] == "FLOW.CREATE"
+    assert executor.calls[1][0] == "FLOW.CREATE_MANY"
+    assert executor.calls[1][1].startswith("__flow_auto__:")
 
 
 def test_complete_many_allows_ok_response():
-    redis = AckRedis()
-    client = FlowClient(redis)
+    executor = AckExecutor()
+    client = FlowClient(executor)
     item = ClaimedFlow("f1", b"lease", 3, partition_key="p1")
 
     result = client.complete_many(None, [item], result=b"ok", now_ms=100)
@@ -2733,12 +2842,12 @@ def test_complete_many_allows_ok_response():
 
 
 def test_many_mutations_put_options_before_items():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
     item = ClaimedFlow("f1", b"lease", 3, partition_key="p1")
 
     client.complete_many(None, [item], result=b"ok", now_ms=100)
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.COMPLETE_MANY",
         "MIXED",
         "RESULT",
@@ -2753,7 +2862,7 @@ def test_many_mutations_put_options_before_items():
     )
 
     client.retry_many("p1", [ClaimedFlow("f1", b"lease", 3)], error=b"err", now_ms=101)
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.RETRY_MANY",
         "p1",
         "ERROR",
@@ -2767,7 +2876,7 @@ def test_many_mutations_put_options_before_items():
     )
 
     client.fail_many("p1", [ClaimedFlow("f1", b"lease", 3)], error=b"err", now_ms=102)
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.FAIL_MANY",
         "p1",
         "ERROR",
@@ -2782,8 +2891,8 @@ def test_many_mutations_put_options_before_items():
 
 
 def test_transition_and_cancel_many_wire_shapes():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.transition_many(
         None,
@@ -2792,7 +2901,7 @@ def test_transition_and_cancel_many_wire_shapes():
         items=[FencedItem("f1", 4, b"lease", partition_key="p1")],
         now_ms=100,
     )
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.TRANSITION_MANY",
         "MIXED",
         "a",
@@ -2807,7 +2916,7 @@ def test_transition_and_cancel_many_wire_shapes():
     )
 
     client.cancel_many("p1", [FencedItem("f1", 4)], reason=b"stop", now_ms=101)
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.CANCEL_MANY",
         "p1",
         "REASON",
@@ -2821,21 +2930,21 @@ def test_transition_and_cancel_many_wire_shapes():
 
 
 def test_single_extra_mutation_commands():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.extend_lease(
         "f1", b"lease", fencing_token=3, lease_ms=10_000, partition_key="p1", now_ms=100
     )
-    assert redis.calls[-1][0] == "FLOW.EXTEND_LEASE"
+    assert executor.calls[-1][0] == "FLOW.EXTEND_LEASE"
 
     client.cancel(
         "f1", fencing_token=3, lease_token=b"lease", partition_key="p1", reason=b"stop", now_ms=101
     )
-    assert redis.calls[-1][0] == "FLOW.CANCEL"
+    assert executor.calls[-1][0] == "FLOW.CANCEL"
 
     client.rewind("f1", to_event="e1", partition_key="p1", expect_state="failed", now_ms=102)
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.REWIND",
         "f1",
         "TO_EVENT",
@@ -2849,18 +2958,18 @@ def test_single_extra_mutation_commands():
     )
 
     client.value_put(b"value", partition_key="p1", owner_flow_id="f1", ttl_ms=1_000, now_ms=103)
-    assert redis.calls[-1][0] == "FLOW.VALUE.PUT"
+    assert executor.calls[-1][0] == "FLOW.VALUE.PUT"
 
 
 def test_query_policy_and_cleanup_commands():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     assert client.list("order", state="queued", count=10)[0].id == "f1"
-    assert redis.calls[-1] == ("FLOW.LIST", "order", "STATE", "queued", "COUNT", 10)
+    assert executor.calls[-1] == ("FLOW.LIST", "order", "STATE", "queued", "COUNT", 10)
 
     assert client.terminals("order", state="completed", rev=True, count=5)[0].id == "f1"
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.TERMINALS",
         "order",
         "COUNT",
@@ -2872,10 +2981,10 @@ def test_query_policy_and_cleanup_commands():
     )
 
     assert client.failures("order", from_ms=10, to_ms=20)[0].id == "f1"
-    assert redis.calls[-1] == ("FLOW.FAILURES", "order", "FROM_MS", 10, "TO_MS", 20)
+    assert executor.calls[-1] == ("FLOW.FAILURES", "order", "FROM_MS", 10, "TO_MS", 20)
 
     assert client.stats("order", state="queued", attributes={"tenant": "acme"})["count"] == 1
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.STATS",
         "order",
         "STATE",
@@ -2886,7 +2995,7 @@ def test_query_policy_and_cleanup_commands():
     )
 
     assert client.by_parent("p", count=1, terminal_only=True)[0].id == "f1"
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.BY_PARENT",
         "p",
         "COUNT",
@@ -2903,7 +3012,7 @@ def test_query_policy_and_cleanup_commands():
 
 
 def test_protocol_ferricstore_commands_are_first_class():
-    class ProtocolRedis(FakeRedis):
+    class ProtocolExecutor(FakeExecutor):
         def execute_command(self, *args):
             self.calls.append(args)
             command = args[0]
@@ -2951,14 +3060,14 @@ def test_protocol_ferricstore_commands_are_first_class():
                 return [b"ops", b"10", b"latency_ms", b"2"]
             return b"OK"
 
-    redis = ProtocolRedis()
-    client = FlowClient(redis)
+    executor = ProtocolExecutor()
+    client = FlowClient(executor)
 
     assert client.cas("k", b"old", b"new", ex=10) is True
-    assert redis.calls[-1] == ("CAS", "k", b"old", b"new", "EX", 10)
+    assert executor.calls[-1] == ("CAS", "k", b"old", b"new", "EX", 10)
 
     assert client.lock("lock:k", "owner", 1_000) is True
-    assert redis.calls[-1] == ("LOCK", "lock:k", "owner", 1_000)
+    assert executor.calls[-1] == ("LOCK", "lock:k", "owner", 1_000)
     assert client.unlock("lock:k", "owner") == 1
     assert client.extend_lock("lock:k", "owner", 2_000) == 1
 
@@ -2966,7 +3075,7 @@ def test_protocol_ferricstore_commands_are_first_class():
     assert isinstance(rate, RateLimitResult)
     assert rate.allowed is True
     assert rate.count == 3
-    assert redis.calls[-1] == ("RATELIMIT.ADD", "rl:k", 1000, 10, 3)
+    assert executor.calls[-1] == ("RATELIMIT.ADD", "rl:k", 1000, 10, 3)
 
     info = client.key_info("k")
     assert isinstance(info, KeyInfo)
@@ -2977,10 +3086,10 @@ def test_protocol_ferricstore_commands_are_first_class():
     computed = client.fetch_or_compute("foc:k", ttl_ms=5_000, hint="expensive")
     assert computed.hit is True
     assert computed.value == b"value"
-    assert redis.calls[-1] == ("FETCH_OR_COMPUTE", "foc:k", 5000, "expensive")
+    assert executor.calls[-1] == ("FETCH_OR_COMPUTE", "foc:k", 5000, "expensive")
 
     assert client.fetch_or_compute_result("foc:k", b"value", ttl_ms=5_000) is True
-    assert redis.calls[-1] == ("FETCH_OR_COMPUTE_RESULT", "foc:k", b"value", 5000)
+    assert executor.calls[-1] == ("FETCH_OR_COMPUTE_RESULT", "foc:k", b"value", 5000)
     assert client.fetch_or_compute_error("foc:k", "failed") is True
 
     assert client.cluster_keyslot("k") == 42
@@ -2988,75 +3097,65 @@ def test_protocol_ferricstore_commands_are_first_class():
     assert client.cluster_stats()["total_keys"] == 12
     assert client.cluster_status()["promotion_epoch"] == 3
     assert client.cluster_join("node@127.0.0.1", replace=True) is True
-    assert redis.calls[-1] == ("CLUSTER.JOIN", "node@127.0.0.1", "REPLACE")
+    assert executor.calls[-1] == ("CLUSTER.JOIN", "node@127.0.0.1", "REPLACE")
 
     client.ferricstore_config("GET", "max_memory")
-    assert redis.calls[-1] == ("FERRICSTORE.CONFIG", "GET", "max_memory")
+    assert executor.calls[-1] == ("FERRICSTORE.CONFIG", "GET", "max_memory")
     assert client.ferricstore_metrics()["ops"] == b"10"
 
 
-def test_command_passes_through_normal_redis_commands():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+def test_command_passes_through_data_structure_commands():
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     assert client.command("SET", "k", "v")[b"id"] == b"f1"
-    assert redis.calls[-1] == ("SET", "k", "v")
+    assert executor.calls[-1] == ("SET", "k", "v")
 
 
 def test_command_pipeline_batches_mixed_commands_with_sequential_fallback():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     pipe = client.pipeline()
     result = pipe.command("SET", "k", "v").command("FLOW.CREATE", "f1", "TYPE", "order").execute()
 
     assert len(result) == 2
-    assert redis.calls[0] == ("SET", "k", "v")
-    assert redis.calls[1] == ("FLOW.CREATE", "f1", "TYPE", "order")
+    assert executor.calls[0] == ("SET", "k", "v")
+    assert executor.calls[1] == ("FLOW.CREATE", "f1", "TYPE", "order")
 
 
 def test_command_pipeline_context_executes_on_success():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     with client.pipeline() as pipe:
         pipe.command("GET", "k")
         pipe.command("HSET", "h", "f", "v")
 
     assert pipe.results is not None
-    assert redis.calls[-2:] == [("GET", "k"), ("HSET", "h", "f", "v")]
+    assert executor.calls[-2:] == [("GET", "k"), ("HSET", "h", "f", "v")]
 
 
-def test_command_pipeline_maps_protocol_redis_pipeline_errors():
-    class ErrorPipe:
-        def execute_command(self, *args):
-            return self
-
-        def execute(self):
-            raise RuntimeError("ERR flow already exists")
-
-    class ProtocolRedis:
-        def pipeline(self, transaction=False):
-            return ErrorPipe()
-
-    class RedisExecutor:
-        client = ProtocolRedis()
-
+def test_command_pipeline_maps_native_execute_batch_errors():
+    class BatchExecutor:
         def execute_command(self, *args):
             return b"OK"
 
-    client = FlowClient(RedisExecutor())
+        def execute_batch(self, commands):
+            raise RuntimeError("ERR flow already exists")
+
+    client = FlowClient(BatchExecutor())
 
     with pytest.raises(FlowAlreadyExistsError):
         client.pipeline().command("FLOW.CREATE", "f1").execute()
 
 
 def test_server_errors_are_typed():
-    class ErrorRedis:
+    class ErrorExecutor:
         def execute_command(self, *args):
             raise RuntimeError("ERR flow already exists")
 
-    client = FlowClient(ErrorRedis())
+    client = FlowClient(ErrorExecutor())
 
     with pytest.raises(FlowAlreadyExistsError) as exc:
         client.command("FLOW.CREATE", "f1")
@@ -3065,11 +3164,11 @@ def test_server_errors_are_typed():
 
 
 def test_stale_lease_errors_are_typed():
-    class ErrorRedis:
+    class ErrorExecutor:
         def execute_command(self, *args):
             raise RuntimeError("ERR stale flow lease")
 
-    client = FlowClient(ErrorRedis())
+    client = FlowClient(ErrorExecutor())
 
     with pytest.raises(StaleLeaseError):
         client.complete("f1", lease_token=b"old", fencing_token=1, return_record=False)
@@ -3105,8 +3204,8 @@ def test_claimed_item_compact_rows_fallback_to_resp_maps():
 
 
 def test_install_policy_still_builds_state_policy():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     client.install_policy(
         "order",
@@ -3122,20 +3221,20 @@ def test_install_policy_still_builds_state_policy():
         },
     )
 
-    assert redis.calls[-1][:4] == ("FLOW.POLICY.SET", "order", "STATE", "queued")
+    assert executor.calls[-1][:4] == ("FLOW.POLICY.SET", "order", "STATE", "queued")
 
 
 def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
-    redis = FakeRedis()
-    client = FlowClient(redis)
+    executor = FakeExecutor()
+    client = FlowClient(executor)
 
     assert client.attributes("order", state="queued", count=10) == [{"name": "tenant", "count": 3}]
-    assert redis.calls[-1] == ("FLOW.ATTRIBUTES", "order", "STATE", "queued", "COUNT", 10)
+    assert executor.calls[-1] == ("FLOW.ATTRIBUTES", "order", "STATE", "queued", "COUNT", 10)
 
     assert client.attribute_values("order", "tenant", state="queued") == [
         {"value": "acme", "count": 2}
     ]
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.ATTRIBUTE_VALUES",
         "order",
         "tenant",
@@ -3153,7 +3252,7 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     assert isinstance(schedule, ScheduleResult)
     assert schedule.status == "active"
     assert schedule["status"] == "active"
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.SCHEDULE.CREATE",
         "daily-report",
         "TIMEZONE",
@@ -3169,18 +3268,18 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     due = client.schedule_fire_due(block_ms=1000, limit=50)
     assert isinstance(due, ScheduleResult)
     assert due["status"] == "active"
-    assert redis.calls[-1] == ("FLOW.SCHEDULE.FIRE_DUE", "BLOCK", 1000, "LIMIT", 50)
+    assert executor.calls[-1] == ("FLOW.SCHEDULE.FIRE_DUE", "BLOCK", 1000, "LIMIT", 50)
     schedules = client.schedule_list(target_type="flow")
     assert isinstance(schedules[0], ScheduleResult)
     assert schedules[0]["status"] == "active"
-    assert redis.calls[-1] == ("FLOW.SCHEDULE.LIST", "TARGET_TYPE", "flow")
+    assert executor.calls[-1] == ("FLOW.SCHEDULE.LIST", "TARGET_TYPE", "flow")
 
-    redis.responses.append("OK")
+    executor.responses.append("OK")
     deleted = client.schedule_delete("daily-report", now_ms=200)
     assert isinstance(deleted, ScheduleResult)
     assert deleted.id == "daily-report"
     assert deleted.status == "deleted"
-    assert redis.calls[-1] == ("FLOW.SCHEDULE.DELETE", "daily-report", "NOW", 200)
+    assert executor.calls[-1] == ("FLOW.SCHEDULE.DELETE", "daily-report", "NOW", 200)
 
     effect = client.effect_reserve(
         "flow-1",
@@ -3196,7 +3295,7 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     assert isinstance(effect, EffectResult)
     assert effect.status == "active"
     assert effect["status"] == "active"
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.EFFECT.RESERVE",
         "flow-1",
         "EFFECT_KEY",
@@ -3225,7 +3324,7 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     )
     assert isinstance(effect, EffectResult)
     assert effect["status"] == "active"
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.EFFECT.CONFIRM",
         "flow-1",
         "EFFECT_KEY",
@@ -3245,7 +3344,7 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     )
     assert isinstance(effect, EffectResult)
     assert effect["status"] == "active"
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.EFFECT.FAIL",
         "flow-1",
         "EFFECT_KEY",
@@ -3268,7 +3367,7 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     )
     assert isinstance(effect, EffectResult)
     assert effect["status"] == "active"
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.EFFECT.COMPENSATE",
         "flow-1",
         "EFFECT_KEY",
@@ -3298,7 +3397,7 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     assert isinstance(approval, ApprovalResult)
     assert approval.status == "active"
     assert approval["status"] == "active"
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.APPROVAL.REQUEST",
         "approval-1",
         "FLOW_ID",
@@ -3324,7 +3423,7 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     approval = client.approval_approve("approval-1", approver="admin", reason="ok")
     assert isinstance(approval, ApprovalResult)
     assert approval["status"] == "active"
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.APPROVAL.APPROVE",
         "approval-1",
         "APPROVER",
@@ -3335,7 +3434,7 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
 
     ledger = client.governance_ledger("flow-1", partition_key="tenant-a", rev=True, limit=5)
     assert ledger[0]["status"] == "active"
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.GOVERNANCE.LEDGER",
         "flow-1",
         "PARTITION",
@@ -3350,7 +3449,7 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     assert isinstance(circuit, CircuitBreakerStatus)
     assert circuit.status == "active"
     assert circuit["status"] == "active"
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.CIRCUIT.OPEN",
         "email",
         "OPEN_MS",
@@ -3365,7 +3464,7 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     assert budget.scope == "tenant-a"
     assert budget.reservation_id == "budget-res-1"
     assert budget["remaining"] == 93
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.BUDGET.RESERVE",
         "tenant-a",
         "AMOUNT",
@@ -3381,7 +3480,7 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     overview = client.governance_overview(scope="tenant-a", status="pending", flow_id="flow-1")
     assert isinstance(overview, GovernanceOverview)
     assert overview["status"] == "active"
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.GOVERNANCE.OVERVIEW",
         "SCOPE",
         "tenant-a",
@@ -3394,7 +3493,7 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     committed = client.budget_commit("tenant-a", "budget-res-1", 7, usage={"tokens": 7})
     assert committed.status == "committed"
     assert committed.usage == {"tokens": 7}
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.BUDGET.COMMIT",
         "tenant-a",
         "RESERVATION_ID",
@@ -3407,7 +3506,7 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
 
     released = client.budget_release("tenant-a", "budget-res-unused")
     assert released.get("reserved_amount") == 10
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.BUDGET.RELEASE",
         "tenant-a",
         "RESERVATION_ID",
@@ -3415,7 +3514,7 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     )
 
     client.limit_lease("tenant-a", shard_id=1, amount=5, ttl_ms=1000, limit=10)
-    assert redis.calls[-1] == (
+    assert executor.calls[-1] == (
         "FLOW.LIMIT.LEASE",
         "tenant-a",
         "SHARD_ID",

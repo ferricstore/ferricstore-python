@@ -135,7 +135,7 @@ Support matrix:
 | `workers` | No | No | Yes | Yes |
 | `concurrency` | Yes | No | Yes | Yes |
 | `command_connections` | Advanced | Advanced | Advanced | Advanced |
-| `claim_connections` | RESP claim pool | RESP claim pool | RESP claim pool | RESP claim pool |
+| `claim_connections` | Advanced native claim pool | Advanced native claim pool | Advanced native claim pool | Advanced native claim pool |
 | `batch_size` | Yes | Yes | Yes | Yes |
 | `lease_ms` | Yes | State-level for workflow handlers | No | No |
 | `priority` | Yes | Yes | No | Yes |
@@ -233,21 +233,7 @@ client = QueueClient.from_url(
 )
 ```
 
-For `redis://` / `rediss://`, high-level `from_url(...)` methods pass unknown
-keyword arguments to `redis-py`:
-
-```python
-client = QueueClient.from_url(
-    "rediss://app_user:secret@ferricstore.service:6380/0",
-    socket_connect_timeout=2,
-    socket_timeout=10,
-    health_check_interval=30,
-    max_connections=128,
-)
-```
-
-This supports normal Redis URL auth, ACL username/password, TLS, Sentinel/proxy
-options, and pool settings supported by `redis-py`.
+Unknown `from_url(...)` keyword arguments are passed to the native protocol adapter. Keep production services explicit about `timeout`, `max_connections`, and `lanes`.
 
 ## Recommended production default
 

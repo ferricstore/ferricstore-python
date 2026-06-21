@@ -33,20 +33,11 @@ def _client() -> FlowClient:
 
 
 def _integration_url() -> str:
-    return os.environ.get("FERRICSTORE_URL", "redis://127.0.0.1:6379/0")
-
-
-def _uses_protocol_transport() -> bool:
-    return _integration_url().startswith("ferric://")
-
-
-def _skip_protocol_transport(reason: str) -> None:
-    if _uses_protocol_transport():
-        pytest.skip(reason)
+    return os.environ.get("FERRICSTORE_URL", "ferric://127.0.0.1:6388")
 
 
 def _require_protocol_transport() -> None:
-    if not _uses_protocol_transport():
+    if not _integration_url().startswith(("ferric://", "ferrics://")):
         pytest.skip("native protocol coverage runs with FERRICSTORE_URL=ferric://...")
 
 
@@ -204,7 +195,7 @@ def test_real_ferricstore_command_and_flow_cycle() -> None:
 
 
 def test_real_ferricstore_protocol_helpers_and_diagnostics() -> None:
-    _skip_protocol_transport("generic RESP diagnostics are covered by redis:// integration")
+    _require_protocol_transport()
 
     client = _client()
     suffix = _suffix()
@@ -268,7 +259,7 @@ def test_real_ferricstore_protocol_helpers_and_diagnostics() -> None:
 
 
 def test_real_ferricstore_raw_store_command_families() -> None:
-    _skip_protocol_transport("raw RESP command families are covered by redis:// integration")
+    _require_protocol_transport()
 
     client = _client()
     suffix = _suffix()
@@ -969,8 +960,7 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
         )
         value_ref = _field(value_response, "ref")
         assert value_ref is not None
-        if _uses_protocol_transport():
-            assert client.value_mget([value_ref]) == [{"shared": True}]
+        assert client.value_mget([value_ref]) == [{"shared": True}]
 
         signal_id = f"py-sdk:signal:{suffix}"
         signal_partition = f"{signal_id}:partition"

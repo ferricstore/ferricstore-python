@@ -82,7 +82,6 @@ Check:
 
 - use `AsyncQueueClient` / `AsyncWorkflowClient`, not sync clients
 - set enough `max_connections`
-- install `hiredis`
 - use `enqueue_many` for bursts
 - bound downstream concurrency with semaphores
 

@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any, cast
 from urllib.parse import urlparse
 
-from ferricstore.adapters import AsyncRedisAdapter, AsyncRedisCommandExecutor
+from ferricstore.adapters import AsyncCommandExecutor
 from ferricstore.backpressure import BackpressureController, BackpressurePolicy
 from ferricstore.client import (
     FlowClient,
@@ -33,8 +33,8 @@ from ferricstore.client import (
     _shared_create_many_attributes,
 )
 from ferricstore.codecs import Codec, RawCodec
+from ferricstore.commands import AsyncDataCommandsMixin
 from ferricstore.errors import OverloadedError, map_exception
-from ferricstore.redis_commands import AsyncRedisCommandsMixin
 from ferricstore.types import (
     ApprovalResult,
     BudgetResult,
@@ -57,7 +57,7 @@ from ferricstore.types import (
 
 
 class _AsyncErrorMappingExecutor:
-    def __init__(self, executor: AsyncRedisCommandExecutor) -> None:
+    def __init__(self, executor: AsyncCommandExecutor) -> None:
         self._executor = executor
 
     async def execute_command(self, *args: Any) -> Any:
@@ -77,7 +77,7 @@ class _AsyncErrorMappingExecutor:
 
 
 class AsyncCommandPipeline:
-    """Async mixed-command pipeline over `redis.asyncio` when available."""
+    """Async mixed-command pipeline over the configured FerricStore executor."""
 
     def __init__(self, client: AsyncFlowClient) -> None:
         self.client = client
@@ -97,15 +97,13 @@ class AsyncCommandPipeline:
 
     async def execute(self) -> builtins.list[Any]:
         raw_executor = getattr(self.client.executor, "_executor", self.client.executor)
-        redis_client = getattr(raw_executor, "client", None)
-        pipeline_factory = getattr(redis_client, "pipeline", None)
-
-        if callable(pipeline_factory):
-            pipe = pipeline_factory(transaction=False)
-            for command in self.commands:
-                pipe.execute_command(*command)
+        execute_batch = getattr(raw_executor, "execute_batch", None)
+        if callable(execute_batch):
             try:
-                self.results = list(await pipe.execute())
+                result = execute_batch(self.commands)
+                if inspect.isawaitable(result):
+                    result = await result
+                self.results = list(result)
             except Exception as exc:
                 mapped = map_exception(exc)
                 if mapped is exc:
@@ -192,12 +190,12 @@ class AsyncTransactionSession:
         return await self.client.discard()
 
 
-class AsyncFlowClient(AsyncRedisCommandsMixin):
-    """True async FerricFlow client over `redis.asyncio` or any async executor."""
+class AsyncFlowClient(AsyncDataCommandsMixin):
+    """True async FerricFlow client over the FerricStore native protocol."""
 
     def __init__(
         self,
-        executor: AsyncRedisCommandExecutor,
+        executor: AsyncCommandExecutor,
         *,
         codec: Codec | None = None,
         backpressure: BackpressurePolicy | None = None,
@@ -221,16 +219,13 @@ class AsyncFlowClient(AsyncRedisCommandsMixin):
         backpressure: BackpressurePolicy | None = None,
         **kwargs: Any,
     ) -> AsyncFlowClient:
-        if urlparse(url).scheme.lower() in {"ferric", "ferrics"}:
-            from ferricstore.protocol import AsyncProtocolAdapterPool
+        if urlparse(url).scheme.lower() not in {"ferric", "ferrics"}:
+            raise ValueError("FerricStore SDK URLs must use ferric:// or ferrics://")
 
-            return cls(
-                AsyncProtocolAdapterPool.from_url(url, **kwargs),
-                codec=codec,
-                backpressure=backpressure,
-            )
+        from ferricstore.protocol import AsyncProtocolAdapterPool
+
         return cls(
-            AsyncRedisAdapter.from_url(url, **kwargs),
+            AsyncProtocolAdapterPool.from_url(url, **kwargs),
             codec=codec,
             backpressure=backpressure,
         )

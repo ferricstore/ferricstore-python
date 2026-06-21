@@ -66,15 +66,8 @@ Guidance:
 | Async client | One async client per event loop is the simple safe default. |
 | Sync client | One client per process/service component is usually enough; use multiple clients for isolated pools. |
 
-RESP/Redis URLs are still supported for compatibility. If you use
-`redis://` / `rediss://`, keep RESP3 and raw byte responses:
-
-```python
-redis.Redis.from_url(url, protocol=3, decode_responses=False)
-```
-
-For RESP URLs, pass normal `redis-py` TLS, auth, ACL, Sentinel/proxy, and pool
-options through `from_url(...)`.
+The SDK URL transport is native-only. Use `ferric://` or `ferrics://`; tune
+`max_connections` and `lanes` only after measuring.
 
 Connection sizing defaults:
 
@@ -82,7 +75,6 @@ Connection sizing defaults:
 | --- | --- |
 | Protocol queue/workflow workers | Leave `command_connections` / `claim_connections` unset. Claim traffic reuses the same multiplexed connection. |
 | Protocol high-throughput services | Try `max_connections=2` or higher `lanes` only after measuring. |
-| RESP queue workers | Size Redis pools for concurrent producers, workers, and async completion depth. |
 | Web/API producers | Bound local concurrency and retries; do not create a client per request. |
 | Dedicated benchmark clients | Use a larger pool only when the benchmark is intentionally driving many in-flight batches. |
 
@@ -389,7 +381,7 @@ At minimum, log or export:
 | worker shutdown drain time | Deployment safety. |
 
 The SDK returns worker result objects from `run_once`, `join`, and batch helpers.
-Use those for local counters. Wrap handlers and Redis adapters for latency
+Use those for local counters. Wrap handlers and command executors for latency
 histograms.
 
 ## Backpressure
@@ -427,7 +419,7 @@ Minimum failure tests:
 
 ## Security and ACLs
 
-Use Redis/FerricStore auth and TLS according to your deployment. Keep admin
+Use FerricStore auth and TLS according to your deployment. Keep admin
 helpers out of request handlers:
 
 - `cluster_*`
@@ -442,7 +434,6 @@ Give normal application workers only the command categories they need.
 Before calling a Python SDK service production-ready:
 
 - `ferric://` or `ferrics://` protocol connection is configured for new services.
-- RESP3/raw bytes is configured only when using Redis-compatible `redis://` URLs.
 - Connect and command timeouts are set.
 - Connection pool size matches worker/producers.
 - Handler p99 is below `lease_ms` with margin, or leases are extended.

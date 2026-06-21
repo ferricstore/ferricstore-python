@@ -746,16 +746,13 @@ def test_queue_client_from_url_creates_bounded_command_and_claim_pools(monkeypat
     monkeypatch.setattr("ferricstore.worker.FlowClient.from_url", staticmethod(from_url))
 
     queue_client = QueueClient.from_url(
-        "redis://example/0",
+        "ferric://example:6388",
         worker_config=WorkerConfig(workers=3),
     )
 
     worker = queue_client.queue(type="email").worker()
 
-    assert calls == [
-        ("redis://example/0", {"max_connections": 3}),
-        ("redis://example/0", {"max_connections": 3}),
-    ]
+    assert calls == [("ferric://example:6388", {"max_connections": 1})]
     assert worker.client is queue_client.flow
     assert worker.claim_client is queue_client.claim_flow
 
@@ -821,17 +818,15 @@ def test_queue_worker_config_at_queue_time_resizes_claim_pool(monkeypatch):
 
     monkeypatch.setattr("ferricstore.worker.FlowClient.from_url", staticmethod(from_url))
 
-    queue_client = QueueClient.from_url("redis://example/0")
+    queue_client = QueueClient.from_url("ferric://example:6388")
     worker = queue_client.queue(
         type="email",
         worker_config=WorkerConfig(workers=16),
     ).worker()
 
-    assert calls[0][1]["max_connections"] == 2
-    assert calls[1][1]["max_connections"] == 1
-    assert calls[2][1]["max_connections"] == 16
+    assert calls[0][1]["max_connections"] == 1
     assert worker.client is queue_client.flow
-    assert worker.claim_client is calls[2][2]
+    assert worker.claim_client is queue_client.flow
 
 
 def test_queue_worker_config_does_not_resize_protocol_claim_pool(monkeypatch):

@@ -86,7 +86,7 @@ async def create_email(req: dict):
 | --- | --- |
 | Using sync client in async route | Use `AsyncQueueClient` / `AsyncWorkflowClient`. |
 | Protocol client saturation | Increase `lanes` first; use `max_connections` only after measuring. |
-| RESP pool saturation | Increase `max_connections`. |
+| Native pool saturation | Increase `lanes` first; use `max_connections` only after measuring. |
 | Unbounded handler concurrency | Set `WorkerConfig(concurrency=...)`. |
 | Claiming values the handler does not need | Use explicit `claim_values`. |
 | Running worker in serverless handler | Enqueue in serverless, run worker elsewhere. |

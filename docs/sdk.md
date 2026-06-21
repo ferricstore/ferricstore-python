@@ -2,11 +2,7 @@
 
 This guide covers the public Python SDK surface and when to use each layer.
 
-FerricStore supports the `ferric://` protocol transport and Redis-compatible
-RESP. New SDK services should start with `ferric://`: it defaults to one
-multiplexed connection with 8 request lanes. The SDK gives typed helpers for
-FerricFlow and FerricStore commands, while still letting you call normal
-Redis-compatible commands through one passthrough method.
+FerricStore Python SDK uses the native `ferric://` / `ferrics://` protocol. It defaults to one multiplexed connection with 8 request lanes. The SDK gives typed helpers for FerricFlow and FerricStore commands, while still letting you call lower-level data-structure commands through one passthrough method.
 
 If you are new, start with [Quickstart](quickstart.md). If you need
 production-style examples for sagas, IoT fanout, AI orchestration, human
@@ -23,9 +19,9 @@ approval, webhooks, or batch fanout, read [Use Case Examples](use-cases.md).
 | Low-level Flow commands | `FlowClient` |
 | Queue/workflow support types | `CreateItem`, `ClaimedFlow`, `FencedItem`, `ChildSpec`, `RetryPolicy`, `WorkerConfig`, `ValueConfig`, `ExceptionPolicy`, `FlowRecord` |
 | Protocol FerricStore commands | `cas`, `lock`, `ratelimit_add`, `fetch_or_compute`, `key_info`, cluster/admin helpers |
-| Normal Redis commands | `client.command(...)` |
+| Data-structure commands | typed helpers such as `kv_set`, `hash_set`, `list_push`, or `client.command(...)` |
 | Payload codecs | `RawCodec`, `JsonCodec` |
-| Transport adapter | `RedisAdapter`, `RedisCommandExecutor` |
+| Transport adapter | native protocol adapter, or a custom `CommandExecutor` for tests/advanced embedding |
 
 For production deployment defaults, worker sizing, lease/reclaim policy,
 observability, graceful shutdown, and security guidance, read
@@ -54,12 +50,7 @@ from ferricstore import WorkflowClient
 client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 ```
 
-For `ferric://`, `from_url` uses the FerricStore protocol adapter. For
-`redis://`, it uses `redis-py` with RESP3 and raw byte responses:
-
-```python
-redis.Redis.from_url(url, protocol=3, decode_responses=False)
-```
+`from_url` uses the native FerricStore protocol adapter. URLs must use `ferric://` or `ferrics://`.
 
 Use JSON payloads when you want language-neutral structured values:
 
@@ -80,7 +71,7 @@ raw bytes on decode.
 | Explicit durable state machine | `WorkflowClient` plus `@workflow.state` handlers |
 | Async queue or workflow service | `AsyncQueueClient` / `AsyncWorkflowClient` |
 | Advanced batching, fanout, custom routing | `FlowClient` directly |
-| Normal Redis data structures | `client.command("SET", ...)`, `client.command("HSET", ...)` |
+| Data-structure commands | `client.kv_set(...)`, `client.hash_set(...)`, `client.list_push(...)`, or `client.command(...)` |
 | Locks, CAS, rate limits, fetch stampede protection | First-class protocol helpers on `FlowClient` |
 | Cluster/admin operations | Cluster/admin helpers or `client.command(...)` |
 
@@ -114,9 +105,9 @@ explicit profiles in `examples/protocol_kv_benchmark.py`,
 `examples/protocol_dbos_benchmark.py`, and
 `examples/protocol_restate_latency_benchmark.py`.
 
-## Normal Redis commands
+## Data-structure commands
 
-Use `command` as the explicit escape hatch for every Redis-compatible command.
+Use typed helpers for common data-structure commands, and `command` as the explicit escape hatch for commands that do not yet have a typed helper.
 
 ```python
 client.command("SET", "k", "v")
@@ -125,12 +116,11 @@ client.command("HSET", "user:1", "name", "Ada")
 client.command("ZADD", "scores", 10, "a")
 ```
 
-The SDK does not try to wrap every Redis command. FerricStore-specific behavior
-gets typed helpers; standard Redis commands stay reachable through `command`.
+The SDK does not try to wrap every low-level command. FerricStore-specific behavior gets typed helpers; low-level command access stays reachable through `command`.
 
 ## FerricStore protocol commands
 
-FerricStore adds commands that are not part of vanilla Redis. The SDK exposes the
+FerricStore adds commands that are not part of the basic data-structure command set. The SDK exposes the
 main ones directly.
 
 ### CAS
@@ -662,7 +652,7 @@ return retry(error=b"temporary", run_at_ms=next_attempt_ms)
 return fail(error=b"permanent")
 ```
 
-A handler can also call other Flow or Redis commands through the context/client
+A handler can also call other Flow or FerricStore commands through the context/client
 helpers exposed by the workflow layer:
 
 ```python
@@ -717,7 +707,7 @@ Use these defaults for production hot paths:
 | Queue workload | `QueueClient.queue(...).enqueue(...)` plus `.worker(...)` |
 | State machine | `WorkflowClient.workflow(...)` plus `@workflow.state(...)` |
 | Payload-heavy flows | Use named values and request only needed values |
-| Normal Redis operations | Use `client.command(...)` |
+| Data-structure operations | Use typed helpers or `client.command(...)` |
 | Reused expensive values | Use `value_put`, `value_refs`, and `value_mget` |
 | Expensive cached computation | Use `fetch_or_compute` |
 
@@ -725,7 +715,7 @@ Avoid hydrating payloads or named values unless the handler needs them. Avoid
 post-mutation reads in hot paths unless the next line of user code actually uses
 the new record.
 
-For production services, also set explicit Redis timeouts, size connection pools,
+For production services, also set explicit FerricStore timeouts, size connection pools,
 wire graceful shutdown, cap value hydration with `value_max_bytes`, and verify
 crash/reclaim behavior in integration tests. See [Production Readiness](production.md).
 
@@ -778,7 +768,7 @@ def email_sent(job):
 signup.start("signup-1", payload=b"user")
 ```
 
-### Protocol command plus Redis passthrough
+### Protocol command plus low-level passthrough
 
 ```python
 if client.ratelimit_add("rl:user:1", window_ms=1_000, max=10).allowed:

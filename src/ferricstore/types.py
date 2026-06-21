@@ -241,11 +241,38 @@ class PubSubMessage:
         *,
         decode: Callable[[Any], Any] | None = None,
     ) -> PubSubMessage:
+        if isinstance(value, (list, tuple)) and value:
+            kind = _str(value[0], "event")
+            if kind == "message" and len(value) >= 3:
+                message = value[2]
+                if decode is not None:
+                    message = decode(message)
+                return cls(kind=kind, channel=_str(value[1]), message=message, raw={"event": value})
+            if kind == "pmessage" and len(value) >= 4:
+                message = value[3]
+                if decode is not None:
+                    message = decode(message)
+                return cls(
+                    kind=kind,
+                    pattern=_optional_str(value[1]),
+                    channel=_str(value[2]),
+                    message=message,
+                    raw={"event": value},
+                )
+
         if not isinstance(value, dict):
             return cls(kind="event", channel="", message=value, raw={"event": value})
 
         raw = _raw_map(value)
-        message = _get(value, "message")
+        payload = _get(value, "payload")
+        message_source = value
+        if _str(raw.get("event")) == "PUBSUB_MESSAGE" and isinstance(payload, dict):
+            raw = _raw_map(payload)
+            message_source = payload
+
+        message = _get(message_source, "message")
+        if message is None:
+            message = raw.get("message")
         if decode is not None and message is not None:
             message = decode(message)
 

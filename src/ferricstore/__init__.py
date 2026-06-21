@@ -1,9 +1,4 @@
-from ferricstore.adapters import (
-    AsyncRedisAdapter,
-    AsyncRedisCommandExecutor,
-    RedisAdapter,
-    RedisCommandExecutor,
-)
+from ferricstore.adapters import AsyncCommandExecutor, CommandExecutor
 from ferricstore.async_client import (
     AsyncCommandPipeline,
     AsyncFlowClient,
@@ -107,20 +102,19 @@ QueueWorker = QueueFlowWorker
 QueueWorkerResult = QueueFlowWorkerResult
 AsyncQueueWorker = AsyncQueueFlowWorker
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 __all__ = [
     "ApprovalResult",
+    "AsyncCommandExecutor",
     "AsyncCommandPipeline",
     "AsyncFlowClient",
-    "AsyncPubSubSession",
     "AsyncProtocolAdapter",
     "AsyncProtocolPipeline",
+    "AsyncPubSubSession",
     "AsyncQueue",
     "AsyncQueueClient",
     "AsyncQueueWorker",
-    "AsyncRedisAdapter",
-    "AsyncRedisCommandExecutor",
     "AsyncTransactionSession",
     "AsyncWorkflow",
     "AsyncWorkflowBudget",
@@ -137,6 +131,7 @@ __all__ = [
     "ClaimedFlow",
     "ClaimedItem",
     "Codec",
+    "CommandExecutor",
     "CommandPipeline",
     "Complete",
     "CreateItem",
@@ -169,14 +164,12 @@ __all__ = [
     "QueueWorkerResult",
     "RateLimitResult",
     "RawCodec",
-    "RedisAdapter",
-    "RedisCommandExecutor",
     "Retry",
     "RetryPolicy",
     "ScheduleResult",
     "StaleLeaseError",
-    "Transition",
     "TransactionSession",
+    "Transition",
     "ValueConfig",
     "Worker",
     "WorkerConfig",

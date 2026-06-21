@@ -1448,9 +1448,9 @@ def _compact_pipeline_zadd_payload_from_raw(
 class ProtocolAdapter:
     """FerricStore protocol TCP adapter for the sync SDK.
 
-    The adapter accepts the same `execute_command(*args)` shape as the Redis
-    adapter. It encodes supported Redis/FerricFlow commands into protocol
-    typed frames so high-level Queue/Workflow code can switch transport by URL.
+    The adapter accepts the small `execute_command(*args)` SDK executor shape.
+    It encodes supported FerricStore and FerricFlow commands into native protocol
+    typed frames.
     """
 
     client: ProtocolAdapter
@@ -1543,7 +1543,7 @@ class ProtocolAdapter:
 
     def pipeline(self, transaction: bool = False) -> ProtocolPipeline:
         if transaction:
-            raise InvalidCommandError("protocol pipeline does not support Redis transactions")
+            raise InvalidCommandError("protocol pipeline does not support transaction mode")
         return ProtocolPipeline(self)
 
     def execute_command(self, *args: Any) -> Any:
@@ -2473,7 +2473,7 @@ class ProtocolAdapterPool:
 
     def pipeline(self, transaction: bool = False) -> ProtocolPipeline:
         if transaction:
-            raise InvalidCommandError("protocol pipeline does not support Redis transactions")
+            raise InvalidCommandError("protocol pipeline does not support transaction mode")
         return ProtocolPipeline(self)
 
     def execute_command(self, *args: Any) -> Any:
@@ -2659,7 +2659,7 @@ class AsyncProtocolAdapter:
 
     def pipeline(self, transaction: bool = False) -> AsyncProtocolPipeline:
         if transaction:
-            raise InvalidCommandError("protocol pipeline does not support Redis transactions")
+            raise InvalidCommandError("protocol pipeline does not support transaction mode")
         return AsyncProtocolPipeline(self)
 
     async def execute_command(self, *args: Any) -> Any:
@@ -3102,7 +3102,7 @@ class AsyncProtocolAdapterPool:
 
     def pipeline(self, transaction: bool = False) -> AsyncProtocolPipeline:
         if transaction:
-            raise InvalidCommandError("protocol pipeline does not support Redis transactions")
+            raise InvalidCommandError("protocol pipeline does not support transaction mode")
         return AsyncProtocolPipeline(self)
 
     async def execute_command(self, *args: Any) -> Any:
@@ -6035,10 +6035,10 @@ def _normalize_protocol_url_kwargs(kwargs: dict[str, Any]) -> None:
         kwargs["timeout"] = kwargs.pop("socket_timeout")
     if "health_check_interval" in kwargs and "heartbeat_interval" not in kwargs:
         kwargs["heartbeat_interval"] = kwargs.pop("health_check_interval")
-    for redis_only in (
+    for compatibility_only in (
         "decode_responses",
         "max_connections",
         "protocol",
         "retry_on_timeout",
     ):
-        kwargs.pop(redis_only, None)
+        kwargs.pop(compatibility_only, None)

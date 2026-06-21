@@ -4,6 +4,7 @@ services:
     environment:
       FERRICSTORE_NATIVE_ENABLED: "true"
       FERRICSTORE_PROTECTED_MODE: "false"
+      FERRICSTORE_SHARD_COUNT: "${FERRICSTORE_SHARD_COUNT:-4}"
     ports:
       - "6379:6379"
       - "6388:6388"

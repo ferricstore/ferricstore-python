@@ -5669,7 +5669,7 @@ Decision:
 - `FLOW.GET RETURN META` bottleneck is likely not atom key conversion in compact response encoding.
 
 Related observation:
-- Native protocol currently does not expose Redis-style list/hash/set/zset families as first-class commands; they remain RESP-side coverage today.
+- Native protocol currently does not expose data-structure list/hash/set/zset families as first-class commands; they remain older protocol coverage today.
 
 ### Flow value refs vs Flow metadata read, current-server sample
 
@@ -5989,7 +5989,7 @@ Decision:
 ```text
 Rejected and removed.
 Wire/request compaction alone does not solve compound write slowness and can make set/zset writes worse.
-The next write optimization must group mutations into real shard/apply batches while preserving Redis semantics.
+The next write optimization must group mutations into real shard/apply batches while preserving data-structure command semantics.
 ```
 
 ### Final kept DS read compact modes after write-mode revert
@@ -6551,13 +6551,13 @@ Problem found:
 
 ```text
 Native compact PIPELINE ZRANGE treated stop=-1 as unsupported and fell back to the generic FerricStore.Impl.zrange path.
-That made normal Redis usage like ZRANGE key 0 -1 look like a server stall under load.
+That made normal ZRANGE usage like ZRANGE key 0 -1 look like a server stall under load.
 ```
 
 Fix:
 
 ```text
-Normalize Redis negative rank bounds inside the native compact ZRANGE path using the zset index count.
+Normalize negative rank bounds inside the native compact ZRANGE path using the zset index count.
 Use the ready ETS zset rank index directly for bounded/full-rank reads.
 Fall back to the existing generic path only when the zset index is unavailable or not ready.
 ```

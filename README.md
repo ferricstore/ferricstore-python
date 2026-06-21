@@ -2,7 +2,7 @@
 
 Python SDK for FerricStore and FerricFlow.
 
-Status: public alpha `0.1.1`. APIs may change before `1.0`, but the SDK is
+Status: public alpha `0.2.0`. APIs may change before `1.0`, but the SDK is
 tested against command construction, queue/workflow handlers, leases, retries,
 history, indexed attributes, named values, idempotent create, worker loops,
 async flows, and local FerricStore integration scenarios.
@@ -202,7 +202,7 @@ requested values, not history replay.
   with dict fallback.
 - `RetryPolicy`, `WorkerConfig`, `ValueConfig`, and `ExceptionPolicy` for runtime defaults.
 - `RawCodec` by default, `JsonCodec` when you want JSON payloads.
-- `client.command(...)` as the Redis/FerricStore escape hatch.
+- `client.command(...)` as the FerricStore low-level command escape hatch.
 
 ## Async quickstart
 
@@ -259,7 +259,7 @@ lane counts after profiling shows client-side saturation.
 - `examples/queue_worker.py`: queue producer and worker.
 - `examples/async_queue_worker.py`: async queue producer and worker.
 - `examples/state_machine_workflow.py`: explicit workflow runner.
-- `examples/protocol_commands.py`: Redis/FerricStore command helpers.
+- `examples/protocol_commands.py`: FerricStore command helpers.
 - `examples/protocol_kv_benchmark.py`: protocol SET/GET benchmark.
 - `examples/protocol_dbos_benchmark.py`: protocol DBOS-style queued workflow benchmark.
 - `examples/dbos_style_benchmark.py`: DBOS-style throughput benchmark.

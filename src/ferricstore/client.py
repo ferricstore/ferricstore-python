@@ -12,11 +12,11 @@ from dataclasses import dataclass
 from typing import Any, cast
 from urllib.parse import urlparse
 
-from ferricstore.adapters import RedisAdapter, RedisCommandExecutor
+from ferricstore.adapters import CommandExecutor
 from ferricstore.backpressure import BackpressureController, BackpressurePolicy
 from ferricstore.codecs import Codec, RawCodec
+from ferricstore.commands import DataCommandsMixin
 from ferricstore.errors import FerricStoreError, OverloadedError, map_exception
-from ferricstore.redis_commands import RedisCommandsMixin
 from ferricstore.types import (
     ApprovalResult,
     BudgetResult,
@@ -333,7 +333,7 @@ def _coerce_diag_value(value: str) -> Any:
 
 
 class _ErrorMappingExecutor:
-    def __init__(self, executor: RedisCommandExecutor) -> None:
+    def __init__(self, executor: CommandExecutor) -> None:
         self._executor = executor
 
     def execute_command(self, *args: Any) -> Any:
@@ -350,12 +350,7 @@ class _ErrorMappingExecutor:
 
 
 class CommandPipeline:
-    """Small mixed-command pipeline.
-
-    It accepts any Redis/FerricStore command. When backed by `RedisAdapter`, it
-    uses redis-py's pipeline. For custom executors it falls back to sequential
-    execution, preserving the same result list shape.
-    """
+    """Small mixed-command pipeline over the configured FerricStore executor."""
 
     def __init__(self, client: FlowClient) -> None:
         self.client = client
@@ -375,15 +370,10 @@ class CommandPipeline:
 
     def execute(self) -> builtins.list[Any]:
         raw_executor = getattr(self.client.executor, "_executor", self.client.executor)
-        redis_client = getattr(raw_executor, "client", None)
-        pipeline_factory = getattr(redis_client, "pipeline", None)
-
-        if callable(pipeline_factory):
-            pipe = pipeline_factory(transaction=False)
-            for command in self.commands:
-                pipe.execute_command(*command)
+        execute_batch = getattr(raw_executor, "execute_batch", None)
+        if callable(execute_batch):
             try:
-                self.results = pipe.execute()
+                self.results = list(execute_batch(self.commands))
             except Exception as exc:
                 mapped = map_exception(exc)
                 if mapped is exc:
@@ -475,12 +465,12 @@ class TransactionSession:
         return self.client.discard()
 
 
-class FlowClient(RedisCommandsMixin):
-    """FerricFlow client over Redis/FerricStore commands."""
+class FlowClient(DataCommandsMixin):
+    """FerricFlow client over the FerricStore native protocol."""
 
     def __init__(
         self,
-        executor: RedisCommandExecutor,
+        executor: CommandExecutor,
         codec: Codec | None = None,
         *,
         backpressure: BackpressurePolicy | None = None,
@@ -499,15 +489,16 @@ class FlowClient(RedisCommandsMixin):
         backpressure: BackpressurePolicy | None = None,
         **kwargs: Any,
     ) -> FlowClient:
-        if urlparse(url).scheme.lower() in {"ferric", "ferrics"}:
-            from ferricstore.protocol import ProtocolAdapterPool
+        if urlparse(url).scheme.lower() not in {"ferric", "ferrics"}:
+            raise ValueError("FerricStore SDK URLs must use ferric:// or ferrics://")
 
-            return cls(
-                ProtocolAdapterPool.from_url(url, **kwargs),
-                codec=codec,
-                backpressure=backpressure,
-            )
-        return cls(RedisAdapter.from_url(url, **kwargs), codec=codec, backpressure=backpressure)
+        from ferricstore.protocol import ProtocolAdapterPool
+
+        return cls(
+            ProtocolAdapterPool.from_url(url, **kwargs),
+            codec=codec,
+            backpressure=backpressure,
+        )
 
     def autobatch(
         self,

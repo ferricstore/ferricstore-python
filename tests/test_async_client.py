@@ -13,6 +13,7 @@ from ferricstore import (
     OverloadedError,
     StaleLeaseError,
 )
+from ferricstore.commands import DataCommandsMixin
 from ferricstore.types import (
     ApprovalResult,
     ChildSpec,
@@ -24,10 +25,9 @@ from ferricstore.types import (
     GovernanceOverview,
     ScheduleResult,
 )
-from ferricstore.redis_commands import RedisCommandsMixin
 
 
-class FakeAsyncRedis:
+class FakeAsyncExecutor:
     def __init__(self):
         self.calls = []
         self.closed = False
@@ -158,7 +158,7 @@ class FakeAsyncRedis:
         self.closed = True
 
 
-class OverloadThenAckAsyncRedis(FakeAsyncRedis):
+class OverloadThenAckAsyncExecutor(FakeAsyncExecutor):
     def __init__(self, overloads: int):
         super().__init__()
         self.overloads = overloads
@@ -171,7 +171,7 @@ class OverloadThenAckAsyncRedis(FakeAsyncRedis):
         return b"OK"
 
 
-class CreateAckThenGetAsyncRedis(FakeAsyncRedis):
+class CreateAckThenGetAsyncExecutor(FakeAsyncExecutor):
     async def execute_command(self, *args):
         self.calls.append(args)
         if args[0] == "FLOW.CREATE":
@@ -193,8 +193,8 @@ def run(coro):
 
 def test_async_create_uses_real_async_executor_without_thread_fallback(monkeypatch):
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         def forbidden_to_thread(*args, **kwargs):
             raise AssertionError("async client must not use asyncio.to_thread")
@@ -211,7 +211,7 @@ def test_async_create_uses_real_async_executor_without_thread_fallback(monkeypat
         )
 
         assert result == b"OK"
-        assert redis.calls == [
+        assert executor.calls == [
             (
                 "FLOW.CREATE",
                 "f1",
@@ -235,12 +235,12 @@ def test_async_create_uses_real_async_executor_without_thread_fallback(monkeypat
 
 def test_async_create_honors_zero_now_ms():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         await client.create("f-zero", type="order", now_ms=0, return_record=False)
 
-        call = redis.calls[0]
+        call = executor.calls[0]
         assert call[call.index("NOW") + 1] == 0
         assert call[call.index("RUN_AT") + 1] == 0
 
@@ -249,8 +249,8 @@ def test_async_create_honors_zero_now_ms():
 
 def test_async_start_and_step_continue_send_protocol_step_commands():
     async def main():
-        redis = FakeAsyncRedis()
-        redis.responses.extend(
+        executor = FakeAsyncExecutor()
+        executor.responses.extend(
             [
                 {
                     b"id": b"f1",
@@ -272,7 +272,7 @@ def test_async_start_and_step_continue_send_protocol_step_commands():
                 },
             ]
         )
-        client = AsyncFlowClient(redis)
+        client = AsyncFlowClient(executor)
 
         started = await client.start_and_claim(
             "f1",
@@ -296,8 +296,8 @@ def test_async_start_and_step_continue_send_protocol_step_commands():
 
         assert started.run_state == "reserve_inventory"
         assert continued.run_state == "charge_card"
-        assert redis.calls[0][:2] == ("FLOW.START_AND_CLAIM", "f1")
-        assert redis.calls[1][:5] == (
+        assert executor.calls[0][:2] == ("FLOW.START_AND_CLAIM", "f1")
+        assert executor.calls[1][:5] == (
             "FLOW.STEP_CONTINUE",
             "f1",
             b"lease-1",
@@ -314,26 +314,16 @@ def test_async_command_pipeline_is_top_level_exported():
     assert AsyncCommandPipeline.__name__ == "AsyncCommandPipeline"
 
 
-def test_async_command_pipeline_maps_protocol_redis_pipeline_errors():
+def test_async_command_pipeline_maps_native_execute_batch_errors():
     async def main():
-        class ErrorPipe:
-            def execute_command(self, *args):
-                return self
-
-            async def execute(self):
-                raise RuntimeError("ERR flow already exists")
-
-        class ProtocolRedis:
-            def pipeline(self, transaction=False):
-                return ErrorPipe()
-
-        class RedisExecutor:
-            client = ProtocolRedis()
-
+        class BatchExecutor:
             async def execute_command(self, *args):
                 return b"OK"
 
-        client = AsyncFlowClient(RedisExecutor())
+            async def execute_batch(self, commands):
+                raise RuntimeError("ERR flow already exists")
+
+        client = AsyncFlowClient(BatchExecutor())
 
         with pytest.raises(FlowAlreadyExistsError):
             await client.pipeline().command("FLOW.CREATE", "f1").execute()
@@ -343,7 +333,7 @@ def test_async_command_pipeline_maps_protocol_redis_pipeline_errors():
 
 def test_async_session_and_blocking_helpers_are_named_commands():
     async def main():
-        class RedisExecutor:
+        class ExecutorExecutor:
             def __init__(self):
                 self.calls = []
                 self.responses = [
@@ -358,27 +348,27 @@ def test_async_session_and_blocking_helpers_are_named_commands():
                 self.calls.append(args)
                 return self.responses.pop(0)
 
-        redis = RedisExecutor()
-        client = AsyncFlowClient(redis)
+        executor = ExecutorExecutor()
+        client = AsyncFlowClient(executor)
 
         assert await client.subscribe("jobs") == [["subscribe", "jobs", 1]]
-        assert redis.calls[-1] == ("SUBSCRIBE", "jobs")
+        assert executor.calls[-1] == ("SUBSCRIBE", "jobs")
         assert await client.multi() == "OK"
-        assert redis.calls[-1] == ("MULTI",)
+        assert executor.calls[-1] == ("MULTI",)
         assert await client.set("k", "v") == "QUEUED"
-        assert redis.calls[-1] == ("COMMAND_EXEC", "SET", "k", b"v")
+        assert executor.calls[-1] == ("COMMAND_EXEC", "SET", "k", b"v")
         assert await client.transaction_exec() == ["OK"]
-        assert redis.calls[-1] == ("EXEC",)
+        assert executor.calls[-1] == ("EXEC",)
         assert await client.blpop("queue", timeout=1) == [b"queue", b"job"]
-        assert redis.calls[-1] == ("BLPOP", "queue", 1)
+        assert executor.calls[-1] == ("BLPOP", "queue", 1)
 
     run(main())
 
 
-def test_async_redis_command_helper_parity_with_sync_mixin():
+def test_async_data_command_helper_parity_with_sync_mixin():
     sync_methods = {
         name
-        for name, value in RedisCommandsMixin.__dict__.items()
+        for name, value in DataCommandsMixin.__dict__.items()
         if callable(value) and not name.startswith("_")
     }
     missing = sorted(name for name in sync_methods if not hasattr(AsyncFlowClient, name))
@@ -388,25 +378,25 @@ def test_async_redis_command_helper_parity_with_sync_mixin():
         assert inspect.iscoroutinefunction(getattr(AsyncFlowClient, name)), name
 
 
-def test_async_redis_command_helpers_are_codec_aware_and_easy_to_use():
+def test_async_data_command_helpers_are_codec_aware_and_easy_to_use():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis, codec=JsonCodec())
-        redis.responses.extend(["OK", b'{"answer":42}', [b'{"a":1}', None]])
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor, codec=JsonCodec())
+        executor.responses.extend(["OK", b'{"answer":42}', [b'{"a":1}', None]])
 
         assert await client.kv_set("kv", {"answer": 42}, px=100, nx=True) == "OK"
-        assert redis.calls[-1] == ("SET", "kv", b'{"answer":42}', "PX", 100, "NX")
+        assert executor.calls[-1] == ("SET", "kv", b'{"answer":42}', "PX", 100, "NX")
         assert await client.kv_get("kv") == {"answer": 42}
-        assert redis.calls[-1] == ("GET", "kv")
+        assert executor.calls[-1] == ("GET", "kv")
         assert await client.kv_mget("a", "missing") == [{"a": 1}, None]
-        assert redis.calls[-1] == ("MGET", "a", "missing")
+        assert executor.calls[-1] == ("MGET", "a", "missing")
 
     run(main())
 
 
 def test_async_pubsub_session_decodes_native_events_without_raw_command_usage():
     async def main():
-        class EventRedis(FakeAsyncRedis):
+        class EventExecutor(FakeAsyncExecutor):
             def __init__(self):
                 super().__init__()
                 self.events = [
@@ -420,7 +410,7 @@ def test_async_pubsub_session_decodes_native_events_without_raw_command_usage():
             async def wait_event(self, timeout=None):
                 return self.events.pop(0) if self.events else None
 
-        client = AsyncFlowClient(EventRedis(), codec=JsonCodec())
+        client = AsyncFlowClient(EventExecutor(), codec=JsonCodec())
         pubsub = client.pubsub_session()
 
         message = await pubsub.get_message(timeout=0.01)
@@ -435,14 +425,14 @@ def test_async_pubsub_session_decodes_native_events_without_raw_command_usage():
 
 def test_async_transaction_context_uses_named_helpers_inside_multi():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
-        redis.responses.extend(["OK", "QUEUED", ["OK"]])
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
+        executor.responses.extend(["OK", "QUEUED", ["OK"]])
 
         async with client.transaction() as tx:
             assert await tx.set("k", "v") == "QUEUED"
 
-        assert redis.calls == [
+        assert executor.calls == [
             ("MULTI",),
             ("COMMAND_EXEC", "SET", "k", b"v"),
             ("EXEC",),
@@ -453,13 +443,13 @@ def test_async_transaction_context_uses_named_helpers_inside_multi():
 
 def test_async_direct_command_errors_are_typed():
     async def main():
-        class ErrorRedis:
+        class ErrorExecutor:
             async def execute_command(self, *args):
                 if args[0] == "FLOW.CREATE":
                     raise RuntimeError("ERR flow already exists")
                 raise RuntimeError("ERR stale flow lease")
 
-        client = AsyncFlowClient(ErrorRedis())
+        client = AsyncFlowClient(ErrorExecutor())
 
         with pytest.raises(FlowAlreadyExistsError):
             await client.command("FLOW.CREATE", "f1")
@@ -472,8 +462,8 @@ def test_async_direct_command_errors_are_typed():
 
 def test_async_direct_many_methods_noop_on_empty_inputs():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         assert await client.create_many("tenant:1", [], type="order") == []
         assert await client.complete_many("tenant:1", []) == []
@@ -489,15 +479,15 @@ def test_async_direct_many_methods_noop_on_empty_inputs():
         assert await client.retry_many("tenant:1", []) == []
         assert await client.fail_many("tenant:1", []) == []
         assert await client.cancel_many("tenant:1", []) == []
-        assert redis.calls == []
+        assert executor.calls == []
 
     run(main())
 
 
 def test_async_create_ack_followup_get_uses_auto_partition_when_partition_omitted():
     async def main():
-        redis = CreateAckThenGetAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = CreateAckThenGetAsyncExecutor()
+        client = AsyncFlowClient(executor)
         expected_partition = f"__flow_auto__:{zlib.crc32(b'f-auto') % 256}"
 
         record = await client.create(
@@ -509,16 +499,16 @@ def test_async_create_ack_followup_get_uses_auto_partition_when_partition_omitte
         )
 
         assert record.id == "f-auto"
-        assert redis.calls[1][:2] == ("FLOW.GET", "f-auto")
-        assert redis.calls[1][redis.calls[1].index("PARTITION") + 1] == expected_partition
+        assert executor.calls[1][:2] == ("FLOW.GET", "f-auto")
+        assert executor.calls[1][executor.calls[1].index("PARTITION") + 1] == expected_partition
 
     run(main())
 
 
 def test_async_claim_flows_and_complete_jobs_use_hot_compact_paths():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         jobs = await client.claim_flows(
             "order",
@@ -540,7 +530,7 @@ def test_async_claim_flows_and_complete_jobs_use_hot_compact_paths():
             )
         ]
         assert result == [b"OK"]
-        assert redis.calls[0] == (
+        assert executor.calls[0] == (
             "FLOW.CLAIM_DUE",
             "order",
             "STATE",
@@ -560,7 +550,7 @@ def test_async_claim_flows_and_complete_jobs_use_hot_compact_paths():
             "RETURN",
             "JOBS_COMPACT_ATTRS",
         )
-        assert redis.calls[1] == (
+        assert executor.calls[1] == (
             "FLOW.COMPLETE_MANY",
             "tenant:1",
             "RESULT",
@@ -580,8 +570,8 @@ def test_async_claim_flows_and_complete_jobs_use_hot_compact_paths():
 
 def test_async_claim_due_accepts_legacy_job_only_alias():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         jobs = await client.claim_due(
             "order",
@@ -594,15 +584,15 @@ def test_async_claim_due_accepts_legacy_job_only_alias():
         )
 
         assert isinstance(jobs[0], ClaimedFlow)
-        assert redis.calls[0][-2:] == ("RETURN", "JOBS_COMPACT_ATTRS")
+        assert executor.calls[0][-2:] == ("RETURN", "JOBS_COMPACT_ATTRS")
 
     run(main())
 
 
 def test_async_claim_due_rejects_conflicting_include_record_and_job_only():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         with pytest.raises(ValueError, match="include_record and job_only"):
             await client.claim_due(
@@ -613,16 +603,18 @@ def test_async_claim_due_rejects_conflicting_include_record_and_job_only():
                 job_only=False,
             )
 
-        assert redis.calls == []
+        assert executor.calls == []
 
     run(main())
 
 
 def test_async_claim_flows_can_request_compact_state_items():
     async def main():
-        redis = FakeAsyncRedis()
-        redis.responses.append([[b"f1", b"tenant:1", b"lease", 7, b"ready", {b"tenant": b"acme"}]])
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        executor.responses.append(
+            [[b"f1", b"tenant:1", b"lease", 7, b"ready", {b"tenant": b"acme"}]]
+        )
+        client = AsyncFlowClient(executor)
 
         jobs = await client.claim_flows(
             "order",
@@ -643,7 +635,7 @@ def test_async_claim_flows_can_request_compact_state_items():
                 attributes={"tenant": "acme"},
             )
         ]
-        assert redis.calls[0] == (
+        assert executor.calls[0] == (
             "FLOW.CLAIM_DUE",
             "order",
             "WORKER",
@@ -667,8 +659,8 @@ def test_async_claim_flows_can_request_compact_state_items():
 
 def test_async_claim_due_omits_now_when_not_supplied():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         await client.claim_flows(
             "order",
@@ -678,15 +670,15 @@ def test_async_claim_due_omits_now_when_not_supplied():
             limit=10,
         )
 
-        assert "NOW" not in redis.calls[0]
+        assert "NOW" not in executor.calls[0]
 
     run(main())
 
 
 def test_async_claim_due_sends_block_when_supplied():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         await client.claim_flows(
             "order",
@@ -697,16 +689,16 @@ def test_async_claim_due_sends_block_when_supplied():
             block_ms=5000,
         )
 
-        assert "BLOCK" in redis.calls[0]
-        assert redis.calls[0][redis.calls[0].index("BLOCK") + 1] == 5000
+        assert "BLOCK" in executor.calls[0]
+        assert executor.calls[0][executor.calls[0].index("BLOCK") + 1] == 5000
 
     run(main())
 
 
 def test_async_claim_flows_only_sends_reclaim_expired_when_explicit():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         await client.claim_flows(
             "order",
@@ -716,7 +708,7 @@ def test_async_claim_flows_only_sends_reclaim_expired_when_explicit():
             reclaim_expired=False,
         )
 
-        call = redis.calls[0]
+        call = executor.calls[0]
         assert call[call.index("RECLAIM_EXPIRED") : call.index("RECLAIM_EXPIRED") + 2] == (
             "RECLAIM_EXPIRED",
             "false",
@@ -727,8 +719,8 @@ def test_async_claim_flows_only_sends_reclaim_expired_when_explicit():
 
 def test_async_reclaim_exposes_claim_due_response_options_and_partitions():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         result = await client.reclaim(
             "order",
@@ -744,7 +736,7 @@ def test_async_reclaim_exposes_claim_due_response_options_and_partitions():
         )
 
         assert isinstance(result[0], ClaimedFlow)
-        assert redis.calls[0] == (
+        assert executor.calls[0] == (
             "FLOW.RECLAIM",
             "order",
             "WORKER",
@@ -775,21 +767,21 @@ def test_async_reclaim_exposes_claim_due_response_options_and_partitions():
 
 def test_async_reclaim_rejects_non_running_state_alias():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         with pytest.raises(ValueError, match=r"FLOW\.RECLAIM only supports running"):
             await client.reclaim("order", state="queued", worker="worker-1")
 
-        assert redis.calls == []
+        assert executor.calls == []
 
     run(main())
 
 
 def test_async_enqueue_many_keeps_auto_bucket_grouping():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         result = await client.enqueue_many(
             [CreateItem("flow-1", b"a"), CreateItem("flow-2", b"b")],
@@ -798,16 +790,16 @@ def test_async_enqueue_many_keeps_auto_bucket_grouping():
         )
 
         assert result == [b"OK", b"OK"]
-        assert all(call[0] == "FLOW.CREATE_MANY" for call in redis.calls)
-        assert all(str(call[1]).startswith("__flow_auto__:") for call in redis.calls)
+        assert all(call[0] == "FLOW.CREATE_MANY" for call in executor.calls)
+        assert all(str(call[1]).startswith("__flow_auto__:") for call in executor.calls)
 
     run(main())
 
 
 def test_async_enqueue_passes_retention_ttl_ms():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         result = await client.enqueue(
             "f1",
@@ -818,49 +810,49 @@ def test_async_enqueue_passes_retention_ttl_ms():
         )
 
         assert result == b"OK"
-        assert "RETENTION_TTL_MS" in redis.calls[0]
-        assert redis.calls[0][redis.calls[0].index("RETENTION_TTL_MS") + 1] == 300_000
+        assert "RETENTION_TTL_MS" in executor.calls[0]
+        assert executor.calls[0][executor.calls[0].index("RETENTION_TTL_MS") + 1] == 300_000
 
     run(main())
 
 
 def test_async_enqueue_retries_server_overload_with_backpressure():
     async def main():
-        redis = OverloadThenAckAsyncRedis(overloads=2)
+        executor = OverloadThenAckAsyncExecutor(overloads=2)
         client = AsyncFlowClient(
-            redis,
+            executor,
             backpressure=BackpressurePolicy(base_delay_ms=0, max_delay_ms=0, jitter=0),
         )
 
         result = await client.enqueue("f1", type="order", payload=b"hello", now_ms=100)
 
         assert result == b"OK"
-        assert len(redis.calls) == 3
+        assert len(executor.calls) == 3
 
     run(main())
 
 
 def test_async_enqueue_default_backpressure_retries_until_server_recovers():
     async def main():
-        redis = OverloadThenAckAsyncRedis(overloads=12)
+        executor = OverloadThenAckAsyncExecutor(overloads=12)
         client = AsyncFlowClient(
-            redis,
+            executor,
             backpressure=BackpressurePolicy(base_delay_ms=0, max_delay_ms=0, jitter=0),
         )
 
         result = await client.enqueue("f1", type="order", payload=b"hello", now_ms=100)
 
         assert result == b"OK"
-        assert len(redis.calls) == 13
+        assert len(executor.calls) == 13
 
     run(main())
 
 
 def test_async_enqueue_stops_after_backpressure_retry_budget():
     async def main():
-        redis = OverloadThenAckAsyncRedis(overloads=2)
+        executor = OverloadThenAckAsyncExecutor(overloads=2)
         client = AsyncFlowClient(
-            redis,
+            executor,
             backpressure=BackpressurePolicy(
                 max_retries=1,
                 base_delay_ms=0,
@@ -872,15 +864,15 @@ def test_async_enqueue_stops_after_backpressure_retry_budget():
         with pytest.raises(OverloadedError):
             await client.enqueue("f1", type="order", payload=b"hello", now_ms=100)
 
-        assert len(redis.calls) == 2
+        assert len(executor.calls) == 2
 
     run(main())
 
 
 def test_async_enqueue_many_passes_retention_ttl_ms_to_auto_bucket_batches():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         result = await client.enqueue_many(
             [CreateItem("flow-1", b"a"), CreateItem("flow-2", b"b")],
@@ -890,8 +882,8 @@ def test_async_enqueue_many_passes_retention_ttl_ms_to_auto_bucket_batches():
         )
 
         assert result == [b"OK", b"OK"]
-        assert redis.calls
-        for call in redis.calls:
+        assert executor.calls
+        for call in executor.calls:
             assert "RETENTION_TTL_MS" in call
             assert call[call.index("RETENTION_TTL_MS") + 1] == 300_000
 
@@ -900,9 +892,9 @@ def test_async_enqueue_many_passes_retention_ttl_ms_to_auto_bucket_batches():
 
 def test_async_create_many_mixed_allows_auto_partition_items():
     async def main():
-        redis = FakeAsyncRedis()
-        redis.responses = [[b"OK", b"OK"]]
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        executor.responses = [[b"OK", b"OK"]]
+        client = AsyncFlowClient(executor)
 
         result = await client.create_many(
             None,
@@ -916,7 +908,7 @@ def test_async_create_many_mixed_allows_auto_partition_items():
         )
 
         assert result == [b"OK", b"OK"]
-        assert redis.calls[0] == (
+        assert executor.calls[0] == (
             "FLOW.CREATE_MANY",
             "MIXED",
             "TYPE",
@@ -946,9 +938,9 @@ def test_async_create_many_mixed_allows_auto_partition_items():
 
 def test_async_create_many_can_attach_shared_attributes():
     async def main():
-        redis = FakeAsyncRedis()
-        redis.responses = [[b"OK", b"OK"]]
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        executor.responses = [[b"OK", b"OK"]]
+        client = AsyncFlowClient(executor)
 
         result = await client.create_many(
             "tenant:1",
@@ -960,7 +952,7 @@ def test_async_create_many_can_attach_shared_attributes():
         )
 
         assert result == [b"OK", b"OK"]
-        assert redis.calls[0] == (
+        assert executor.calls[0] == (
             "FLOW.CREATE_MANY",
             "tenant:1",
             "TYPE",
@@ -986,9 +978,9 @@ def test_async_create_many_can_attach_shared_attributes():
 
 def test_async_create_many_reuses_identical_item_attributes_as_shared_attributes():
     async def main():
-        redis = FakeAsyncRedis()
-        redis.responses = [[b"OK", b"OK"]]
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        executor.responses = [[b"OK", b"OK"]]
+        client = AsyncFlowClient(executor)
 
         result = await client.create_many(
             "tenant:1",
@@ -1001,7 +993,7 @@ def test_async_create_many_reuses_identical_item_attributes_as_shared_attributes
         )
 
         assert result == [b"OK", b"OK"]
-        call = redis.calls[0]
+        call = executor.calls[0]
         assert call[call.index("ATTRIBUTE") : call.index("ATTRIBUTE") + 3] == (
             "ATTRIBUTE",
             "tenant",
@@ -1013,8 +1005,8 @@ def test_async_create_many_reuses_identical_item_attributes_as_shared_attributes
 
 def test_async_spawn_children_exposes_parent_guards_and_child_policies():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         await client.spawn_children(
             "parent-1",
@@ -1029,7 +1021,7 @@ def test_async_spawn_children_exposes_parent_guards_and_child_policies():
             failure="failed",
         )
 
-        call = redis.calls[0]
+        call = executor.calls[0]
         assert call[call.index("FROM_STATE") + 1] == "running"
         assert call[call.index("WAIT_STATE") + 1] == "waiting_children"
         assert call[call.index("ON_CHILD_FAILED") + 1] == "ignore"
@@ -1042,8 +1034,8 @@ def test_async_spawn_children_exposes_parent_guards_and_child_policies():
 
 def test_async_many_commands_reject_items_from_different_explicit_partition():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         with pytest.raises(ValueError, match="partition_key"):
             await client.create_many(
@@ -1056,15 +1048,15 @@ def test_async_many_commands_reject_items_from_different_explicit_partition():
         with pytest.raises(ValueError, match="partition_key"):
             await client.cancel_many("p1", [FencedItem("f1", 3, partition_key="p2")])
 
-        assert redis.calls == []
+        assert executor.calls == []
 
     run(main())
 
 
 def test_async_signal_builds_flow_signal_command():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         result = await client.signal(
             "f1",
@@ -1079,7 +1071,7 @@ def test_async_signal_builds_flow_signal_command():
         )
 
         assert result == b"OK"
-        assert redis.calls[0] == (
+        assert executor.calls[0] == (
             "FLOW.SIGNAL",
             "f1",
             "SIGNAL",
@@ -1108,44 +1100,44 @@ def test_async_signal_builds_flow_signal_command():
 
 def test_async_value_mget_decodes_with_codec_and_close_awaits_executor():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis, codec=JsonCodec())
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor, codec=JsonCodec())
 
         values = await client.value_mget(["ref-1"])
         await client.close()
 
         assert values == [{"ok": True}]
-        assert redis.closed is True
+        assert executor.closed is True
 
     run(main())
 
 
 def test_async_value_mget_normalizes_omission_metadata_recursively():
     async def main():
-        redis = FakeAsyncRedis()
-        redis.responses = [
+        executor = FakeAsyncExecutor()
+        executor.responses = [
             [{b"ref": b"ref-a", b"omitted": True, b"size": 123, b"nested": {b"k": b"v"}}]
         ]
-        client = AsyncFlowClient(redis)
+        client = AsyncFlowClient(executor)
 
         values = await client.value_mget(["ref-a"], max_bytes=10)
 
         assert values == [{"ref": "ref-a", "omitted": True, "size": 123, "nested": {"k": "v"}}]
-        assert redis.calls[-1] == ("FLOW.VALUE.MGET", "ref-a", "MAX_BYTES", 10)
+        assert executor.calls[-1] == ("FLOW.VALUE.MGET", "ref-a", "MAX_BYTES", 10)
 
     run(main())
 
 
 def test_async_query_policy_and_cleanup_commands():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         assert (await client.list("order", state="queued", count=10))[0].id == "f1"
-        assert redis.calls[-1] == ("FLOW.LIST", "order", "STATE", "queued", "COUNT", 10)
+        assert executor.calls[-1] == ("FLOW.LIST", "order", "STATE", "queued", "COUNT", 10)
 
         assert (await client.terminals("order", state="completed", rev=True, count=5))[0].id == "f1"
-        assert redis.calls[-1] == (
+        assert executor.calls[-1] == (
             "FLOW.TERMINALS",
             "order",
             "COUNT",
@@ -1157,10 +1149,10 @@ def test_async_query_policy_and_cleanup_commands():
         )
 
         assert (await client.failures("order", from_ms=10, to_ms=20))[0].id == "f1"
-        assert redis.calls[-1] == ("FLOW.FAILURES", "order", "FROM_MS", 10, "TO_MS", 20)
+        assert executor.calls[-1] == ("FLOW.FAILURES", "order", "FROM_MS", 10, "TO_MS", 20)
 
         assert (await client.by_parent("p", count=1, terminal_only=True))[0].id == "f1"
-        assert redis.calls[-1] == (
+        assert executor.calls[-1] == (
             "FLOW.BY_PARENT",
             "p",
             "COUNT",
@@ -1170,10 +1162,10 @@ def test_async_query_policy_and_cleanup_commands():
         )
 
         assert (await client.by_root("root", count=1))[0].id == "f1"
-        assert redis.calls[-1] == ("FLOW.BY_ROOT", "root", "COUNT", 1)
+        assert executor.calls[-1] == ("FLOW.BY_ROOT", "root", "COUNT", 1)
 
         assert (await client.by_correlation("checkout-1", include_cold=True))[0].id == "f1"
-        assert redis.calls[-1] == ("FLOW.BY_CORRELATION", "checkout-1", "INCLUDE_COLD", "true")
+        assert executor.calls[-1] == ("FLOW.BY_CORRELATION", "checkout-1", "INCLUDE_COLD", "true")
 
         assert await client.info("order") == {b"ok": 1}
         assert (await client.stuck("order", older_than_ms=100, now_ms=200))[0].id == "f1"
@@ -1186,23 +1178,23 @@ def test_async_query_policy_and_cleanup_commands():
 
 def test_async_client_rejects_sync_flow_client():
     with pytest.raises(TypeError, match="requires an async executor"):
-        AsyncFlowClient(FlowClient(FakeAsyncRedis()))
+        AsyncFlowClient(FlowClient(FakeAsyncExecutor()))
 
 
 def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     async def main():
-        redis = FakeAsyncRedis()
-        client = AsyncFlowClient(redis)
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
 
         assert await client.attributes("order", state="queued", count=10) == [
             {"name": "tenant", "count": 3}
         ]
-        assert redis.calls[-1] == ("FLOW.ATTRIBUTES", "order", "STATE", "queued", "COUNT", 10)
+        assert executor.calls[-1] == ("FLOW.ATTRIBUTES", "order", "STATE", "queued", "COUNT", 10)
 
         assert await client.attribute_values("order", "tenant", state="queued") == [
             {"value": "acme", "count": 2}
         ]
-        assert redis.calls[-1] == (
+        assert executor.calls[-1] == (
             "FLOW.ATTRIBUTE_VALUES",
             "order",
             "tenant",
@@ -1220,7 +1212,7 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         assert isinstance(schedule, ScheduleResult)
         assert schedule.status == "active"
         assert schedule["status"] == "active"
-        assert redis.calls[-1] == (
+        assert executor.calls[-1] == (
             "FLOW.SCHEDULE.CREATE",
             "daily-report",
             "TIMEZONE",
@@ -1236,11 +1228,11 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         due = await client.schedule_fire_due(block_ms=1000, limit=50)
         assert isinstance(due, ScheduleResult)
         assert due["status"] == "active"
-        assert redis.calls[-1] == ("FLOW.SCHEDULE.FIRE_DUE", "BLOCK", 1000, "LIMIT", 50)
+        assert executor.calls[-1] == ("FLOW.SCHEDULE.FIRE_DUE", "BLOCK", 1000, "LIMIT", 50)
         schedules = await client.schedule_list(target_type="flow")
         assert isinstance(schedules[0], ScheduleResult)
         assert schedules[0]["status"] == "active"
-        assert redis.calls[-1] == ("FLOW.SCHEDULE.LIST", "TARGET_TYPE", "flow")
+        assert executor.calls[-1] == ("FLOW.SCHEDULE.LIST", "TARGET_TYPE", "flow")
 
         effect = await client.effect_reserve(
             "flow-1",
@@ -1256,7 +1248,7 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         assert isinstance(effect, EffectResult)
         assert effect.status == "active"
         assert effect["status"] == "active"
-        assert redis.calls[-1] == (
+        assert executor.calls[-1] == (
             "FLOW.EFFECT.RESERVE",
             "flow-1",
             "EFFECT_KEY",
@@ -1285,7 +1277,7 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         )
         assert isinstance(effect, EffectResult)
         assert effect["status"] == "active"
-        assert redis.calls[-1] == (
+        assert executor.calls[-1] == (
             "FLOW.EFFECT.CONFIRM",
             "flow-1",
             "EFFECT_KEY",
@@ -1305,7 +1297,7 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         )
         assert isinstance(effect, EffectResult)
         assert effect["status"] == "active"
-        assert redis.calls[-1] == (
+        assert executor.calls[-1] == (
             "FLOW.EFFECT.FAIL",
             "flow-1",
             "EFFECT_KEY",
@@ -1328,7 +1320,7 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         )
         assert isinstance(effect, EffectResult)
         assert effect["status"] == "active"
-        assert redis.calls[-1] == (
+        assert executor.calls[-1] == (
             "FLOW.EFFECT.COMPENSATE",
             "flow-1",
             "EFFECT_KEY",
@@ -1355,7 +1347,7 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         assert isinstance(approval, ApprovalResult)
         assert approval.status == "active"
         assert approval["status"] == "active"
-        assert redis.calls[-1] == (
+        assert executor.calls[-1] == (
             "FLOW.APPROVAL.REQUEST",
             "approval-1",
             "FLOW_ID",
@@ -1375,7 +1367,7 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         approval = await client.approval_approve("approval-1", approver="admin", reason="ok")
         assert isinstance(approval, ApprovalResult)
         assert approval["status"] == "active"
-        assert redis.calls[-1] == (
+        assert executor.calls[-1] == (
             "FLOW.APPROVAL.APPROVE",
             "approval-1",
             "APPROVER",
@@ -1388,7 +1380,7 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
             "flow-1", partition_key="tenant-a", rev=True, limit=5
         )
         assert ledger[0]["status"] == "active"
-        assert redis.calls[-1] == (
+        assert executor.calls[-1] == (
             "FLOW.GOVERNANCE.LEDGER",
             "flow-1",
             "PARTITION",
@@ -1403,7 +1395,7 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         assert isinstance(circuit, CircuitBreakerStatus)
         assert circuit.status == "active"
         assert circuit["status"] == "active"
-        assert redis.calls[-1] == (
+        assert executor.calls[-1] == (
             "FLOW.CIRCUIT.OPEN",
             "email",
             "OPEN_MS",
@@ -1418,7 +1410,7 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         assert budget.scope == "tenant-a"
         assert budget.reservation_id == "budget-res-1"
         assert budget["remaining"] == 93
-        assert redis.calls[-1] == (
+        assert executor.calls[-1] == (
             "FLOW.BUDGET.RESERVE",
             "tenant-a",
             "AMOUNT",
@@ -1438,7 +1430,7 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         )
         assert isinstance(overview, GovernanceOverview)
         assert overview["status"] == "active"
-        assert redis.calls[-1] == (
+        assert executor.calls[-1] == (
             "FLOW.GOVERNANCE.OVERVIEW",
             "SCOPE",
             "tenant-a",
@@ -1451,7 +1443,7 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         committed = await client.budget_commit("tenant-a", "budget-res-1", 7, usage={"tokens": 7})
         assert committed.status == "committed"
         assert committed.usage == {"tokens": 7}
-        assert redis.calls[-1] == (
+        assert executor.calls[-1] == (
             "FLOW.BUDGET.COMMIT",
             "tenant-a",
             "RESERVATION_ID",
@@ -1464,7 +1456,7 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
 
         released = await client.budget_release("tenant-a", "budget-res-unused")
         assert released.get("reserved_amount") == 10
-        assert redis.calls[-1] == (
+        assert executor.calls[-1] == (
             "FLOW.BUDGET.RELEASE",
             "tenant-a",
             "RESERVATION_ID",
@@ -1472,7 +1464,7 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         )
 
         await client.limit_lease("tenant-a", shard_id=1, amount=5, ttl_ms=1000, limit=10)
-        assert redis.calls[-1] == (
+        assert executor.calls[-1] == (
             "FLOW.LIMIT.LEASE",
             "tenant-a",
             "SHARD_ID",
