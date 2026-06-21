@@ -18,6 +18,7 @@ from ferricstore import (
     JsonCodec,
     RetryPolicy,
 )
+from ferricstore.commands import DataCommandsMixin
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("FERRICSTORE_INTEGRATION") != "1",
@@ -1398,3 +1399,325 @@ def test_real_ferricstore_native_protocol_named_session_and_data_structure_surfa
                 client.delete(*keys)
         client.close()
         producer.close()
+
+
+def test_real_ferricstore_named_data_helpers_cover_native_protocol_surface() -> None:
+    _require_protocol_transport()
+
+    client = _client()
+    suffix = _suffix()
+    prefix = f"py-sdk:native-helper:{suffix}:"
+    keys: list[str] = []
+    covered: set[str] = set()
+
+    def key(name: str) -> str:
+        value = f"{prefix}{name}"
+        keys.append(value)
+        return value
+
+    def call(name: str, *args: Any, **kwargs: Any) -> Any:
+        covered.add(name)
+        return getattr(client, name)(*args, **kwargs)
+
+    try:
+        string_key = key("string")
+        assert _ok(call("set", string_key, "abc", px=60_000, encode=False))
+        assert _ok(call("kv_set", key("kv"), {"answer": 42}, px=60_000))
+        assert call("kv_get", keys[-1]) == {"answer": 42}
+        assert call("exists", string_key) == 1
+        assert _ok(call("mset", {key("mset-a"): "a", key("mset-b"): "b"}, encode=False))
+        assert call("mget", keys[-2], keys[-1], decode=False)[:2] in ([b"a", b"b"], ["a", "b"])
+        assert _ok(call("kv_mset", {key("kmset-a"): {"a": 1}, key("kmset-b"): {"b": 2}}))
+        assert call("kv_mget", keys[-2], keys[-1]) == [{"a": 1}, {"b": 2}]
+        assert call("msetnx", {key("msetnx-a"): "a", key("msetnx-b"): "b"}, encode=False) == 1
+        counter_key = key("counter")
+        assert call("incr", counter_key) == 1
+        assert call("incrby", counter_key, 4) == 5
+        assert call("decr", counter_key) == 4
+        assert call("decrby", counter_key, 2) == 2
+        assert float(_text(call("incrbyfloat", key("float"), 1.5))) >= 1.5
+        append_key = key("append")
+        assert call("append", append_key, "abc", encode=False) == 3
+        assert call("strlen", append_key) == 3
+        assert call("getrange", append_key, 0, 1) in (b"ab", "ab")
+        assert call("setrange", append_key, 1, "Q", encode=False) == 3
+        assert call("getex", append_key, px=60_000, decode=False) in (b"aQc", "aQc")
+        assert call("ttl", append_key) >= 0
+        assert call("pttl", append_key) >= 0
+        assert call("persist", append_key) in (0, 1)
+        assert call("expire", append_key, 60) == 1
+        assert call("pexpire", append_key, 60_000) == 1
+        assert call("expireat", append_key, int(time.time()) + 60) == 1
+        assert call("pexpireat", append_key, int(time.time() * 1000) + 60_000) == 1
+        assert call("expiretime", append_key) >= 0
+        assert call("pexpiretime", append_key) >= 0
+        assert call("type", append_key) in (b"string", "string")
+        assert call("setnx", key("setnx"), "1", encode=False) == 1
+        assert _ok(call("setex", key("setex"), 60, "1", encode=False))
+        assert _ok(call("psetex", key("psetex"), 60_000, "1", encode=False))
+        copy_key = key("copy")
+        renamed_key = key("renamed")
+        renamed_nx_key = key("renamed-nx")
+        assert call("copy", string_key, copy_key, "REPLACE") == 1
+        assert _ok(call("rename", copy_key, renamed_key))
+        assert call("renamenx", renamed_key, renamed_nx_key) == 1
+        assert call("randomkey") is not None
+        assert call("scan", 0, "MATCH", f"{prefix}*") is not None
+        assert call("keys", f"{prefix}*")
+        assert call("dbsize") >= 1
+        assert call("object", "ENCODING", string_key) is not None
+        assert call("memory", "USAGE", string_key) >= 0
+        assert call("getdel", key("getdel"), decode=False) is None
+        assert call("unlink", key("unlink-missing")) >= 0
+        assert call("delete", key("delete-missing")) >= 0
+        assert call("kv_delete", key("kv-delete-missing")) >= 0
+
+        hash_key = key("hash")
+        assert call("hset", hash_key, {"field": "value", "count": "1"}) >= 1
+        assert call("hget", hash_key, "field") == "value"
+        assert call("hmget", hash_key, "field", "missing")[0] == "value"
+        assert call("hgetall", hash_key)
+        assert call("hexists", hash_key, "field") == 1
+        assert call("hkeys", hash_key)
+        assert call("hvals", hash_key)
+        assert call("hlen", hash_key) >= 2
+        assert call("hdel", hash_key, "field") == 1
+
+        raw_hash_key = key("hash-raw")
+        assert client.command("HSET", raw_hash_key, "field", "value", "count", "1") >= 1
+        assert call("hincrby", raw_hash_key, "count", 2) == 3
+        assert float(_text(call("hincrbyfloat", raw_hash_key, "float", 1.25))) >= 1.25
+        assert call("hsetnx", raw_hash_key, "new", "item", encode=False) == 1
+        assert call("hstrlen", raw_hash_key, "field") == 5
+        assert call("hrandfield", raw_hash_key, 1, "WITHVALUES")
+        assert call("hscan", raw_hash_key, 0)
+        assert call("hexpire", raw_hash_key, 60, "field")[0] in (1, -1)
+        assert call("httl", raw_hash_key, "field")
+        assert call("hpersist", raw_hash_key, "field")
+        assert call("hpexpire", raw_hash_key, 60_000, "field")[0] in (1, -1)
+        assert call("hpttl", raw_hash_key, "field")
+        assert call("hexpiretime", raw_hash_key, "field")
+        assert call("hgetex", raw_hash_key, "PX", 60_000, "FIELDS", 1, "field")[0] in (
+            b"value",
+            "value",
+        )
+        assert call("hsetex", raw_hash_key, 60, "temp", "1") >= 0
+        assert call("hgetdel", raw_hash_key, "temp")[0] in (b"1", "1")
+        assert call("hdel", raw_hash_key, "new") == 1
+
+        list_key = key("list")
+        list_dst = key("list-dst")
+        assert call("lpush", list_key, "b", "a", encode=False) == 2
+        assert call("rpush", list_key, "c", encode=False) == 3
+        assert call("lrange", list_key, 0, -1)
+        assert call("llen", list_key) == 3
+        assert call("lindex", list_key, 0) in (b"a", "a")
+        assert _ok(call("lset", list_key, 1, "bb", encode=False))
+        assert call("lrem", list_key, 0, "bb", encode=False) == 1
+        assert _ok(call("ltrim", list_key, 0, 1))
+        assert call("lpos", list_key, "a", encode=False) == 0
+        assert call("linsert", list_key, "AFTER", "a", "aa", encode=False) >= 0
+        assert call("lmove", list_key, list_dst, "LEFT", "RIGHT") is not None
+        assert call("rpoplpush", list_dst, list_key) is not None
+        assert call("lpushx", list_key, "left", encode=False) >= 1
+        assert call("rpushx", list_key, "right", encode=False) >= 1
+        assert call("blpop", list_key, timeout=1) is not None
+        assert call("rpush", list_key, "block", encode=False) >= 1
+        assert call("brpop", list_key, timeout=1) is not None
+        assert call("rpush", list_key, "move", encode=False) >= 1
+        assert call("blmove", list_key, list_dst, "LEFT", "RIGHT", 1) is not None
+        assert call("rpush", list_key, "mpop", encode=False) >= 1
+        assert call("blmpop", 1, [list_key], "LEFT", count=1) is not None
+        assert call("rpush", list_key, "tail", encode=False) >= 1
+        assert call("rpop", list_key) is not None
+        assert call("lpop", list_key) is not None
+
+        set_a = key("set-a")
+        set_b = key("set-b")
+        assert call("sadd", set_a, "a", "b", encode=False) == 2
+        assert call("sadd", set_b, "b", "c", encode=False) == 2
+        assert call("sismember", set_a, "a", encode=False) == 1
+        assert call("smismember", set_a, "a", "z", encode=False)
+        assert call("scard", set_a) == 2
+        assert call("smembers", set_a)
+        assert call("srandmember", set_a, 1)
+        assert call("sdiff", set_a, set_b)
+        assert call("sinter", set_a, set_b)
+        assert call("sunion", set_a, set_b)
+        assert call("sdiffstore", key("sdiff"), set_a, set_b) >= 0
+        assert call("sinterstore", key("sinter"), set_a, set_b) >= 0
+        assert call("sunionstore", key("sunion"), set_a, set_b) >= 0
+        assert call("sintercard", 2, set_a, set_b, "LIMIT", 10) >= 0
+        assert call("smove", set_a, set_b, "a", encode=False) in (0, 1)
+        assert call("sscan", set_a, 0)
+        assert call("spop", set_b, 1) is not None
+        assert call("srem", set_a, "b", encode=False) in (0, 1)
+
+        zset = key("zset")
+        assert call("zadd", zset, {"a": 1, "b": 2, "c": 3}) == 3
+        assert call("zscore", zset, "a") is not None
+        assert call("zrank", zset, "a") == 0
+        assert call("zrevrank", zset, "c") == 0
+        assert call("zrange", zset, 0, -1)
+        assert call("zrevrange", zset, 0, -1)
+        assert call("zcard", zset) == 3
+        assert _text(call("zincrby", zset, 1, "a"))
+        assert call("zcount", zset, "-inf", "+inf") >= 3
+        assert call("zrandmember", zset, 1, "WITHSCORES")
+        assert call("zmscore", zset, "a", "missing")
+        assert call("zrangebyscore", zset, "-inf", "+inf")
+        assert call("zrevrangebyscore", zset, "+inf", "-inf")
+        assert call("zscan", zset, 0)
+        assert call("zrem", zset, "b") == 1
+        assert call("zpopmin", zset, 1)
+        assert call("zpopmax", zset, 1)
+
+        bitmap = key("bitmap")
+        bitmap_out = key("bitmap-out")
+        assert call("setbit", bitmap, 7, 1) == 0
+        assert call("getbit", bitmap, 7) == 1
+        assert call("bitcount", bitmap) >= 1
+        assert call("bitpos", bitmap, 1) >= 0
+        assert call("bitop", "OR", bitmap_out, bitmap) >= 1
+
+        hll = key("hll")
+        hll_dst = key("hll-dst")
+        assert call("pfadd", hll, "a", "b") in (0, 1)
+        assert call("pfcount", hll) >= 1
+        assert _ok(call("pfmerge", hll_dst, hll))
+
+        geo = key("geo")
+        geo_dst = key("geo-dst")
+        assert call("geoadd", geo, 13.361389, 38.115556, "palermo") == 1
+        assert call("geoadd", geo, 15.087269, 37.502669, "catania") == 1
+        assert call("geopos", geo, "palermo")
+        assert call("geodist", geo, "palermo", "catania", "km") is not None
+        assert call("geohash", geo, "palermo")
+        assert call("geosearch", geo, "FROMMEMBER", "palermo", "BYRADIUS", 200, "km")
+        assert (
+            call(
+                "geosearchstore",
+                geo_dst,
+                geo,
+                "FROMMEMBER",
+                "palermo",
+                "BYRADIUS",
+                200,
+                "km",
+            )
+            >= 0
+        )
+
+        stream = key("stream")
+        stream_id = call("xadd", stream, {"field": "value"}, encode=False)
+        group = f"group-{suffix}"
+        assert stream_id is not None
+        assert call("xlen", stream) >= 1
+        assert call("xrange", stream, "-", "+")
+        assert call("xrevrange", stream, "+", "-")
+        assert call("xread", {stream: "0"}, count=1) is not None
+        assert call("xinfo", "STREAM", stream)
+        assert _ok(call("xgroup", "CREATE", stream, group, "0"))
+        assert call("xreadgroup", group, "consumer", {stream: ">"}, count=1) is not None
+        assert call("xack", stream, group, stream_id) >= 0
+        assert call("xtrim", stream, "MAXLEN", "~", 10) >= 0
+        assert call("xdel", stream, stream_id) >= 0
+
+        bloom = key("bf")
+        assert _ok(call("bf_reserve", bloom, 0.01, 100))
+        assert call("bf_add", bloom, "a") in (0, 1)
+        assert call("bf_madd", bloom, "b", "c")
+        assert call("bf_exists", bloom, "a") in (0, 1)
+        assert call("bf_mexists", bloom, "a", "z")
+        assert call("bf_card", bloom) >= 1
+        assert call("bf_info", bloom)
+
+        cuckoo = key("cf")
+        assert _ok(call("cf_reserve", cuckoo, 100))
+        assert call("cf_add", cuckoo, "a") in (0, 1)
+        assert call("cf_addnx", cuckoo, "b") in (0, 1)
+        assert call("cf_exists", cuckoo, "a") in (0, 1)
+        assert call("cf_mexists", cuckoo, "a", "z")
+        assert call("cf_count", cuckoo, "a") >= 0
+        assert call("cf_del", cuckoo, "a") in (0, 1)
+        assert call("cf_info", cuckoo)
+
+        cms_a = key("cms-a")
+        cms_b = key("cms-b")
+        cms_dst = key("cms-dst")
+        cms_prob = key("cms-prob")
+        assert _ok(call("cms_initbydim", cms_a, 20, 4))
+        assert _ok(call("cms_initbydim", cms_b, 20, 4))
+        assert _ok(call("cms_initbyprob", cms_prob, 0.01, 0.99))
+        assert call("cms_incrby", cms_a, "a", 2, "b", 3)
+        assert call("cms_incrby", cms_b, "a", 1)
+        assert call("cms_query", cms_a, "a", "b")
+        assert _ok(call("cms_merge", cms_dst, 2, cms_a, cms_b))
+        assert call("cms_info", cms_dst)
+
+        topk = key("topk")
+        assert _ok(call("topk_reserve", topk, 3))
+        assert call("topk_add", topk, "a", "b", "a")
+        assert call("topk_incrby", topk, "c", 2)
+        assert call("topk_query", topk, "a", "z")
+        assert call("topk_list", topk, "WITHCOUNT")
+        assert call("topk_count", topk, "a", "z")
+        assert call("topk_info", topk)
+
+        tdigest = key("tdigest")
+        tdigest_src = key("tdigest-src")
+        tdigest_dst = key("tdigest-dst")
+        assert _ok(call("tdigest_create", tdigest))
+        assert _ok(call("tdigest_add", tdigest, 1, 2, 3, 4))
+        assert call("tdigest_quantile", tdigest, 0.5)
+        assert call("tdigest_cdf", tdigest, 2)
+        assert call("tdigest_rank", tdigest, 2)
+        assert call("tdigest_revrank", tdigest, 2)
+        assert call("tdigest_byrank", tdigest, 1)
+        assert call("tdigest_byrevrank", tdigest, 1)
+        assert call("tdigest_trimmed_mean", tdigest, 0.1, 0.9) is not None
+        assert call("tdigest_min", tdigest) is not None
+        assert call("tdigest_max", tdigest) is not None
+        assert call("tdigest_info", tdigest)
+        assert _ok(call("tdigest_create", tdigest_src))
+        assert _ok(call("tdigest_add", tdigest_src, 5, 6))
+        assert _ok(call("tdigest_merge", tdigest_dst, 2, tdigest, tdigest_src, "OVERRIDE"))
+        assert _ok(call("tdigest_reset", tdigest))
+
+        assert call("ping") in (b"PONG", "PONG", True)
+        assert call("echo", "hello") in (b"hello", "hello")
+        assert call("server_info") is not None
+        assert call("command_info", "GET") is not None
+        assert call("slowlog", "GET", 10) is not None
+        assert call("config", "GET", "*") is not None
+        assert _ok(call("watch", key("watched")))
+        assert _ok(call("unwatch"))
+        assert _ok(call("multi"))
+        assert _ok(call("discard"))
+        assert _ok(call("multi"))
+        assert call("set", key("tx-set"), "value", encode=False) in (b"QUEUED", "QUEUED")
+        assert call("transaction_exec") is not None
+        assert call("publish", key("channel"), {"event": "helper"}) >= 0
+        assert call("pubsub", "CHANNELS") is not None
+
+        non_docker_safe_helpers = {
+            "command",
+            "flushall",
+            "flushdb",
+            "select",
+            "subscribe",
+            "unsubscribe",
+            "psubscribe",
+            "punsubscribe",
+        }
+        public_helpers = {
+            name
+            for name, value in DataCommandsMixin.__dict__.items()
+            if callable(value) and not name.startswith("_")
+        }
+        assert public_helpers - covered - non_docker_safe_helpers == set()
+    finally:
+        with suppress(Exception):
+            if keys:
+                client.delete(*keys)
+        client.close()
