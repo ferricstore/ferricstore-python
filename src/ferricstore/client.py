@@ -16,6 +16,7 @@ from ferricstore.adapters import RedisAdapter, RedisCommandExecutor
 from ferricstore.backpressure import BackpressureController, BackpressurePolicy
 from ferricstore.codecs import Codec, RawCodec
 from ferricstore.errors import FerricStoreError, OverloadedError, map_exception
+from ferricstore.redis_commands import RedisCommandsMixin
 from ferricstore.types import (
     ApprovalResult,
     BudgetResult,
@@ -393,7 +394,7 @@ class CommandPipeline:
         return self.results
 
 
-class FlowClient:
+class FlowClient(RedisCommandsMixin):
     """FerricFlow client over Redis/FerricStore commands."""
 
     def __init__(

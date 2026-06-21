@@ -586,6 +586,25 @@ def test_real_ferricstore_native_protocol_store_and_admin_surface() -> None:
         assert client.command("ZRANGE", zset_key, 0, -1)
         assert client.command("ZREM", zset_key, "b") == 1
 
+        counter_key = key("counter")
+        assert client.command("INCR", counter_key) == 1
+        assert client.command("EXPIRE", counter_key, 60) == 1
+        assert client.command("TTL", counter_key) >= 0
+
+        stream_key = key("stream")
+        stream_id = client.command("XADD", stream_key, "*", "field", "value")
+        assert isinstance(stream_id, (bytes, str))
+        assert client.command("XLEN", stream_key) == 1
+
+        hll_key = key("hll")
+        assert client.command("PFADD", hll_key, "a", "b") >= 0
+        assert client.command("PFCOUNT", hll_key) >= 1
+
+        bloom_key = key("bloom")
+        assert _ok(client.command("BF.RESERVE", bloom_key, "0.01", "100"))
+        assert client.command("BF.ADD", bloom_key, "member") == 1
+        assert client.command("BF.EXISTS", bloom_key, "member") == 1
+
         cas_key = key("cas")
         assert _ok(client.command("SET", cas_key, client.codec.encode("old")))
         assert client.cas(cas_key, "old", "new") is True

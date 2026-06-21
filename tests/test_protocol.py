@@ -545,6 +545,34 @@ def test_protocol_submit_flow_many_payload_sends_preencoded_custom_flow_frame(mo
     assert adapter._sock.sent[0][24:] == payload
 
 
+def test_protocol_unknown_command_uses_native_command_exec_fallback():
+    command = build_protocol_command("XADD", "stream-1", "*", "field", "value")
+
+    assert command.opcode == 0x0100
+    assert command.lane_id == 1
+    assert command.payload == {
+        "command": "XADD",
+        "args": ["stream-1", "*", "field", "value"],
+    }
+
+
+def test_protocol_module_command_uses_native_command_exec_fallback():
+    command = build_protocol_command("BF.ADD", "bf-1", "member-1")
+
+    assert command.opcode == 0x0100
+    assert command.payload == {"command": "BF.ADD", "args": ["bf-1", "member-1"]}
+
+
+def test_protocol_control_metadata_builders():
+    assert build_protocol_command("OPTIONS").opcode == 0x000B
+    assert build_protocol_command("SHARDS").opcode == 0x0007
+    assert build_protocol_command("BACKPRESSURE").opcode == 0x0008
+
+    route = build_protocol_command("ROUTE", "key-1")
+    assert route.opcode == 0x0006
+    assert route.payload == {"key": "key-1"}
+
+
 def test_protocol_submit_flow_many_payload_expands_scalar_ok_response(monkeypatch):
     monkeypatch.setattr(ProtocolAdapter, "_connect", lambda self: None)
 
@@ -2842,7 +2870,7 @@ def test_protocol_keeps_complex_complete_many_on_generic_request_codec():
     assert isinstance(command.payload, dict)
 
 
-def test_encodes_protocol_set_get_and_rejects_unknown_commands():
+def test_encodes_protocol_set_get_and_falls_back_for_unknown_commands():
     set_cmd = build_protocol_command("SET", "k", b"v", "PX", 10, "NX")
     get_cmd = build_protocol_command("GET", "k")
 
@@ -2859,11 +2887,13 @@ def test_encodes_protocol_set_get_and_rejects_unknown_commands():
     assert mget.payload[0] == 0x94
     assert mget.payload[1] == 2
 
-    with pytest.raises(InvalidCommandError):
-        build_protocol_command("GET.COMPACT", "k")
+    fallback = build_protocol_command("GET.COMPACT", "k")
+    assert fallback.opcode == 0x0100
+    assert fallback.payload == {"command": "GET.COMPACT", "args": ["k"]}
 
-    with pytest.raises(InvalidCommandError):
-        build_protocol_command("MGET.COMPACT", "a", "b")
+    fallback = build_protocol_command("MGET.COMPACT", "a", "b")
+    assert fallback.opcode == 0x0100
+    assert fallback.payload == {"command": "MGET.COMPACT", "args": ["a", "b"]}
 
 
 def test_encodes_protocol_data_structure_commands():

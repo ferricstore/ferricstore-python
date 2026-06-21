@@ -34,6 +34,7 @@ _OP_STARTUP = 0x000C
 _OP_AUTH = 0x0002
 _OP_SUBSCRIBE_EVENTS = 0x0011
 _OP_UNSUBSCRIBE_EVENTS = 0x0012
+_OP_COMMAND_EXEC = 0x0100
 _OP_GET = 0x0101
 _OP_SET = 0x0102
 _OP_MGET = 0x0104
@@ -172,6 +173,7 @@ _OPCODES = {
     "PIPELINE": _OP_PIPELINE,
     "SUBSCRIBE_EVENTS": _OP_SUBSCRIBE_EVENTS,
     "UNSUBSCRIBE_EVENTS": _OP_UNSUBSCRIBE_EVENTS,
+    "COMMAND_EXEC": _OP_COMMAND_EXEC,
     "GET": _OP_GET,
     "SET": _OP_SET,
     "DEL": 0x0103,
@@ -3078,7 +3080,7 @@ def build_protocol_command(*args: Any) -> ProtocolCommand:
 
     name = _command_name(args[0])
     if name not in _OPCODES:
-        raise InvalidCommandError(f"FerricStore protocol transport does not support command {name}")
+        return ProtocolCommand(_OP_COMMAND_EXEC, {"command": name, "args": list(args[1:])}, 1)
 
     if name in {
         "GET",
@@ -3087,6 +3089,11 @@ def build_protocol_command(*args: Any) -> ProtocolCommand:
         "MGET",
         "MSET",
         "PING",
+        "OPTIONS",
+        "ROUTE",
+        "SHARDS",
+        "BACKPRESSURE",
+        "QUIT",
         "CLIENT.SETNAME",
         "CLIENT.INFO",
         "CAS",
@@ -5003,6 +5010,16 @@ def _build_basic_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolC
     if name == "PING":
         payload = {"message": args[0]} if args else {}
         return ProtocolCommand(opcode, payload, 0)
+    if name == "OPTIONS":
+        return ProtocolCommand(opcode, {}, 0)
+    if name == "ROUTE":
+        return ProtocolCommand(opcode, {"key": _require_arg(args, 0, name)}, 0)
+    if name == "SHARDS":
+        return ProtocolCommand(opcode, {}, 0)
+    if name == "BACKPRESSURE":
+        return ProtocolCommand(opcode, {}, 0)
+    if name == "QUIT":
+        return ProtocolCommand(opcode, {}, 0)
     if name == "CLIENT.SETNAME":
         return ProtocolCommand(opcode, {"name": _require_arg(args, 0, name)}, 0)
     if name == "CLIENT.INFO":
@@ -5180,7 +5197,7 @@ def _build_basic_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolC
         "FERRICSTORE.CONFIG",
     }:
         return ProtocolCommand(opcode, {"args": list(args)})
-    raise InvalidCommandError(f"FerricStore protocol transport does not support command {name}")
+    return ProtocolCommand(_OP_COMMAND_EXEC, {"command": name, "args": list(args)}, 1)
 
 
 def _build_flow_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolCommand:

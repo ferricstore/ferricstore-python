@@ -523,6 +523,72 @@ def test_create_and_transition_can_attach_attributes():
     )
 
 
+def test_redis_command_helpers_are_codec_aware_and_easy_to_use():
+    redis = FakeRedis()
+    client = FlowClient(redis, codec=JsonCodec())
+
+    redis.responses.append("OK")
+    assert client.kv_set("kv", {"answer": 42}, px=100, nx=True) == "OK"
+    assert redis.calls[-1] == ("SET", "kv", b'{"answer":42}', "PX", 100, "NX")
+
+    redis.responses.append(b'{"answer":42}')
+    assert client.kv_get("kv") == {"answer": 42}
+    assert redis.calls[-1] == ("GET", "kv")
+
+    redis.responses.append([b'{"a":1}', None])
+    assert client.kv_mget("a", "missing") == [{"a": 1}, None]
+    assert redis.calls[-1] == ("MGET", "a", "missing")
+
+    redis.responses.append("OK")
+    assert client.kv_mset({"a": {"n": 1}, "b": {"n": 2}}) == "OK"
+    assert redis.calls[-1] == ("MSET", "a", b'{"n":1}', "b", b'{"n":2}')
+
+
+def test_redis_command_helpers_cover_non_flow_command_families():
+    redis = FakeRedis()
+    client = FlowClient(redis)
+
+    redis.responses.extend(
+        [
+            1,
+            1,
+            10,
+            2,
+            b"stream-id",
+            1,
+            "OK",
+            1,
+            1,
+            1,
+            1,
+            b"OK",
+        ]
+    )
+
+    assert client.incr("counter") == 1
+    assert redis.calls[-1] == ("INCR", "counter")
+    assert client.expire("counter", 60, nx=True) == 1
+    assert redis.calls[-1] == ("EXPIRE", "counter", 60, "NX")
+    assert client.hset("hash", {"field": "value"}) == 10
+    assert redis.calls[-1] == ("HSET", "hash", "field", b"value")
+    assert client.sadd("set", "a", "b") == 2
+    assert redis.calls[-1] == ("SADD", "set", b"a", b"b")
+    assert client.xadd("stream", {"field": "value"}) == b"stream-id"
+    assert redis.calls[-1] == ("XADD", "stream", "*", "field", b"value")
+    assert client.xlen("stream") == 1
+    assert redis.calls[-1] == ("XLEN", "stream")
+    assert client.bf_reserve("bf", 0.01, 100) == "OK"
+    assert redis.calls[-1] == ("BF.RESERVE", "bf", 0.01, 100)
+    assert client.bf_add("bf", "member") == 1
+    assert redis.calls[-1] == ("BF.ADD", "bf", "member")
+    assert client.pfadd("hll", "a", "b") == 1
+    assert redis.calls[-1] == ("PFADD", "hll", "a", "b")
+    assert client.publish("channel", "message") == 1
+    assert redis.calls[-1] == ("PUBLISH", "channel", b"message")
+    assert client.dbsize() == 1
+    assert redis.calls[-1] == ("DBSIZE",)
+
+
 def test_signal_builds_flow_signal_command_with_guards_and_values():
     redis = AckRedis()
     client = FlowClient(redis)
