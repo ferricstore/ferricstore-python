@@ -1,10 +1,11 @@
 services:
   ferricstore:
-    image: ghcr.io/ferricstore/ferricstore:0.4.1
+    image: ${FERRICSTORE_IMAGE:-ghcr.io/ferricstore/ferricstore:0.5.2}
     environment:
       FERRICSTORE_PROTECTED_MODE: "false"
+      FERRICSTORE_SHARD_COUNT: "${FERRICSTORE_SHARD_COUNT:-4}"
     ports:
-      - "6379:6379"
+      - "6388:6388"
     volumes:
       - ferricstore-data:/data
 

@@ -5,14 +5,18 @@ import inspect
 import uuid
 import zlib
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
+from urllib.parse import urlparse
 
 from ferricstore.async_client import AsyncFlowClient
 from ferricstore.client import FlowClient
 from ferricstore.types import (
-    ClaimedItem,
+    BudgetPolicy,
+    BudgetResult,
+    ClaimedFlow,
     CreateItem,
+    EffectResult,
     ExceptionPolicy,
     FencedItem,
     FlowRecord,
@@ -33,7 +37,7 @@ from ferricstore.workflow import (
     retry,
 )
 
-AsyncFlowJob = ClaimedItem | FlowRecord
+AsyncFlowJob = ClaimedFlow | FlowRecord
 AsyncFlowHandler = Callable[[AsyncFlowJob], Any | Awaitable[Any]]
 AsyncFlowBatchHandler = Callable[[list[AsyncFlowJob]], Any | Awaitable[Any]]
 AsyncErrorMode = ExceptionPolicy | str
@@ -62,6 +66,14 @@ ASYNC_QUEUE_WORKER_CONFIG_KEYS = frozenset(
         "exception_policy",
     }
 )
+
+_PROTOCOL_URL_SCHEMES = {"ferric", "ferrics"}
+
+
+def _is_protocol_url(value: str) -> bool:
+    return urlparse(value).scheme.lower() in _PROTOCOL_URL_SCHEMES
+
+
 ASYNC_WORKFLOW_CONFIG_KEYS = frozenset(
     {
         "workers",
@@ -141,7 +153,7 @@ def _client_from(client: AsyncFlowClient | FlowClient | str | Any) -> AsyncFlowC
             "async Flow SDK requires AsyncFlowClient, an async executor, or URL; "
             "FlowClient is sync-only"
         )
-    if hasattr(client, "execute_command") and not hasattr(client, "claim_jobs"):
+    if hasattr(client, "execute_command") and not hasattr(client, "claim_flows"):
         return AsyncFlowClient(client)
     return client
 
@@ -221,18 +233,19 @@ class AsyncQueueFlowWorker:
             command_connections=command_connections,
             claim_connections=claim_connections,
         )
+        command_max_connections = (
+            1 if isinstance(client, str) and command_connections is None else command_pool_size
+        )
         if isinstance(client, str):
-            self.client = AsyncFlowClient.from_url(client, max_connections=command_pool_size)
+            self.client = AsyncFlowClient.from_url(client, max_connections=command_max_connections)
             self._close_client = True if close_client is None else close_client
         else:
             self.client = _client_from(client)
             self._close_client = False if close_client is None else close_client
         if claim_client is None:
             if isinstance(client, str):
-                self.claim_client = AsyncFlowClient.from_url(
-                    client, max_connections=claim_pool_size
-                )
-                self._close_claim_client = True
+                self.claim_client = self.client
+                self._close_claim_client = False
             else:
                 self.claim_client = self.client
                 self._close_claim_client = False
@@ -360,7 +373,7 @@ class AsyncQueueFlowWorker:
 
     async def run_once(self, handler: AsyncFlowHandler) -> QueueFlowWorkerResult:
         partition_key, partition_keys = self._next_claim_partition()
-        jobs = await self._claim_jobs(
+        jobs = await self._claim_flows(
             partition_key=partition_key, partition_keys=partition_keys, limit=self.batch_size
         )
         result = QueueFlowWorkerResult(claim_calls=1)
@@ -379,7 +392,7 @@ class AsyncQueueFlowWorker:
 
     async def run_batch_once(self, handler: AsyncFlowBatchHandler) -> QueueFlowWorkerResult:
         partition_key, partition_keys = self._next_claim_partition()
-        jobs = await self._claim_jobs(
+        jobs = await self._claim_flows(
             partition_key=partition_key,
             partition_keys=partition_keys,
             limit=self.batch_size,
@@ -398,7 +411,7 @@ class AsyncQueueFlowWorker:
             claim_calls=1,
         )
 
-    async def _claim_jobs(
+    async def _claim_flows(
         self,
         *,
         partition_key: str | None,
@@ -429,7 +442,7 @@ class AsyncQueueFlowWorker:
 
         return cast(
             list[AsyncFlowJob],
-            await self.claim_client.claim_jobs(
+            await self.claim_client.claim_flows(
                 self.type,
                 state=self.state,
                 states=self.states,
@@ -525,7 +538,7 @@ class AsyncQueueFlowWorker:
 
         if handled.mixed_results is None:
             await self.client.complete_jobs(
-                cast(list[ClaimedItem], handled.jobs),
+                cast(list[ClaimedFlow], handled.jobs),
                 result=handled.first_result,
                 independent=self.complete_independent,
             )
@@ -562,7 +575,7 @@ class AsyncQueueFlowWorker:
             for message, jobs in groups.items():
                 await self.client.fail_many(
                     None,
-                    cast(list[ClaimedItem], jobs),
+                    cast(list[ClaimedFlow], jobs),
                     error=message,
                     independent=self.complete_independent,
                 )
@@ -573,7 +586,7 @@ class AsyncQueueFlowWorker:
         for message, jobs in groups.items():
             await self.client.retry_many(
                 None,
-                cast(list[ClaimedItem], jobs),
+                cast(list[ClaimedFlow], jobs),
                 error=message,
                 independent=self.complete_independent,
             )
@@ -640,18 +653,19 @@ class AsyncQueueFlow:
             claim_connections=claim_connections,
         )
         self._url = client if isinstance(client, str) else None
+        command_max_connections = (
+            1 if isinstance(client, str) and command_connections is None else command_pool_size
+        )
         if isinstance(client, str):
             self._owns_client = True
-            self.client = AsyncFlowClient.from_url(client, max_connections=command_pool_size)
+            self.client = AsyncFlowClient.from_url(client, max_connections=command_max_connections)
         else:
             self._owns_client = False
             self.client = _client_from(client)
         if claim_client is None:
             if isinstance(client, str):
-                self.claim_client = AsyncFlowClient.from_url(
-                    client, max_connections=claim_pool_size
-                )
-                self._owns_claim_client = True
+                self.claim_client = self.client
+                self._owns_claim_client = False
             else:
                 self.claim_client = self.client
                 self._owns_claim_client = False
@@ -919,17 +933,19 @@ class AsyncQueueClient:
         self._claim_client_explicit = claim_client is not None
         self._owned_extra_claim_flows: list[AsyncFlowClient] = []
         self._claim_pool_size = claim_pool_size
+        command_max_connections = (
+            1
+            if isinstance(client, str)
+            and (worker_config is None or worker_config.command_connections is None)
+            else command_pool_size
+        )
         self.flow = (
-            AsyncFlowClient.from_url(client, max_connections=command_pool_size)
+            AsyncFlowClient.from_url(client, max_connections=command_max_connections)
             if isinstance(client, str)
             else _client_from(client)
         )
         if claim_client is None:
-            self.claim_flow = (
-                AsyncFlowClient.from_url(client, max_connections=claim_pool_size)
-                if isinstance(client, str)
-                else self.flow
-            )
+            self.claim_flow = self.flow
         else:
             self.claim_flow = (
                 AsyncFlowClient.from_url(claim_client, max_connections=claim_pool_size)
@@ -940,10 +956,8 @@ class AsyncQueueClient:
         self.worker_config = worker_config
         self.value_config = value_config or ValueConfig()
         self._owns_flow = _owns_clients or isinstance(client, str)
-        self._owns_claim_flow = (
-            _owns_clients
-            or isinstance(claim_client, str)
-            or (claim_client is None and isinstance(client, str))
+        self._owns_claim_flow = (_owns_clients and self.claim_flow is not self.flow) or isinstance(
+            claim_client, str
         )
 
     @classmethod
@@ -956,17 +970,17 @@ class AsyncQueueClient:
         value_config: ValueConfig | None = None,
         **kwargs: Any,
     ) -> AsyncQueueClient:
-        command_pool_size, claim_pool_size = resolve_worker_connection_counts(
+        command_pool_size, _claim_pool_size = resolve_worker_connection_counts(
             worker_config=worker_config,
             default_workers=1,
         )
         command_kwargs = dict(kwargs)
-        command_kwargs.setdefault("max_connections", command_pool_size)
-        claim_kwargs = dict(kwargs)
-        claim_kwargs["max_connections"] = claim_pool_size
+        if worker_config is None or worker_config.command_connections is None:
+            command_kwargs.setdefault("max_connections", 1)
+        else:
+            command_kwargs.setdefault("max_connections", command_pool_size)
         instance = cls(
             AsyncFlowClient.from_url(url, **command_kwargs),
-            claim_client=AsyncFlowClient.from_url(url, **claim_kwargs),
             retry_policy=retry_policy,
             worker_config=worker_config,
             value_config=value_config,
@@ -975,26 +989,14 @@ class AsyncQueueClient:
         instance._url = url
         instance._base_url_kwargs = dict(kwargs)
         instance._claim_client_explicit = False
-        instance._claim_pool_size = claim_pool_size
+        instance._claim_pool_size = 1
         return instance
 
     def _claim_flow_for_worker_config(
         self,
         worker_config: WorkerConfig | None,
     ) -> AsyncFlowClient:
-        if self._claim_client_explicit or self._url is None or worker_config is None:
-            return self.claim_flow
-        _, claim_pool_size = resolve_worker_connection_counts(
-            worker_config=worker_config,
-            default_workers=1,
-        )
-        if claim_pool_size == self._claim_pool_size:
-            return self.claim_flow
-        claim_kwargs = dict(self._base_url_kwargs)
-        claim_kwargs["max_connections"] = claim_pool_size
-        claim_flow = AsyncFlowClient.from_url(self._url, **claim_kwargs)
-        self._owned_extra_claim_flows.append(claim_flow)
-        return claim_flow
+        return self.claim_flow
 
     def queue(
         self,
@@ -1152,6 +1154,214 @@ class AsyncWorkflowFlowCommands:
         )
 
 
+class AsyncWorkflowBudget:
+    """Async budget reservation helper for workflow handlers."""
+
+    def __init__(
+        self,
+        ctx: AsyncWorkflowContext,
+        *,
+        scope: str,
+        amount: int,
+        limit: int | None = None,
+        window_ms: int | None = None,
+        usage_key: str = "amount",
+        attribute_prefix: str = "governance_budget",
+    ) -> None:
+        self.ctx = ctx
+        self.scope = scope
+        self.amount = amount
+        self.limit = limit
+        self.window_ms = window_ms
+        self.usage_key = usage_key
+        self.attribute_prefix = attribute_prefix
+        self.reservation: BudgetResult | None = None
+        self._closed = False
+
+    @property
+    def reservation_id(self) -> str:
+        if self.reservation is None or self.reservation.reservation_id is None:
+            raise RuntimeError("budget reservation has not been opened")
+        return self.reservation.reservation_id
+
+    async def __aenter__(self) -> AsyncWorkflowBudget:
+        self.reservation = await self.ctx.client.budget_reserve(
+            self.scope,
+            self.amount,
+            limit=self.limit,
+            window_ms=self.window_ms,
+        )
+        self.ctx._record_budget_result(self.attribute_prefix, self.reservation)
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._closed:
+            return
+        if exc_type is None:
+            await self.commit(self.amount)
+        else:
+            await self.release()
+
+    async def commit(
+        self, actual_amount: int | None = None, *, usage: dict[str, Any] | None = None
+    ) -> BudgetResult:
+        actual = self.amount if actual_amount is None else actual_amount
+        result = await self.ctx.client.budget_commit(
+            self.scope,
+            self.reservation_id,
+            actual,
+            usage=usage if usage is not None else {self.usage_key: actual},
+        )
+        self._closed = True
+        self.ctx._record_budget_result(self.attribute_prefix, result)
+        return result
+
+    async def release(self) -> BudgetResult:
+        result = await self.ctx.client.budget_release(self.scope, self.reservation_id)
+        self._closed = True
+        self.ctx._record_budget_result(self.attribute_prefix, result)
+        return result
+
+
+class AsyncWorkflowEffect:
+    """Async external-effect helper bound to an async workflow job."""
+
+    def __init__(
+        self,
+        ctx: AsyncWorkflowContext,
+        effect_key: str,
+        effect_type: str,
+        *,
+        operation_digest: str | None = None,
+        idempotency_key: str | None = None,
+        governance_scope: str | None = None,
+        external_id: str | Callable[[Any], str | None] | None = None,
+    ) -> None:
+        self.ctx = ctx
+        self.effect_key = effect_key
+        self.effect_type = effect_type
+        self.operation_digest = operation_digest or idempotency_key or f"{effect_type}:{effect_key}"
+        self.idempotency_key = idempotency_key
+        self.governance_scope = governance_scope
+        self.external_id = external_id
+        self.reservation: EffectResult | None = None
+        self._result: EffectResult | None = None
+        self._started_at: float | None = None
+        self._closed = False
+
+    async def reserve(self) -> EffectResult:
+        if self.reservation is not None:
+            return self.reservation
+        self.reservation = await self.ctx.client.effect_reserve(
+            self.ctx.id,
+            self.effect_key,
+            self.effect_type,
+            partition_key=self.ctx.partition_key,
+            lease_token=self.ctx.lease_token,
+            fencing_token=self.ctx.fencing_token,
+            operation_digest=self.operation_digest,
+            idempotency_key=self.idempotency_key,
+            governance_scope=self.governance_scope,
+        )
+        self._started_at = asyncio.get_running_loop().time()
+        return self.reservation
+
+    async def confirm(
+        self,
+        *,
+        external_id: str | None = None,
+        latency_ms: int | None = None,
+    ) -> EffectResult:
+        if self._closed and self._result is not None:
+            return self._result
+        await self.reserve()
+        self._result = await self.ctx.client.effect_confirm(
+            self.ctx.id,
+            self.effect_key,
+            partition_key=self.ctx.partition_key,
+            lease_token=self.ctx.lease_token,
+            fencing_token=self.ctx.fencing_token,
+            external_id=external_id,
+            latency_ms=self._latency_ms(latency_ms),
+        )
+        self._closed = True
+        return self._result
+
+    async def fail(
+        self,
+        *,
+        error: str | None = None,
+        reason: str | None = None,
+        latency_ms: int | None = None,
+    ) -> EffectResult:
+        if self._closed and self._result is not None:
+            return self._result
+        await self.reserve()
+        self._result = await self.ctx.client.effect_fail(
+            self.ctx.id,
+            self.effect_key,
+            partition_key=self.ctx.partition_key,
+            lease_token=self.ctx.lease_token,
+            fencing_token=self.ctx.fencing_token,
+            error=error,
+            reason=reason,
+            latency_ms=self._latency_ms(latency_ms),
+        )
+        self._closed = True
+        return self._result
+
+    async def call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        await self.reserve()
+        try:
+            result = func(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            await self.fail(error=str(exc), reason=exc.__class__.__name__)
+            raise
+        await self.confirm(external_id=self._resolve_external_id(result))
+        return result
+
+    def __call__(self, func: Callable[..., Any]) -> Callable[..., Any]:
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            return await self.call(func, *args, **kwargs)
+
+        return wrapper
+
+    async def __aenter__(self) -> AsyncWorkflowEffect:
+        await self.reserve()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._closed:
+            return
+        if exc_type is None:
+            await self.confirm()
+        else:
+            await self.fail(
+                error=str(exc) if exc is not None else None,
+                reason=exc_type.__name__ if exc_type is not None else None,
+            )
+
+    def _resolve_external_id(self, result: Any) -> str | None:
+        if callable(self.external_id):
+            return self.external_id(result)
+        if isinstance(self.external_id, str):
+            return self.external_id
+        if isinstance(result, str):
+            return result
+        if isinstance(result, bytes):
+            return result.decode()
+        return None
+
+    def _latency_ms(self, explicit: int | None = None) -> int | None:
+        if explicit is not None:
+            return explicit
+        if self._started_at is None:
+            return None
+        return max(int((asyncio.get_running_loop().time() - self._started_at) * 1000), 0)
+
+
 class AsyncWorkflowContext:
     """Async workflow handler context with value-ref helpers."""
 
@@ -1162,6 +1372,7 @@ class AsyncWorkflowContext:
         self.state_name = state_name
         self.flow = AsyncWorkflowFlowCommands(self)
         self._value_cache: dict[str, Any] = {}
+        self._governance_attributes: dict[str, Any] = {}
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.job, name)
@@ -1254,6 +1465,74 @@ class AsyncWorkflowContext:
 
         return values
 
+    def budget(
+        self,
+        scope: str,
+        amount: int,
+        *,
+        limit: int | None = None,
+        window_ms: int | None = None,
+        usage_key: str = "amount",
+        attribute_prefix: str = "governance_budget",
+    ) -> AsyncWorkflowBudget:
+        return AsyncWorkflowBudget(
+            self,
+            scope=scope,
+            amount=amount,
+            limit=limit,
+            window_ms=window_ms,
+            usage_key=usage_key,
+            attribute_prefix=attribute_prefix,
+        )
+
+    def effect(
+        self,
+        effect_key: str,
+        effect_type: str,
+        *,
+        operation_digest: str | None = None,
+        idempotency_key: str | None = None,
+        governance_scope: str | None = None,
+        external_id: str | Callable[[Any], str | None] | None = None,
+    ) -> AsyncWorkflowEffect:
+        return AsyncWorkflowEffect(
+            self,
+            effect_key,
+            effect_type,
+            operation_digest=operation_digest,
+            idempotency_key=idempotency_key,
+            governance_scope=governance_scope,
+            external_id=external_id,
+        )
+
+    def _state_budget(self, policy: BudgetPolicy | None) -> AsyncWorkflowBudget | None:
+        if policy is None:
+            return None
+        scope = policy.scope(self) if callable(policy.scope) else policy.scope
+        return self.budget(
+            scope,
+            policy.amount,
+            limit=policy.limit,
+            window_ms=policy.window_ms,
+            usage_key=policy.usage_key,
+            attribute_prefix=policy.attribute_prefix,
+        )
+
+    def _record_budget_result(self, prefix: str, result: BudgetResult) -> None:
+        attrs = {
+            f"{prefix}_scope": result.scope,
+            f"{prefix}_status": result.status,
+            f"{prefix}_reservation_id": result.reservation_id,
+            f"{prefix}_reserved_amount": result.reserved_amount,
+            f"{prefix}_actual_amount": result.actual_amount,
+            f"{prefix}_overage_amount": result.overage_amount,
+            f"{prefix}_remaining": result.remaining,
+            f"{prefix}_over_budget": result.over_budget,
+        }
+        self._governance_attributes.update(
+            {key: value for key, value in attrs.items() if value is not None}
+        )
+
 
 class AsyncWorkflow:
     """Simple async state-machine workflow runtime.
@@ -1317,18 +1596,19 @@ class AsyncWorkflow:
             claim_connections=claim_connections,
         )
         self._url = client if isinstance(client, str) else None
+        command_max_connections = (
+            1 if isinstance(client, str) and command_connections is None else command_pool_size
+        )
         if isinstance(client, str):
             self._owns_client = True
-            self.client = AsyncFlowClient.from_url(client, max_connections=command_pool_size)
+            self.client = AsyncFlowClient.from_url(client, max_connections=command_max_connections)
         else:
             self._owns_client = False
             self.client = _client_from(client)
         if claim_client is None:
             if isinstance(client, str):
-                self.claim_client = AsyncFlowClient.from_url(
-                    client, max_connections=claim_pool_size
-                )
-                self._owns_claim_client = True
+                self.claim_client = self.client
+                self._owns_claim_client = False
             else:
                 self.claim_client = self.client
                 self._owns_claim_client = False
@@ -1362,6 +1642,7 @@ class AsyncWorkflow:
         self.handlers: dict[str, AsyncWorkflowHandler] = {}
         self.error_modes: dict[str, AsyncErrorMode] = {}
         self.retry_policies: dict[str, RetryPolicy] = {}
+        self.budget_policies: dict[str, BudgetPolicy] = {}
         self._partition_cursors = [0 for _ in range(workers)]
         self._state_cursors = [0 for _ in range(workers)]
         self._running = False
@@ -1375,12 +1656,14 @@ class AsyncWorkflow:
         exception_policy: AsyncErrorMode | None = None,
         on_error: AsyncErrorMode | None = None,
         retry_policy: RetryPolicy | None = None,
+        budget: BudgetPolicy | None = None,
     ) -> Callable[[AsyncWorkflowHandler], AsyncWorkflowHandler]:
         return self.on(
             state_name,
             exception_policy=exception_policy,
             on_error=on_error,
             retry_policy=retry_policy,
+            budget=budget,
         )
 
     def on(
@@ -1390,6 +1673,7 @@ class AsyncWorkflow:
         exception_policy: AsyncErrorMode | None = None,
         on_error: AsyncErrorMode | None = None,
         retry_policy: RetryPolicy | None = None,
+        budget: BudgetPolicy | None = None,
     ) -> Callable[[AsyncWorkflowHandler], AsyncWorkflowHandler]:
         if state_name not in self.states:
             raise ValueError(f"unknown workflow state: {state_name!r}")
@@ -1411,6 +1695,10 @@ class AsyncWorkflow:
                 self.retry_policies[state_name] = retry_policy
             else:
                 self.retry_policies.pop(state_name, None)
+            if budget is not None:
+                self.budget_policies[state_name] = budget
+            else:
+                self.budget_policies.pop(state_name, None)
             return handler
 
         return decorate
@@ -1531,7 +1819,7 @@ class AsyncWorkflow:
         else:
             jobs = cast(
                 list[AsyncFlowJob],
-                await self.claim_client.claim_jobs(self.type, **cast(Any, claim_kwargs)),
+                await self.claim_client.claim_flows(self.type, **cast(Any, claim_kwargs)),
             )
         result = AsyncWorkflowWorkerResult(claim_calls=1)
         if not jobs:
@@ -1550,7 +1838,7 @@ class AsyncWorkflow:
 
     async def _run_once_any_state(self, worker_index: int) -> AsyncWorkflowWorkerResult:
         partition_key, partition_keys = self._next_claim_partition(worker_index)
-        jobs = await self.claim_client.claim_jobs(
+        jobs = await self.claim_client.claim_flows(
             self.type,
             worker=f"{self.type}:async-workflow:{worker_index}",
             partition_key=partition_key,
@@ -1586,8 +1874,8 @@ class AsyncWorkflow:
             and all(state_name in self.handlers for state_name in self.states)
         )
 
-    def _group_jobs_by_run_state(self, jobs: list[ClaimedItem]) -> dict[str, list[ClaimedItem]]:
-        grouped: dict[str, list[ClaimedItem]] = {}
+    def _group_jobs_by_run_state(self, jobs: list[ClaimedFlow]) -> dict[str, list[ClaimedFlow]]:
+        grouped: dict[str, list[ClaimedFlow]] = {}
         for job in jobs:
             state_name = job.run_state
             if state_name not in self.handlers:
@@ -1648,26 +1936,35 @@ class AsyncWorkflow:
         on_error = self.error_modes.get(state_name, self.on_error)
 
         async def run_one(job: AsyncFlowJob) -> Transition | Complete | Retry | Fail:
+            ctx = AsyncWorkflowContext(self, job, state_name)
+            budget = ctx._state_budget(self.budget_policies.get(state_name))
             try:
                 async with semaphore:
-                    value = handler(AsyncWorkflowContext(self, job, state_name))
+                    if budget is not None:
+                        await budget.__aenter__()
+                    value = handler(ctx)
                     if inspect.isawaitable(value):
                         value = await value
             except Exception as exc:
+                if budget is not None:
+                    await budget.release()
                 if on_error == "raise":
                     raise
                 value = fail(error=str(exc)) if on_error == "fail" else retry(error=str(exc))
-            return self._normalize_outcome(value)
+                return self._merge_governance_attributes(value, ctx._governance_attributes)
+            if budget is not None:
+                await budget.commit()
+            return self._merge_governance_attributes(value, ctx._governance_attributes)
 
         outcomes = await asyncio.gather(*(run_one(job) for job in jobs))
 
         first = outcomes[0]
         if all(outcome == first for outcome in outcomes):
-            await self._apply_uniform(state_name, cast(list[ClaimedItem], jobs), first)
+            await self._apply_uniform(state_name, cast(list[ClaimedFlow], jobs), first)
             return len(jobs)
 
         for job, outcome in zip(jobs, outcomes, strict=False):
-            await self._apply_uniform(state_name, [cast(ClaimedItem, job)], outcome)
+            await self._apply_uniform(state_name, [cast(ClaimedFlow, job)], outcome)
         return len(jobs)
 
     def _normalize_outcome(self, value: Any) -> Transition | Complete | Retry | Fail:
@@ -1675,10 +1972,20 @@ class AsyncWorkflow:
             return value
         return complete(result=value)
 
+    def _merge_governance_attributes(
+        self, value: Any, attributes: dict[str, Any]
+    ) -> Transition | Complete | Retry | Fail:
+        outcome = self._normalize_outcome(value)
+        if not attributes:
+            return outcome
+        merged = dict(outcome.attributes_merge or {})
+        merged.update(attributes)
+        return replace(outcome, attributes_merge=merged)
+
     async def _apply_uniform(
         self,
         state_name: str,
-        jobs: list[ClaimedItem],
+        jobs: list[ClaimedFlow],
         outcome: Transition | Complete | Retry | Fail,
     ) -> None:
         partition_key = self._uniform_partition_key(jobs)
@@ -1703,6 +2010,7 @@ class AsyncWorkflow:
                 value_refs=outcome.value_refs,
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
+                attributes_merge=outcome.attributes_merge,
                 run_at_ms=outcome.run_at_ms,
                 independent=True,
             )
@@ -1718,6 +2026,7 @@ class AsyncWorkflow:
                 value_refs=outcome.value_refs,
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
+                attributes_merge=outcome.attributes_merge,
                 independent=True,
             )
             return
@@ -1731,6 +2040,7 @@ class AsyncWorkflow:
                 value_refs=outcome.value_refs,
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
+                attributes_merge=outcome.attributes_merge,
                 run_at_ms=outcome.run_at_ms,
                 independent=True,
             )
@@ -1745,6 +2055,7 @@ class AsyncWorkflow:
             value_refs=outcome.value_refs,
             drop_values=outcome.drop_values,
             override_values=outcome.override_values,
+            attributes_merge=outcome.attributes_merge,
             independent=True,
         )
 
@@ -1787,7 +2098,7 @@ class AsyncWorkflow:
         return await asyncio.to_thread(run_thread)
 
     @staticmethod
-    def _uniform_partition_key(jobs: list[ClaimedItem]) -> str | None:
+    def _uniform_partition_key(jobs: list[ClaimedFlow]) -> str | None:
         first = jobs[0].partition_key
         if first is not None and all(job.partition_key == first for job in jobs):
             return first
@@ -1828,17 +2139,19 @@ class AsyncWorkflowClient:
         self._claim_client_explicit = claim_client is not None
         self._owned_extra_claim_flows: list[AsyncFlowClient] = []
         self._claim_pool_size = claim_pool_size
+        command_max_connections = (
+            1
+            if isinstance(client, str)
+            and (worker_config is None or worker_config.command_connections is None)
+            else command_pool_size
+        )
         self.flow = (
-            AsyncFlowClient.from_url(client, max_connections=command_pool_size)
+            AsyncFlowClient.from_url(client, max_connections=command_max_connections)
             if isinstance(client, str)
             else _client_from(client)
         )
         if claim_client is None:
-            self.claim_flow = (
-                AsyncFlowClient.from_url(client, max_connections=claim_pool_size)
-                if isinstance(client, str)
-                else self.flow
-            )
+            self.claim_flow = self.flow
         else:
             self.claim_flow = (
                 AsyncFlowClient.from_url(claim_client, max_connections=claim_pool_size)
@@ -1849,10 +2162,8 @@ class AsyncWorkflowClient:
         self.worker_config = worker_config
         self.value_config = value_config or ValueConfig()
         self._owns_flow = _owns_clients or isinstance(client, str)
-        self._owns_claim_flow = (
-            _owns_clients
-            or isinstance(claim_client, str)
-            or (claim_client is None and isinstance(client, str))
+        self._owns_claim_flow = (_owns_clients and self.claim_flow is not self.flow) or isinstance(
+            claim_client, str
         )
 
     @classmethod
@@ -1865,17 +2176,17 @@ class AsyncWorkflowClient:
         value_config: ValueConfig | None = None,
         **kwargs: Any,
     ) -> AsyncWorkflowClient:
-        command_pool_size, claim_pool_size = resolve_worker_connection_counts(
+        command_pool_size, _claim_pool_size = resolve_worker_connection_counts(
             worker_config=worker_config,
             default_workers=1,
         )
         command_kwargs = dict(kwargs)
-        command_kwargs.setdefault("max_connections", command_pool_size)
-        claim_kwargs = dict(kwargs)
-        claim_kwargs["max_connections"] = claim_pool_size
+        if worker_config is None or worker_config.command_connections is None:
+            command_kwargs.setdefault("max_connections", 1)
+        else:
+            command_kwargs.setdefault("max_connections", command_pool_size)
         instance = cls(
             AsyncFlowClient.from_url(url, **command_kwargs),
-            claim_client=AsyncFlowClient.from_url(url, **claim_kwargs),
             retry_policy=retry_policy,
             worker_config=worker_config,
             value_config=value_config,
@@ -1884,26 +2195,14 @@ class AsyncWorkflowClient:
         instance._url = url
         instance._base_url_kwargs = dict(kwargs)
         instance._claim_client_explicit = False
-        instance._claim_pool_size = claim_pool_size
+        instance._claim_pool_size = 1
         return instance
 
     def _claim_flow_for_worker_config(
         self,
         worker_config: WorkerConfig | None,
     ) -> AsyncFlowClient:
-        if self._claim_client_explicit or self._url is None or worker_config is None:
-            return self.claim_flow
-        _, claim_pool_size = resolve_worker_connection_counts(
-            worker_config=worker_config,
-            default_workers=1,
-        )
-        if claim_pool_size == self._claim_pool_size:
-            return self.claim_flow
-        claim_kwargs = dict(self._base_url_kwargs)
-        claim_kwargs["max_connections"] = claim_pool_size
-        claim_flow = AsyncFlowClient.from_url(self._url, **claim_kwargs)
-        self._owned_extra_claim_flows.append(claim_flow)
-        return claim_flow
+        return self.claim_flow
 
     def workflow(
         self,

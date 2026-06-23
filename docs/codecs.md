@@ -7,7 +7,7 @@ The SDK defaults to raw bytes. This is fastest and avoids accidental JSON work.
 ```python
 from ferricstore import RawCodec, WorkflowClient
 
-client = WorkflowClient.from_url("redis://127.0.0.1:6379/0", codec=RawCodec())
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388", codec=RawCodec())
 ```
 
 Accepts:
@@ -24,7 +24,7 @@ Returns `bytes | None` on decode.
 ```python
 from ferricstore import JsonCodec, WorkflowClient
 
-client = WorkflowClient.from_url("redis://127.0.0.1:6379/0", codec=JsonCodec())
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388", codec=JsonCodec())
 orders = client.workflow(type="order")
 
 orders.start(

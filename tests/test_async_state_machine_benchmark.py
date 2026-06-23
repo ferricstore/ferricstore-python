@@ -60,7 +60,7 @@ def test_pipeline_create_mode_uses_create_inflight(monkeypatch):
 
     result = asyncio.run(
         bench.create_workflows(
-            url="redis://example/0",
+            url="ferric://example:6388",
             run_id="run",
             flow_type="email",
             indices=list(range(6)),

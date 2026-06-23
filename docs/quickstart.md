@@ -25,7 +25,7 @@ was seen.
 ```python
 from ferricstore import WorkflowClient, complete, transition
 
-client = WorkflowClient.from_url("redis://127.0.0.1:6379/0")
+client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 order = client.workflow(
     type="order",
     initial_state="created",
@@ -60,7 +60,7 @@ Use a queue when each item is one unit of durable work.
 ```python
 from ferricstore import QueueClient
 
-client = QueueClient.from_url("redis://127.0.0.1:6379/0")
+client = QueueClient.from_url("ferric://127.0.0.1:6388")
 emails = client.queue(type="email")
 
 emails.enqueue("email-1", payload=b"welcome:user-1")
@@ -108,7 +108,7 @@ from ferricstore import AsyncQueueClient
 
 
 async def main():
-    client = AsyncQueueClient.from_url("redis://127.0.0.1:6379/0")
+    client = AsyncQueueClient.from_url("ferric://127.0.0.1:6388")
     emails = client.queue(type="email")
 
     worker = emails.worker()
@@ -132,7 +132,7 @@ thread executors unless you have a specific reason.
 | Durable queue | `QueueClient` / `AsyncQueueClient` |
 | Explicit state machine | `WorkflowClient` / `AsyncWorkflowClient` |
 | Custom command control | `FlowClient` / `AsyncFlowClient` |
-| Normal Redis command | `client.command(...)` |
+| Data-structure command | `client.command(...)` |
 | Fanout/children | `spawn_children` or workflow `job.flow.spawn_children(...)` |
 | Large optional data | named values and `value_mget` |
 

@@ -4,7 +4,7 @@ from ferricstore import WorkflowClient, WorkflowWorker, complete, transition
 
 
 def main() -> None:
-    client = WorkflowClient.from_url("redis://127.0.0.1:6379/0")
+    client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
     signup = client.workflow(
         type="signup",
         initial_state="created",

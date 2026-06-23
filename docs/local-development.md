@@ -26,23 +26,23 @@ Or with a direct Docker command:
 
 ```bash
 docker run --name ferricstore-dev \
-  -p 6379:6379 \
+  -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore-dev-data:/data \
-  ghcr.io/ferricstore/ferricstore:0.4.1
+  ghcr.io/ferricstore/ferricstore:0.5.2
 ```
 
 This starts one local FerricStore server on:
 
 ```text
-redis://127.0.0.1:6379/0
+ferric://127.0.0.1:6388
 ```
 
 If you built the server image locally, replace the image name:
 
 ```bash
 docker run --name ferricstore-dev \
-  -p 6379:6379 \
+  -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore-dev-data:/data \
   your-local-image:tag
@@ -53,7 +53,7 @@ docker run --name ferricstore-dev \
 ```bash
 python examples/order_workflow.py
 python examples/queue_worker.py
-python examples/native_commands.py
+python examples/protocol_commands.py
 ```
 
 ## Run tests
@@ -62,13 +62,14 @@ python examples/native_commands.py
 pytest
 ```
 
-Unit tests use fake Redis executors and do not require the server. Integration
+Unit tests use fake command executors and do not require the server. Integration
 or benchmark runs need a local FerricStore server.
 
 Run the integration test against the Compose server:
 
 ```bash
 FERRICSTORE_INTEGRATION=1 pytest tests/integration
+FERRICSTORE_INTEGRATION=1 FERRICSTORE_URL=ferric://127.0.0.1:6388 pytest tests/integration
 ```
 
 ## Stop local services

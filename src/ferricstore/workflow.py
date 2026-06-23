@@ -8,13 +8,17 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Any, cast
+from urllib.parse import urlparse
 
 from ferricstore.client import FlowClient
 from ferricstore.errors import FerricStoreError
 from ferricstore.types import (
+    BudgetPolicy,
+    BudgetResult,
     ChildSpec,
-    ClaimedItem,
+    ClaimedFlow,
     CreateItem,
+    EffectResult,
     ExceptionPolicy,
     FencedItem,
     FlowRecord,
@@ -24,6 +28,12 @@ from ferricstore.types import (
     normalize_exception_policy,
     resolve_worker_connection_counts,
 )
+
+_PROTOCOL_URL_SCHEMES = {"ferric", "ferrics"}
+
+
+def _is_protocol_url(value: str) -> bool:
+    return urlparse(value).scheme.lower() in _PROTOCOL_URL_SCHEMES
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +47,7 @@ class StateConfig:
     on_error: str = ExceptionPolicy.RETRY.value
     retry: RetryPolicy | None = None
     return_record: bool = False
+    budget: BudgetPolicy | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +68,7 @@ class Transition:
     value_refs: dict[str, str] | None = None
     drop_values: builtins.list[str] | None = None
     override_values: builtins.list[str] | None = None
+    attributes_merge: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +80,7 @@ class Complete:
     value_refs: dict[str, str] | None = None
     drop_values: builtins.list[str] | None = None
     override_values: builtins.list[str] | None = None
+    attributes_merge: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +92,7 @@ class Retry:
     value_refs: dict[str, str] | None = None
     drop_values: builtins.list[str] | None = None
     override_values: builtins.list[str] | None = None
+    attributes_merge: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +104,7 @@ class Fail:
     value_refs: dict[str, str] | None = None
     drop_values: builtins.list[str] | None = None
     override_values: builtins.list[str] | None = None
+    attributes_merge: dict[str, Any] | None = None
 
 
 Outcome = Transition | Complete | Retry | Fail
@@ -202,6 +217,27 @@ class WorkflowFlowCommands:
             **kwargs,
         )
 
+    def start_and_claim(
+        self,
+        id: str,
+        *,
+        type: str | None = None,
+        initial_state: str | None = None,
+        worker: str,
+        payload: Any = None,
+        partition_key: str | None | object = _CURRENT_PARTITION,
+        **kwargs: Any,
+    ) -> FlowRecord:
+        return self.client.start_and_claim(
+            id,
+            type=self._type(type),
+            initial_state=initial_state or self._state(type, None),
+            worker=worker,
+            payload=payload,
+            partition_key=self._partition(partition_key),
+            **kwargs,
+        )
+
     def create_many(
         self,
         items: builtins.list[CreateItem],
@@ -236,13 +272,42 @@ class WorkflowFlowCommands:
             **kwargs,
         )
 
+    def run_steps_many(
+        self,
+        items: builtins.list[str | dict[str, Any] | CreateItem],
+        *,
+        type: str | None = None,
+        states: Sequence[str] | None = None,
+        steps: int | None = None,
+        worker: str,
+        payload: Any = None,
+        result: Any = None,
+        partition_key: str | None | object = _CURRENT_PARTITION,
+        **kwargs: Any,
+    ) -> bytes:
+        return self.client.run_steps_many(
+            items,
+            type=self._type(type),
+            states=states,
+            steps=steps,
+            worker=worker,
+            payload=payload,
+            result=result,
+            partition_key=self._partition(partition_key),
+            **kwargs,
+        )
+
     def claim_due(
         self, type: str | None = None, **kwargs: Any
-    ) -> builtins.list[FlowRecord] | builtins.list[ClaimedItem]:
+    ) -> builtins.list[FlowRecord] | builtins.list[ClaimedFlow]:
         return self.client.claim_due(self._type(type), **kwargs)
 
-    def claim_jobs(self, type: str | None = None, **kwargs: Any) -> builtins.list[ClaimedItem]:
-        return self.client.claim_jobs(self._type(type), **kwargs)
+    def claim_flows(self, type: str | None = None, **kwargs: Any) -> builtins.list[ClaimedFlow]:
+        return self.client.claim_flows(self._type(type), **kwargs)
+
+    def claim_jobs(self, type: str | None = None, **kwargs: Any) -> builtins.list[ClaimedFlow]:
+        """Compatibility alias for claim_flows()."""
+        return self.claim_flows(type, **kwargs)
 
     def signal(self, id: str | None = None, **kwargs: Any) -> Any:
         kwargs.setdefault("partition_key", self._ctx.partition_key)
@@ -291,6 +356,27 @@ class WorkflowFlowCommands:
             fencing_token=self._ctx.fencing_token if fencing_token is None else fencing_token,
             partition_key=self._partition(partition_key),
             return_record=return_record,
+            **kwargs,
+        )
+
+    def step_continue(
+        self,
+        to_state: str,
+        *,
+        id: str | None = None,
+        from_state: str | None = None,
+        lease_token: bytes | None = None,
+        fencing_token: int | None = None,
+        partition_key: str | None | object = _CURRENT_PARTITION,
+        **kwargs: Any,
+    ) -> FlowRecord:
+        return self.client.step_continue(
+            id or self._ctx.id,
+            lease_token=lease_token or self._ctx.lease_token,
+            from_state=from_state or self._ctx.state,
+            to_state=to_state,
+            fencing_token=self._ctx.fencing_token if fencing_token is None else fencing_token,
+            partition_key=self._partition(partition_key),
             **kwargs,
         )
 
@@ -465,21 +551,265 @@ class WorkflowFlowCommands:
         return self.client.policy_get(self._type(type), **kwargs)
 
 
+class WorkflowBudget:
+    """Synchronous budget reservation helper for workflow handlers."""
+
+    __slots__ = (
+        "_closed",
+        "_committed",
+        "amount",
+        "attribute_prefix",
+        "ctx",
+        "limit",
+        "reservation",
+        "scope",
+        "usage_key",
+        "window_ms",
+    )
+
+    def __init__(
+        self,
+        ctx: WorkflowContext,
+        *,
+        scope: str,
+        amount: int,
+        limit: int | None = None,
+        window_ms: int | None = None,
+        usage_key: str = "amount",
+        attribute_prefix: str = "governance_budget",
+    ) -> None:
+        self.ctx = ctx
+        self.scope = scope
+        self.amount = amount
+        self.limit = limit
+        self.window_ms = window_ms
+        self.usage_key = usage_key
+        self.attribute_prefix = attribute_prefix
+        self.reservation: BudgetResult | None = None
+        self._closed = False
+        self._committed = False
+
+    @property
+    def reservation_id(self) -> str:
+        if self.reservation is None or self.reservation.reservation_id is None:
+            raise FerricStoreError("budget reservation has not been opened")
+        return self.reservation.reservation_id
+
+    def __enter__(self) -> WorkflowBudget:
+        self.reservation = self.ctx.client.budget_reserve(
+            self.scope,
+            self.amount,
+            limit=self.limit,
+            window_ms=self.window_ms,
+        )
+        self.ctx._record_budget_result(self.attribute_prefix, self.reservation)
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._closed:
+            return
+        if exc_type is None:
+            self.commit(self.amount)
+        else:
+            self.release()
+
+    def commit(
+        self,
+        actual_amount: int | None = None,
+        *,
+        usage: dict[str, Any] | None = None,
+    ) -> BudgetResult:
+        actual = self.amount if actual_amount is None else actual_amount
+        result = self.ctx.client.budget_commit(
+            self.scope,
+            self.reservation_id,
+            actual,
+            usage=usage if usage is not None else {self.usage_key: actual},
+        )
+        self._closed = True
+        self._committed = True
+        self.ctx._record_budget_result(self.attribute_prefix, result)
+        return result
+
+    def release(self) -> BudgetResult:
+        result = self.ctx.client.budget_release(self.scope, self.reservation_id)
+        self._closed = True
+        self.ctx._record_budget_result(self.attribute_prefix, result)
+        return result
+
+
+class WorkflowEffect:
+    """Synchronous external-effect helper bound to a workflow job.
+
+    Use this for side effects such as payment calls, email sends, or model
+    invocations where FerricStore should reserve/confirm/fail an effect record
+    and apply circuit-breaker policy around the call.
+    """
+
+    __slots__ = (
+        "_closed",
+        "_result",
+        "_started_at",
+        "ctx",
+        "effect_key",
+        "effect_type",
+        "external_id",
+        "governance_scope",
+        "idempotency_key",
+        "operation_digest",
+        "reservation",
+    )
+
+    def __init__(
+        self,
+        ctx: WorkflowContext,
+        effect_key: str,
+        effect_type: str,
+        *,
+        operation_digest: str | None = None,
+        idempotency_key: str | None = None,
+        governance_scope: str | None = None,
+        external_id: str | Callable[[Any], str | None] | None = None,
+    ) -> None:
+        self.ctx = ctx
+        self.effect_key = effect_key
+        self.effect_type = effect_type
+        self.operation_digest = operation_digest or idempotency_key or f"{effect_type}:{effect_key}"
+        self.idempotency_key = idempotency_key
+        self.governance_scope = governance_scope
+        self.external_id = external_id
+        self.reservation: EffectResult | None = None
+        self._result: EffectResult | None = None
+        self._started_at: float | None = None
+        self._closed = False
+
+    def reserve(self) -> EffectResult:
+        if self.reservation is not None:
+            return self.reservation
+        self.reservation = self.ctx.client.effect_reserve(
+            self.ctx.id,
+            self.effect_key,
+            self.effect_type,
+            partition_key=self.ctx.partition_key,
+            lease_token=self.ctx.lease_token,
+            fencing_token=self.ctx.fencing_token,
+            operation_digest=self.operation_digest,
+            idempotency_key=self.idempotency_key,
+            governance_scope=self.governance_scope,
+        )
+        self._started_at = time.perf_counter()
+        return self.reservation
+
+    def confirm(
+        self,
+        *,
+        external_id: str | None = None,
+        latency_ms: int | None = None,
+    ) -> EffectResult:
+        if self._closed and self._result is not None:
+            return self._result
+        self.reserve()
+        self._result = self.ctx.client.effect_confirm(
+            self.ctx.id,
+            self.effect_key,
+            partition_key=self.ctx.partition_key,
+            lease_token=self.ctx.lease_token,
+            fencing_token=self.ctx.fencing_token,
+            external_id=external_id,
+            latency_ms=self._latency_ms(latency_ms),
+        )
+        self._closed = True
+        return self._result
+
+    def fail(
+        self,
+        *,
+        error: str | None = None,
+        reason: str | None = None,
+        latency_ms: int | None = None,
+    ) -> EffectResult:
+        if self._closed and self._result is not None:
+            return self._result
+        self.reserve()
+        self._result = self.ctx.client.effect_fail(
+            self.ctx.id,
+            self.effect_key,
+            partition_key=self.ctx.partition_key,
+            lease_token=self.ctx.lease_token,
+            fencing_token=self.ctx.fencing_token,
+            error=error,
+            reason=reason,
+            latency_ms=self._latency_ms(latency_ms),
+        )
+        self._closed = True
+        return self._result
+
+    def call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        self.reserve()
+        try:
+            result = func(*args, **kwargs)
+        except Exception as exc:
+            self.fail(error=str(exc), reason=exc.__class__.__name__)
+            raise
+        self.confirm(external_id=self._resolve_external_id(result))
+        return result
+
+    def __call__(self, func: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            return self.call(func, *args, **kwargs)
+
+        return wrapper
+
+    def __enter__(self) -> WorkflowEffect:
+        self.reserve()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._closed:
+            return
+        if exc_type is None:
+            self.confirm()
+        else:
+            self.fail(
+                error=str(exc) if exc is not None else None,
+                reason=exc_type.__name__ if exc_type is not None else None,
+            )
+
+    def _resolve_external_id(self, result: Any) -> str | None:
+        if callable(self.external_id):
+            return self.external_id(result)
+        if isinstance(self.external_id, str):
+            return self.external_id
+        if isinstance(result, str):
+            return result
+        if isinstance(result, bytes):
+            return result.decode()
+        return None
+
+    def _latency_ms(self, explicit: int | None = None) -> int | None:
+        if explicit is not None:
+            return explicit
+        if self._started_at is None:
+            return None
+        return max(int((time.perf_counter() - self._started_at) * 1000), 0)
+
+
 class WorkflowContext:
     """Handler context with current job metadata and Flow command helpers."""
 
-    __slots__ = ("_value_cache", "flow", "job", "state_name", "workflow")
+    __slots__ = ("_governance_attributes", "_value_cache", "flow", "job", "state_name", "workflow")
 
     def __init__(
         self,
         workflow: Workflow,
-        job: FlowRecord | ClaimedItem,
+        job: FlowRecord | ClaimedFlow,
         state_name: str,
     ) -> None:
         self.workflow = workflow
         self.job = job
         self.state_name = state_name
         self.flow = WorkflowFlowCommands(self)
+        self._governance_attributes: dict[str, Any] = {}
         self._value_cache: dict[str, Any] = {}
 
     @property
@@ -601,6 +931,74 @@ class WorkflowContext:
         config = self.workflow._states.get(self.state_name)
         return None if config is None else config.value_max_bytes
 
+    def budget(
+        self,
+        scope: str,
+        amount: int,
+        *,
+        limit: int | None = None,
+        window_ms: int | None = None,
+        usage_key: str = "amount",
+        attribute_prefix: str = "governance_budget",
+    ) -> WorkflowBudget:
+        return WorkflowBudget(
+            self,
+            scope=scope,
+            amount=amount,
+            limit=limit,
+            window_ms=window_ms,
+            usage_key=usage_key,
+            attribute_prefix=attribute_prefix,
+        )
+
+    def effect(
+        self,
+        effect_key: str,
+        effect_type: str,
+        *,
+        operation_digest: str | None = None,
+        idempotency_key: str | None = None,
+        governance_scope: str | None = None,
+        external_id: str | Callable[[Any], str | None] | None = None,
+    ) -> WorkflowEffect:
+        return WorkflowEffect(
+            self,
+            effect_key,
+            effect_type,
+            operation_digest=operation_digest,
+            idempotency_key=idempotency_key,
+            governance_scope=governance_scope,
+            external_id=external_id,
+        )
+
+    def _state_budget(self, policy: BudgetPolicy | None) -> WorkflowBudget | None:
+        if policy is None:
+            return None
+        scope = policy.scope(self) if callable(policy.scope) else policy.scope
+        return self.budget(
+            scope,
+            policy.amount,
+            limit=policy.limit,
+            window_ms=policy.window_ms,
+            usage_key=policy.usage_key,
+            attribute_prefix=policy.attribute_prefix,
+        )
+
+    def _record_budget_result(self, prefix: str, result: BudgetResult) -> None:
+        attrs = {
+            f"{prefix}_scope": result.scope,
+            f"{prefix}_status": result.status,
+            f"{prefix}_reservation_id": result.reservation_id,
+            f"{prefix}_reserved_amount": result.reserved_amount,
+            f"{prefix}_actual_amount": result.actual_amount,
+            f"{prefix}_overage_amount": result.overage_amount,
+            f"{prefix}_remaining": result.remaining,
+            f"{prefix}_over_budget": result.over_budget,
+        }
+        self._governance_attributes.update(
+            {key: value for key, value in attrs.items() if value is not None}
+        )
+
     @property
     def lease_token(self) -> bytes:
         return self.job.lease_token
@@ -640,6 +1038,7 @@ def transition(
     value_refs: dict[str, str] | None = None,
     drop_values: builtins.list[str] | None = None,
     override_values: builtins.list[str] | None = None,
+    attributes_merge: dict[str, Any] | None = None,
 ) -> Transition:
     return Transition(
         to_state=to_state,
@@ -650,6 +1049,7 @@ def transition(
         value_refs=value_refs,
         drop_values=drop_values,
         override_values=override_values,
+        attributes_merge=attributes_merge,
     )
 
 
@@ -662,6 +1062,7 @@ def complete(
     value_refs: dict[str, str] | None = None,
     drop_values: builtins.list[str] | None = None,
     override_values: builtins.list[str] | None = None,
+    attributes_merge: dict[str, Any] | None = None,
 ) -> Complete:
     return Complete(
         result=result,
@@ -671,6 +1072,7 @@ def complete(
         value_refs=value_refs,
         drop_values=drop_values,
         override_values=override_values,
+        attributes_merge=attributes_merge,
     )
 
 
@@ -683,6 +1085,7 @@ def retry(
     value_refs: dict[str, str] | None = None,
     drop_values: builtins.list[str] | None = None,
     override_values: builtins.list[str] | None = None,
+    attributes_merge: dict[str, Any] | None = None,
 ) -> Retry:
     return Retry(
         error=error,
@@ -692,6 +1095,7 @@ def retry(
         value_refs=value_refs,
         drop_values=drop_values,
         override_values=override_values,
+        attributes_merge=attributes_merge,
     )
 
 
@@ -704,6 +1108,7 @@ def fail(
     value_refs: dict[str, str] | None = None,
     drop_values: builtins.list[str] | None = None,
     override_values: builtins.list[str] | None = None,
+    attributes_merge: dict[str, Any] | None = None,
 ) -> Fail:
     return Fail(
         error=error,
@@ -713,6 +1118,7 @@ def fail(
         value_refs=value_refs,
         drop_values=drop_values,
         override_values=override_values,
+        attributes_merge=attributes_merge,
     )
 
 
@@ -729,6 +1135,7 @@ def state(
     retry_policy: RetryPolicy | None = None,
     retry: RetryPolicy | None = None,
     return_record: bool = False,
+    budget: BudgetPolicy | None = None,
 ) -> Callable[[Handler], Handler]:
     if exception_policy is not None and on_error is not None:
         raise ValueError("exception_policy and on_error are mutually exclusive")
@@ -751,6 +1158,7 @@ def state(
             on_error=resolved_on_error,
             retry=resolved_retry_policy,
             return_record=return_record,
+            budget=budget,
         )
         return fn
 
@@ -830,6 +1238,28 @@ class Workflow:
             **attrs,
         )
 
+    def start_and_claim(
+        self,
+        id: str,
+        *,
+        worker: str,
+        payload: Any = None,
+        initial_state: str | None = None,
+        **attrs: Any,
+    ) -> FlowRecord:
+        partition_key = attrs.pop("partition_key", None) or self.partition_key(attrs)
+        for name in self.partition_by:
+            attrs.pop(name, None)
+        return self.client.start_and_claim(
+            id,
+            type=self.type,
+            initial_state=initial_state or self.initial_state,
+            worker=worker,
+            payload=payload,
+            partition_key=partition_key,
+            **attrs,
+        )
+
     def create_many(
         self,
         partition_key: str | None,
@@ -841,6 +1271,32 @@ class Workflow:
             items,
             type=self.type,
             state=attrs.pop("state", self.initial_state),
+            **attrs,
+        )
+
+    def run_steps_many(
+        self,
+        items: builtins.list[str | dict[str, Any] | CreateItem],
+        *,
+        states: Sequence[str] | None = None,
+        steps: int | None = None,
+        worker: str,
+        payload: Any = None,
+        result: Any = None,
+        **attrs: Any,
+    ) -> bytes:
+        partition_key = attrs.pop("partition_key", None) or self.partition_key(attrs)
+        for name in self.partition_by:
+            attrs.pop(name, None)
+        return self.client.run_steps_many(
+            items,
+            type=self.type,
+            states=states,
+            steps=steps,
+            worker=worker,
+            payload=payload,
+            result=result,
+            partition_key=partition_key,
             **attrs,
         )
 
@@ -903,11 +1359,11 @@ class Workflow:
         reclaim_expired: bool | None = None,
         reclaim_ratio: int | None = None,
         block_ms: int | None = None,
-    ) -> builtins.list[FlowRecord | ClaimedItem]:
+    ) -> builtins.list[FlowRecord | ClaimedFlow]:
         config = self._states[state_name]
         claim_client = getattr(self, "claim_client", self.client)
         if not config.claim_record and not config.claim_payload and not config.claim_values:
-            jobs = claim_client.claim_jobs(
+            jobs = claim_client.claim_flows(
                 self.type,
                 state=state_name,
                 worker=worker,
@@ -921,12 +1377,12 @@ class Workflow:
                 block_ms=block_ms,
             )
             return cast(
-                builtins.list[FlowRecord | ClaimedItem],
+                builtins.list[FlowRecord | ClaimedFlow],
                 self._stamp_compact_jobs(jobs, state_name),
             )
 
         return cast(
-            builtins.list[FlowRecord | ClaimedItem],
+            builtins.list[FlowRecord | ClaimedFlow],
             claim_client.claim_due(
                 self.type,
                 state=state_name,
@@ -1015,7 +1471,7 @@ class Workflow:
     def handle_claimed_batch(
         self,
         state_name: str,
-        jobs: Sequence[FlowRecord | ClaimedItem],
+        jobs: Sequence[FlowRecord | ClaimedFlow],
     ) -> builtins.list[FlowRecord | bytes]:
         return cast(
             builtins.list[FlowRecord | bytes],
@@ -1025,7 +1481,7 @@ class Workflow:
     def handle_claimed_batch_count(
         self,
         state_name: str,
-        jobs: Sequence[FlowRecord | ClaimedItem],
+        jobs: Sequence[FlowRecord | ClaimedFlow],
     ) -> int:
         return cast(int, self._handle_known_state_batch(state_name, jobs, materialize=False))
 
@@ -1095,31 +1551,33 @@ class Workflow:
         )
 
     def context(
-        self, job: FlowRecord | ClaimedItem, state_name: str | None = None
+        self, job: FlowRecord | ClaimedFlow, state_name: str | None = None
     ) -> WorkflowContext:
         return WorkflowContext(self, job, state_name or self._logical_state(job))
 
-    def handle(self, job: FlowRecord | ClaimedItem) -> FlowRecord | bytes:
+    def handle(self, job: FlowRecord | ClaimedFlow) -> FlowRecord | bytes:
         state_name = self._logical_state(job)
         handler = self._handler_for(state_name)
+        ctx = self.context(job, state_name)
         try:
-            outcome = handler(self.context(job, state_name))
+            outcome = self._run_handler_with_context(handler, ctx, state_name, job)
         except Exception as exc:
             return self._handle_exception(job, exc, state_name=state_name)
         return self.apply(job, outcome, state_name=state_name)
 
     def handle_batch(
-        self, jobs: Sequence[FlowRecord | ClaimedItem]
+        self, jobs: Sequence[FlowRecord | ClaimedFlow]
     ) -> builtins.list[FlowRecord | bytes]:
         if not jobs:
             return []
 
-        planned: builtins.list[tuple[FlowRecord | ClaimedItem, str, Outcome]] = []
+        planned: builtins.list[tuple[FlowRecord | ClaimedFlow, str, Outcome]] = []
         for job in jobs:
             state_name = self._logical_state(job)
             handler = self._handler_for(state_name)
+            ctx = self.context(job, state_name)
             try:
-                outcome = handler(self.context(job, state_name))
+                outcome = self._run_handler_with_context(handler, ctx, state_name, job)
             except Exception as exc:
                 outcome = self._exception_outcome(job, exc, state_name=state_name)
             planned.append((job, state_name, outcome))
@@ -1145,7 +1603,7 @@ class Workflow:
     def _handle_known_state_batch(
         self,
         state_name: str,
-        jobs: Sequence[FlowRecord | ClaimedItem],
+        jobs: Sequence[FlowRecord | ClaimedFlow],
         *,
         materialize: bool = True,
     ) -> builtins.list[FlowRecord | bytes] | int:
@@ -1156,8 +1614,9 @@ class Workflow:
         mixed_outcomes: builtins.list[Outcome] | None = None
 
         for idx, job in enumerate(jobs):
+            ctx = self.context(job, state_name)
             try:
-                outcome = handler(self.context(job, state_name))
+                outcome = self._run_handler_with_context(handler, ctx, state_name, job)
             except Exception as exc:
                 outcome = self._exception_outcome(job, exc, state_name=state_name)
 
@@ -1192,7 +1651,7 @@ class Workflow:
 
     def apply(
         self,
-        job: FlowRecord | ClaimedItem,
+        job: FlowRecord | ClaimedFlow,
         outcome: Outcome,
         *,
         state_name: str | None = None,
@@ -1219,6 +1678,7 @@ class Workflow:
                 value_refs=outcome.value_refs,
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
+                attributes_merge=outcome.attributes_merge,
                 **common,
             )
         if isinstance(outcome, Complete):
@@ -1231,6 +1691,7 @@ class Workflow:
                 value_refs=outcome.value_refs,
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
+                attributes_merge=outcome.attributes_merge,
                 **common,
             )
         if isinstance(outcome, Retry):
@@ -1243,6 +1704,7 @@ class Workflow:
                 value_refs=outcome.value_refs,
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
+                attributes_merge=outcome.attributes_merge,
                 **common,
             )
         if isinstance(outcome, Fail):
@@ -1255,13 +1717,14 @@ class Workflow:
                 value_refs=outcome.value_refs,
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
+                attributes_merge=outcome.attributes_merge,
                 **common,
             )
         raise FerricStoreError(f"unknown workflow outcome: {outcome!r}")
 
     def _apply_uniform_batch(
         self,
-        jobs: Sequence[FlowRecord | ClaimedItem],
+        jobs: Sequence[FlowRecord | ClaimedFlow],
         state_name: str,
         outcome: Outcome,
         *,
@@ -1321,6 +1784,7 @@ class Workflow:
                 value_refs=outcome.value_refs,
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
+                attributes_merge=outcome.attributes_merge,
                 independent=True,
             )
             if not materialize:
@@ -1330,7 +1794,7 @@ class Workflow:
         if isinstance(outcome, Complete):
             response = self.client.complete_many(
                 partition_key,
-                cast(builtins.list[ClaimedItem], jobs),
+                cast(builtins.list[ClaimedFlow], jobs),
                 result=outcome.result,
                 payload=outcome.payload,
                 ttl_ms=outcome.ttl_ms,
@@ -1338,6 +1802,7 @@ class Workflow:
                 value_refs=outcome.value_refs,
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
+                attributes_merge=outcome.attributes_merge,
                 independent=True,
             )
             if not materialize:
@@ -1347,7 +1812,7 @@ class Workflow:
         if isinstance(outcome, Retry):
             response = self.client.retry_many(
                 partition_key,
-                cast(builtins.list[ClaimedItem], jobs),
+                cast(builtins.list[ClaimedFlow], jobs),
                 error=outcome.error,
                 payload=outcome.payload,
                 run_at_ms=outcome.run_at_ms,
@@ -1355,6 +1820,7 @@ class Workflow:
                 value_refs=outcome.value_refs,
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
+                attributes_merge=outcome.attributes_merge,
                 independent=True,
             )
             if not materialize:
@@ -1364,7 +1830,7 @@ class Workflow:
         if isinstance(outcome, Fail):
             response = self.client.fail_many(
                 partition_key,
-                cast(builtins.list[ClaimedItem], jobs),
+                cast(builtins.list[ClaimedFlow], jobs),
                 error=outcome.error,
                 payload=outcome.payload,
                 ttl_ms=outcome.ttl_ms,
@@ -1372,6 +1838,7 @@ class Workflow:
                 value_refs=outcome.value_refs,
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
+                attributes_merge=outcome.attributes_merge,
                 independent=True,
             )
             if not materialize:
@@ -1380,9 +1847,40 @@ class Workflow:
 
         raise FerricStoreError(f"unknown workflow outcome: {outcome!r}")
 
+    def _run_handler_with_context(
+        self,
+        handler: Handler,
+        ctx: WorkflowContext,
+        state_name: str,
+        job: FlowRecord | ClaimedFlow,
+    ) -> Outcome:
+        budget = ctx._state_budget(self._states[state_name].budget)
+        try:
+            if budget is not None:
+                budget.__enter__()
+            outcome = handler(ctx)
+        except Exception as exc:
+            if budget is not None:
+                budget.release()
+            outcome = self._exception_outcome(job, exc, state_name=state_name)
+            return self._merge_governance_attributes(outcome, ctx._governance_attributes)
+        if budget is not None:
+            budget.commit()
+        return self._merge_governance_attributes(outcome, ctx._governance_attributes)
+
+    @staticmethod
+    def _merge_governance_attributes(outcome: Any, attributes: dict[str, Any]) -> Outcome:
+        if not isinstance(outcome, (Transition, Complete, Retry, Fail)):
+            outcome = complete(result=outcome)
+        if not attributes:
+            return cast(Outcome, outcome)
+        merged = dict(outcome.attributes_merge or {})
+        merged.update(attributes)
+        return cast(Outcome, replace(outcome, attributes_merge=merged))
+
     def _exception_outcome(
         self,
-        job: FlowRecord | ClaimedItem,
+        job: FlowRecord | ClaimedFlow,
         exc: Exception,
         *,
         state_name: str,
@@ -1396,7 +1894,7 @@ class Workflow:
 
     def _handle_exception(
         self,
-        job: FlowRecord | ClaimedItem,
+        job: FlowRecord | ClaimedFlow,
         exc: Exception,
         *,
         state_name: str | None = None,
@@ -1409,18 +1907,18 @@ class Workflow:
         )
 
     @staticmethod
-    def _logical_state(job: FlowRecord | ClaimedItem) -> str:
+    def _logical_state(job: FlowRecord | ClaimedFlow) -> str:
         return job.run_state or job.state
 
     @staticmethod
-    def _uniform_partition_key(jobs: Sequence[FlowRecord | ClaimedItem]) -> str | None:
+    def _uniform_partition_key(jobs: Sequence[FlowRecord | ClaimedFlow]) -> str | None:
         first = jobs[0].partition_key
         if first is not None and all(job.partition_key == first for job in jobs):
             return first
         return None
 
     @staticmethod
-    def _uniform_current_state(jobs: Sequence[FlowRecord | ClaimedItem]) -> str | None:
+    def _uniform_current_state(jobs: Sequence[FlowRecord | ClaimedFlow]) -> str | None:
         first = jobs[0].state
         if all(job.state == first for job in jobs):
             return first
@@ -1434,9 +1932,9 @@ class Workflow:
 
     def _stamp_compact_jobs(
         self,
-        jobs: builtins.list[ClaimedItem],
+        jobs: builtins.list[ClaimedFlow],
         state_name: str,
-    ) -> builtins.list[ClaimedItem]:
+    ) -> builtins.list[ClaimedFlow]:
         for job in jobs:
             object.__setattr__(job, "type", self.type)
             object.__setattr__(job, "state", "running")
@@ -1514,6 +2012,7 @@ class FlowWorkflow(Workflow):
         retry_policy: RetryPolicy | None = None,
         retry: RetryPolicy | None = None,
         return_record: bool = False,
+        budget: BudgetPolicy | None = None,
     ) -> Callable[[Handler], Handler]:
         def decorate(fn: Handler) -> Handler:
             if name in self._states:
@@ -1540,6 +2039,7 @@ class FlowWorkflow(Workflow):
                 retry_policy=retry_policy,
                 retry=retry,
                 return_record=return_record,
+                budget=budget,
             )(fn)
             config = cast(Any, handler).__ferric_state__
             self._states[config.name] = config
@@ -1576,22 +2076,24 @@ class WorkflowClient:
             worker_config=worker_config,
             default_workers=1,
         )
+        command_max_connections = (
+            1
+            if isinstance(client, str)
+            and (worker_config is None or worker_config.command_connections is None)
+            else command_pool_size
+        )
         self._url = client if isinstance(client, str) else None
         self._base_url_kwargs: dict[str, Any] = {}
         self._claim_client_explicit = claim_client is not None
         self._owned_extra_claim_flows: builtins.list[FlowClient] = []
         self._claim_pool_size = claim_pool_size
         self.flow = (
-            FlowClient.from_url(client, max_connections=command_pool_size)
+            FlowClient.from_url(client, max_connections=command_max_connections)
             if isinstance(client, str)
             else client
         )
         if claim_client is None:
-            self.claim_flow = (
-                FlowClient.from_url(client, max_connections=claim_pool_size)
-                if isinstance(client, str)
-                else self.flow
-            )
+            self.claim_flow = self.flow
         else:
             self.claim_flow = (
                 FlowClient.from_url(claim_client, max_connections=claim_pool_size)
@@ -1602,10 +2104,8 @@ class WorkflowClient:
         self.worker_config = worker_config
         self.value_config = value_config or ValueConfig()
         self._owns_flow = _owns_clients or isinstance(client, str)
-        self._owns_claim_flow = (
-            _owns_clients
-            or isinstance(claim_client, str)
-            or (claim_client is None and isinstance(client, str))
+        self._owns_claim_flow = (_owns_clients and self.claim_flow is not self.flow) or isinstance(
+            claim_client, str
         )
 
     @classmethod
@@ -1618,17 +2118,17 @@ class WorkflowClient:
         value_config: ValueConfig | None = None,
         **kwargs: Any,
     ) -> WorkflowClient:
-        command_pool_size, claim_pool_size = resolve_worker_connection_counts(
+        command_pool_size, _claim_pool_size = resolve_worker_connection_counts(
             worker_config=worker_config,
             default_workers=1,
         )
         command_kwargs = dict(kwargs)
-        command_kwargs.setdefault("max_connections", command_pool_size)
-        claim_kwargs = dict(kwargs)
-        claim_kwargs["max_connections"] = claim_pool_size
+        if worker_config is None or worker_config.command_connections is None:
+            command_kwargs.setdefault("max_connections", 1)
+        else:
+            command_kwargs.setdefault("max_connections", command_pool_size)
         instance = cls(
             FlowClient.from_url(url, **command_kwargs),
-            claim_client=FlowClient.from_url(url, **claim_kwargs),
             retry_policy=retry_policy,
             worker_config=worker_config,
             value_config=value_config,
@@ -1637,26 +2137,14 @@ class WorkflowClient:
         instance._url = url
         instance._base_url_kwargs = dict(kwargs)
         instance._claim_client_explicit = False
-        instance._claim_pool_size = claim_pool_size
+        instance._claim_pool_size = 1
         return instance
 
     def _claim_flow_for_worker_config(
         self,
         worker_config: WorkerConfig | None,
     ) -> FlowClient:
-        if self._claim_client_explicit or self._url is None or worker_config is None:
-            return self.claim_flow
-        _, claim_pool_size = resolve_worker_connection_counts(
-            worker_config=worker_config,
-            default_workers=1,
-        )
-        if claim_pool_size == self._claim_pool_size:
-            return self.claim_flow
-        claim_kwargs = dict(self._base_url_kwargs)
-        claim_kwargs["max_connections"] = claim_pool_size
-        claim_flow = FlowClient.from_url(self._url, **claim_kwargs)
-        self._owned_extra_claim_flows.append(claim_flow)
-        return claim_flow
+        return self.claim_flow
 
     def workflow(
         self,
@@ -1901,7 +2389,7 @@ class WorkflowWorker:
 
     def _run_once_any_state(self) -> WorkflowWorkerResult:
         partition_key, partition_keys = self._next_claim_partition()
-        jobs = self.workflow.claim_client.claim_jobs(
+        jobs = self.workflow.claim_client.claim_flows(
             self.workflow.type,
             worker=self.worker,
             partition_key=partition_key,
@@ -1960,9 +2448,9 @@ class WorkflowWorker:
         )
 
     def _group_jobs_by_run_state(
-        self, jobs: builtins.list[ClaimedItem]
-    ) -> dict[str, builtins.list[ClaimedItem]]:
-        grouped: dict[str, builtins.list[ClaimedItem]] = {}
+        self, jobs: builtins.list[ClaimedFlow]
+    ) -> dict[str, builtins.list[ClaimedFlow]]:
+        grouped: dict[str, builtins.list[ClaimedFlow]] = {}
         for job in jobs:
             state_name = job.run_state
             if state_name not in self.workflow._states:

@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      ferricstore_image:
+        description: "FerricStore image for integration tests"
+        required: false
+        default: "ghcr.io/ferricstore/ferricstore:0.5.2"
 
 permissions:
   contents: read
@@ -75,9 +80,22 @@ jobs:
   integration:
     name: FerricStore integration
     runs-on: ubuntu-latest
+    env:
+      FERRICSTORE_IMAGE: ${{ inputs.ferricstore_image || 'ghcr.io/ferricstore/ferricstore:0.5.2' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      - name: Checkout FerricStore server
+        if: ${{ env.FERRICSTORE_IMAGE == 'ferricstore-sdk-ci:local' }}
+        uses: actions/checkout@v6
+        with:
+          repository: ferricstore/ferricstore
+          path: ferricstore-server
+
+      - name: Build FerricStore image
+        if: ${{ env.FERRICSTORE_IMAGE == 'ferricstore-sdk-ci:local' }}
+        run: docker build -t ferricstore-sdk-ci:local ferricstore-server
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -93,12 +111,13 @@ jobs:
       - name: Start FerricStore
         run: |
           docker compose up -d ferricstore
-          python scripts/wait_for_ferricstore.py
+          FERRICSTORE_PORT=6388 python scripts/wait_for_ferricstore.py
 
-      - name: Run integration tests
+      - name: Run native integration tests
         run: python -m pytest tests/integration
         env:
           FERRICSTORE_INTEGRATION: "1"
+          FERRICSTORE_URL: "ferric://127.0.0.1:6388"
 
       - name: FerricStore logs
         if: always()

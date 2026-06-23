@@ -37,7 +37,7 @@ The worker no longer owns the job.
 
 Fix:
 
-- do not reuse old `ClaimedItem` values
+- do not reuse old `ClaimedFlow` values
 - always pass `job.partition_key`
 - increase or extend leases
 - investigate slow handlers
@@ -82,7 +82,6 @@ Check:
 
 - use `AsyncQueueClient` / `AsyncWorkflowClient`, not sync clients
 - set enough `max_connections`
-- install `hiredis`
 - use `enqueue_many` for bursts
 - bound downstream concurrency with semaphores
 
@@ -91,7 +90,7 @@ Check:
 Check:
 
 - keep hot mutators ack-only; use `return_record=True` only when needed
-- use `claim_jobs` when full records are not needed
+- use `claim_due(..., include_record=False)` when full records are not needed
 - avoid payload hydration in hot handlers
 - use `enqueue_many` for producer bursts
 - increase workers only until server/downstream latency rises

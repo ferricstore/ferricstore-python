@@ -736,7 +736,7 @@ def run_state_machine_throughput(args: argparse.Namespace) -> dict[str, float | 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FerricFlow state-machine Workflow API benchmark")
-    parser.add_argument("--url", default="redis://127.0.0.1:7379")
+    parser.add_argument("--url", default="ferric://127.0.0.1:6388")
     parser.add_argument("--shape", choices=("live", "preloaded"), default="live")
     parser.add_argument("--flows", type=int, default=10_000)
     parser.add_argument("--steps", type=int, default=1)

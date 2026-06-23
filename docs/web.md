@@ -23,7 +23,7 @@ from ferricstore import ExceptionPolicy, JsonCodec, QueueClient, RetryPolicy, Va
 
 def queue_client() -> QueueClient:
     return QueueClient.from_url(
-        "redis://ferricstore.service:6379/0",
+        "ferric://ferricstore.service:6388",
         codec=JsonCodec(),
         socket_connect_timeout=2,
         socket_timeout=10,
@@ -129,7 +129,7 @@ Use `WorkflowClient` when one business object moves through named states.
 from ferricstore import JsonCodec, WorkflowClient, complete, transition
 
 
-client = WorkflowClient.from_url("redis://ferricstore.service:6379/0", codec=JsonCodec())
+client = WorkflowClient.from_url("ferric://ferricstore.service:6388", codec=JsonCodec())
 orders = client.workflow(type="order", initial_state="created", partition_by=("tenant_id", "order_id"))
 
 

@@ -4,13 +4,14 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Any, cast
+from urllib.parse import urlparse
 
 from ferricstore.client import FlowClient
 from ferricstore.types import (
-    ClaimedItem,
+    ClaimedFlow,
     ExceptionPolicy,
     FlowRecord,
     RetryPolicy,
@@ -21,7 +22,7 @@ from ferricstore.types import (
 )
 from ferricstore.workflow import Workflow
 
-FlowJob = ClaimedItem | FlowRecord
+FlowJob = ClaimedFlow | FlowRecord
 FlowHandler = Callable[[FlowJob], Any]
 FlowBatchHandler = Callable[[list[FlowJob]], Any]
 ErrorMode = ExceptionPolicy | str
@@ -45,12 +46,21 @@ QUEUE_WORKER_CONFIG_KEYS = frozenset(
         "complete_independent",
         "claim_partition_batch_size",
         "claim_drain_batches",
+        "claim_prefetch",
+        "protocol_wake_hints",
         "scan_before_blocking",
         "complete_async_depth",
+        "fuse_complete_claim",
         "empty_claim_cooldown_s",
         "partial_claim_cooldown_s",
     }
 )
+
+_PROTOCOL_URL_SCHEMES = {"ferric", "ferrics"}
+
+
+def _is_protocol_url(value: str) -> bool:
+    return urlparse(value).scheme.lower() in _PROTOCOL_URL_SCHEMES
 
 
 @dataclass(frozen=True)
@@ -68,6 +78,13 @@ class _HandledBatch:
     first_result: Any = None
     mixed_results: list[tuple[FlowJob, Any]] | None = None
     failures: list[tuple[FlowJob, Exception]] | None = None
+
+
+@dataclass
+class _PendingClaim:
+    future: Future[list[FlowJob]]
+    partition_key: str | None
+    partition_keys: list[str] | None
 
 
 class QueueFlowWorker:
@@ -100,8 +117,11 @@ class QueueFlowWorker:
         partition_keys: Sequence[str] | None = None,
         claim_partition_batch_size: int | None = None,
         claim_drain_batches: int = 1,
+        claim_prefetch: int = 0,
+        protocol_wake_hints: bool = False,
         scan_before_blocking: bool = False,
         complete_async_depth: int = 0,
+        fuse_complete_claim: bool = False,
         completion_clients: Sequence[FlowClient] | None = None,
         claim_client: FlowClient | str | None = None,
         command_connections: int | None = None,
@@ -125,6 +145,8 @@ class QueueFlowWorker:
             raise ValueError("claim_partition_batch_size must be positive")
         if claim_drain_batches <= 0:
             raise ValueError("claim_drain_batches must be positive")
+        if claim_prefetch < 0:
+            raise ValueError("claim_prefetch must be non-negative")
         if complete_async_depth < 0:
             raise ValueError("complete_async_depth must be non-negative")
         if block_ms is not None and block_ms < 0:
@@ -148,16 +170,19 @@ class QueueFlowWorker:
             command_connections=command_connections,
             claim_connections=claim_connections,
         )
+        command_max_connections = (
+            1 if isinstance(client, str) and command_connections is None else command_pool_size
+        )
         if isinstance(client, str):
-            self.client = FlowClient.from_url(client, max_connections=command_pool_size)
+            self.client = FlowClient.from_url(client, max_connections=command_max_connections)
             self._owns_client = True
         else:
             self.client = client
             self._owns_client = False
         if claim_client is None:
             if isinstance(client, str):
-                self.claim_client = FlowClient.from_url(client, max_connections=claim_pool_size)
-                self._owns_claim_client = True
+                self.claim_client = self.client
+                self._owns_claim_client = False
             else:
                 self.claim_client = self.client
                 self._owns_claim_client = False
@@ -189,6 +214,8 @@ class QueueFlowWorker:
             else len(self.partition_keys or []) or 1
         )
         self.claim_drain_batches = claim_drain_batches
+        self.claim_prefetch = claim_prefetch
+        self.protocol_wake_hints = bool(protocol_wake_hints)
         self.scan_before_blocking = scan_before_blocking
         self.idle_sleep_s = max(idle_sleep_s, 0.0)
         self.max_idle_sleep_s = (
@@ -214,7 +241,9 @@ class QueueFlowWorker:
             raise ValueError("completion_clients must be non-empty")
         self._completion_client_index = 0
         self._complete_async_depth = complete_async_depth
+        self.fuse_complete_claim = bool(fuse_complete_claim)
         self._pending_completions: list[Future[QueueFlowWorkerResult]] = []
+        self._pending_claims: list[_PendingClaim] = []
         self._partition_cursor = 0
         self._claim_cooldown_until: dict[str, float] = {}
         default_claim_cooldown_s = min(self.idle_sleep_s, 0.001)
@@ -226,6 +255,8 @@ class QueueFlowWorker:
             if partial_claim_cooldown_s is None
             else partial_claim_cooldown_s
         )
+        self._protocol_wake_hints_enabled = False
+        self._subscribe_protocol_wake_hints()
 
     def run(self, handler: FlowHandler) -> None:
         self.run_forever(handler)
@@ -285,7 +316,8 @@ class QueueFlowWorker:
                 )
                 self._totals = self._merge_results(self._totals, result)
                 if result.claimed == 0:
-                    time.sleep(idle_sleep_s)
+                    if not self._wait_for_protocol_wake_hint(idle_sleep_s):
+                        time.sleep(idle_sleep_s)
                     idle_sleep_s = min(
                         self.max_idle_sleep_s,
                         max(idle_sleep_s * 2, self.idle_sleep_s),
@@ -302,6 +334,7 @@ class QueueFlowWorker:
         self.stop()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join()
+        self._clear_pending_claims()
         result = self.flush()
         self._totals = self._merge_results(self._totals, result)
         if self._executor is not None:
@@ -315,6 +348,37 @@ class QueueFlowWorker:
 
     def flush(self) -> QueueFlowWorkerResult:
         return self._drain_pending_completions(block=True)
+
+    def _clear_pending_claims(self) -> None:
+        for pending in self._pending_claims:
+            pending.future.cancel()
+        self._pending_claims.clear()
+
+    def _subscribe_protocol_wake_hints(self) -> None:
+        if not self.protocol_wake_hints:
+            return
+        subscribe = getattr(self.claim_client, "subscribe_flow_wake", None)
+        wait_event = getattr(self.claim_client, "wait_event", None)
+        if not callable(subscribe) or not callable(wait_event):
+            return
+        subscribe(
+            self.type,
+            state=self.state,
+            states=self.states,
+            partition_key=self.partition_key,
+            partition_keys=self.partition_keys,
+            priority=self.priority,
+            limit=self.batch_size,
+        )
+        self._protocol_wake_hints_enabled = True
+
+    def _wait_for_protocol_wake_hint(self, timeout_s: float) -> bool:
+        if not self._protocol_wake_hints_enabled or timeout_s <= 0:
+            return False
+        wait_event = getattr(self.claim_client, "wait_event", None)
+        if not callable(wait_event):
+            return False
+        return wait_event(timeout=timeout_s) is not None
 
     def run_once(self, handler: FlowHandler) -> QueueFlowWorkerResult:
         return self._run_once(handler, batch_handler=False)
@@ -357,6 +421,9 @@ class QueueFlowWorker:
         *,
         batch_handler: bool,
     ) -> QueueFlowWorkerResult:
+        if self._can_prefetch_claims():
+            return self._run_prefetched_once(handler, batch_handler=batch_handler)
+
         result = self._drain_pending_completions(block=False)
 
         if self._should_scan_owned_partitions_before_blocking():
@@ -412,6 +479,59 @@ class QueueFlowWorker:
             batch_handler=batch_handler,
         )
 
+    def _run_prefetched_once(
+        self,
+        handler: FlowHandler | FlowBatchHandler,
+        *,
+        batch_handler: bool,
+    ) -> QueueFlowWorkerResult:
+        result = self._drain_pending_completions(block=False)
+        self._fill_pending_claims()
+        pending = self._take_pending_claim(block=False)
+        if pending is None and self._has_progress(result):
+            return result
+        if pending is None and self._pending_completions:
+            result = self._merge_results(
+                result,
+                self._drain_pending_completions(block=True, limit=1),
+            )
+            if self._has_progress(result):
+                return result
+        if pending is None:
+            pending = self._take_pending_claim(block=True)
+        if pending is None:
+            return result
+
+        jobs = pending.future.result()
+        result = self._merge_results(result, QueueFlowWorkerResult(claim_calls=1))
+        if not jobs:
+            self._cool_claim_keys(
+                pending.partition_key,
+                pending.partition_keys,
+                self.empty_claim_cooldown_s,
+            )
+            self._fill_pending_claims()
+            return result
+
+        result = self._process_claimed_jobs(
+            jobs,
+            handler,
+            result,
+            batch_handler=batch_handler,
+        )
+        if len(jobs) < self.batch_size:
+            self._cool_claim_keys(
+                pending.partition_key,
+                pending.partition_keys,
+                self.partial_claim_cooldown_s,
+            )
+        self._fill_pending_claims()
+        return result
+
+    @staticmethod
+    def _has_progress(result: QueueFlowWorkerResult) -> bool:
+        return result.claimed > 0 or result.completed > 0 or result.retried > 0 or result.failed > 0
+
     def _drain_claim_plan(
         self,
         handler: FlowHandler | FlowBatchHandler,
@@ -423,17 +543,40 @@ class QueueFlowWorker:
         block_ms: int | None,
         batch_handler: bool,
     ) -> QueueFlowWorkerResult:
-        remaining_credit = max(claim_credit, 1)
+        capacity = self._available_claim_capacity()
+        if capacity <= 0:
+            return result
+
+        remaining_credit = min(max(claim_credit, 1), capacity)
         drain_count = 0
+        pending_complete: _HandledBatch | None = None
+        pending_claim_future: Future[list[FlowJob]] | None = None
 
         while remaining_credit > 0 and drain_count < self.claim_drain_batches:
             limit = min(self.batch_size, remaining_credit)
-            jobs = self._claim_jobs(
-                claim_partition_key=claim_partition_key,
-                claim_partition_keys=claim_partition_keys,
-                limit=limit,
-                block_ms=block_ms,
-            )
+            if pending_claim_future is not None:
+                jobs = pending_claim_future.result()
+                pending_claim_future = None
+            elif pending_complete is None:
+                jobs = self._claim_flows(
+                    claim_partition_key=claim_partition_key,
+                    claim_partition_keys=claim_partition_keys,
+                    limit=limit,
+                    block_ms=block_ms,
+                )
+            else:
+                jobs = self._complete_and_claim_flows(
+                    pending_complete,
+                    claim_partition_key=claim_partition_key,
+                    claim_partition_keys=claim_partition_keys,
+                    limit=limit,
+                    block_ms=block_ms,
+                )
+                result = self._merge_results(
+                    result,
+                    QueueFlowWorkerResult(completed=len(pending_complete.jobs)),
+                )
+                pending_complete = None
             result = self._merge_results(result, QueueFlowWorkerResult(claim_calls=1))
             if not jobs:
                 self._cool_claim_keys(
@@ -446,35 +589,13 @@ class QueueFlowWorker:
                 if batch_handler
                 else self._run_handlers(jobs, cast(FlowHandler, handler))
             )
-            result = self._merge_results(
-                result,
-                QueueFlowWorkerResult(claimed=len(jobs)),
-            )
-
-            if self._completion_executor is not None:
-                while len(self._pending_completions) >= self._complete_async_depth:
-                    result = self._merge_results(
-                        result,
-                        self._drain_pending_completions(block=True, limit=1),
-                    )
-                complete_client = self._next_completion_client()
-                self._pending_completions.append(
-                    self._completion_executor.submit(
-                        self._finish_batch,
-                        handled,
-                        complete_client,
-                    )
-                )
-            else:
-                result = self._merge_results(
-                    result,
-                    self._finish_batch(handled, self.client),
-                )
+            result = self._merge_results(result, QueueFlowWorkerResult(claimed=len(jobs)))
 
             remaining_credit -= len(jobs)
             drain_count += 1
 
             if len(jobs) < limit:
+                result = self._finish_handled_batch(handled, result)
                 self._cool_claim_keys(
                     claim_partition_key,
                     claim_partition_keys,
@@ -482,9 +603,305 @@ class QueueFlowWorker:
                 )
                 break
 
+            if self._should_fuse_complete_claim(handled, remaining_credit, drain_count):
+                pending_complete = handled
+            elif self._should_async_fuse_complete_claim(handled, remaining_credit, drain_count):
+                submitted = self._submit_async_complete_and_claim(
+                    handled,
+                    claim_partition_key=claim_partition_key,
+                    claim_partition_keys=claim_partition_keys,
+                    limit=min(self.batch_size, remaining_credit),
+                    block_ms=block_ms,
+                )
+                if submitted is None:
+                    result = self._finish_handled_batch(handled, result)
+                else:
+                    pending_claim_future = submitted
+            else:
+                result = self._finish_handled_batch(handled, result)
+
+        if pending_complete is not None:
+            result = self._finish_handled_batch(pending_complete, result)
+
         return result
 
-    def _claim_jobs(
+    def _should_fuse_complete_claim(
+        self,
+        handled: _HandledBatch,
+        remaining_credit: int,
+        drain_count: int,
+    ) -> bool:
+        return (
+            remaining_credit > 0
+            and self.fuse_complete_claim
+            and drain_count < self.claim_drain_batches
+            and self._completion_executor is None
+            and not self.claim_values
+            and bool(handled.jobs)
+            and handled.mixed_results is None
+            and not handled.failures
+            and callable(getattr(self.client, "complete_flows_and_claim_flows", None))
+        )
+
+    def _should_async_fuse_complete_claim(
+        self,
+        handled: _HandledBatch,
+        remaining_credit: int,
+        drain_count: int,
+    ) -> bool:
+        return (
+            remaining_credit > 0
+            and self.fuse_complete_claim
+            and drain_count < self.claim_drain_batches
+            and self._completion_executor is not None
+            and not self.claim_values
+            and bool(handled.jobs)
+            and handled.mixed_results is None
+            and not handled.failures
+            and callable(getattr(self.claim_client, "submit_complete_flows_and_claim_flows", None))
+        )
+
+    def _submit_async_complete_and_claim(
+        self,
+        handled: _HandledBatch,
+        *,
+        claim_partition_key: str | None,
+        claim_partition_keys: list[str] | None,
+        limit: int,
+        block_ms: int | None,
+    ) -> Future[list[FlowJob]] | None:
+        submitted = self.claim_client.submit_complete_flows_and_claim_flows(
+            cast(list[ClaimedFlow], handled.jobs),
+            result=handled.first_result,
+            independent=self.complete_independent,
+            type=self.type,
+            state=self.state,
+            states=self.states,
+            worker=self.worker,
+            partition_key=claim_partition_key,
+            partition_keys=claim_partition_keys,
+            lease_ms=self.lease_ms,
+            limit=limit,
+            priority=self.priority,
+            block_ms=block_ms,
+            reclaim_expired=self.reclaim_expired,
+            reclaim_ratio=self.reclaim_ratio,
+        )
+        if submitted is None:
+            return None
+
+        complete_future, claim_future = submitted
+        completion_result: Future[QueueFlowWorkerResult] = Future()
+
+        def complete_done(source: Future[int]) -> None:
+            if completion_result.cancelled():
+                return
+            try:
+                completion_result.set_result(QueueFlowWorkerResult(completed=source.result()))
+            except BaseException as exc:
+                if not completion_result.cancelled():
+                    completion_result.set_exception(exc)
+
+        complete_future.add_done_callback(complete_done)
+        self._pending_completions.append(completion_result)
+        return cast(Future[list[FlowJob]], claim_future)
+
+    def _complete_and_claim_flows(
+        self,
+        handled: _HandledBatch,
+        *,
+        claim_partition_key: str | None,
+        claim_partition_keys: list[str] | None,
+        limit: int,
+        block_ms: int | None,
+    ) -> list[FlowJob]:
+        return cast(
+            list[FlowJob],
+            self.client.complete_flows_and_claim_flows(
+                cast(list[ClaimedFlow], handled.jobs),
+                result=handled.first_result,
+                independent=self.complete_independent,
+                type=self.type,
+                state=self.state,
+                states=self.states,
+                worker=self.worker,
+                partition_key=claim_partition_key,
+                partition_keys=claim_partition_keys,
+                lease_ms=self.lease_ms,
+                limit=limit,
+                priority=self.priority,
+                block_ms=block_ms,
+                reclaim_expired=self.reclaim_expired,
+                reclaim_ratio=self.reclaim_ratio,
+            ),
+        )
+
+    def _finish_handled_batch(
+        self,
+        handled: _HandledBatch,
+        result: QueueFlowWorkerResult,
+    ) -> QueueFlowWorkerResult:
+        if self._completion_executor is not None:
+            while len(self._pending_completions) >= self._complete_async_depth:
+                result = self._merge_results(
+                    result,
+                    self._drain_pending_completions(block=True, limit=1),
+                )
+            complete_client = self._next_completion_client()
+            self._pending_completions.append(
+                self._completion_executor.submit(
+                    self._finish_batch,
+                    handled,
+                    complete_client,
+                )
+            )
+            return result
+
+        return self._merge_results(result, self._finish_batch(handled, self.client))
+
+    def _available_claim_capacity(self) -> int:
+        if self._complete_async_depth <= 0:
+            return self.batch_size * max(self.claim_drain_batches, 1)
+
+        completion_slots = self._complete_async_depth - len(self._pending_completions)
+        if completion_slots <= 0:
+            return 0
+
+        return self.batch_size * max(1, min(self.claim_drain_batches, completion_slots))
+
+    def _can_prefetch_claims(self) -> bool:
+        if self.claim_prefetch <= 0 or self.block_ms is None:
+            return False
+        method_name = "claim_due_future" if self.claim_values else "claim_flows_future"
+        return callable(getattr(self.claim_client, method_name, None))
+
+    def _fill_pending_claims(self) -> None:
+        while len(self._pending_claims) < self.claim_prefetch:
+            partition_key, partition_keys = self._next_claim_partition()
+            self._pending_claims.append(
+                _PendingClaim(
+                    future=self._claim_flows_future(
+                        claim_partition_key=partition_key,
+                        claim_partition_keys=partition_keys,
+                        limit=self.batch_size,
+                        block_ms=self.block_ms,
+                    ),
+                    partition_key=partition_key,
+                    partition_keys=partition_keys,
+                )
+            )
+
+    def _take_pending_claim(self, *, block: bool) -> _PendingClaim | None:
+        if not self._pending_claims:
+            return None
+
+        for idx, pending in enumerate(self._pending_claims):
+            if pending.future.done():
+                return self._pending_claims.pop(idx)
+
+        if not block:
+            return None
+
+        done, _pending = wait(
+            [pending.future for pending in self._pending_claims],
+            return_when=FIRST_COMPLETED,
+        )
+        if not done:
+            return None
+        done_future = next(iter(done))
+        for idx, pending in enumerate(self._pending_claims):
+            if pending.future is done_future:
+                return self._pending_claims.pop(idx)
+        return None
+
+    def _claim_flows_future(
+        self,
+        *,
+        claim_partition_key: str | None,
+        claim_partition_keys: list[str] | None,
+        limit: int,
+        block_ms: int | None,
+    ) -> Future[list[FlowJob]]:
+        if self.claim_values:
+            return cast(
+                Future[list[FlowJob]],
+                self.claim_client.claim_due_future(
+                    self.type,
+                    state=self.state,
+                    states=self.states,
+                    worker=self.worker,
+                    partition_key=claim_partition_key,
+                    partition_keys=claim_partition_keys,
+                    lease_ms=self.lease_ms,
+                    limit=limit,
+                    priority=self.priority,
+                    reclaim_expired=self.reclaim_expired,
+                    reclaim_ratio=self.reclaim_ratio,
+                    block_ms=block_ms,
+                    payload=False,
+                    values=self.claim_values,
+                    value_max_bytes=self.value_max_bytes,
+                ),
+            )
+
+        return cast(
+            Future[list[FlowJob]],
+            self.claim_client.claim_flows_future(
+                self.type,
+                state=self.state,
+                states=self.states,
+                worker=self.worker,
+                partition_key=claim_partition_key,
+                partition_keys=claim_partition_keys,
+                lease_ms=self.lease_ms,
+                limit=limit,
+                priority=self.priority,
+                reclaim_expired=self.reclaim_expired,
+                reclaim_ratio=self.reclaim_ratio,
+                block_ms=block_ms,
+            ),
+        )
+
+    def _process_claimed_jobs(
+        self,
+        jobs: list[FlowJob],
+        handler: FlowHandler | FlowBatchHandler,
+        result: QueueFlowWorkerResult,
+        *,
+        batch_handler: bool,
+    ) -> QueueFlowWorkerResult:
+        handled = (
+            self._run_batch_handler(jobs, cast(FlowBatchHandler, handler))
+            if batch_handler
+            else self._run_handlers(jobs, cast(FlowHandler, handler))
+        )
+        result = self._merge_results(
+            result,
+            QueueFlowWorkerResult(claimed=len(jobs)),
+        )
+
+        if self._completion_executor is not None:
+            while len(self._pending_completions) >= self._complete_async_depth:
+                result = self._merge_results(
+                    result,
+                    self._drain_pending_completions(block=True, limit=1),
+                )
+            complete_client = self._next_completion_client()
+            self._pending_completions.append(
+                self._completion_executor.submit(
+                    self._finish_batch,
+                    handled,
+                    complete_client,
+                )
+            )
+            return result
+
+        return self._merge_results(
+            result,
+            self._finish_batch(handled, self.client),
+        )
+
+    def _claim_flows(
         self,
         *,
         claim_partition_key: str | None,
@@ -516,7 +933,7 @@ class QueueFlowWorker:
 
         return cast(
             list[FlowJob],
-            self.claim_client.claim_jobs(
+            self.claim_client.claim_flows(
                 self.type,
                 state=self.state,
                 states=self.states,
@@ -750,7 +1167,7 @@ class QueueFlowWorker:
 
         if handled.mixed_results is None:
             client.complete_jobs(
-                cast(list[ClaimedItem], handled.jobs),
+                cast(list[ClaimedFlow], handled.jobs),
                 result=handled.first_result,
                 independent=self.complete_independent,
             )
@@ -787,7 +1204,7 @@ class QueueFlowWorker:
             for message, group_jobs in grouped.items():
                 client.fail_many(
                     None,
-                    cast(list[ClaimedItem], group_jobs),
+                    cast(list[ClaimedFlow], group_jobs),
                     error=message,
                     independent=self.complete_independent,
                 )
@@ -796,7 +1213,7 @@ class QueueFlowWorker:
         for message, group_jobs in grouped.items():
             client.retry_many(
                 None,
-                cast(list[ClaimedItem], group_jobs),
+                cast(list[ClaimedFlow], group_jobs),
                 error=message,
                 independent=self.complete_independent,
             )
@@ -975,22 +1392,24 @@ class QueueClient:
             worker_config=worker_config,
             default_workers=1,
         )
+        command_max_connections = (
+            1
+            if isinstance(client, str)
+            and (worker_config is None or worker_config.command_connections is None)
+            else command_pool_size
+        )
         self._url = client if isinstance(client, str) else None
         self._base_url_kwargs: dict[str, Any] = {}
         self._claim_client_explicit = claim_client is not None
         self._owned_extra_claim_flows: list[FlowClient] = []
         self._claim_pool_size = claim_pool_size
         self.flow = (
-            FlowClient.from_url(client, max_connections=command_pool_size)
+            FlowClient.from_url(client, max_connections=command_max_connections)
             if isinstance(client, str)
             else client
         )
         if claim_client is None:
-            self.claim_flow = (
-                FlowClient.from_url(client, max_connections=claim_pool_size)
-                if isinstance(client, str)
-                else self.flow
-            )
+            self.claim_flow = self.flow
         else:
             self.claim_flow = (
                 FlowClient.from_url(claim_client, max_connections=claim_pool_size)
@@ -1001,10 +1420,8 @@ class QueueClient:
         self.worker_config = worker_config
         self.value_config = value_config or ValueConfig()
         self._owns_flow = _owns_clients or isinstance(client, str)
-        self._owns_claim_flow = (
-            _owns_clients
-            or isinstance(claim_client, str)
-            or (claim_client is None and isinstance(client, str))
+        self._owns_claim_flow = (_owns_clients and self.claim_flow is not self.flow) or isinstance(
+            claim_client, str
         )
 
     @classmethod
@@ -1017,17 +1434,17 @@ class QueueClient:
         value_config: ValueConfig | None = None,
         **kwargs: Any,
     ) -> QueueClient:
-        command_pool_size, claim_pool_size = resolve_worker_connection_counts(
+        command_pool_size, _claim_pool_size = resolve_worker_connection_counts(
             worker_config=worker_config,
             default_workers=1,
         )
         command_kwargs = dict(kwargs)
-        command_kwargs.setdefault("max_connections", command_pool_size)
-        claim_kwargs = dict(kwargs)
-        claim_kwargs["max_connections"] = claim_pool_size
+        if worker_config is None or worker_config.command_connections is None:
+            command_kwargs.setdefault("max_connections", 1)
+        else:
+            command_kwargs.setdefault("max_connections", command_pool_size)
         instance = cls(
             FlowClient.from_url(url, **command_kwargs),
-            claim_client=FlowClient.from_url(url, **claim_kwargs),
             retry_policy=retry_policy,
             worker_config=worker_config,
             value_config=value_config,
@@ -1036,26 +1453,14 @@ class QueueClient:
         instance._url = url
         instance._base_url_kwargs = dict(kwargs)
         instance._claim_client_explicit = False
-        instance._claim_pool_size = claim_pool_size
+        instance._claim_pool_size = 1
         return instance
 
     def _claim_flow_for_worker_config(
         self,
         worker_config: WorkerConfig | None,
     ) -> FlowClient:
-        if self._claim_client_explicit or self._url is None or worker_config is None:
-            return self.claim_flow
-        _, claim_pool_size = resolve_worker_connection_counts(
-            worker_config=worker_config,
-            default_workers=1,
-        )
-        if claim_pool_size == self._claim_pool_size:
-            return self.claim_flow
-        claim_kwargs = dict(self._base_url_kwargs)
-        claim_kwargs["max_connections"] = claim_pool_size
-        claim_flow = FlowClient.from_url(self._url, **claim_kwargs)
-        self._owned_extra_claim_flows.append(claim_flow)
-        return claim_flow
+        return self.claim_flow
 
     def queue(
         self,

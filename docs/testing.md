@@ -48,13 +48,13 @@ def test_created_handler_moves_to_charged():
 
 ## Test command construction
 
-Use a fake Redis executor when you want to assert command shape.
+Use a fake command executor when you want to assert command shape.
 
 ```python
 from ferricstore import FlowClient, WorkflowClient
 
 
-class FakeRedis:
+class FakeExecutor:
     def __init__(self):
         self.calls = []
 
@@ -64,13 +64,13 @@ class FakeRedis:
 
 
 def test_workflow_start_command():
-    redis = FakeRedis()
-    client = WorkflowClient(FlowClient(redis))
+    executor = FakeExecutor()
+    client = WorkflowClient(FlowClient(executor))
     orders = client.workflow(type="order", initial_state="created")
 
     orders.start("order-1", payload=b"p")
 
-    assert redis.calls[0][:4] == (
+    assert executor.calls[0][:4] == (
         "FLOW.CREATE",
         "order-1",
         "TYPE",
@@ -116,7 +116,7 @@ from ferricstore import WorkflowClient, complete, transition
 
 
 def test_order_workflow_integration():
-    client = WorkflowClient.from_url("redis://127.0.0.1:6379/0")
+    client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
     order = client.workflow(type="test_order", initial_state="created")
 
     @order.state("created")

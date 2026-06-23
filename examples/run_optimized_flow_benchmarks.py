@@ -135,7 +135,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run optimized FerricFlow queue and workflow benchmarks."
     )
-    parser.add_argument("--url", default="redis://127.0.0.1:6379/0")
+    parser.add_argument("--url", default="ferric://127.0.0.1:6388")
     parser.add_argument("--which", choices=["all", "queue", "workflow"], default="all")
     parser.add_argument("--runtime", choices=["sync", "async", "both"], default="sync")
     parser.add_argument("--start-server", action="store_true")

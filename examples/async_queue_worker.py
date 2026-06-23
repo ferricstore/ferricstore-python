@@ -9,7 +9,7 @@ async def send_email(job) -> bytes:
 
 
 async def main() -> None:
-    client = AsyncQueueClient.from_url("redis://127.0.0.1:6379/0")
+    client = AsyncQueueClient.from_url("ferric://127.0.0.1:6388")
     emails = client.queue(type="email")
 
     await emails.enqueue("email-1", payload=b"welcome:user-1", idempotent=True)

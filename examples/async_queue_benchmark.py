@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from ferricstore import AsyncFlowClient, ClaimedItem, CreateItem
+from ferricstore import AsyncFlowClient, ClaimedFlow, CreateItem
 
 FLOW_TYPE = "dbos_python_sdk_async_bench"
 QUEUE_STATE = "queued"
@@ -428,7 +428,7 @@ async def run_worker(
                 drained_count += 1
         return drained_count
 
-    async def complete_batch(jobs: list[ClaimedItem]) -> int:
+    async def complete_batch(jobs: list[ClaimedFlow]) -> int:
         await client.complete_jobs(
             jobs,
             result=result,
@@ -801,7 +801,7 @@ async def run_queued_throughput(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FerricFlow true-async queue throughput benchmark")
-    parser.add_argument("--url", default="redis://127.0.0.1:7379")
+    parser.add_argument("--url", default="ferric://127.0.0.1:6388")
     parser.add_argument("--shape", choices=("live", "preloaded"), default="live")
     parser.add_argument("--flows", type=int, default=10_000)
     parser.add_argument("--workers", type=int, default=16)

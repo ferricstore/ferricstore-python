@@ -29,7 +29,7 @@ Minimal code or commands:
 - Python version:
 - OS/architecture:
 - Sync or async:
-- Redis/FerricStore URL shape, without credentials:
+- FerricStore URL shape, without credentials:
 
 ## Additional context
 

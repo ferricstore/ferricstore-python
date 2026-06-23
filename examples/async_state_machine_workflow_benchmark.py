@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from ferricstore import AsyncFlowClient, ClaimedItem, CreateItem, FencedItem
+from ferricstore import AsyncFlowClient, ClaimedFlow, CreateItem, FencedItem
 
 AUTO_PARTITION_PREFIX = "__flow_auto__:"
 AUTO_PARTITION_BUCKETS = 256
@@ -116,7 +116,7 @@ def auto_partition_server_shard_for_index(index: int, server_shards: int) -> int
     return server_shard_for_slot(slot, server_shards)
 
 
-def claimed_partition_counts(jobs: list[ClaimedItem]) -> dict[str, int]:
+def claimed_partition_counts(jobs: list[ClaimedFlow]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for job in jobs:
         if job.partition_key:
@@ -528,7 +528,7 @@ async def run_workflow_worker(
     wake_coalesce_s = max(wake_coalesce_ms, 0.0) / 1000.0
     claim_partition_batch_size = max(claim_partition_batch_size, 1)
     apply_inflight = max(apply_inflight, 0)
-    pending_applies: list[asyncio.Task[tuple[int, int, str | None, list[ClaimedItem]]]] = []
+    pending_applies: list[asyncio.Task[tuple[int, int, str | None, list[ClaimedFlow]]]] = []
     expected_actions = counters.workflows * len(states)
 
     same_group = None
@@ -553,7 +553,7 @@ async def run_workflow_worker(
             return keys[0], None
         return None, keys
 
-    async def notify_next_state(state_name: str, jobs: list[ClaimedItem]) -> None:
+    async def notify_next_state(state_name: str, jobs: list[ClaimedFlow]) -> None:
         if wake_coordinator is None:
             return
         await wake_coordinator.notify_partition_counts(
@@ -565,8 +565,8 @@ async def run_workflow_worker(
 
     async def apply_jobs(
         state_name: str,
-        jobs: list[ClaimedItem],
-    ) -> tuple[int, int, str | None, list[ClaimedItem]]:
+        jobs: list[ClaimedFlow],
+    ) -> tuple[int, int, str | None, list[ClaimedFlow]]:
         batch_size = len(jobs)
         if state_name == final_state:
             if terminal_mode == "fail":
@@ -608,16 +608,16 @@ async def run_workflow_worker(
 
     async def apply_claimed_jobs(
         state_name: str,
-        jobs: list[ClaimedItem],
-    ) -> tuple[int, int, str | None, list[ClaimedItem]]:
+        jobs: list[ClaimedFlow],
+    ) -> tuple[int, int, str | None, list[ClaimedFlow]]:
         if claim_states_mode == "cursor":
             return await apply_jobs(state_name, jobs)
 
         completed_count = 0
         claimed_count = 0
-        next_jobs: list[ClaimedItem] = []
+        next_jobs: list[ClaimedFlow] = []
         next_state: str | None = None
-        grouped: dict[str, list[ClaimedItem]] = {}
+        grouped: dict[str, list[ClaimedFlow]] = {}
         for job in jobs:
             grouped.setdefault(job.run_state or job.state, []).append(job)
 
@@ -1090,7 +1090,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="FerricFlow true-async state-machine workflow benchmark"
     )
-    parser.add_argument("--url", default="redis://127.0.0.1:7379")
+    parser.add_argument("--url", default="ferric://127.0.0.1:6388")
     parser.add_argument("--shape", choices=("live", "preloaded"), default="live")
     parser.add_argument("--flows", type=int, default=10_000)
     parser.add_argument("--steps", type=int, default=3)
