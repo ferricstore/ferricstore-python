@@ -9,7 +9,7 @@ on:
       ferricstore_image:
         description: "FerricStore image for integration tests"
         required: false
-        default: ""
+        default: "ghcr.io/ferricstore/ferricstore:0.5.2"
 
 permissions:
   contents: read
@@ -81,20 +81,20 @@ jobs:
     name: FerricStore integration
     runs-on: ubuntu-latest
     env:
-      FERRICSTORE_IMAGE: ${{ inputs.ferricstore_image || 'ferricstore-sdk-ci:local' }}
+      FERRICSTORE_IMAGE: ${{ inputs.ferricstore_image || 'ghcr.io/ferricstore/ferricstore:0.5.2' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
       - name: Checkout FerricStore server
-        if: ${{ inputs.ferricstore_image == '' }}
+        if: ${{ env.FERRICSTORE_IMAGE == 'ferricstore-sdk-ci:local' }}
         uses: actions/checkout@v6
         with:
           repository: ferricstore/ferricstore
           path: ferricstore-server
 
       - name: Build FerricStore image
-        if: ${{ inputs.ferricstore_image == '' }}
+        if: ${{ env.FERRICSTORE_IMAGE == 'ferricstore-sdk-ci:local' }}
         run: docker build -t ferricstore-sdk-ci:local ferricstore-server
 
       - name: Set up Python

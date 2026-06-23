@@ -26,11 +26,10 @@ Or with a direct Docker command:
 
 ```bash
 docker run --name ferricstore-dev \
-  -p 6379:6379 \
   -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore-dev-data:/data \
-  ghcr.io/ferricstore/ferricstore:0.5.1
+  ghcr.io/ferricstore/ferricstore:0.5.2
 ```
 
 This starts one local FerricStore server on:
@@ -43,7 +42,6 @@ If you built the server image locally, replace the image name:
 
 ```bash
 docker run --name ferricstore-dev \
-  -p 6379:6379 \
   -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore-dev-data:/data \

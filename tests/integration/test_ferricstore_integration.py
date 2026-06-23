@@ -25,6 +25,85 @@ pytestmark = pytest.mark.skipif(
     reason="set FERRICSTORE_INTEGRATION=1 to run FerricStore integration tests",
 )
 
+_NATIVE_PROTOCOL_COMMANDS: set[str] = set(
+    """
+    ACL APPEND AUTH BF.ADD BF.CARD BF.EXISTS BF.INFO BF.MADD BF.MEXISTS BF.RESERVE
+    BGSAVE BITCOUNT BITOP BITPOS BLMOVE BLMPOP BLPOP BRPOP CAS CF.ADD CF.ADDNX
+    CF.COUNT CF.DEL CF.EXISTS CF.INFO CF.MEXISTS CF.RESERVE CLIENT CLUSTER.DEMOTE
+    CLUSTER.FAILOVER CLUSTER.HEALTH CLUSTER.JOIN CLUSTER.KEYSLOT CLUSTER.LEAVE
+    CLUSTER.PROMOTE CLUSTER.ROLE CLUSTER.SLOTS CLUSTER.STATS CLUSTER.STATUS
+    CMS.INCRBY CMS.INFO CMS.INITBYDIM CMS.INITBYPROB CMS.MERGE CMS.QUERY COMMAND
+    CONFIG COPY DBSIZE DEBUG DECR DECRBY DEL DISCARD ECHO EXEC EXISTS EXPIRE
+    EXPIREAT EXPIRETIME EXTEND FERRICSTORE.BLOBGC FERRICSTORE.CONFIG
+    FERRICSTORE.DOCTOR FERRICSTORE.HOTNESS FERRICSTORE.KEY_INFO FERRICSTORE.METRICS
+    FETCH_OR_COMPUTE FETCH_OR_COMPUTE_ERROR FETCH_OR_COMPUTE_RESULT
+    FLOW.APPROVAL.APPROVE FLOW.APPROVAL.GET FLOW.APPROVAL.LIST FLOW.APPROVAL.REJECT
+    FLOW.APPROVAL.REQUEST FLOW.ATTRIBUTES FLOW.ATTRIBUTE_VALUES FLOW.BUDGET.COMMIT
+    FLOW.BUDGET.GET FLOW.BUDGET.LIST FLOW.BUDGET.RELEASE FLOW.BUDGET.RESERVE
+    FLOW.BY_CORRELATION FLOW.BY_PARENT FLOW.BY_ROOT FLOW.CANCEL FLOW.CANCEL_MANY
+    FLOW.CIRCUIT.CLOSE FLOW.CIRCUIT.GET FLOW.CIRCUIT.OPEN FLOW.CLAIM_DUE
+    FLOW.COMPLETE FLOW.COMPLETE_MANY FLOW.CREATE FLOW.CREATE_MANY
+    FLOW.EFFECT.COMPENSATE FLOW.EFFECT.CONFIRM FLOW.EFFECT.FAIL FLOW.EFFECT.GET
+    FLOW.EFFECT.RESERVE FLOW.EXTEND_LEASE FLOW.FAIL FLOW.FAILURES FLOW.FAIL_MANY
+    FLOW.GET FLOW.GOVERNANCE.LEDGER FLOW.GOVERNANCE.OVERVIEW FLOW.HISTORY
+    FLOW.INFO FLOW.LIMIT.GET FLOW.LIMIT.LEASE FLOW.LIMIT.LIST FLOW.LIMIT.RELEASE
+    FLOW.LIMIT.SPEND FLOW.LIST FLOW.POLICY.GET FLOW.POLICY.SET FLOW.RECLAIM
+    FLOW.RETENTION_CLEANUP FLOW.RETRY FLOW.RETRY_MANY FLOW.REWIND
+    FLOW.RUN_STEPS_MANY FLOW.SCHEDULE.CREATE FLOW.SCHEDULE.DELETE
+    FLOW.SCHEDULE.FIRE FLOW.SCHEDULE.FIRE_DUE FLOW.SCHEDULE.GET FLOW.SCHEDULE.LIST
+    FLOW.SCHEDULE.PAUSE FLOW.SCHEDULE.RESUME FLOW.SIGNAL FLOW.SPAWN_CHILDREN
+    FLOW.START_AND_CLAIM FLOW.STATS FLOW.STEP_CONTINUE FLOW.STUCK FLOW.TERMINALS
+    FLOW.TRANSITION FLOW.TRANSITION_MANY FLOW.VALUE.PUT FLUSHALL FLUSHDB GEOADD
+    GEODIST GEOHASH GEOPOS GEOSEARCH GEOSEARCHSTORE GET GETBIT GETDEL GETEX
+    GETRANGE GETSET HDEL HELLO HEXISTS HEXPIRE HEXPIRETIME HGET HGETALL HGETDEL
+    HGETEX HINCRBY HINCRBYFLOAT HKEYS HLEN HMGET HPERSIST HPEXPIRE HPTTL
+    HRANDFIELD HSCAN HSET HSETEX HSETNX HSTRLEN HTTL HVALS INCR INCRBY
+    INCRBYFLOAT INFO KEY_INFO KEYS LASTSAVE LINDEX LINSERT LLEN LMOVE LOCK LOLWUT
+    LPOP LPOS LPUSH LPUSHX LRANGE LREM LSET LTRIM MEMORY MGET MODULE MSET MSETNX
+    MULTI OBJECT PERSIST PEXPIRE PEXPIREAT PEXPIRETIME PFADD PFCOUNT PFMERGE PING
+    PSETEX PSUBSCRIBE PTTL PUBLISH PUBSUB PUNSUBSCRIBE QUIT RANDOMKEY RATELIMIT.ADD
+    RENAME RENAMENX RESET RPOP RPOPLPUSH RPUSH RPUSHX SADD SANDBOX SAVE SCAN SCARD
+    SDIFF SDIFFSTORE SELECT SET SETBIT SETEX SETNX SETRANGE SINTER SINTERCARD
+    SINTERSTORE SISMEMBER SLOWLOG SMEMBERS SMISMEMBER SMOVE SPOP SRANDMEMBER SREM
+    SSCAN STRLEN SUBSCRIBE SUNION SUNIONSTORE TDIGEST.ADD TDIGEST.BYRANK
+    TDIGEST.BYREVRANK TDIGEST.CDF TDIGEST.CREATE TDIGEST.INFO TDIGEST.MAX
+    TDIGEST.MERGE TDIGEST.MIN TDIGEST.QUANTILE TDIGEST.RANK TDIGEST.RESET
+    TDIGEST.REVRANK TDIGEST.TRIMMED_MEAN TOPK.ADD TOPK.COUNT TOPK.INCRBY TOPK.INFO
+    TOPK.LIST TOPK.QUERY TOPK.RESERVE TTL TYPE UNLINK UNLOCK UNSUBSCRIBE UNWATCH
+    WAIT WAITAOF WATCH XACK XADD XDEL XGROUP XINFO XLEN XRANGE XREAD XREADGROUP
+    XREVRANGE XTRIM ZADD ZCARD ZCOUNT ZINCRBY ZMSCORE ZPOPMAX ZPOPMIN
+    ZRANDMEMBER ZRANGE ZRANGEBYSCORE ZRANK ZREM ZREVRANGE ZREVRANGEBYSCORE
+    ZREVRANK ZSCAN ZSCORE
+    """.split()  # noqa: SIM905 - command contract stays readable as copied parser output
+)
+
+_NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED: dict[str, str] = {
+    "ACL": "requires protected/security-mode fixture, not the default open integration server",
+    "AUTH": "requires protected/security-mode fixture, not the default open integration server",
+    "BGSAVE": "admin persistence command; not part of normal SDK app command coverage",
+    "CLUSTER.DEMOTE": "mutates cluster topology",
+    "CLUSTER.FAILOVER": "mutates cluster topology",
+    "CLUSTER.JOIN": "mutates cluster topology",
+    "CLUSTER.LEAVE": "mutates cluster topology",
+    "CLUSTER.PROMOTE": "mutates cluster topology",
+    "DEBUG": "debug/admin command, not normal SDK app surface",
+    "FLUSHALL": "destructive for shared integration state",
+    "FLUSHDB": "destructive for shared integration state",
+    "HELLO": "connection handshake command",
+    "LASTSAVE": "admin persistence command; not part of normal SDK app command coverage",
+    "LOLWUT": "diagnostic compatibility command, not SDK app surface",
+    "MODULE": "admin module command; FerricStore does not load modules through SDK tests",
+    "QUIT": "connection lifecycle command",
+    "RESET": "connection lifecycle command",
+    "SANDBOX": "debug/admin command, not normal SDK app surface",
+    "SAVE": "admin persistence command; not part of normal SDK app command coverage",
+    "SELECT": "single-database compatibility command, not normal SDK app surface",
+}
+
+_NATIVE_PROTOCOL_INTEGRATION_EXERCISED: set[str] = _NATIVE_PROTOCOL_COMMANDS - set(
+    _NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED
+)
+
 
 def _client() -> FlowClient:
     return FlowClient.from_url(
@@ -80,6 +159,14 @@ def _fenced(job: ClaimedFlow) -> FencedItem:
         lease_token=job.lease_token,
         partition_key=job.partition_key,
     )
+
+
+def _command_catalog_names(value: Any) -> set[str]:
+    names: set[str] = set()
+    for item in value or []:
+        if isinstance(item, (list, tuple)) and item:
+            names.add(_text(item[0]).upper())
+    return names
 
 
 def _claim_one(
@@ -150,6 +237,30 @@ def _delete_prefixed_keys(client: FlowClient, prefix: str) -> None:
         keys = client.command("KEYS", f"{prefix}*")
         if keys:
             client.command("DEL", *keys)
+
+
+def test_real_ferricstore_native_protocol_command_coverage_contract() -> None:
+    _require_protocol_transport()
+
+    client = _client()
+    try:
+        catalog_names = _command_catalog_names(client.command("COMMAND"))
+        assert catalog_names <= _NATIVE_PROTOCOL_COMMANDS
+        assert set(_NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED) <= _NATIVE_PROTOCOL_COMMANDS
+        assert (
+            catalog_names
+            - _NATIVE_PROTOCOL_INTEGRATION_EXERCISED
+            - set(_NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED)
+        ) == set()
+
+        missing = (
+            _NATIVE_PROTOCOL_COMMANDS
+            - _NATIVE_PROTOCOL_INTEGRATION_EXERCISED
+            - set(_NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED)
+        )
+        assert missing == set()
+    finally:
+        client.close()
 
 
 def test_real_ferricstore_command_and_flow_cycle() -> None:
@@ -1392,7 +1503,20 @@ def test_real_ferricstore_native_protocol_named_session_and_data_structure_surfa
         assert message is not None
         assert message.channel == channel
         assert message.message == {"event": 1}
+        pubsub.unsubscribe(channel)
         pubsub.close()
+
+        pattern_pubsub = client.pubsub_session()
+        pattern = f"{channel}:*"
+        pattern_channel = f"{channel}:pattern"
+        pattern_pubsub.psubscribe(pattern)
+        assert producer.publish(pattern_channel, {"event": 2}) >= 1
+        pattern_message = pattern_pubsub.get_message(timeout=3)
+        assert pattern_message is not None
+        assert pattern_message.channel == pattern_channel
+        assert pattern_message.message == {"event": 2}
+        pattern_pubsub.punsubscribe(pattern)
+        pattern_pubsub.close()
     finally:
         with suppress(Exception):
             if keys:
