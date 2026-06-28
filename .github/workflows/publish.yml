@@ -42,7 +42,7 @@ jobs:
         run: python -m pytest --cov=ferricstore --cov-report=term-missing
 
       - name: Bandit
-        run: python -m bandit -q -r src/ferricstore
+        run: python -m bandit -q -c pyproject.toml -r src/ferricstore
 
       - name: Build
         run: python -m build
