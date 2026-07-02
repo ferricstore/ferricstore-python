@@ -19,6 +19,7 @@ from ferricstore.client import (
     _append_named_values,
     _append_payload_read,
     _append_read_options,
+    _append_state_meta,
     _append_value_return,
     _auto_partition_key_for_id,
     _expand_many_response,
@@ -31,6 +32,7 @@ from ferricstore.client import (
     _parse_kv_response,
     _resolve_include_record,
     _shared_create_many_attributes,
+    _shared_create_many_state_meta,
 )
 from ferricstore.codecs import Codec, RawCodec
 from ferricstore.commands import AsyncDataCommandsMixin
@@ -464,6 +466,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         idempotent: bool | None = None,
         retention_ttl_ms: int | None = None,
         attributes: dict[str, Any] | None = None,
+        state_meta: dict[str, Any] | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         return_record: bool = False,
@@ -480,6 +483,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         _append_bool(args, "IDEMPOTENT", idempotent)
         _append(args, "RETENTION_TTL_MS", retention_ttl_ms)
         _append_attributes(args, attributes=attributes)
+        _append_state_meta(args, state_meta)
         _append_named_values(args, self.codec, values=values, value_refs=value_refs)
         response = await self._execute_producer_write(*args)
         if not return_record:
@@ -500,6 +504,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         idempotent: bool | None = None,
         retention_ttl_ms: int | None = None,
         attributes: dict[str, Any] | None = None,
+        state_meta: dict[str, Any] | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         return_record: bool = False,
@@ -516,6 +521,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
             idempotent=idempotent,
             retention_ttl_ms=retention_ttl_ms,
             attributes=attributes,
+            state_meta=state_meta,
             values=values,
             value_refs=value_refs,
             return_record=return_record,
@@ -538,6 +544,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         priority: int | None = None,
         retention_ttl_ms: int | None = None,
         attributes: dict[str, Any] | None = None,
+        state_meta: dict[str, Any] | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
     ) -> FlowRecord:
@@ -564,6 +571,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         _append(args, "PRIORITY", priority)
         _append(args, "RETENTION_TTL_MS", retention_ttl_ms)
         _append_attributes(args, attributes=attributes)
+        _append_state_meta(args, state_meta)
         _append_named_values(args, self.codec, values=values, value_refs=value_refs)
         response = await self.executor.execute_command(*args)
         return await self._record_or_get(response, id, partition_key)
@@ -585,6 +593,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         attributes: dict[str, Any] | None = None,
+        state_meta: dict[str, Any] | None = None,
     ) -> builtins.list[Any] | Any:
         if not items:
             return []
@@ -605,6 +614,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
                 values=values,
                 value_refs=value_refs,
                 attributes=attributes,
+                state_meta=state_meta,
             )
 
         grouped: dict[str, builtins.list[tuple[int, CreateItem]]] = {}
@@ -629,6 +639,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
                 values=values,
                 value_refs=value_refs,
                 attributes=attributes,
+                state_meta=state_meta,
             )
             for (idx, _item), item_result in zip(
                 indexed_items,
@@ -655,11 +666,13 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         attributes: dict[str, Any] | None = None,
+        state_meta: dict[str, Any] | None = None,
     ) -> builtins.list[FlowRecord] | Any:
         if not items:
             return []
 
         attributes = _shared_create_many_attributes(items, attributes)
+        state_meta = _shared_create_many_state_meta(items, state_meta)
         now_ms = now_ms if now_ms is not None else _now_ms()
         if partition_key is not None:
             for item in items:
@@ -688,6 +701,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
             _append(args, "RETURN", "OK_ON_SUCCESS")
         _append(args, "RETENTION_TTL_MS", retention_ttl_ms)
         _append_attributes(args, attributes=attributes)
+        _append_state_meta(args, state_meta)
         extended_items = _has_named_item_values(items) or (
             mixed and any(item.partition_key is None for item in items)
         )
@@ -1011,6 +1025,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         priority: int | None = None,
@@ -1038,6 +1053,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -1066,6 +1082,9 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         value_refs: dict[str, str] | None = None,
         drop_values: builtins.list[str] | None = None,
         override_values: builtins.list[str] | None = None,
+        attributes_merge: dict[str, Any] | None = None,
+        attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         now_ms: int | None = None,
         worker: str | None = None,
     ) -> FlowRecord:
@@ -1085,6 +1104,12 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         _append(args, "PARTITION", partition_key)
         _append(args, "WORKER", worker)
         _append_encoded(args, "PAYLOAD", self.codec, payload)
+        _append_attributes(
+            args,
+            attributes_merge=attributes_merge,
+            attributes_delete=attributes_delete,
+        )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -1109,6 +1134,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
@@ -1130,6 +1156,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -1186,6 +1213,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = False,
@@ -1208,6 +1236,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -1235,6 +1264,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         priority: int | None = None,
@@ -1256,6 +1286,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -1288,6 +1319,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = False,
@@ -1310,6 +1342,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -1336,6 +1369,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
@@ -1357,6 +1391,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -1383,6 +1418,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = False,
@@ -1405,6 +1441,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -1431,6 +1468,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
@@ -1452,6 +1490,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -1477,6 +1516,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = False,
@@ -1498,6 +1538,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -1521,6 +1562,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         value_refs: dict[str, str] | None = None,
         drop_values: builtins.list[str] | None = None,
         override_values: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
@@ -1536,6 +1578,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         _append(args, "TTL", ttl_ms)
         _append(args, "NOW", now_ms if now_ms is not None else _now_ms())
         _append_bool(args, "INDEPENDENT", independent)
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -2019,8 +2062,10 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         *,
         retry: RetryPolicy | None = None,
         states: dict[str, RetryPolicy] | None = None,
+        indexed_state_meta: str | None = None,
     ) -> Any:
         args: builtins.list[Any] = ["FLOW.POLICY.SET", type]
+        _append(args, "INDEXED_STATE_META", indexed_state_meta)
         if retry is not None:
             self._append_retry_policy(args, retry)
         for state, policy in (states or {}).items():

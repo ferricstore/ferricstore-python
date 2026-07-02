@@ -69,6 +69,7 @@ class Transition:
     drop_values: builtins.list[str] | None = None
     override_values: builtins.list[str] | None = None
     attributes_merge: dict[str, Any] | None = None
+    state_meta: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +82,7 @@ class Complete:
     drop_values: builtins.list[str] | None = None
     override_values: builtins.list[str] | None = None
     attributes_merge: dict[str, Any] | None = None
+    state_meta: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +95,7 @@ class Retry:
     drop_values: builtins.list[str] | None = None
     override_values: builtins.list[str] | None = None
     attributes_merge: dict[str, Any] | None = None
+    state_meta: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +108,7 @@ class Fail:
     drop_values: builtins.list[str] | None = None
     override_values: builtins.list[str] | None = None
     attributes_merge: dict[str, Any] | None = None
+    state_meta: dict[str, Any] | None = None
 
 
 Outcome = Transition | Complete | Retry | Fail
@@ -1039,6 +1043,7 @@ def transition(
     drop_values: builtins.list[str] | None = None,
     override_values: builtins.list[str] | None = None,
     attributes_merge: dict[str, Any] | None = None,
+    state_meta: dict[str, Any] | None = None,
 ) -> Transition:
     return Transition(
         to_state=to_state,
@@ -1050,6 +1055,7 @@ def transition(
         drop_values=drop_values,
         override_values=override_values,
         attributes_merge=attributes_merge,
+        state_meta=state_meta,
     )
 
 
@@ -1063,6 +1069,7 @@ def complete(
     drop_values: builtins.list[str] | None = None,
     override_values: builtins.list[str] | None = None,
     attributes_merge: dict[str, Any] | None = None,
+    state_meta: dict[str, Any] | None = None,
 ) -> Complete:
     return Complete(
         result=result,
@@ -1073,6 +1080,7 @@ def complete(
         drop_values=drop_values,
         override_values=override_values,
         attributes_merge=attributes_merge,
+        state_meta=state_meta,
     )
 
 
@@ -1086,6 +1094,7 @@ def retry(
     drop_values: builtins.list[str] | None = None,
     override_values: builtins.list[str] | None = None,
     attributes_merge: dict[str, Any] | None = None,
+    state_meta: dict[str, Any] | None = None,
 ) -> Retry:
     return Retry(
         error=error,
@@ -1096,6 +1105,7 @@ def retry(
         drop_values=drop_values,
         override_values=override_values,
         attributes_merge=attributes_merge,
+        state_meta=state_meta,
     )
 
 
@@ -1109,6 +1119,7 @@ def fail(
     drop_values: builtins.list[str] | None = None,
     override_values: builtins.list[str] | None = None,
     attributes_merge: dict[str, Any] | None = None,
+    state_meta: dict[str, Any] | None = None,
 ) -> Fail:
     return Fail(
         error=error,
@@ -1119,6 +1130,7 @@ def fail(
         drop_values=drop_values,
         override_values=override_values,
         attributes_merge=attributes_merge,
+        state_meta=state_meta,
     )
 
 
@@ -1310,6 +1322,7 @@ class Workflow:
         *,
         retry_policy: RetryPolicy | None = None,
         retry: RetryPolicy | None = None,
+        indexed_state_meta: str | None = None,
     ) -> Any:
         if retry_policy is not None and retry is not None:
             raise ValueError("retry_policy and retry are mutually exclusive")
@@ -1325,9 +1338,10 @@ class Workflow:
             for config in self._states.values()
             if config.retry is not None
         }
-        return self.client.install_policy(
-            self.type, retry=resolved_retry_policy, states=state_policies
-        )
+        kwargs: dict[str, Any] = {"retry": resolved_retry_policy, "states": state_policies}
+        if indexed_state_meta is not None:
+            kwargs["indexed_state_meta"] = indexed_state_meta
+        return self.client.install_policy(self.type, **kwargs)
 
     def policy_get(self, *, state: str | None = None) -> dict[Any, Any]:
         return self.client.policy_get(self.type, state=state)
@@ -1679,6 +1693,7 @@ class Workflow:
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
                 attributes_merge=outcome.attributes_merge,
+                state_meta=outcome.state_meta,
                 **common,
             )
         if isinstance(outcome, Complete):
@@ -1692,6 +1707,7 @@ class Workflow:
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
                 attributes_merge=outcome.attributes_merge,
+                state_meta=outcome.state_meta,
                 **common,
             )
         if isinstance(outcome, Retry):
@@ -1705,6 +1721,7 @@ class Workflow:
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
                 attributes_merge=outcome.attributes_merge,
+                state_meta=outcome.state_meta,
                 **common,
             )
         if isinstance(outcome, Fail):
@@ -1718,6 +1735,7 @@ class Workflow:
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
                 attributes_merge=outcome.attributes_merge,
+                state_meta=outcome.state_meta,
                 **common,
             )
         raise FerricStoreError(f"unknown workflow outcome: {outcome!r}")
@@ -1785,6 +1803,7 @@ class Workflow:
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
                 attributes_merge=outcome.attributes_merge,
+                state_meta=outcome.state_meta,
                 independent=True,
             )
             if not materialize:
@@ -1803,6 +1822,7 @@ class Workflow:
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
                 attributes_merge=outcome.attributes_merge,
+                state_meta=outcome.state_meta,
                 independent=True,
             )
             if not materialize:
@@ -1821,6 +1841,7 @@ class Workflow:
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
                 attributes_merge=outcome.attributes_merge,
+                state_meta=outcome.state_meta,
                 independent=True,
             )
             if not materialize:
@@ -1839,6 +1860,7 @@ class Workflow:
                 drop_values=outcome.drop_values,
                 override_values=outcome.override_values,
                 attributes_merge=outcome.attributes_merge,
+                state_meta=outcome.state_meta,
                 independent=True,
             )
             if not materialize:
@@ -2175,6 +2197,7 @@ class WorkflowClient:
         retry_policy: RetryPolicy | None = None,
         retry: RetryPolicy | None = None,
         states: dict[str, RetryPolicy] | None = None,
+        indexed_state_meta: str | None = None,
     ) -> Any:
         if retry_policy is not None and retry is not None:
             raise ValueError("retry_policy and retry are mutually exclusive")
@@ -2185,7 +2208,10 @@ class WorkflowClient:
             if retry is not None
             else self.retry_policy
         )
-        return self.flow.install_policy(type, retry=resolved_retry_policy, states=states)
+        kwargs: dict[str, Any] = {"retry": resolved_retry_policy, "states": states}
+        if indexed_state_meta is not None:
+            kwargs["indexed_state_meta"] = indexed_state_meta
+        return self.flow.install_policy(type, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.flow, name)

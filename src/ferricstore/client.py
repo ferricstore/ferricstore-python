@@ -112,6 +112,14 @@ def _append_attributes(
         args.extend(["ATTRIBUTE_DELETE", name])
 
 
+def _append_state_meta(
+    args: builtins.list[Any],
+    state_meta: dict[str, Any] | None,
+) -> None:
+    for name, value in (state_meta or {}).items():
+        args.extend(["STATE_META", name, value])
+
+
 def _merge_named_map(base: dict[str, Any] | None, item: dict[str, Any] | None) -> dict[str, Any]:
     merged: dict[str, Any] = {}
     if base:
@@ -143,6 +151,29 @@ def _shared_create_many_attributes(
     if attributes is not None and attributes != first:
         raise ValueError(
             "create_many item attributes must match shared attributes when both are provided"
+        )
+
+    return first
+
+
+def _shared_create_many_state_meta(
+    items: builtins.list[CreateItem],
+    state_meta: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    item_meta = [item.state_meta for item in items if item.state_meta]
+    if not item_meta:
+        return state_meta
+
+    first = item_meta[0]
+    if any(meta != first for meta in item_meta):
+        raise ValueError(
+            "create_many supports shared state_meta only; use state_meta=... "
+            "or separate create calls for per-item state_meta"
+        )
+
+    if state_meta is not None and state_meta != first:
+        raise ValueError(
+            "create_many item state_meta must match shared state_meta when both are provided"
         )
 
     return first
@@ -703,6 +734,7 @@ class FlowClient(DataCommandsMixin):
         idempotent: bool | None = None,
         retention_ttl_ms: int | None = None,
         attributes: dict[str, Any] | None = None,
+        state_meta: dict[str, Any] | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         return_record: bool = False,
@@ -719,6 +751,7 @@ class FlowClient(DataCommandsMixin):
         _append_bool(args, "IDEMPOTENT", idempotent)
         _append(args, "RETENTION_TTL_MS", retention_ttl_ms)
         _append_attributes(args, attributes=attributes)
+        _append_state_meta(args, state_meta)
         _append_named_values(args, self.codec, values=values, value_refs=value_refs)
         response = self._execute_producer_write(*args)
         if not return_record:
@@ -739,6 +772,7 @@ class FlowClient(DataCommandsMixin):
         idempotent: bool | None = None,
         retention_ttl_ms: int | None = None,
         attributes: dict[str, Any] | None = None,
+        state_meta: dict[str, Any] | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         return_record: bool = False,
@@ -756,6 +790,7 @@ class FlowClient(DataCommandsMixin):
             idempotent=idempotent,
             retention_ttl_ms=retention_ttl_ms,
             attributes=attributes,
+            state_meta=state_meta,
             values=values,
             value_refs=value_refs,
             return_record=return_record,
@@ -778,6 +813,7 @@ class FlowClient(DataCommandsMixin):
         priority: int | None = None,
         retention_ttl_ms: int | None = None,
         attributes: dict[str, Any] | None = None,
+        state_meta: dict[str, Any] | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
     ) -> FlowRecord:
@@ -804,6 +840,7 @@ class FlowClient(DataCommandsMixin):
         _append(args, "PRIORITY", priority)
         _append(args, "RETENTION_TTL_MS", retention_ttl_ms)
         _append_attributes(args, attributes=attributes)
+        _append_state_meta(args, state_meta)
         _append_named_values(args, self.codec, values=values, value_refs=value_refs)
         response = self.executor.execute_command(*args)
         return self._record_or_get(response, id, partition_key)
@@ -899,6 +936,7 @@ class FlowClient(DataCommandsMixin):
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         attributes: dict[str, Any] | None = None,
+        state_meta: dict[str, Any] | None = None,
     ) -> builtins.list[Any] | Any:
         """Create many queued flows, grouping no-partition items by auto bucket."""
         if not items:
@@ -920,6 +958,7 @@ class FlowClient(DataCommandsMixin):
                 values=values,
                 value_refs=value_refs,
                 attributes=attributes,
+                state_meta=state_meta,
             )
 
         if any(item.partition_key is not None for item in items):
@@ -946,6 +985,7 @@ class FlowClient(DataCommandsMixin):
                     values=values,
                     value_refs=value_refs,
                     attributes=attributes,
+                    state_meta=state_meta,
                 )
                 for (idx, _item), item_result in zip(
                     indexed_items,
@@ -977,6 +1017,7 @@ class FlowClient(DataCommandsMixin):
                 values=values,
                 value_refs=value_refs,
                 attributes=attributes,
+                state_meta=state_meta,
             )
             for (idx, _item), item_result in zip(
                 indexed_items,
@@ -1003,8 +1044,10 @@ class FlowClient(DataCommandsMixin):
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         attributes: dict[str, Any] | None = None,
+        state_meta: dict[str, Any] | None = None,
     ) -> builtins.list[Any]:
         attributes = _shared_create_many_attributes(items, attributes)
+        state_meta = _shared_create_many_state_meta(items, state_meta)
         now_ms = now_ms if now_ms is not None else _now_ms()
         if partition_key is not None:
             for item in items:
@@ -1033,6 +1076,7 @@ class FlowClient(DataCommandsMixin):
             _append(args, "RETURN", "OK_ON_SUCCESS")
         _append(args, "RETENTION_TTL_MS", retention_ttl_ms)
         _append_attributes(args, attributes=attributes)
+        _append_state_meta(args, state_meta)
         extended_items = _has_named_item_values(items) or (
             mixed and any(item.partition_key is None for item in items)
         )
@@ -1074,6 +1118,7 @@ class FlowClient(DataCommandsMixin):
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         attributes: dict[str, Any] | None = None,
+        state_meta: dict[str, Any] | None = None,
     ) -> builtins.list[FlowRecord] | Any:
         if not items:
             return []
@@ -1093,6 +1138,7 @@ class FlowClient(DataCommandsMixin):
             values=values,
             value_refs=value_refs,
             attributes=attributes,
+            state_meta=state_meta,
         )
         return self._records_or_response(self._execute_producer_write(*args))
 
@@ -1113,6 +1159,7 @@ class FlowClient(DataCommandsMixin):
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         attributes: dict[str, Any] | None = None,
+        state_meta: dict[str, Any] | None = None,
     ) -> Future[Any]:
         future: Future[Any] = Future()
         if not items:
@@ -1139,6 +1186,7 @@ class FlowClient(DataCommandsMixin):
             values=values,
             value_refs=value_refs,
             attributes=attributes,
+            state_meta=state_meta,
         )
         source = submit_command(*args)
 
@@ -1627,6 +1675,7 @@ class FlowClient(DataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         priority: int | None = None,
@@ -1654,6 +1703,7 @@ class FlowClient(DataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -1682,6 +1732,9 @@ class FlowClient(DataCommandsMixin):
         value_refs: dict[str, str] | None = None,
         drop_values: builtins.list[str] | None = None,
         override_values: builtins.list[str] | None = None,
+        attributes_merge: dict[str, Any] | None = None,
+        attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         now_ms: int | None = None,
         worker: str | None = None,
         return_job: bool = False,
@@ -1704,6 +1757,12 @@ class FlowClient(DataCommandsMixin):
         _append_encoded(args, "PAYLOAD", self.codec, payload)
         if return_job:
             args.extend(["RETURN", "JOBS_COMPACT"])
+        _append_attributes(
+            args,
+            attributes_merge=attributes_merge,
+            attributes_delete=attributes_delete,
+        )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -1730,6 +1789,7 @@ class FlowClient(DataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
@@ -1752,6 +1812,7 @@ class FlowClient(DataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         if return_ok_on_success:
             _append(args, "RETURN", "OK_ON_SUCCESS")
         _append_named_values(
@@ -2040,6 +2101,7 @@ class FlowClient(DataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = False,
@@ -2062,6 +2124,7 @@ class FlowClient(DataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -2089,6 +2152,7 @@ class FlowClient(DataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         priority: int | None = None,
@@ -2110,6 +2174,7 @@ class FlowClient(DataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -2142,6 +2207,7 @@ class FlowClient(DataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = False,
@@ -2164,6 +2230,7 @@ class FlowClient(DataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -2190,6 +2257,7 @@ class FlowClient(DataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
@@ -2211,6 +2279,7 @@ class FlowClient(DataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -2237,6 +2306,7 @@ class FlowClient(DataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = False,
@@ -2259,6 +2329,7 @@ class FlowClient(DataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -2285,6 +2356,7 @@ class FlowClient(DataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
@@ -2306,6 +2378,7 @@ class FlowClient(DataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -2331,6 +2404,7 @@ class FlowClient(DataCommandsMixin):
         override_values: builtins.list[str] | None = None,
         attributes_merge: dict[str, Any] | None = None,
         attributes_delete: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = False,
@@ -2352,6 +2426,7 @@ class FlowClient(DataCommandsMixin):
             attributes_merge=attributes_merge,
             attributes_delete=attributes_delete,
         )
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -2375,6 +2450,7 @@ class FlowClient(DataCommandsMixin):
         value_refs: dict[str, str] | None = None,
         drop_values: builtins.list[str] | None = None,
         override_values: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
@@ -2390,6 +2466,7 @@ class FlowClient(DataCommandsMixin):
         _append(args, "TTL", ttl_ms)
         _append(args, "NOW", now_ms if now_ms is not None else _now_ms())
         _append_bool(args, "INDEPENDENT", independent)
+        _append_state_meta(args, state_meta)
         _append_named_values(
             args,
             self.codec,
@@ -2861,8 +2938,10 @@ class FlowClient(DataCommandsMixin):
         *,
         retry: RetryPolicy | None = None,
         states: dict[str, RetryPolicy] | None = None,
+        indexed_state_meta: str | None = None,
     ) -> Any:
         args: builtins.list[Any] = ["FLOW.POLICY.SET", type]
+        _append(args, "INDEXED_STATE_META", indexed_state_meta)
         if retry is not None:
             self._append_retry_policy(args, retry)
         for state, policy in (states or {}).items():
@@ -3528,6 +3607,7 @@ class AutobatchFlowClient:
         now_ms: int | None = None,
         priority: int | None = None,
         idempotent: bool | None = None,
+        state_meta: dict[str, Any] | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         return_record: bool = False,
@@ -3538,6 +3618,7 @@ class AutobatchFlowClient:
             or parent_flow_id is not None
             or root_flow_id is not None
             or correlation_id is not None
+            or state_meta is not None
         ):
             try:
                 future.set_result(
@@ -3554,6 +3635,7 @@ class AutobatchFlowClient:
                         now_ms=now_ms,
                         priority=priority,
                         idempotent=idempotent,
+                        state_meta=state_meta,
                         values=values,
                         value_refs=value_refs,
                         return_record=return_record,
@@ -3616,6 +3698,7 @@ class AutobatchFlowClient:
         now_ms: int | None = None,
         priority: int | None = None,
         idempotent: bool | None = None,
+        state_meta: dict[str, Any] | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         return_record: bool = False,
@@ -3633,6 +3716,7 @@ class AutobatchFlowClient:
             now_ms=now_ms,
             priority=priority,
             idempotent=idempotent,
+            state_meta=state_meta,
             values=values,
             value_refs=value_refs,
             return_record=return_record,
@@ -3651,12 +3735,13 @@ class AutobatchFlowClient:
         value_refs: dict[str, str] | None = None,
         drop_values: builtins.list[str] | None = None,
         override_values: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = False,
     ) -> Future[FlowRecord | bytes]:
         future: Future[FlowRecord | bytes] = Future()
-        if return_record or partition_key is None:
+        if return_record or partition_key is None or state_meta is not None:
             try:
                 future.set_result(
                     self.client.complete(
@@ -3670,6 +3755,7 @@ class AutobatchFlowClient:
                         value_refs=value_refs,
                         drop_values=drop_values,
                         override_values=override_values,
+                        state_meta=state_meta,
                         ttl_ms=ttl_ms,
                         now_ms=now_ms,
                         return_record=return_record,
@@ -3727,6 +3813,7 @@ class AutobatchFlowClient:
         value_refs: dict[str, str] | None = None,
         drop_values: builtins.list[str] | None = None,
         override_values: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = False,
@@ -3742,6 +3829,7 @@ class AutobatchFlowClient:
             value_refs=value_refs,
             drop_values=drop_values,
             override_values=override_values,
+            state_meta=state_meta,
             ttl_ms=ttl_ms,
             now_ms=now_ms,
             return_record=return_record,
@@ -3761,12 +3849,13 @@ class AutobatchFlowClient:
         value_refs: dict[str, str] | None = None,
         drop_values: builtins.list[str] | None = None,
         override_values: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         priority: int | None = None,
         return_record: bool = False,
     ) -> FlowRecord | bytes:
-        if return_record or partition_key is None:
+        if return_record or partition_key is None or state_meta is not None:
             return self.client.transition(
                 id,
                 from_state=from_state,
@@ -3779,6 +3868,7 @@ class AutobatchFlowClient:
                 value_refs=value_refs,
                 drop_values=drop_values,
                 override_values=override_values,
+                state_meta=state_meta,
                 run_at_ms=run_at_ms,
                 now_ms=now_ms,
                 priority=priority,
@@ -3838,11 +3928,12 @@ class AutobatchFlowClient:
         value_refs: dict[str, str] | None = None,
         drop_values: builtins.list[str] | None = None,
         override_values: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = False,
     ) -> FlowRecord | bytes:
-        if return_record or partition_key is None:
+        if return_record or partition_key is None or state_meta is not None:
             return self.client.retry(
                 id,
                 lease_token=lease_token,
@@ -3854,6 +3945,7 @@ class AutobatchFlowClient:
                 value_refs=value_refs,
                 drop_values=drop_values,
                 override_values=override_values,
+                state_meta=state_meta,
                 run_at_ms=run_at_ms,
                 now_ms=now_ms,
                 return_record=return_record,
@@ -3908,11 +4000,12 @@ class AutobatchFlowClient:
         value_refs: dict[str, str] | None = None,
         drop_values: builtins.list[str] | None = None,
         override_values: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = False,
     ) -> FlowRecord | bytes:
-        if return_record or partition_key is None:
+        if return_record or partition_key is None or state_meta is not None:
             return self.client.fail(
                 id,
                 lease_token=lease_token,
@@ -3924,6 +4017,7 @@ class AutobatchFlowClient:
                 value_refs=value_refs,
                 drop_values=drop_values,
                 override_values=override_values,
+                state_meta=state_meta,
                 ttl_ms=ttl_ms,
                 now_ms=now_ms,
                 return_record=return_record,
@@ -3977,11 +4071,12 @@ class AutobatchFlowClient:
         value_refs: dict[str, str] | None = None,
         drop_values: builtins.list[str] | None = None,
         override_values: builtins.list[str] | None = None,
+        state_meta: dict[str, Any] | None = None,
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         return_record: bool = False,
     ) -> FlowRecord | bytes:
-        if return_record or partition_key is None:
+        if return_record or partition_key is None or state_meta is not None:
             return self.client.cancel(
                 id,
                 fencing_token=fencing_token,
@@ -3992,6 +4087,7 @@ class AutobatchFlowClient:
                 value_refs=value_refs,
                 drop_values=drop_values,
                 override_values=override_values,
+                state_meta=state_meta,
                 ttl_ms=ttl_ms,
                 now_ms=now_ms,
                 return_record=return_record,

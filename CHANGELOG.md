@@ -6,6 +6,14 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.3.0
+
+- Added state-scoped Flow metadata with `state_meta` on sync and async mutation commands.
+- Added `indexed_state_meta` policy support for indexing one state metadata key per workflow type.
+- Added `FlowRecord.state_meta` and `FlowRecord.indexed_state_meta` decoding.
+- Passed state metadata through queue/workflow outcomes and autobatch-safe mutation paths.
+- Updated Docker integration defaults to FerricStore `0.6.0` and covered state metadata in live integration tests.
+
 ## 0.1.1
 
 - Fixed Flow command compatibility issues found by live FerricStore integration tests.

@@ -650,6 +650,7 @@ class CreateItem:
     values: dict[str, Any] | None = None
     value_refs: dict[str, str] | None = None
     attributes: dict[str, Any] | None = None
+    state_meta: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -878,6 +879,8 @@ class FlowRecord:
     root_flow_id: str | None = None
     correlation_id: str | None = None
     attributes: dict[str, Any] | None = None
+    state_meta: dict[str, Any] | None = None
+    indexed_state_meta: str | None = None
     value_refs: dict[str, Any] | None = None
     values: dict[str, Any] | None = None
     value_sizes: dict[str, Any] | None = None
@@ -906,6 +909,8 @@ class FlowRecord:
             root_flow_id=_optional_str(_get(value, "root_flow_id")),
             correlation_id=_optional_str(_get(value, "correlation_id")),
             attributes=_str_key_map(_get(value, "attributes")),
+            state_meta=_str_key_map(_get(value, "state_meta")),
+            indexed_state_meta=_optional_str(_get(value, "indexed_state_meta")),
             value_refs=_str_key_map(_get(value, "value_refs")),
             values=values,
             value_sizes=_str_key_map(_get(value, "value_sizes")),

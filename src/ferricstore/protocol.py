@@ -369,6 +369,7 @@ _FIELD_NAMES = {
     "IDEMPOTENCY_KEY": "idempotency_key",
     "INCLUDE_COLD": "include_cold",
     "INDEPENDENT": "independent",
+    "INDEXED_STATE_META": "indexed_state_meta",
     "IF_STATE": "if_state",
     "INITIAL_STATE": "initial_state",
     "ITEMS": "items",
@@ -424,6 +425,7 @@ _FIELD_NAMES = {
     "SHARD_ID": "shard_id",
     "SCOPE": "scope",
     "STATE": "state",
+    "STATE_META": "state_meta",
     "STATUS": "status",
     "STATES": "states",
     "START_AT_MS": "start_at_ms",
@@ -5269,6 +5271,8 @@ def _build_basic_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolC
 
 def _build_flow_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolCommand:
     opcode = _OPCODES[name]
+    if _has_flow_command_only_option(args):
+        return _command_exec_protocol_command(name, args)
     if name == "FLOW.CREATE":
         payload = {"id": _require_arg(args, 0, name)}
         payload.update(_option_map(args[1:]))
@@ -5470,6 +5474,14 @@ def _build_flow_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolCo
     raise InvalidCommandError(f"FerricStore protocol transport does not support command {name}")
 
 
+def _has_flow_command_only_option(args: tuple[Any, ...]) -> bool:
+    return any(_command_token(arg) in {"STATE_META", "INDEXED_STATE_META"} for arg in args)
+
+
+def _command_exec_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolCommand:
+    return ProtocolCommand(_OP_COMMAND_EXEC, {"command": name, "args": list(args)}, 1)
+
+
 def _flow_create_many_payload(args: tuple[Any, ...]) -> dict[str, Any]:
     wire_partition = _text(_require_arg(args, 0, "FLOW.CREATE_MANY"))
     item_token = _find_item_token(args, 1)
@@ -5667,6 +5679,12 @@ def _option_map(args: tuple[Any, ...]) -> dict[str, Any]:
             name = _text(_require_arg(args, idx + 1, token))
             value = _require_arg(args, idx + 2, token)
             payload.setdefault(map_field, {})[name] = value
+            idx += 3
+            continue
+        if token == "STATE_META":
+            name = _text(_require_arg(args, idx + 1, token))
+            value = _require_arg(args, idx + 2, token)
+            payload.setdefault("state_meta", {})[name] = value
             idx += 3
             continue
         if token == "ATTRIBUTE_DELETE":

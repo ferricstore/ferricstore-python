@@ -23,6 +23,7 @@ from ferricstore.types import (
     EffectResult,
     FencedItem,
     GovernanceOverview,
+    RetryPolicy,
     ScheduleResult,
 )
 
@@ -976,6 +977,156 @@ def test_async_create_many_can_attach_shared_attributes():
     run(main())
 
 
+def test_async_flow_mutation_commands_can_attach_state_meta():
+    async def main():
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
+        claimed = [ClaimedFlow("f1", b"lease", 7, partition_key="tenant:1")]
+        fenced = [FencedItem("f1", 7, lease_token=b"lease", partition_key="tenant:1")]
+
+        def assert_state_meta(call, value):
+            index = call.index("STATE_META")
+            assert call[index : index + 3] == ("STATE_META", "version", value)
+
+        await client.create("f1", type="order", state_meta={"version": 1}, now_ms=100)
+        assert_state_meta(executor.calls[-1], 1)
+
+        executor.responses.append(
+            {
+                b"id": b"f2",
+                b"type": b"order",
+                b"state": b"running",
+                b"partition_key": b"tenant:1",
+                b"version": 1,
+                b"lease_token": b"lease",
+                b"fencing_token": 7,
+            }
+        )
+        await client.start_and_claim(
+            "f2",
+            type="order",
+            initial_state="accept",
+            worker="worker-1",
+            state_meta={"version": 2},
+            now_ms=101,
+        )
+        assert_state_meta(executor.calls[-1], 2)
+
+        await client.transition(
+            "f1",
+            from_state="queued",
+            to_state="charged",
+            lease_token=b"lease",
+            fencing_token=7,
+            state_meta={"version": 3},
+            now_ms=102,
+        )
+        assert_state_meta(executor.calls[-1], 3)
+
+        executor.responses.append(
+            {
+                b"id": b"f1",
+                b"type": b"order",
+                b"state": b"running",
+                b"partition_key": b"tenant:1",
+                b"version": 2,
+                b"lease_token": b"lease",
+                b"fencing_token": 8,
+            }
+        )
+        await client.step_continue(
+            "f1",
+            lease_token=b"lease",
+            from_state="charged",
+            to_state="settled",
+            fencing_token=7,
+            state_meta={"version": 4},
+            now_ms=103,
+        )
+        assert_state_meta(executor.calls[-1], 4)
+
+        await client.complete(
+            "f1",
+            lease_token=b"lease",
+            fencing_token=7,
+            state_meta={"version": 5},
+        )
+        assert_state_meta(executor.calls[-1], 5)
+
+        await client.retry(
+            "f1",
+            lease_token=b"lease",
+            fencing_token=7,
+            state_meta={"version": 6},
+        )
+        assert_state_meta(executor.calls[-1], 6)
+
+        await client.fail(
+            "f1",
+            lease_token=b"lease",
+            fencing_token=7,
+            state_meta={"version": 7},
+        )
+        assert_state_meta(executor.calls[-1], 7)
+
+        await client.cancel(
+            "f1",
+            fencing_token=7,
+            lease_token=b"lease",
+            state_meta={"version": 8},
+        )
+        assert_state_meta(executor.calls[-1], 8)
+
+        await client.complete_many("tenant:1", claimed, state_meta={"version": 9})
+        assert_state_meta(executor.calls[-1], 9)
+
+        await client.transition_many(
+            "tenant:1",
+            from_state="queued",
+            to_state="charged",
+            items=fenced,
+            state_meta={"version": 10},
+        )
+        assert_state_meta(executor.calls[-1], 10)
+
+        await client.retry_many("tenant:1", claimed, state_meta={"version": 11})
+        assert_state_meta(executor.calls[-1], 11)
+
+        await client.fail_many("tenant:1", claimed, state_meta={"version": 12})
+        assert_state_meta(executor.calls[-1], 12)
+
+        await client.cancel_many("tenant:1", fenced, state_meta={"version": 13})
+        assert_state_meta(executor.calls[-1], 13)
+
+    run(main())
+
+
+def test_async_create_many_can_attach_shared_state_meta():
+    async def main():
+        executor = FakeAsyncExecutor()
+        executor.responses = [[b"OK", b"OK"]]
+        client = AsyncFlowClient(executor)
+
+        result = await client.create_many(
+            "tenant:1",
+            [CreateItem("f1", b"p1"), CreateItem("f2", b"p2")],
+            type="order",
+            state="queued",
+            now_ms=100,
+            state_meta={"version": 1},
+        )
+
+        assert result == [b"OK", b"OK"]
+        call = executor.calls[0]
+        assert call[call.index("STATE_META") : call.index("STATE_META") + 3] == (
+            "STATE_META",
+            "version",
+            1,
+        )
+
+    run(main())
+
+
 def test_async_create_many_reuses_identical_item_attributes_as_shared_attributes():
     async def main():
         executor = FakeAsyncExecutor()
@@ -1179,6 +1330,27 @@ def test_async_query_policy_and_cleanup_commands():
 def test_async_client_rejects_sync_flow_client():
     with pytest.raises(TypeError, match="requires an async executor"):
         AsyncFlowClient(FlowClient(FakeAsyncExecutor()))
+
+
+def test_async_install_policy_can_set_indexed_state_meta():
+    async def main():
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
+
+        await client.install_policy(
+            "order",
+            indexed_state_meta="version",
+            retry=RetryPolicy(max_retries=2),
+            states={"queued": RetryPolicy(max_retries=5)},
+        )
+
+        call = executor.calls[-1]
+        assert call[:4] == ("FLOW.POLICY.SET", "order", "INDEXED_STATE_META", "version")
+        assert call[4:6] == ("MAX_RETRIES", 2)
+        state_index = call.index("STATE")
+        assert call[state_index : state_index + 4] == ("STATE", "queued", "MAX_RETRIES", 5)
+
+    run(main())
 
 
 def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_responses():

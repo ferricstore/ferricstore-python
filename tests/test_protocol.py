@@ -22,6 +22,7 @@ from ferricstore.protocol import (
     _COMPACT_PIPELINE_REQUEST,
     _COMPACT_PIPELINE_RESPONSE,
     _FLAG_CUSTOM_PAYLOAD,
+    _OP_COMMAND_EXEC,
     AsyncProtocolAdapterPool,
     ProtocolAdapterPool,
     ProtocolCommand,
@@ -1263,6 +1264,63 @@ def test_protocol_builds_flow_stats_with_attributes():
         "state": "queued",
         "attributes": {"tenant": "acme"},
     }
+
+
+def test_protocol_builds_flow_state_meta_and_indexed_policy_payloads():
+    create = build_protocol_command(
+        "FLOW.CREATE",
+        "f1",
+        "TYPE",
+        "order",
+        "STATE",
+        "accept",
+        "STATE_META",
+        "version",
+        1,
+    )
+    assert create == ProtocolCommand(
+        _OP_COMMAND_EXEC,
+        {
+            "command": "FLOW.CREATE",
+            "args": [
+                "f1",
+                "TYPE",
+                "order",
+                "STATE",
+                "accept",
+                "STATE_META",
+                "version",
+                1,
+            ],
+        },
+        1,
+    )
+
+    complete = build_protocol_command(
+        "FLOW.COMPLETE",
+        "f1",
+        b"lease",
+        "FENCING",
+        7,
+        "STATE_META",
+        "version",
+        3,
+    )
+    assert complete == ProtocolCommand(
+        _OP_COMMAND_EXEC,
+        {
+            "command": "FLOW.COMPLETE",
+            "args": ["f1", b"lease", "FENCING", 7, "STATE_META", "version", 3],
+        },
+        1,
+    )
+
+    policy = build_protocol_command("FLOW.POLICY.SET", "order", "INDEXED_STATE_META", "version")
+    assert policy == ProtocolCommand(
+        _OP_COMMAND_EXEC,
+        {"command": "FLOW.POLICY.SET", "args": ["order", "INDEXED_STATE_META", "version"]},
+        1,
+    )
 
 
 def test_protocol_encodes_mset_and_mget_compact_wire_requests():

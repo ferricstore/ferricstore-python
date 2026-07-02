@@ -5,7 +5,7 @@ FerricStore Python SDK is public alpha.
 Current version:
 
 ```text
-0.2.0
+0.3.0
 ```
 
 ## What alpha means

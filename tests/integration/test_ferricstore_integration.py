@@ -34,8 +34,9 @@ _NATIVE_PROTOCOL_COMMANDS: set[str] = set(
     CLUSTER.PROMOTE CLUSTER.ROLE CLUSTER.SLOTS CLUSTER.STATS CLUSTER.STATUS
     CMS.INCRBY CMS.INFO CMS.INITBYDIM CMS.INITBYPROB CMS.MERGE CMS.QUERY COMMAND
     CONFIG COPY DBSIZE DEBUG DECR DECRBY DEL DISCARD ECHO EXEC EXISTS EXPIRE
-    EXPIREAT EXPIRETIME EXTEND FERRICSTORE.BLOBGC FERRICSTORE.CONFIG
-    FERRICSTORE.DOCTOR FERRICSTORE.HOTNESS FERRICSTORE.KEY_INFO FERRICSTORE.METRICS
+    EXPIREAT EXPIRETIME EXTEND FERRICSTORE.BLOBGC FERRICSTORE.CAPABILITIES
+    FERRICSTORE.CONFIG FERRICSTORE.DOCTOR FERRICSTORE.HOTNESS FERRICSTORE.KEY_INFO
+    FERRICSTORE.METRICS FERRICSTORE.NAMESPACE FERRICSTORE.QUOTA FERRICSTORE.TELEMETRY
     FETCH_OR_COMPUTE FETCH_OR_COMPUTE_ERROR FETCH_OR_COMPUTE_RESULT
     FLOW.APPROVAL.APPROVE FLOW.APPROVAL.GET FLOW.APPROVAL.LIST FLOW.APPROVAL.REJECT
     FLOW.APPROVAL.REQUEST FLOW.ATTRIBUTES FLOW.ATTRIBUTE_VALUES FLOW.BUDGET.COMMIT
@@ -89,6 +90,8 @@ _NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED: dict[str, str] = {
     "DEBUG": "debug/admin command, not normal SDK app surface",
     "FLUSHALL": "destructive for shared integration state",
     "FLUSHDB": "destructive for shared integration state",
+    "FERRICSTORE.NAMESPACE": "management command requires namespace control-plane support",
+    "FERRICSTORE.QUOTA": "management command requires quota control-plane support",
     "HELLO": "connection handshake command",
     "LASTSAVE": "admin persistence command; not part of normal SDK app command coverage",
     "LOLWUT": "diagnostic compatibility command, not SDK app surface",
@@ -306,6 +309,53 @@ def test_real_ferricstore_command_and_flow_cycle() -> None:
         client.close()
 
 
+def test_real_ferricstore_state_meta_policy_and_flow_cycle() -> None:
+    client = _client()
+    suffix = _suffix()
+    flow_type = f"py-sdk-native-state-meta-{suffix}"
+    flow_id = f"py-sdk:state-meta:{suffix}"
+    partition = f"{flow_id}:partition"
+    now = int(time.time() * 1000)
+
+    try:
+        assert client.install_policy(flow_type, indexed_state_meta="version")
+        policy = client.policy_get(flow_type)
+        assert _text(_field(policy, "indexed_state_meta")) == "version"
+
+        assert client.create(
+            flow_id,
+            type=flow_type,
+            state="accept",
+            partition_key=partition,
+            state_meta={"version": "1", "owner": "risk"},
+            now_ms=now,
+            run_at_ms=now,
+            idempotent=True,
+        )
+
+        record = client.get(flow_id, partition_key=partition)
+        assert record.state_meta == {"accept": {"version": "1", "owner": "risk"}}
+        assert record.indexed_state_meta == "version"
+
+        claimed = _claim_one(client, flow_type, "accept", partition, now_ms=now + 1)
+        assert client.complete(
+            flow_id,
+            lease_token=claimed.lease_token,
+            fencing_token=claimed.fencing_token,
+            partition_key=partition,
+            state_meta={"version": "3"},
+            now_ms=now + 2,
+        )
+
+        record = client.get(flow_id, partition_key=partition)
+        assert record.state_meta == {
+            "accept": {"version": "1", "owner": "risk"},
+            "completed": {"version": "3"},
+        }
+    finally:
+        client.close()
+
+
 def test_real_ferricstore_protocol_helpers_and_diagnostics() -> None:
     _require_protocol_transport()
 
@@ -365,6 +415,8 @@ def test_real_ferricstore_protocol_helpers_and_diagnostics() -> None:
         assert client.ferricstore_config("GET", "*") is not None
         assert isinstance(client.ferricstore_metrics(), dict)
         assert isinstance(client.ferricstore_hotness(), dict)
+        assert isinstance(client.command("FERRICSTORE.CAPABILITIES"), dict)
+        assert isinstance(client.command("FERRICSTORE.TELEMETRY", "CLUSTER_INFO"), dict)
     finally:
         _delete_prefixed_keys(client, prefix)
         client.close()

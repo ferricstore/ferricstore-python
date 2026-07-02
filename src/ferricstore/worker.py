@@ -1362,6 +1362,7 @@ class Queue:
         *,
         retry_policy: RetryPolicy | None = None,
         retry: RetryPolicy | None = None,
+        indexed_state_meta: str | None = None,
     ) -> Any:
         if retry_policy is not None and retry is not None:
             raise ValueError("retry_policy and retry are mutually exclusive")
@@ -1372,7 +1373,10 @@ class Queue:
             if retry is not None
             else self.retry_policy
         )
-        return self.client.install_policy(self.type, retry=resolved_retry_policy)
+        kwargs: dict[str, Any] = {"retry": resolved_retry_policy}
+        if indexed_state_meta is not None:
+            kwargs["indexed_state_meta"] = indexed_state_meta
+        return self.client.install_policy(self.type, **kwargs)
 
 
 class QueueClient:
@@ -1489,6 +1493,7 @@ class QueueClient:
         retry_policy: RetryPolicy | None = None,
         retry: RetryPolicy | None = None,
         states: dict[str, RetryPolicy] | None = None,
+        indexed_state_meta: str | None = None,
     ) -> Any:
         if retry_policy is not None and retry is not None:
             raise ValueError("retry_policy and retry are mutually exclusive")
@@ -1499,7 +1504,10 @@ class QueueClient:
             if retry is not None
             else self.retry_policy
         )
-        return self.flow.install_policy(type, retry=resolved_retry_policy, states=states)
+        kwargs: dict[str, Any] = {"retry": resolved_retry_policy, "states": states}
+        if indexed_state_meta is not None:
+            kwargs["indexed_state_meta"] = indexed_state_meta
+        return self.flow.install_policy(type, **kwargs)
 
     def close(self) -> None:
         for claim_flow in self._owned_extra_claim_flows:

@@ -524,6 +524,85 @@ def test_create_and_transition_can_attach_attributes():
     )
 
 
+def test_flow_mutation_commands_can_attach_state_meta():
+    executor = FakeExecutor()
+    client = FlowClient(executor)
+    claimed = [ClaimedFlow("f1", b"lease", 7, partition_key="tenant:1")]
+    fenced = [FencedItem("f1", 7, lease_token=b"lease", partition_key="tenant:1")]
+
+    def assert_state_meta(call, value):
+        index = call.index("STATE_META")
+        assert call[index : index + 3] == ("STATE_META", "version", value)
+
+    client.create("f1", type="order", state_meta={"version": 1}, now_ms=100)
+    assert_state_meta(executor.calls[-1], 1)
+
+    client.start_and_claim(
+        "f2",
+        type="order",
+        initial_state="accept",
+        worker="worker-1",
+        state_meta={"version": 2},
+        now_ms=101,
+    )
+    assert_state_meta(executor.calls[-1], 2)
+
+    client.transition(
+        "f1",
+        from_state="queued",
+        to_state="charged",
+        lease_token=b"lease",
+        fencing_token=7,
+        state_meta={"version": 3},
+        now_ms=102,
+    )
+    assert_state_meta(executor.calls[-1], 3)
+
+    client.step_continue(
+        "f1",
+        lease_token=b"lease",
+        from_state="charged",
+        to_state="settled",
+        fencing_token=7,
+        state_meta={"version": 4},
+        now_ms=103,
+    )
+    assert_state_meta(executor.calls[-1], 4)
+
+    client.complete("f1", lease_token=b"lease", fencing_token=7, state_meta={"version": 5})
+    assert_state_meta(executor.calls[-1], 5)
+
+    client.retry("f1", lease_token=b"lease", fencing_token=7, state_meta={"version": 6})
+    assert_state_meta(executor.calls[-1], 6)
+
+    client.fail("f1", lease_token=b"lease", fencing_token=7, state_meta={"version": 7})
+    assert_state_meta(executor.calls[-1], 7)
+
+    client.cancel("f1", fencing_token=7, lease_token=b"lease", state_meta={"version": 8})
+    assert_state_meta(executor.calls[-1], 8)
+
+    client.complete_many("tenant:1", claimed, state_meta={"version": 9})
+    assert_state_meta(executor.calls[-1], 9)
+
+    client.transition_many(
+        "tenant:1",
+        from_state="queued",
+        to_state="charged",
+        items=fenced,
+        state_meta={"version": 10},
+    )
+    assert_state_meta(executor.calls[-1], 10)
+
+    client.retry_many("tenant:1", claimed, state_meta={"version": 11})
+    assert_state_meta(executor.calls[-1], 11)
+
+    client.fail_many("tenant:1", claimed, state_meta={"version": 12})
+    assert_state_meta(executor.calls[-1], 12)
+
+    client.cancel_many("tenant:1", fenced, state_meta={"version": 13})
+    assert_state_meta(executor.calls[-1], 13)
+
+
 def test_data_command_helpers_are_codec_aware_and_easy_to_use():
     executor = FakeExecutor()
     client = FlowClient(executor, codec=JsonCodec())
@@ -2395,6 +2474,84 @@ def test_create_many_can_attach_shared_attributes():
     )
 
 
+def test_create_many_can_attach_shared_state_meta():
+    executor = FakeExecutor()
+    client = FlowClient(executor)
+
+    client.create_many(
+        "tenant:1",
+        [CreateItem("f1", b"p1"), CreateItem("f2", b"p2")],
+        type="order",
+        state="queued",
+        now_ms=100,
+        state_meta={"version": 1, "owner": "risk"},
+    )
+
+    assert executor.calls[0] == (
+        "FLOW.CREATE_MANY",
+        "tenant:1",
+        "TYPE",
+        "order",
+        "STATE",
+        "queued",
+        "NOW",
+        100,
+        "RUN_AT",
+        100,
+        "STATE_META",
+        "version",
+        1,
+        "STATE_META",
+        "owner",
+        "risk",
+        "ITEMS",
+        "f1",
+        b"p1",
+        "f2",
+        b"p2",
+    )
+
+
+def test_create_many_reuses_identical_item_state_meta_as_shared_state_meta():
+    executor = FakeExecutor()
+    client = FlowClient(executor)
+
+    client.create_many(
+        "tenant:1",
+        [
+            CreateItem("f1", b"p1", state_meta={"version": 1}),
+            CreateItem("f2", b"p2", state_meta={"version": 1}),
+        ],
+        type="order",
+        now_ms=100,
+    )
+
+    call = executor.calls[0]
+    assert call[call.index("STATE_META") : call.index("STATE_META") + 3] == (
+        "STATE_META",
+        "version",
+        1,
+    )
+
+
+def test_create_many_rejects_mixed_item_state_meta_instead_of_dropping_it():
+    executor = FakeExecutor()
+    client = FlowClient(executor)
+
+    with pytest.raises(ValueError, match="shared state_meta"):
+        client.create_many(
+            "tenant:1",
+            [
+                CreateItem("f1", b"p1", state_meta={"version": 1}),
+                CreateItem("f2", b"p2", state_meta={"version": 2}),
+            ],
+            type="order",
+            now_ms=100,
+        )
+
+    assert executor.calls == []
+
+
 def test_create_many_reuses_identical_item_attributes_as_shared_attributes():
     executor = FakeExecutor()
     client = FlowClient(executor)
@@ -2669,6 +2826,66 @@ def test_autobatch_create_uses_create_many_independent_for_ack_calls():
     assert executor.calls[0][0] == "FLOW.CREATE_MANY"
     assert executor.calls[0][1] == "MIXED"
     assert "INDEPENDENT" in executor.calls[0]
+
+
+def test_autobatch_state_meta_uses_direct_mutation_commands():
+    executor = FakeExecutor()
+    client = FlowClient(executor).autobatch(max_batch=10, max_delay_ms=5)
+
+    client.create(
+        "f1",
+        type="order",
+        partition_key="tenant:1",
+        state_meta={"version": "1"},
+    )
+    client.complete(
+        "f1",
+        lease_token=b"lease",
+        fencing_token=7,
+        partition_key="tenant:1",
+        state_meta={"version": "2"},
+    )
+    client.transition(
+        "f1",
+        from_state="queued",
+        to_state="charged",
+        lease_token=b"lease",
+        fencing_token=7,
+        partition_key="tenant:1",
+        state_meta={"version": "3"},
+    )
+    client.retry(
+        "f1",
+        lease_token=b"lease",
+        fencing_token=7,
+        partition_key="tenant:1",
+        state_meta={"version": "4"},
+    )
+    client.fail(
+        "f1",
+        lease_token=b"lease",
+        fencing_token=7,
+        partition_key="tenant:1",
+        state_meta={"version": "5"},
+    )
+    client.cancel(
+        "f1",
+        lease_token=b"lease",
+        fencing_token=7,
+        partition_key="tenant:1",
+        state_meta={"version": "6"},
+    )
+    client.close()
+
+    assert [call[0] for call in executor.calls] == [
+        "FLOW.CREATE",
+        "FLOW.COMPLETE",
+        "FLOW.TRANSITION",
+        "FLOW.RETRY",
+        "FLOW.FAIL",
+        "FLOW.CANCEL",
+    ]
+    assert all("STATE_META" in call for call in executor.calls)
 
 
 def test_autobatch_close_timeout_does_not_hang():
@@ -3222,6 +3439,47 @@ def test_install_policy_still_builds_state_policy():
     )
 
     assert executor.calls[-1][:4] == ("FLOW.POLICY.SET", "order", "STATE", "queued")
+
+
+def test_install_policy_can_set_indexed_state_meta():
+    executor = FakeExecutor()
+    client = FlowClient(executor)
+
+    client.install_policy(
+        "order",
+        indexed_state_meta="version",
+        retry=RetryPolicy(max_retries=2),
+        states={"queued": RetryPolicy(max_retries=5)},
+    )
+
+    call = executor.calls[-1]
+    assert call[:4] == ("FLOW.POLICY.SET", "order", "INDEXED_STATE_META", "version")
+    assert call[4:6] == ("MAX_RETRIES", 2)
+    state_index = call.index("STATE")
+    assert call[state_index : state_index + 4] == ("STATE", "queued", "MAX_RETRIES", 5)
+
+
+def test_flow_record_decodes_state_meta_and_indexed_state_meta():
+    record = FlowRecord.from_resp(
+        {
+            b"id": b"f1",
+            b"type": b"order",
+            b"state": b"completed",
+            b"partition_key": b"tenant:1",
+            b"version": 3,
+            b"state_meta": {
+                b"accept": {b"version": 1},
+                b"completed": {b"version": 3},
+            },
+            b"indexed_state_meta": b"version",
+        }
+    )
+
+    assert record.state_meta == {
+        "accept": {"version": 1},
+        "completed": {"version": 3},
+    }
+    assert record.indexed_state_meta == "version"
 
 
 def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
