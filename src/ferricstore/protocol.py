@@ -1491,6 +1491,7 @@ class ProtocolAdapter:
         self.max_decompressed_response_bytes = max_decompressed_response_bytes
         self.client = self
         self._lock = threading.Lock()
+        self._connect_lock = threading.Lock()
         self._request_id = 0
         self._lane_cursor = 0
         self._sock: socket.socket | ssl.SSLSocket | None = None
@@ -1501,6 +1502,8 @@ class ProtocolAdapter:
         self._events_cv = threading.Condition()
         self._heartbeat_thread: threading.Thread | None = None
         self._last_activity = time.monotonic()
+        self._closed = False
+        self._connecting = False
         self._connect()
 
     @classmethod
@@ -1535,13 +1538,26 @@ class ProtocolAdapter:
             return self._events.pop(0)
 
     def close(self) -> None:
+        self._close_transport(mark_closed=True)
+
+    def _close_transport(
+        self,
+        exc: BaseException | None = None,
+        *,
+        mark_closed: bool = False,
+        expected_sock: socket.socket | ssl.SSLSocket | None = None,
+    ) -> None:
+        if mark_closed:
+            self._closed = True
+        if expected_sock is not None and self._sock is not expected_sock:
+            return
         sock = self._sock
         self._sock = None
         if sock is not None:
             with contextlib.suppress(OSError):
                 sock.shutdown(socket.SHUT_RDWR)
             sock.close()
-        self._fail_pending(FerricStoreError("protocol connection is closed"))
+        self._fail_pending(exc or FerricStoreError("protocol connection is closed"))
 
     def pipeline(self, transaction: bool = False) -> ProtocolPipeline:
         if transaction:
@@ -1691,6 +1707,7 @@ class ProtocolAdapter:
         pending: list[tuple[int, Future[ProtocolResponse]]] = []
         frames: list[bytes] = []
 
+        self._ensure_connected()
         with self._lock:
             try:
                 for command in protocol_commands:
@@ -2046,13 +2063,25 @@ class ProtocolAdapter:
 
         for attempt in range(3):
             try:
-                self._connect_once()
+                self._connecting = True
+                try:
+                    self._connect_once()
+                    if self.password is not None:
+                        self._response_value(
+                            self._request(
+                                _OP_AUTH,
+                                0,
+                                {"username": self.username, "password": self.password},
+                            )
+                        )
+                finally:
+                    self._connecting = False
                 break
             except (ConnectionError, OSError, TimeoutError, FerricStoreError) as exc:
                 if not self._startup_retryable(exc):
                     raise
                 last_error = exc
-                self.close()
+                self._close_transport(exc, mark_closed=False)
                 if attempt == 2:
                     raise
                 time.sleep(0.02 * (attempt + 1))
@@ -2060,14 +2089,6 @@ class ProtocolAdapter:
             if last_error is not None:
                 raise last_error
 
-        if self.password is not None:
-            self._response_value(
-                self._request(
-                    _OP_AUTH,
-                    0,
-                    {"username": self.username, "password": self.password},
-                )
-            )
         self._start_heartbeat()
 
     @staticmethod
@@ -2089,7 +2110,11 @@ class ProtocolAdapter:
             self._sock.settimeout(None)
         else:
             self._sock = raw_sock
-        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop,
+            args=(self._sock,),
+            daemon=True,
+        )
         self._reader_thread.start()
 
         startup: dict[str, Any] = {
@@ -2107,17 +2132,20 @@ class ProtocolAdapter:
 
         self._heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop,
+            args=(self._sock,),
             name="ferricstore-protocol-heartbeat",
             daemon=True,
         )
         self._heartbeat_thread.start()
 
-    def _heartbeat_loop(self) -> None:
+    def _heartbeat_loop(self, sock: socket.socket | ssl.SSLSocket | None = None) -> None:
+        if sock is None:
+            sock = self._sock
         interval = float(self.heartbeat_interval or 0)
         timeout = self.heartbeat_timeout
-        while interval > 0 and self._sock is not None:
+        while interval > 0 and self._sock is sock and sock is not None:
             time.sleep(interval)
-            if self._sock is None:
+            if self._sock is not sock:
                 return
             if time.monotonic() - self._last_activity < interval:
                 continue
@@ -2133,8 +2161,11 @@ class ProtocolAdapter:
                 if request_id is not None:
                     self._pending.pop(request_id, None)
                     self._pending_traces.pop(request_id, None)
-                self._fail_pending(FerricStoreError("protocol heartbeat failed", raw=exc))
-                self.close()
+                self._close_transport(
+                    FerricStoreError("protocol heartbeat failed", raw=exc),
+                    mark_closed=False,
+                    expected_sock=sock,
+                )
                 return
 
     def _next_request_id(self) -> int:
@@ -2217,6 +2248,7 @@ class ProtocolAdapter:
     ) -> tuple[int, Future[ProtocolResponse]]:
         trace_enabled = bool(flags & _FLAG_TRACE)
         submit_started_ns = time.perf_counter_ns() if trace_enabled else 0
+        self._ensure_connected()
         with self._lock:
             lock_acquired_ns = time.perf_counter_ns() if trace_enabled else 0
             request_id = self._next_request_id()
@@ -2243,10 +2275,12 @@ class ProtocolAdapter:
                 raise
             return request_id, future
 
-    def _reader_loop(self) -> None:
+    def _reader_loop(self, sock: socket.socket | ssl.SSLSocket | None = None) -> None:
+        if sock is None:
+            sock = self._sock
         try:
-            while self._sock is not None:
-                response = self._recv_response()
+            while self._sock is sock and sock is not None:
+                response = self._recv_response(sock)
                 self._last_activity = time.monotonic()
                 if response.request_id == 0:
                     with self._events_cv:
@@ -2263,8 +2297,7 @@ class ProtocolAdapter:
                 else:
                     self._pending_traces.pop(response.request_id, None)
         except Exception as exc:
-            if self._sock is not None:
-                self._fail_pending(exc)
+            self._close_transport(exc, mark_closed=False, expected_sock=sock)
 
     def _fail_pending(self, exc: BaseException) -> None:
         pending = list(self._pending.values())
@@ -2290,20 +2323,23 @@ class ProtocolAdapter:
                 raw=response,
             )
 
-    def _recv_response(self) -> ProtocolResponse:
+    def _recv_response(
+        self,
+        sock: socket.socket | ssl.SSLSocket | None = None,
+    ) -> ProtocolResponse:
         read_started_ns = time.perf_counter_ns()
-        header = self._recv_exact(_HEADER.size)
+        header = self._recv_exact(_HEADER.size, sock)
         magic, version, flags, lane_id, opcode, request_id, body_len = _HEADER.unpack(header)
         if magic != _MAGIC or version != _RESPONSE_VERSION:
             raise FerricStoreError("invalid protocol response frame header")
 
         self._check_response_size(body_len)
-        body = self._recv_exact(body_len)
+        body = self._recv_exact(body_len, sock)
         chunks = [body]
         total_body_len = body_len
         final_flags = flags
         while final_flags & _FLAG_MORE_CHUNKS:
-            next_header = self._recv_exact(_HEADER.size)
+            next_header = self._recv_exact(_HEADER.size, sock)
             (
                 next_magic,
                 next_version,
@@ -2323,7 +2359,7 @@ class ProtocolAdapter:
                 raise FerricStoreError("invalid protocol chunk continuation")
             total_body_len += next_body_len
             self._check_response_size(total_body_len)
-            chunks.append(self._recv_exact(next_body_len))
+            chunks.append(self._recv_exact(next_body_len, sock))
             final_flags = next_flags
 
         body = chunks[0] if len(chunks) == 1 else b"".join(chunks)
@@ -2373,8 +2409,9 @@ class ProtocolAdapter:
             trace=trace,
         )
 
-    def _recv_exact(self, size: int) -> bytes:
-        sock = self._require_socket()
+    def _recv_exact(self, size: int, sock: socket.socket | ssl.SSLSocket | None = None) -> bytes:
+        if sock is None:
+            sock = self._require_socket()
         if size == 0:
             return b""
         chunk = sock.recv(size)
@@ -2406,6 +2443,22 @@ class ProtocolAdapter:
         if self._sock is None:
             raise FerricStoreError("protocol connection is closed")
         return self._sock
+
+    def _ensure_connected(self) -> None:
+        if self._sock is not None:
+            return
+        if self._closed:
+            raise FerricStoreError("protocol connection is closed")
+        if self._connecting:
+            raise FerricStoreError("protocol connection is closed")
+        with self._connect_lock:
+            if self._sock is not None:
+                return
+            if self._closed:
+                raise FerricStoreError("protocol connection is closed")
+            if self._connecting:
+                raise FerricStoreError("protocol connection is closed")
+            self._connect()
 
     def _response_value(self, response: ProtocolResponse) -> Any:
         return _response_value(response)
@@ -2594,6 +2647,7 @@ class AsyncProtocolAdapter:
         self._events_cv = asyncio.Condition()
         self._queued_write_bytes = 0
         self._last_activity = time.monotonic()
+        self._closed = False
 
     @classmethod
     def from_url(cls, url: str, **kwargs: Any) -> AsyncProtocolAdapter:
@@ -2634,6 +2688,22 @@ class AsyncProtocolAdapter:
             return self._events.pop(0)
 
     async def close(self) -> None:
+        await self._close_transport(mark_closed=True)
+
+    async def _close_transport(
+        self,
+        exc: BaseException | None = None,
+        *,
+        mark_closed: bool = False,
+        expected_reader: asyncio.StreamReader | None = None,
+        expected_writer: asyncio.StreamWriter | None = None,
+    ) -> None:
+        if mark_closed:
+            self._closed = True
+        if expected_reader is not None and self._reader is not expected_reader:
+            return
+        if expected_writer is not None and self._writer is not expected_writer:
+            return
         writer = self._writer
         reader_task = self._reader_task
         heartbeat_task = self._heartbeat_task
@@ -2643,21 +2713,18 @@ class AsyncProtocolAdapter:
         self._heartbeat_task = None
         if heartbeat_task is not None and heartbeat_task is not asyncio.current_task():
             heartbeat_task.cancel()
-        if reader_task is not None:
+        if reader_task is not None and reader_task is not asyncio.current_task():
             reader_task.cancel()
         if writer is not None:
             writer.close()
             await writer.wait_closed()
-        if reader_task is not None:
+        if reader_task is not None and reader_task is not asyncio.current_task():
             with contextlib.suppress(asyncio.CancelledError):
                 await reader_task
         if heartbeat_task is not None and heartbeat_task is not asyncio.current_task():
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat_task
-        if reader_task is not None:
-            with contextlib.suppress(asyncio.CancelledError):
-                await reader_task
-        self._fail_pending(FerricStoreError("protocol connection is closed"))
+        self._fail_pending(exc or FerricStoreError("protocol connection is closed"))
 
     def pipeline(self, transaction: bool = False) -> AsyncProtocolPipeline:
         if transaction:
@@ -2716,12 +2783,16 @@ class AsyncProtocolAdapter:
         return [self._batch_item_value(item) for item in values]
 
     async def _ensure_connected(self) -> None:
-        if self._writer is not None:
+        if self._writer is not None and not self._writer.is_closing():
             return
+        if getattr(self, "_closed", False):
+            raise FerricStoreError("protocol connection is closed")
 
         async with self._connect_lock:
-            if self._writer is not None:
+            if self._writer is not None and not self._writer.is_closing():
                 return
+            if self._writer is not None:
+                await self._close_transport(mark_closed=False)
 
             context = (self.ssl_context or ssl.create_default_context()) if self.tls else None
             connect = asyncio.open_connection(
@@ -2734,7 +2805,7 @@ class AsyncProtocolAdapter:
                 self._reader, self._writer = await connect
             else:
                 self._reader, self._writer = await asyncio.wait_for(connect, self.timeout)
-            self._reader_task = asyncio.create_task(self._reader_loop())
+            self._reader_task = asyncio.create_task(self._reader_loop(self._reader, self._writer))
 
             startup: dict[str, Any] = {
                 "compression": self.compression,
@@ -2759,16 +2830,20 @@ class AsyncProtocolAdapter:
     def _start_heartbeat(self) -> None:
         if self.heartbeat_interval is None or self.heartbeat_interval <= 0:
             return
-        if self._heartbeat_task is None or self._heartbeat_task.done():
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        old_task = self._heartbeat_task
+        if old_task is not None and old_task is not asyncio.current_task() and not old_task.done():
+            old_task.cancel()
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(self._writer))
 
-    async def _heartbeat_loop(self) -> None:
+    async def _heartbeat_loop(self, writer: asyncio.StreamWriter | None = None) -> None:
+        if writer is None:
+            writer = self._writer
         interval = float(self.heartbeat_interval or 0)
         timeout = self.heartbeat_timeout
         try:
-            while interval > 0 and self._writer is not None:
+            while interval > 0 and self._writer is writer and writer is not None:
                 await asyncio.sleep(interval)
-                if self._writer is None:
+                if self._writer is not writer:
                     return
                 if time.monotonic() - self._last_activity < interval:
                     continue
@@ -2779,23 +2854,14 @@ class AsyncProtocolAdapter:
                     else:
                         await asyncio.wait_for(request, timeout=timeout)
                 except Exception as exc:
-                    self._fail_pending(FerricStoreError("protocol heartbeat failed", raw=exc))
-                    await self._close_after_heartbeat_failure()
+                    await self._close_transport(
+                        FerricStoreError("protocol heartbeat failed", raw=exc),
+                        mark_closed=False,
+                        expected_writer=writer,
+                    )
                     return
         except asyncio.CancelledError:
             raise
-
-    async def _close_after_heartbeat_failure(self) -> None:
-        writer = self._writer
-        reader_task = self._reader_task
-        self._reader = None
-        self._writer = None
-        self._reader_task = None
-        if reader_task is not None:
-            reader_task.cancel()
-        if writer is not None:
-            writer.close()
-            await writer.wait_closed()
 
     def _next_request_id(self) -> int:
         self._request_id = (self._request_id + 1) & 0xFFFFFFFFFFFFFFFF
@@ -2877,10 +2943,18 @@ class AsyncProtocolAdapter:
             self._pending_traces.pop(request_id, None)
             raise FerricStoreError("protocol request timed out") from exc
 
-    async def _reader_loop(self) -> None:
+    async def _reader_loop(
+        self,
+        reader: asyncio.StreamReader | None = None,
+        writer: asyncio.StreamWriter | None = None,
+    ) -> None:
+        if reader is None:
+            reader = self._reader
+        if writer is None:
+            writer = self._writer
         try:
-            while self._reader is not None:
-                response = await self._recv_response()
+            while self._reader is reader and reader is not None:
+                response = await self._recv_response(reader)
                 self._last_activity = time.monotonic()
                 if response.request_id == 0:
                     async with self._events_cv:
@@ -2899,9 +2973,12 @@ class AsyncProtocolAdapter:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._reader = None
-            self._writer = None
-            self._fail_pending(exc)
+            await self._close_transport(
+                exc,
+                mark_closed=False,
+                expected_reader=reader,
+                expected_writer=writer,
+            )
 
     def _fail_pending(self, exc: BaseException) -> None:
         pending = list(self._pending.values())
@@ -2927,20 +3004,20 @@ class AsyncProtocolAdapter:
                 raw=response,
             )
 
-    async def _recv_response(self) -> ProtocolResponse:
+    async def _recv_response(self, reader: asyncio.StreamReader | None = None) -> ProtocolResponse:
         read_started_ns = time.perf_counter_ns()
-        header = await self._recv_exact(_HEADER.size)
+        header = await self._recv_exact(_HEADER.size, reader)
         magic, version, flags, lane_id, opcode, request_id, body_len = _HEADER.unpack(header)
         if magic != _MAGIC or version != _RESPONSE_VERSION:
             raise FerricStoreError("invalid protocol response frame header")
 
         self._check_response_size(body_len)
-        body = await self._recv_exact(body_len)
+        body = await self._recv_exact(body_len, reader)
         chunks = [body]
         total_body_len = body_len
         final_flags = flags
         while final_flags & _FLAG_MORE_CHUNKS:
-            next_header = await self._recv_exact(_HEADER.size)
+            next_header = await self._recv_exact(_HEADER.size, reader)
             (
                 next_magic,
                 next_version,
@@ -2960,7 +3037,7 @@ class AsyncProtocolAdapter:
                 raise FerricStoreError("invalid protocol chunk continuation")
             total_body_len += next_body_len
             self._check_response_size(total_body_len)
-            chunks.append(await self._recv_exact(next_body_len))
+            chunks.append(await self._recv_exact(next_body_len, reader))
             final_flags = next_flags
 
         body = chunks[0] if len(chunks) == 1 else b"".join(chunks)
@@ -3010,8 +3087,9 @@ class AsyncProtocolAdapter:
             trace=trace,
         )
 
-    async def _recv_exact(self, size: int) -> bytes:
-        reader = self._require_reader()
+    async def _recv_exact(self, size: int, reader: asyncio.StreamReader | None = None) -> bytes:
+        if reader is None:
+            reader = self._require_reader()
         try:
             return await reader.readexactly(size)
         except asyncio.IncompleteReadError as exc:

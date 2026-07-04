@@ -6,6 +6,11 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.3.1
+
+- Added sync and async native-protocol reconnect handling after heartbeat or idle
+  socket drops, while keeping explicit user closes final.
+
 ## 0.3.0
 
 - Added state-scoped Flow metadata with `state_meta` on sync and async mutation commands.

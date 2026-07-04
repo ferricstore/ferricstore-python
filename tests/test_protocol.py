@@ -4,6 +4,7 @@ import asyncio
 import socket
 import struct
 import threading
+import time
 import zlib
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
@@ -135,7 +136,7 @@ def test_protocol_connect_uses_timeout_only_for_connect_not_socket_reads(monkeyp
         return fake_socket
 
     monkeypatch.setattr(socket, "create_connection", fake_create_connection)
-    monkeypatch.setattr(ProtocolAdapter, "_reader_loop", lambda self: None)
+    monkeypatch.setattr(ProtocolAdapter, "_reader_loop", lambda self, *_args: None)
     monkeypatch.setattr(ProtocolAdapter, "_request", lambda self, *args, **kwargs: object())
     monkeypatch.setattr(ProtocolAdapter, "_response_value", lambda self, response: b"OK")
 
@@ -1897,6 +1898,194 @@ def test_protocol_adapter_sends_idle_heartbeat_ping():
     assert received[1] == (0x0003, 0, {})
 
 
+def test_protocol_adapter_reconnects_after_server_closes_idle_socket():
+    header = struct.Struct(">4sBBIHQI")
+    status = struct.Struct(">H")
+    received: list[tuple[int, int, Any]] = []
+    first_connection_closed = threading.Event()
+
+    def recv_exact(conn: socket.socket, size: int) -> bytes:
+        chunks = bytearray()
+        while len(chunks) < size:
+            chunk = conn.recv(size - len(chunks))
+            if not chunk:
+                raise RuntimeError("connection closed")
+            chunks.extend(chunk)
+        return bytes(chunks)
+
+    def recv_frame(conn: socket.socket) -> tuple[int, int, int, Any]:
+        raw_header = recv_exact(conn, header.size)
+        magic, version, _flags, lane_id, opcode, request_id, body_len = header.unpack(raw_header)
+        assert magic == b"FSNP"
+        assert version == 0x01
+        value, rest = decode_value(recv_exact(conn, body_len))
+        assert rest == b""
+        return opcode, lane_id, request_id, value
+
+    def response(opcode: int, lane_id: int, request_id: int, value: Any) -> bytes:
+        body = status.pack(0) + encode_value(value)
+        return header.pack(b"FSNP", 0x81, 0, lane_id, opcode, request_id, len(body)) + body
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    port = listener.getsockname()[1]
+
+    def serve() -> None:
+        with listener:
+            first, _addr = listener.accept()
+            with first:
+                startup_opcode, startup_lane, startup_id, startup_payload = recv_frame(first)
+                received.append((startup_opcode, startup_lane, startup_payload))
+                first.sendall(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
+            first_connection_closed.set()
+
+            second, _addr = listener.accept()
+            with second:
+                startup_opcode, startup_lane, startup_id, startup_payload = recv_frame(second)
+                received.append((startup_opcode, startup_lane, startup_payload))
+                second.sendall(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
+
+                get_opcode, get_lane, get_id, get_payload = recv_frame(second)
+                received.append((get_opcode, get_lane, get_payload))
+                second.sendall(response(get_opcode, get_lane, get_id, b"value-after-reconnect"))
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+
+    adapter = ProtocolAdapter(
+        "127.0.0.1",
+        port,
+        client_name="pytest",
+        timeout=1.0,
+        heartbeat_interval=None,
+    )
+    try:
+        assert first_connection_closed.wait(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        while adapter._sock is not None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert adapter._sock is None
+
+        assert adapter.execute_command("GET", "k") == b"value-after-reconnect"
+    finally:
+        adapter.close()
+        thread.join(timeout=1.0)
+
+    assert received[0][0] == 0x000C
+    assert received[1][0] == 0x000C
+    assert received[2] == (0x0101, 1, {b"key": b"k"})
+
+
+def test_protocol_adapter_sync_reconnect_is_single_flight():
+    adapter = object.__new__(ProtocolAdapter)
+    adapter._sock = None
+    adapter._closed = False
+    adapter._connecting = False
+    adapter._connect_lock = threading.Lock()
+
+    calls = 0
+    calls_lock = threading.Lock()
+    start = threading.Barrier(9)
+
+    def fake_connect() -> None:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        time.sleep(0.03)
+        adapter._sock = object()
+
+    adapter._connect = fake_connect
+
+    def worker() -> None:
+        start.wait(timeout=1.0)
+        adapter._ensure_connected()
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    start.wait(timeout=1.0)
+    for thread in threads:
+        thread.join(timeout=1.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert calls == 1
+
+
+def test_protocol_adapter_stale_reader_does_not_close_newer_socket():
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def shutdown(self, *_args: Any) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    adapter = object.__new__(ProtocolAdapter)
+    old_socket = FakeSocket()
+    new_socket = FakeSocket()
+    adapter._sock = old_socket
+    adapter._pending = {}
+    adapter._pending_traces = {}
+    adapter._closed = False
+    entered = threading.Event()
+    proceed = threading.Event()
+
+    def fake_recv_response(*_args: Any, **_kwargs: Any) -> ProtocolResponse:
+        entered.set()
+        assert proceed.wait(timeout=1.0)
+        raise FerricStoreError("old reader failed")
+
+    adapter._recv_response = fake_recv_response
+
+    thread = threading.Thread(target=adapter._reader_loop)
+    thread.start()
+    assert entered.wait(timeout=1.0)
+    adapter._sock = new_socket
+    proceed.set()
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert adapter._sock is new_socket
+    assert not new_socket.closed
+
+
+def test_protocol_adapter_stale_heartbeat_does_not_close_newer_socket():
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def shutdown(self, *_args: Any) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    adapter = object.__new__(ProtocolAdapter)
+    old_socket = FakeSocket()
+    new_socket = FakeSocket()
+    adapter._sock = old_socket
+    adapter.heartbeat_interval = 0.001
+    adapter.heartbeat_timeout = 0.001
+    adapter._last_activity = 0.0
+    adapter._pending = {}
+    adapter._pending_traces = {}
+    adapter._closed = False
+
+    def fake_submit_request(*_args: Any, **_kwargs: Any) -> tuple[int, Future[ProtocolResponse]]:
+        adapter._sock = new_socket
+        raise FerricStoreError("old heartbeat failed")
+
+    adapter._submit_request = fake_submit_request
+
+    adapter._heartbeat_loop()
+
+    assert adapter._sock is new_socket
+    assert not new_socket.closed
+
+
 def test_protocol_adapter_execute_command_with_trace_unwraps_value_and_timings():
     header = struct.Struct(">4sBBIHQI")
     status = struct.Struct(">H")
@@ -2711,6 +2900,189 @@ def test_async_protocol_adapter_sends_idle_heartbeat_ping():
 
     assert received[0][0] == 0x000C
     assert received[1] == (0x0003, 0, {})
+
+
+def test_async_protocol_adapter_reconnects_after_server_closes_idle_socket():
+    header = struct.Struct(">4sBBIHQI")
+    status = struct.Struct(">H")
+    received: list[tuple[int, int, Any]] = []
+
+    async def recv_frame(
+        reader: asyncio.StreamReader,
+    ) -> tuple[int, int, int, Any]:
+        raw_header = await reader.readexactly(header.size)
+        magic, version, _flags, lane_id, opcode, request_id, body_len = header.unpack(raw_header)
+        assert magic == b"FSNP"
+        assert version == 0x01
+        value, rest = decode_value(await reader.readexactly(body_len))
+        assert rest == b""
+        return opcode, lane_id, request_id, value
+
+    def response(opcode: int, lane_id: int, request_id: int, value: Any) -> bytes:
+        body = status.pack(0) + encode_value(value)
+        return header.pack(b"FSNP", 0x81, 0, lane_id, opcode, request_id, len(body)) + body
+
+    async def run() -> None:
+        connected = 0
+        first_connection_closed = asyncio.Event()
+
+        async def handle(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            nonlocal connected
+            connected += 1
+            try:
+                startup_opcode, startup_lane, startup_id, startup_payload = await recv_frame(reader)
+                received.append((startup_opcode, startup_lane, startup_payload))
+                writer.write(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
+                await writer.drain()
+
+                if connected == 1:
+                    return
+
+                get_opcode, get_lane, get_id, get_payload = await recv_frame(reader)
+                received.append((get_opcode, get_lane, get_payload))
+                writer.write(response(get_opcode, get_lane, get_id, b"async-value-after-reconnect"))
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+                if connected == 1:
+                    first_connection_closed.set()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        adapter = AsyncProtocolAdapter(
+            "127.0.0.1",
+            port,
+            client_name="pytest",
+            timeout=1.0,
+            heartbeat_interval=None,
+        )
+        transport_dropped = asyncio.Event()
+        original_close_transport = adapter._close_transport
+
+        async def close_transport_and_notify(*args: Any, **kwargs: Any) -> None:
+            await original_close_transport(*args, **kwargs)
+            if not kwargs.get("mark_closed", False):
+                transport_dropped.set()
+
+        adapter._close_transport = close_transport_and_notify
+        try:
+            await adapter._ensure_connected()
+            await asyncio.wait_for(first_connection_closed.wait(), timeout=1.0)
+            await asyncio.wait_for(transport_dropped.wait(), timeout=1.0)
+            assert await adapter.execute_command("GET", "k") == b"async-value-after-reconnect"
+        finally:
+            await adapter.close()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+
+    assert received[0][0] == 0x000C
+    assert received[1][0] == 0x000C
+    assert received[2] == (0x0101, 1, {b"key": b"k"})
+
+
+def test_async_protocol_adapter_stale_reader_does_not_close_newer_writer():
+    class FakeWriter:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            return None
+
+        def is_closing(self) -> bool:
+            return self.closed
+
+    async def run() -> None:
+        adapter = object.__new__(AsyncProtocolAdapter)
+        old_reader = object()
+        new_reader = object()
+        old_writer = FakeWriter()
+        new_writer = FakeWriter()
+        adapter._reader = old_reader
+        adapter._writer = old_writer
+        adapter._reader_task = None
+        adapter._heartbeat_task = None
+        adapter._pending = {}
+        adapter._pending_traces = {}
+        entered = asyncio.Event()
+        proceed = asyncio.Event()
+
+        async def fake_recv_response(*_args: Any, **_kwargs: Any) -> ProtocolResponse:
+            entered.set()
+            await proceed.wait()
+            raise FerricStoreError("old reader failed")
+
+        adapter._recv_response = fake_recv_response
+
+        task = asyncio.create_task(adapter._reader_loop())
+        adapter._reader_task = task
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        adapter._reader = new_reader
+        adapter._writer = new_writer
+        proceed.set()
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert adapter._reader is new_reader
+        assert adapter._writer is new_writer
+        assert not new_writer.closed
+
+    asyncio.run(run())
+
+
+def test_async_protocol_adapter_stale_heartbeat_does_not_close_newer_writer():
+    class FakeWriter:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            return None
+
+        def is_closing(self) -> bool:
+            return self.closed
+
+    async def run() -> None:
+        adapter = object.__new__(AsyncProtocolAdapter)
+        old_reader = object()
+        new_reader = object()
+        old_writer = FakeWriter()
+        new_writer = FakeWriter()
+        adapter._reader = old_reader
+        adapter._writer = old_writer
+        adapter._reader_task = None
+        adapter._heartbeat_task = None
+        adapter._pending = {}
+        adapter._pending_traces = {}
+        adapter.heartbeat_interval = 0.001
+        adapter.heartbeat_timeout = 0.001
+        adapter._last_activity = 0.0
+
+        async def fake_request(*_args: Any, **_kwargs: Any) -> ProtocolResponse:
+            adapter._reader = new_reader
+            adapter._writer = new_writer
+            raise FerricStoreError("old heartbeat failed")
+
+        adapter._request = fake_request
+
+        task = asyncio.create_task(adapter._heartbeat_loop())
+        adapter._heartbeat_task = task
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert adapter._reader is new_reader
+        assert adapter._writer is new_writer
+        assert not new_writer.closed
+
+    asyncio.run(run())
 
 
 def test_async_protocol_send_drains_only_after_threshold():
