@@ -120,6 +120,25 @@ def _append_state_meta(
         args.extend(["STATE_META", name, value])
 
 
+def _append_search_state_meta(
+    args: builtins.list[Any],
+    state: str | None,
+    state_meta: dict[str, Any] | None,
+) -> None:
+    if not state_meta:
+        return
+
+    if all(isinstance(value, Mapping) for value in state_meta.values()):
+        for meta_state, values in state_meta.items():
+            args.extend(["STATE_META", meta_state, dict(values)])
+        return
+
+    if state is None:
+        raise ValueError("search state_meta filters require state=... or nested {state: {...}}")
+
+    args.extend(["STATE_META", state, dict(state_meta)])
+
+
 def _merge_named_map(base: dict[str, Any] | None, item: dict[str, Any] | None) -> dict[str, Any]:
     merged: dict[str, Any] = {}
     if base:
@@ -352,6 +371,29 @@ def _append_extra_options(args: builtins.list[Any], options: dict[str, Any] | No
             args.extend([name.upper(), value])
 
 
+def _management_pair_args(
+    pairs: Mapping[str, Any] | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> builtins.list[Any]:
+    args: builtins.list[Any] = []
+    merged: dict[str, Any] = {}
+    if pairs:
+        merged.update(dict(pairs))
+    if extra:
+        merged.update(dict(extra))
+
+    for key, value in merged.items():
+        if value is None:
+            continue
+        args.extend([str(key).upper(), value])
+    return args
+
+
+def _management_rule_args(rules: Sequence[Any] | Any) -> builtins.list[str]:
+    values = [rules] if isinstance(rules, (str, bytes)) else list(cast(Sequence[Any], rules))
+    return [_text(value) for value in values]
+
+
 def _coerce_diag_value(value: str) -> Any:
     if value == "":
         return value
@@ -531,6 +573,29 @@ class FlowClient(DataCommandsMixin):
             backpressure=backpressure,
         )
 
+    @classmethod
+    def from_urls(
+        cls,
+        urls: Sequence[str],
+        *,
+        codec: Codec | None = None,
+        backpressure: BackpressurePolicy | None = None,
+        **kwargs: Any,
+    ) -> FlowClient:
+        if not urls:
+            raise ValueError("FerricStore SDK requires at least one URL")
+        for url in urls:
+            if urlparse(url).scheme.lower() not in {"ferric", "ferrics"}:
+                raise ValueError("FerricStore SDK URLs must use ferric:// or ferrics://")
+
+        from ferricstore.protocol import ProtocolAdapterPool
+
+        return cls(
+            ProtocolAdapterPool.from_urls(list(urls), **kwargs),
+            codec=codec,
+            backpressure=backpressure,
+        )
+
     def autobatch(
         self,
         *,
@@ -559,6 +624,18 @@ class FlowClient(DataCommandsMixin):
             self._transaction_mode = True
 
         return result
+
+    def refresh_topology(self) -> Any:
+        refresh = getattr(self.executor, "refresh_topology", None)
+        if not callable(refresh):
+            raise RuntimeError("topology refresh requires a topology-aware protocol executor")
+        return refresh()
+
+    def route(self, key: str | bytes) -> Any:
+        route = getattr(self.executor, "route", None)
+        if not callable(route):
+            raise RuntimeError("route lookup requires a topology-aware protocol executor")
+        return route(key)
 
     def pipeline(self) -> CommandPipeline:
         return CommandPipeline(self)
@@ -716,6 +793,134 @@ class FlowClient(DataCommandsMixin):
 
     def ferricstore_blobgc(self, *args: Any) -> Any:
         return self.executor.execute_command("FERRICSTORE.BLOBGC", *args)
+
+    def capabilities(self) -> dict[str, Any]:
+        return cast(
+            dict[str, Any],
+            _normalize_admin_response(self.executor.execute_command("FERRICSTORE.CAPABILITIES")),
+        )
+
+    def acl_set_user(self, username: str, rules: Sequence[Any] | Any) -> Any:
+        return _normalize_admin_response(
+            self.executor.execute_command("ACL", "SETUSER", username, *_management_rule_args(rules))
+        )
+
+    def acl_del_user(self, username: str) -> Any:
+        return _normalize_admin_response(self.executor.execute_command("ACL", "DELUSER", username))
+
+    def acl_get_user(self, username: str) -> Any:
+        return _normalize_admin_response(self.executor.execute_command("ACL", "GETUSER", username))
+
+    def acl_list_users(self) -> Any:
+        return _normalize_admin_response(self.executor.execute_command("ACL", "LIST"))
+
+    def acl_save(self) -> Any:
+        return _normalize_admin_response(self.executor.execute_command("ACL", "SAVE"))
+
+    def ensure_namespace(
+        self,
+        prefix: str,
+        attrs: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        return _normalize_admin_response(
+            self.executor.execute_command(
+                "FERRICSTORE.NAMESPACE",
+                "ENSURE",
+                prefix,
+                *_management_pair_args(attrs, kwargs),
+            )
+        )
+
+    def get_namespace(self, prefix: str) -> Any:
+        return _normalize_admin_response(
+            self.executor.execute_command("FERRICSTORE.NAMESPACE", "GET", prefix)
+        )
+
+    def list_namespaces(self) -> Any:
+        return _normalize_admin_response(
+            self.executor.execute_command("FERRICSTORE.NAMESPACE", "LIST")
+        )
+
+    def delete_namespace(self, prefix: str) -> Any:
+        return _normalize_admin_response(
+            self.executor.execute_command("FERRICSTORE.NAMESPACE", "DELETE", prefix)
+        )
+
+    def set_quota(
+        self,
+        namespace: str,
+        quota_spec: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        return _normalize_admin_response(
+            self.executor.execute_command(
+                "FERRICSTORE.QUOTA",
+                "SET",
+                namespace,
+                *_management_pair_args(quota_spec, kwargs),
+            )
+        )
+
+    def get_quota(self, namespace: str) -> Any:
+        return _normalize_admin_response(
+            self.executor.execute_command("FERRICSTORE.QUOTA", "GET", namespace)
+        )
+
+    def quota_usage(self, namespace: str) -> Any:
+        return _normalize_admin_response(
+            self.executor.execute_command("FERRICSTORE.QUOTA", "USAGE", namespace)
+        )
+
+    def cluster_info(self) -> dict[str, Any]:
+        return cast(
+            dict[str, Any],
+            _normalize_admin_response(
+                self.executor.execute_command("FERRICSTORE.TELEMETRY", "CLUSTER_INFO")
+            ),
+        )
+
+    def namespace_usage(self, prefix: str) -> dict[str, Any]:
+        return cast(
+            dict[str, Any],
+            _normalize_admin_response(
+                self.executor.execute_command("FERRICSTORE.TELEMETRY", "NAMESPACE_USAGE", prefix)
+            ),
+        )
+
+    def flow_query(
+        self,
+        attrs: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> builtins.list[Any]:
+        return cast(
+            builtins.list[Any],
+            _normalize_admin_response(
+                self.executor.execute_command(
+                    "FERRICSTORE.TELEMETRY",
+                    "FLOW_QUERY",
+                    *_management_pair_args(attrs, kwargs),
+                )
+            ),
+        )
+
+    def flow_history(
+        self,
+        id: str,
+        attrs: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> builtins.list[Any]:
+        return cast(
+            builtins.list[Any],
+            _normalize_admin_response(
+                self.executor.execute_command(
+                    "FERRICSTORE.TELEMETRY",
+                    "FLOW_HISTORY",
+                    id,
+                    *_management_pair_args(attrs, kwargs),
+                )
+            ),
+        )
 
     def create(
         self,
@@ -2541,6 +2746,39 @@ class FlowClient(DataCommandsMixin):
         _append_attributes(args, attributes=attributes)
         _append_bool(args, "INCLUDE_COLD", include_cold)
         _append_bool(args, "CONSISTENT_PROJECTION", consistent_projection)
+        return self._records(self.executor.execute_command(*args))
+
+    def search(
+        self,
+        type: str,
+        *,
+        state: str | None = None,
+        partition_key: str | None = None,
+        count: int | None = None,
+        from_ms: int | None = None,
+        to_ms: int | None = None,
+        rev: bool | None = None,
+        attributes: dict[str, Any] | None = None,
+        state_meta: dict[str, Any] | None = None,
+        terminal_only: bool | None = None,
+        include_cold: bool | None = None,
+        consistent_projection: bool | None = None,
+    ) -> builtins.list[FlowRecord]:
+        args: builtins.list[Any] = ["FLOW.SEARCH", type]
+        _append_read_options(
+            args,
+            state=state,
+            partition_key=partition_key,
+            count=count,
+            from_ms=from_ms,
+            to_ms=to_ms,
+            rev=rev,
+            terminal_only=terminal_only,
+            include_cold=include_cold,
+            consistent_projection=consistent_projection,
+        )
+        _append_attributes(args, attributes=attributes)
+        _append_search_state_meta(args, state, state_meta)
         return self._records(self.executor.execute_command(*args))
 
     def stats(

@@ -23,10 +23,11 @@ The SDK only opens FerricStore native protocol connections from URLs. Use `ferri
 | Claim/lease | `claim_due`, `reclaim`, `extend_lease` |
 | Mutate | `transition`, `transition_many`, `complete`, `complete_many`, `retry`, `retry_many`, `fail`, `fail_many`, `cancel`, `cancel_many`, `rewind` |
 | Children | `spawn_children` |
-| Query | `get`, `history`, `list`, `terminals`, `failures`, `by_parent`, `by_root`, `by_correlation`, `info`, `stuck` |
+| Query | `get`, `history`, `list`, `search`, `terminals`, `failures`, `by_parent`, `by_root`, `by_correlation`, `info`, `stuck` |
 | Attribute discovery | `attributes`, `attribute_values` |
 | Schedules | `schedule_create`, `schedule_get`, `schedule_fire`, `schedule_pause`, `schedule_resume`, `schedule_delete`, `schedule_fire_due`, `schedule_list` |
 | Governance | `effect_reserve`, `effect_confirm`, `effect_fail`, `effect_compensate`, `effect_get`, `governance_ledger`, `approval_request`, `approval_approve`, `approval_reject`, `approval_get`, `approval_list`, `governance_overview`, `circuit_open`, `circuit_close`, `circuit_get`, `budget_reserve`, `budget_commit`, `budget_release`, `budget_get`, `budget_list`, `limit_lease`, `limit_spend`, `limit_release`, `limit_get`, `limit_list` |
+| Management reads/writes | `capabilities`, `acl_*`, `ensure_namespace`, `get_namespace`, `list_namespaces`, `delete_namespace`, `set_quota`, `get_quota`, `quota_usage`, `cluster_info`, `namespace_usage`, `flow_query`, `flow_history` |
 | Policy/cleanup | `install_policy`, `policy_get`, `retention_cleanup` |
 
 `from_url` uses the native FerricStore protocol adapter.
@@ -422,6 +423,14 @@ events = client.history(
 
 ```python
 client.list("order", state="queued", count=100)
+client.search(
+    "order",
+    state="completed",
+    attributes={"tenant": "acme"},
+    state_meta={"version": 3},
+    terminal_only=True,
+    count=100,
+)
 client.terminals("order", state="completed", rev=True, count=100)
 client.failures("order", from_ms=0, to_ms=now_ms)
 client.by_parent("parent-flow-id", terminal_only=True)
@@ -430,6 +439,9 @@ client.by_correlation("checkout-123", include_cold=True)
 client.info("order", include_cold=True)
 client.stuck("order", older_than_ms=60_000)
 ```
+
+Broad `search(...)` filters use server-side policy indexes. Attribute filters
+require `indexed_attributes`; state metadata filters require `indexed_state_meta`.
 
 ## Attribute Discovery
 

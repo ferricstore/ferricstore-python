@@ -73,7 +73,7 @@ raw bytes on decode.
 | Advanced batching, fanout, custom routing | `FlowClient` directly |
 | Data-structure commands | `client.kv_set(...)`, `client.hash_set(...)`, `client.list_push(...)`, or `client.command(...)` |
 | Locks, CAS, rate limits, fetch stampede protection | First-class protocol helpers on `FlowClient` |
-| Cluster/admin operations | Cluster/admin helpers or `client.command(...)` |
+| Cluster/admin operations | Cluster/admin and management helpers, or `client.command(...)` |
 
 Rule of thumb: start with `QueueClient` for queues, start with `WorkflowClient`
 for state machines, use the async equivalents in `asyncio` services, and drop to
@@ -227,6 +227,21 @@ client.ferricstore_blobgc("RUN")
 
 Admin commands depend on the server configuration and ACLs. Use them from
 operator code, not normal request handlers.
+
+### Management/control-plane helpers
+
+`FlowClient` and `AsyncFlowClient` expose narrow management operations for
+control planes. They map to stable FerricStore commands instead of requiring
+arbitrary command execution.
+
+```python
+caps = client.capabilities()
+client.acl_set_user("platform_worker", ["on", "+PING", "+@read", "~tenant:acme:*"])
+client.ensure_namespace("tenant:acme:", {"owner": "platform"})
+client.set_quota("tenant:acme:", {"keys": 100_000, "bytes": 1_000_000_000})
+usage = client.namespace_usage("tenant:acme:")
+flows = client.flow_query({"type": "order", "state": "failed"})
+```
 
 ## FlowClient basics
 

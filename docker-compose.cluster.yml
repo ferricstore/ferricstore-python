@@ -1,0 +1,74 @@
+services:
+  fs0:
+    image: ${FERRICSTORE_IMAGE:-ghcr.io/ferricstore/ferricstore:0.7.2}
+    hostname: fs0
+    environment:
+      FERRICSTORE_PROTECTED_MODE: "false"
+      FERRICSTORE_SHARD_COUNT: "${FERRICSTORE_SHARD_COUNT:-4}"
+      FERRICSTORE_NATIVE_ENABLED: "true"
+      FERRICSTORE_NATIVE_BIND: "0.0.0.0"
+      FERRICSTORE_NATIVE_PORT: "6388"
+      RELEASE_NODE: "ferricstore@fs0"
+      RELEASE_COOKIE: "${FERRICSTORE_COOKIE:-ferricstore-sdk-cluster}"
+      FERRICSTORE_NODE_NAME: "ferricstore@fs0"
+      FERRICSTORE_COOKIE: "${FERRICSTORE_COOKIE:-ferricstore-sdk-cluster}"
+      FERRICSTORE_CLUSTER_NODES: "ferricstore@fs0,ferricstore@fs1,ferricstore@fs2"
+      FERRICSTORE_CLUSTER_AUTO_JOIN: "true"
+      FERRICSTORE_DISCOVERY: "epmd"
+      FERRICSTORE_NATIVE_ADVERTISE_HOST: "127.0.0.1"
+      FERRICSTORE_NATIVE_ADVERTISE_PORT: "${FERRICSTORE_CLUSTER_PORT_0:-56388}"
+    ports:
+      - "${FERRICSTORE_CLUSTER_PORT_0:-56388}:6388"
+    volumes:
+      - ferricstore-cluster-fs0:/data
+
+  fs1:
+    image: ${FERRICSTORE_IMAGE:-ghcr.io/ferricstore/ferricstore:0.7.2}
+    hostname: fs1
+    environment:
+      FERRICSTORE_PROTECTED_MODE: "false"
+      FERRICSTORE_SHARD_COUNT: "${FERRICSTORE_SHARD_COUNT:-4}"
+      FERRICSTORE_NATIVE_ENABLED: "true"
+      FERRICSTORE_NATIVE_BIND: "0.0.0.0"
+      FERRICSTORE_NATIVE_PORT: "6388"
+      RELEASE_NODE: "ferricstore@fs1"
+      RELEASE_COOKIE: "${FERRICSTORE_COOKIE:-ferricstore-sdk-cluster}"
+      FERRICSTORE_NODE_NAME: "ferricstore@fs1"
+      FERRICSTORE_COOKIE: "${FERRICSTORE_COOKIE:-ferricstore-sdk-cluster}"
+      FERRICSTORE_CLUSTER_NODES: "ferricstore@fs0,ferricstore@fs1,ferricstore@fs2"
+      FERRICSTORE_CLUSTER_AUTO_JOIN: "true"
+      FERRICSTORE_DISCOVERY: "epmd"
+      FERRICSTORE_NATIVE_ADVERTISE_HOST: "127.0.0.1"
+      FERRICSTORE_NATIVE_ADVERTISE_PORT: "${FERRICSTORE_CLUSTER_PORT_1:-56389}"
+    ports:
+      - "${FERRICSTORE_CLUSTER_PORT_1:-56389}:6388"
+    volumes:
+      - ferricstore-cluster-fs1:/data
+
+  fs2:
+    image: ${FERRICSTORE_IMAGE:-ghcr.io/ferricstore/ferricstore:0.7.2}
+    hostname: fs2
+    environment:
+      FERRICSTORE_PROTECTED_MODE: "false"
+      FERRICSTORE_SHARD_COUNT: "${FERRICSTORE_SHARD_COUNT:-4}"
+      FERRICSTORE_NATIVE_ENABLED: "true"
+      FERRICSTORE_NATIVE_BIND: "0.0.0.0"
+      FERRICSTORE_NATIVE_PORT: "6388"
+      RELEASE_NODE: "ferricstore@fs2"
+      RELEASE_COOKIE: "${FERRICSTORE_COOKIE:-ferricstore-sdk-cluster}"
+      FERRICSTORE_NODE_NAME: "ferricstore@fs2"
+      FERRICSTORE_COOKIE: "${FERRICSTORE_COOKIE:-ferricstore-sdk-cluster}"
+      FERRICSTORE_CLUSTER_NODES: "ferricstore@fs0,ferricstore@fs1,ferricstore@fs2"
+      FERRICSTORE_CLUSTER_AUTO_JOIN: "true"
+      FERRICSTORE_DISCOVERY: "epmd"
+      FERRICSTORE_NATIVE_ADVERTISE_HOST: "127.0.0.1"
+      FERRICSTORE_NATIVE_ADVERTISE_PORT: "${FERRICSTORE_CLUSTER_PORT_2:-56390}"
+    ports:
+      - "${FERRICSTORE_CLUSTER_PORT_2:-56390}:6388"
+    volumes:
+      - ferricstore-cluster-fs2:/data
+
+volumes:
+  ferricstore-cluster-fs0:
+  ferricstore-cluster-fs1:
+  ferricstore-cluster-fs2:

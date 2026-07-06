@@ -28,6 +28,7 @@ from ferricstore.protocol import (
     ProtocolAdapterPool,
     ProtocolCommand,
     ProtocolResponse,
+    RoutingTopology,
     _compact_flow_many_payloads_from_raw,
     _compact_pipeline_payload_from_raw,
     _try_fast_response_value,
@@ -77,6 +78,84 @@ def test_flow_client_from_protocol_url_uses_protocol_adapter_pool(monkeypatch):
     assert created == {"url": "ferric://localhost:6388", "kwargs": {"timeout": 1.0}}
 
 
+def test_flow_client_from_protocol_urls_uses_topology_adapter_pool(monkeypatch):
+    created = {}
+
+    class FakeProtocolAdapterPool:
+        @classmethod
+        def from_urls(cls, urls, **kwargs):
+            created["urls"] = urls
+            created["kwargs"] = kwargs
+            return cls()
+
+        def execute_command(self, *args):
+            return b"OK"
+
+    monkeypatch.setattr("ferricstore.protocol.ProtocolAdapterPool", FakeProtocolAdapterPool)
+
+    client = FlowClient.from_urls(
+        ["ferric://seed-a:6388", "ferric://seed-b:6388"],
+        timeout=1.0,
+        endpoint_policy="any",
+    )
+
+    assert client.command("PING") == b"OK"
+    assert created == {
+        "urls": ["ferric://seed-a:6388", "ferric://seed-b:6388"],
+        "kwargs": {"timeout": 1.0, "endpoint_policy": "any"},
+    }
+
+
+def test_flow_client_topology_helpers_delegate_to_executor():
+    class FakeTopologyExecutor:
+        def execute_command(self, *args):
+            return b"OK"
+
+        def refresh_topology(self):
+            return "refreshed"
+
+        def route(self, key):
+            return {"key": key}
+
+    client = FlowClient(FakeTopologyExecutor())
+
+    assert client.refresh_topology() == "refreshed"
+    assert client.route("k1") == {"key": "k1"}
+
+
+def test_async_flow_client_from_protocol_urls_uses_topology_adapter_pool(monkeypatch):
+    created = {}
+
+    class FakeAsyncProtocolAdapterPool:
+        @classmethod
+        def from_urls(cls, urls, **kwargs):
+            created["urls"] = urls
+            created["kwargs"] = kwargs
+            return cls()
+
+        async def execute_command(self, *args):
+            return b"OK"
+
+    monkeypatch.setattr(
+        "ferricstore.protocol.AsyncProtocolAdapterPool",
+        FakeAsyncProtocolAdapterPool,
+    )
+
+    async def run():
+        client = AsyncFlowClient.from_urls(
+            ["ferric://seed-a:6388", "ferric://seed-b:6388"],
+            endpoint_policy="any",
+        )
+        assert await client.command("PING") == b"OK"
+
+    asyncio.run(run())
+
+    assert created == {
+        "urls": ["ferric://seed-a:6388", "ferric://seed-b:6388"],
+        "kwargs": {"endpoint_policy": "any"},
+    }
+
+
 def test_protocol_from_url_ignores_compatibility_only_kwargs(monkeypatch):
     captured = {}
 
@@ -107,6 +186,316 @@ def test_protocol_from_url_ignores_compatibility_only_kwargs(monkeypatch):
             "tls": False,
         },
     }
+
+
+def test_routing_topology_builds_slot_table_from_shards_payload():
+    topology = RoutingTopology.build(
+        {
+            "route_epoch": 7,
+            "shard_count": 2,
+            "ranges": [
+                {
+                    "first_slot": 0,
+                    "last_slot": 511,
+                    "shard": 0,
+                    "lane_id": 1,
+                    "endpoint": {
+                        "node": "a@cluster",
+                        "host": "node-a.local",
+                        "native_port": 6388,
+                    },
+                },
+                {
+                    "first_slot": 512,
+                    "last_slot": 1023,
+                    "shard": 1,
+                    "lane_id": 2,
+                    "endpoint": {
+                        "node": "b@cluster",
+                        "host": "node-b.local",
+                        "native_port": 6389,
+                    },
+                },
+            ],
+        }
+    )
+
+    key_for_shard_0 = next(
+        f"slot-a-{idx}" for idx in range(10_000) if topology.slot_for_key(f"slot-a-{idx}") < 512
+    )
+    key_for_shard_1 = next(
+        f"slot-b-{idx}" for idx in range(10_000) if topology.slot_for_key(f"slot-b-{idx}") >= 512
+    )
+
+    route0 = topology.route_key(key_for_shard_0)
+    route1 = topology.route_key(key_for_shard_1)
+
+    assert topology.route_epoch == 7
+    assert topology.slot_for_key("{tenant}:one") == topology.slot_for_key("{tenant}:two")
+    assert route0["shard"] == 0
+    assert route0["endpoint"]["host"] == "node-a.local"
+    assert route1["shard"] == 1
+    assert route1["lane_id"] == 2
+    assert route1["endpoint_key"] == ("node-b.local", 6389)
+
+
+def test_protocol_adapter_pool_from_urls_routes_keyed_commands_to_shard_leader(monkeypatch):
+    created: dict[str, FakeProtocolAdapter] = {}
+
+    class FakeProtocolAdapter:
+        def __init__(self, url, **kwargs):
+            self.url = url
+            self.kwargs = kwargs
+            self.calls: list[tuple[Any, ...]] = []
+
+        def execute_command(self, *args):
+            self.calls.append(args)
+            if args[0] == "SHARDS":
+                return {
+                    "route_epoch": 1,
+                    "shard_count": 1,
+                    "ranges": [
+                        {
+                            "first_slot": 0,
+                            "last_slot": 1023,
+                            "shard": 0,
+                            "lane_id": 3,
+                            "endpoint": {
+                                "node": "leader@cluster",
+                                "host": "leader.local",
+                                "native_port": 6391,
+                            },
+                        }
+                    ],
+                }
+            return {"url": self.url, "args": args}
+
+        def close(self):
+            self.calls.append(("CLOSE",))
+
+    def fake_from_url(url, **kwargs):
+        adapter = FakeProtocolAdapter(url, **kwargs)
+        created[url] = adapter
+        return adapter
+
+    monkeypatch.setattr(ProtocolAdapter, "from_url", fake_from_url)
+
+    pool = ProtocolAdapterPool.from_urls(
+        ["ferric://seed.local:6388"],
+        timeout=1.0,
+        endpoint_policy="any",
+    )
+
+    result = pool.execute_command("SET", "tenant-key", b"value")
+
+    assert result["url"] == "ferric://leader.local:6391"
+    assert created["ferric://seed.local:6388"].calls == [("SHARDS",)]
+    assert created["ferric://leader.local:6391"].calls == [("SET", "tenant-key", b"value")]
+    assert created["ferric://leader.local:6391"].kwargs["timeout"] == 1.0
+
+
+def test_protocol_adapter_pool_from_urls_rejects_untrusted_learned_endpoint(monkeypatch):
+    class FakeProtocolAdapter:
+        def execute_command(self, *args):
+            if args[0] == "SHARDS":
+                return {
+                    "ranges": [
+                        {
+                            "first_slot": 0,
+                            "last_slot": 1023,
+                            "shard": 0,
+                            "lane_id": 1,
+                            "endpoint": {
+                                "node": "other@cluster",
+                                "host": "other.local",
+                                "native_port": 6388,
+                            },
+                        }
+                    ]
+                }
+            return b"OK"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        ProtocolAdapter,
+        "from_url",
+        lambda *_args, **_kwargs: FakeProtocolAdapter(),
+    )
+
+    pool = ProtocolAdapterPool.from_urls(["ferric://seed.local:6388"])
+
+    with pytest.raises(FerricStoreError, match="unsafe learned endpoint"):
+        pool.execute_command("GET", "tenant-key")
+
+
+def test_protocol_adapter_pool_from_urls_rejects_untrusted_learned_seed_host_port(
+    monkeypatch,
+):
+    created: dict[str, Any] = {}
+
+    class FakeProtocolAdapter:
+        def __init__(self, url, **kwargs):
+            self.url = url
+            self.calls: list[tuple[Any, ...]] = []
+
+        def execute_command(self, *args):
+            self.calls.append(args)
+            if args[0] == "SHARDS":
+                return {
+                    "ranges": [
+                        {
+                            "first_slot": 0,
+                            "last_slot": 1023,
+                            "shard": 0,
+                            "lane_id": 1,
+                            "endpoint": {
+                                "node": "other-port@cluster",
+                                "host": "seed.local",
+                                "native_port": 6391,
+                            },
+                        }
+                    ]
+                }
+            return {"url": self.url, "args": args}
+
+        def close(self):
+            pass
+
+    def fake_from_url(url, **kwargs):
+        adapter = FakeProtocolAdapter(url, **kwargs)
+        created[url] = adapter
+        return adapter
+
+    monkeypatch.setattr(ProtocolAdapter, "from_url", fake_from_url)
+
+    strict_pool = ProtocolAdapterPool.from_urls(["ferric://seed.local:6388"])
+    with pytest.raises(FerricStoreError, match="unsafe learned endpoint"):
+        strict_pool.execute_command("GET", "tenant-key")
+
+    trusted_pool = ProtocolAdapterPool.from_urls(
+        ["ferric://seed.local:6388"],
+        trusted_hosts=["seed.local"],
+    )
+    result = trusted_pool.execute_command("GET", "tenant-key")
+    assert result["url"] == "ferric://seed.local:6391"
+
+
+def test_async_topology_pool_warm_connections_opens_learned_adapters(monkeypatch):
+    created: dict[str, Any] = {}
+
+    class FakeAsyncProtocolAdapter:
+        def __init__(self, url, **kwargs):
+            self.url = url
+            self.ensure_connected_calls = 0
+
+        async def execute_command(self, *args):
+            if args[0] == "SHARDS":
+                return {
+                    "ranges": [
+                        {
+                            "first_slot": 0,
+                            "last_slot": 1023,
+                            "shard": 0,
+                            "lane_id": 1,
+                            "endpoint": {
+                                "node": "leader@cluster",
+                                "host": "leader.local",
+                                "native_port": 6391,
+                            },
+                        }
+                    ]
+                }
+            return b"OK"
+
+        async def _ensure_connected(self):
+            self.ensure_connected_calls += 1
+
+        async def close(self):
+            pass
+
+    def fake_from_url(url, **kwargs):
+        adapter = FakeAsyncProtocolAdapter(url, **kwargs)
+        created[url] = adapter
+        return adapter
+
+    monkeypatch.setattr(AsyncProtocolAdapter, "from_url", fake_from_url)
+
+    async def run():
+        pool = protocol_module.AsyncTopologyProtocolAdapterPool(
+            ["ferric://seed.local:6388"],
+            endpoint_policy="any",
+            warm_connections=True,
+        )
+        await pool.refresh_topology()
+
+    asyncio.run(run())
+
+    assert created["ferric://leader.local:6391"].ensure_connected_calls == 1
+
+
+def test_protocol_adapter_pool_refreshes_topology_after_route_failure_without_replay(
+    monkeypatch,
+):
+    created: dict[str, FakeProtocolAdapter] = {}
+    shard_epoch = {"value": 0}
+
+    class FakeProtocolAdapter:
+        def __init__(self, url, **kwargs):
+            self.url = url
+            self.calls: list[tuple[Any, ...]] = []
+
+        def execute_command(self, *args):
+            self.calls.append(args)
+            if args[0] == "SHARDS":
+                shard_epoch["value"] += 1
+                leader = "old.local" if shard_epoch["value"] == 1 else "new.local"
+                return {
+                    "route_epoch": shard_epoch["value"],
+                    "shard_count": 1,
+                    "ranges": [
+                        {
+                            "first_slot": 0,
+                            "last_slot": 1023,
+                            "shard": 0,
+                            "lane_id": 1,
+                            "endpoint": {
+                                "node": f"{leader}@cluster",
+                                "host": leader,
+                                "native_port": 6388,
+                            },
+                        }
+                    ],
+                }
+            if self.url == "ferric://old.local:6388":
+                raise FerricStoreError("protocol connection closed")
+            return {"url": self.url, "args": args}
+
+        def close(self):
+            self.calls.append(("CLOSE",))
+
+    def fake_from_url(url, **kwargs):
+        adapter = FakeProtocolAdapter(url, **kwargs)
+        created[url] = adapter
+        return adapter
+
+    monkeypatch.setattr(ProtocolAdapter, "from_url", fake_from_url)
+
+    pool = ProtocolAdapterPool.from_urls(
+        ["ferric://seed.local:6388"],
+        endpoint_policy="any",
+    )
+
+    with pytest.raises(FerricStoreError, match="connection closed"):
+        pool.execute_command("SET", "tenant-key", b"first")
+
+    assert created["ferric://old.local:6388"].calls == [("SET", "tenant-key", b"first")]
+
+    result = pool.execute_command("SET", "tenant-key", b"second")
+
+    assert result["url"] == "ferric://new.local:6388"
+    assert created["ferric://new.local:6388"].calls == [("SET", "tenant-key", b"second")]
 
 
 def test_protocol_connect_uses_timeout_only_for_connect_not_socket_reads(monkeypatch):
@@ -1247,6 +1636,34 @@ def test_protocol_keeps_generic_flow_list_payload_for_unsupported_filters():
     }
 
 
+def test_protocol_builds_control_opcode_payloads():
+    assert build_protocol_command("HELLO", "ROLE", "sdk") == ProtocolCommand(
+        0x0001,
+        {"role": "sdk"},
+        0,
+    )
+    assert build_protocol_command("AUTH", "platform", "secret") == ProtocolCommand(
+        0x0002,
+        {"username": "platform", "password": "secret"},
+        0,
+    )
+    assert build_protocol_command("STARTUP", "CLIENT", "python") == ProtocolCommand(
+        0x000C,
+        {"client": "python"},
+        0,
+    )
+    assert build_protocol_command("WINDOW_UPDATE", "LANE", 1, "CREDIT", 64) == ProtocolCommand(
+        0x000D,
+        {"lane": 1, "credit": 64},
+        0,
+    )
+    assert build_protocol_command("ROUTE_BATCH", "key-1", "key-2") == ProtocolCommand(
+        0x000F,
+        {"keys": ["key-1", "key-2"]},
+        0,
+    )
+
+
 def test_protocol_builds_flow_stats_with_attributes():
     command = build_protocol_command(
         "FLOW.STATS",
@@ -1264,6 +1681,48 @@ def test_protocol_builds_flow_stats_with_attributes():
         "type": "email",
         "state": "queued",
         "attributes": {"tenant": "acme"},
+    }
+
+
+def test_protocol_builds_flow_search_with_attributes_and_state_meta():
+    command = build_protocol_command(
+        "FLOW.SEARCH",
+        "email",
+        "STATE",
+        "queued",
+        "ATTRIBUTE",
+        "tenant",
+        "acme",
+        "STATE_META",
+        "queued",
+        {"version": 3},
+        "TERMINAL_ONLY",
+        "true",
+    )
+
+    assert command.opcode == 0x0230
+    assert command.flags == 0
+    assert command.payload == {
+        "type": "email",
+        "state": "queued",
+        "attributes": {"tenant": "acme"},
+        "state_meta": {"queued": {"version": 3}},
+        "terminal_only": True,
+    }
+
+    flat_meta = build_protocol_command(
+        "FLOW.SEARCH",
+        "email",
+        "STATE",
+        "queued",
+        "STATE_META",
+        "version",
+        3,
+    )
+    assert flat_meta.payload == {
+        "type": "email",
+        "state": "queued",
+        "state_meta": {"queued": {"version": 3}},
     }
 
 

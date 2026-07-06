@@ -41,10 +41,15 @@ from ferricstore.errors import (
 )
 from ferricstore.protocol import (
     AsyncProtocolAdapter,
+    AsyncProtocolAdapterPool,
     AsyncProtocolPipeline,
+    AsyncTopologyProtocolAdapterPool,
     ProtocolAdapter,
+    ProtocolAdapterPool,
     ProtocolCommand,
     ProtocolPipeline,
+    RoutingTopology,
+    TopologyProtocolAdapterPool,
 )
 from ferricstore.types import (
     ApprovalResult,
@@ -102,7 +107,7 @@ QueueWorker = QueueFlowWorker
 QueueWorkerResult = QueueFlowWorkerResult
 AsyncQueueWorker = AsyncQueueFlowWorker
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 __all__ = [
     "ApprovalResult",
@@ -110,11 +115,13 @@ __all__ = [
     "AsyncCommandPipeline",
     "AsyncFlowClient",
     "AsyncProtocolAdapter",
+    "AsyncProtocolAdapterPool",
     "AsyncProtocolPipeline",
     "AsyncPubSubSession",
     "AsyncQueue",
     "AsyncQueueClient",
     "AsyncQueueWorker",
+    "AsyncTopologyProtocolAdapterPool",
     "AsyncTransactionSession",
     "AsyncWorkflow",
     "AsyncWorkflowBudget",
@@ -154,6 +161,7 @@ __all__ = [
     "LockNotOwnedError",
     "OverloadedError",
     "ProtocolAdapter",
+    "ProtocolAdapterPool",
     "ProtocolCommand",
     "ProtocolPipeline",
     "PubSubMessage",
@@ -166,8 +174,10 @@ __all__ = [
     "RawCodec",
     "Retry",
     "RetryPolicy",
+    "RoutingTopology",
     "ScheduleResult",
     "StaleLeaseError",
+    "TopologyProtocolAdapterPool",
     "TransactionSession",
     "Transition",
     "ValueConfig",

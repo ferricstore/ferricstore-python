@@ -147,6 +147,7 @@ class FakeExecutor:
             "FLOW.BY_ROOT",
             "FLOW.BY_CORRELATION",
             "FLOW.STUCK",
+            "FLOW.SEARCH",
         }:
             return [
                 {
@@ -3482,9 +3483,115 @@ def test_flow_record_decodes_state_meta_and_indexed_state_meta():
     assert record.indexed_state_meta == "version"
 
 
+def test_management_wrappers_build_control_plane_commands_and_normalize_responses():
+    executor = FakeExecutor()
+    client = FlowClient(executor)
+    executor.responses.extend(
+        [
+            {b"sdk": True, b"flow_observability": True},
+            b"OK",
+            {b"user": b"platform"},
+            [b"default", b"platform"],
+            b"OK",
+            b"OK",
+            {b"prefix": b"tenant:"},
+            {b"prefix": b"tenant:"},
+            [{b"prefix": b"tenant:"}],
+            b"OK",
+            {b"keys": 100, b"bytes": 1024},
+            {b"keys": 100, b"bytes": 1024},
+            {b"keys": 2, b"bytes": 256},
+            {b"cluster": b"ok"},
+            {b"keys": 2},
+            [{b"id": b"f1", b"type": b"order"}],
+            [{b"event": b"created"}],
+        ]
+    )
+
+    assert client.capabilities() == {"sdk": True, "flow_observability": True}
+    assert client.acl_set_user("platform", ["on", "+PING", "~tenant:*"]) == "OK"
+    assert client.acl_get_user("platform") == {"user": "platform"}
+    assert client.acl_list_users() == ["default", "platform"]
+    assert client.acl_del_user("platform") == "OK"
+    assert client.acl_save() == "OK"
+    assert client.ensure_namespace("tenant:", {"owner": "platform"}, durability="memory") == {
+        "prefix": "tenant:"
+    }
+    assert client.get_namespace("tenant:") == {"prefix": "tenant:"}
+    assert client.list_namespaces() == [{"prefix": "tenant:"}]
+    assert client.delete_namespace("tenant:") == "OK"
+    assert client.set_quota("tenant:", {"keys": 100}, bytes=1024) == {
+        "keys": 100,
+        "bytes": 1024,
+    }
+    assert client.get_quota("tenant:") == {"keys": 100, "bytes": 1024}
+    assert client.quota_usage("tenant:") == {"keys": 2, "bytes": 256}
+    assert client.cluster_info() == {"cluster": "ok"}
+    assert client.namespace_usage("tenant:") == {"keys": 2}
+    assert client.flow_query({"type": "order"}, state="queued") == [{"id": "f1", "type": "order"}]
+    assert client.flow_history("f1", {"include": "metadata"}) == [{"event": "created"}]
+
+    assert executor.calls == [
+        ("FERRICSTORE.CAPABILITIES",),
+        ("ACL", "SETUSER", "platform", "on", "+PING", "~tenant:*"),
+        ("ACL", "GETUSER", "platform"),
+        ("ACL", "LIST"),
+        ("ACL", "DELUSER", "platform"),
+        ("ACL", "SAVE"),
+        (
+            "FERRICSTORE.NAMESPACE",
+            "ENSURE",
+            "tenant:",
+            "OWNER",
+            "platform",
+            "DURABILITY",
+            "memory",
+        ),
+        ("FERRICSTORE.NAMESPACE", "GET", "tenant:"),
+        ("FERRICSTORE.NAMESPACE", "LIST"),
+        ("FERRICSTORE.NAMESPACE", "DELETE", "tenant:"),
+        ("FERRICSTORE.QUOTA", "SET", "tenant:", "KEYS", 100, "BYTES", 1024),
+        ("FERRICSTORE.QUOTA", "GET", "tenant:"),
+        ("FERRICSTORE.QUOTA", "USAGE", "tenant:"),
+        ("FERRICSTORE.TELEMETRY", "CLUSTER_INFO"),
+        ("FERRICSTORE.TELEMETRY", "NAMESPACE_USAGE", "tenant:"),
+        ("FERRICSTORE.TELEMETRY", "FLOW_QUERY", "TYPE", "order", "STATE", "queued"),
+        ("FERRICSTORE.TELEMETRY", "FLOW_HISTORY", "f1", "INCLUDE", "metadata"),
+    ]
+
+
 def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     executor = FakeExecutor()
     client = FlowClient(executor)
+
+    search_results = client.search(
+        "order",
+        state="queued",
+        count=10,
+        attributes={"tenant": "acme"},
+        state_meta={"version": 1},
+        terminal_only=True,
+        consistent_projection=True,
+    )
+    assert search_results[0].id == "f1"
+    assert executor.calls[-1] == (
+        "FLOW.SEARCH",
+        "order",
+        "COUNT",
+        10,
+        "STATE",
+        "queued",
+        "TERMINAL_ONLY",
+        "true",
+        "CONSISTENT_PROJECTION",
+        "true",
+        "ATTRIBUTE",
+        "tenant",
+        "acme",
+        "STATE_META",
+        "queued",
+        {"version": 1},
+    )
 
     assert client.attributes("order", state="queued", count=10) == [{"name": "tenant", "count": 3}]
     assert executor.calls[-1] == ("FLOW.ATTRIBUTES", "order", "STATE", "queued", "COUNT", 10)

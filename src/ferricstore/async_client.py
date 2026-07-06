@@ -19,12 +19,15 @@ from ferricstore.client import (
     _append_named_values,
     _append_payload_read,
     _append_read_options,
+    _append_search_state_meta,
     _append_state_meta,
     _append_value_return,
     _auto_partition_key_for_id,
     _expand_many_response,
     _flow_return,
     _has_named_item_values,
+    _management_pair_args,
+    _management_rule_args,
     _merge_named_map,
     _normalize_admin_response,
     _now_ms,
@@ -232,6 +235,29 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
             backpressure=backpressure,
         )
 
+    @classmethod
+    def from_urls(
+        cls,
+        urls: Sequence[str],
+        *,
+        codec: Codec | None = None,
+        backpressure: BackpressurePolicy | None = None,
+        **kwargs: Any,
+    ) -> AsyncFlowClient:
+        if not urls:
+            raise ValueError("FerricStore SDK requires at least one URL")
+        for url in urls:
+            if urlparse(url).scheme.lower() not in {"ferric", "ferrics"}:
+                raise ValueError("FerricStore SDK URLs must use ferric:// or ferrics://")
+
+        from ferricstore.protocol import AsyncProtocolAdapterPool
+
+        return cls(
+            AsyncProtocolAdapterPool.from_urls(list(urls), **kwargs),
+            codec=codec,
+            backpressure=backpressure,
+        )
+
     async def close(self) -> None:
         close = getattr(self.executor, "close", None)
         if callable(close):
@@ -258,6 +284,24 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         if name == "MULTI":
             self._transaction_mode = True
 
+        return result
+
+    async def refresh_topology(self) -> Any:
+        refresh = getattr(self.executor, "refresh_topology", None)
+        if not callable(refresh):
+            raise RuntimeError("topology refresh requires a topology-aware protocol executor")
+        result = refresh()
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    async def route(self, key: str | bytes) -> Any:
+        route = getattr(self.executor, "route", None)
+        if not callable(route):
+            raise RuntimeError("route lookup requires a topology-aware protocol executor")
+        result = route(key)
+        if inspect.isawaitable(result):
+            return await result
         return result
 
     def pipeline(self) -> AsyncCommandPipeline:
@@ -448,6 +492,147 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
 
     async def ferricstore_blobgc(self, *args: Any) -> Any:
         return await self.executor.execute_command("FERRICSTORE.BLOBGC", *args)
+
+    async def capabilities(self) -> dict[str, Any]:
+        return cast(
+            dict[str, Any],
+            _normalize_admin_response(
+                await self.executor.execute_command("FERRICSTORE.CAPABILITIES")
+            ),
+        )
+
+    async def acl_set_user(self, username: str, rules: Sequence[Any] | Any) -> Any:
+        return _normalize_admin_response(
+            await self.executor.execute_command(
+                "ACL",
+                "SETUSER",
+                username,
+                *_management_rule_args(rules),
+            )
+        )
+
+    async def acl_del_user(self, username: str) -> Any:
+        return _normalize_admin_response(
+            await self.executor.execute_command("ACL", "DELUSER", username)
+        )
+
+    async def acl_get_user(self, username: str) -> Any:
+        return _normalize_admin_response(
+            await self.executor.execute_command("ACL", "GETUSER", username)
+        )
+
+    async def acl_list_users(self) -> Any:
+        return _normalize_admin_response(await self.executor.execute_command("ACL", "LIST"))
+
+    async def acl_save(self) -> Any:
+        return _normalize_admin_response(await self.executor.execute_command("ACL", "SAVE"))
+
+    async def ensure_namespace(
+        self,
+        prefix: str,
+        attrs: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        return _normalize_admin_response(
+            await self.executor.execute_command(
+                "FERRICSTORE.NAMESPACE",
+                "ENSURE",
+                prefix,
+                *_management_pair_args(attrs, kwargs),
+            )
+        )
+
+    async def get_namespace(self, prefix: str) -> Any:
+        return _normalize_admin_response(
+            await self.executor.execute_command("FERRICSTORE.NAMESPACE", "GET", prefix)
+        )
+
+    async def list_namespaces(self) -> Any:
+        return _normalize_admin_response(
+            await self.executor.execute_command("FERRICSTORE.NAMESPACE", "LIST")
+        )
+
+    async def delete_namespace(self, prefix: str) -> Any:
+        return _normalize_admin_response(
+            await self.executor.execute_command("FERRICSTORE.NAMESPACE", "DELETE", prefix)
+        )
+
+    async def set_quota(
+        self,
+        namespace: str,
+        quota_spec: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        return _normalize_admin_response(
+            await self.executor.execute_command(
+                "FERRICSTORE.QUOTA",
+                "SET",
+                namespace,
+                *_management_pair_args(quota_spec, kwargs),
+            )
+        )
+
+    async def get_quota(self, namespace: str) -> Any:
+        return _normalize_admin_response(
+            await self.executor.execute_command("FERRICSTORE.QUOTA", "GET", namespace)
+        )
+
+    async def quota_usage(self, namespace: str) -> Any:
+        return _normalize_admin_response(
+            await self.executor.execute_command("FERRICSTORE.QUOTA", "USAGE", namespace)
+        )
+
+    async def cluster_info(self) -> dict[str, Any]:
+        return cast(
+            dict[str, Any],
+            _normalize_admin_response(
+                await self.executor.execute_command("FERRICSTORE.TELEMETRY", "CLUSTER_INFO")
+            ),
+        )
+
+    async def namespace_usage(self, prefix: str) -> dict[str, Any]:
+        return cast(
+            dict[str, Any],
+            _normalize_admin_response(
+                await self.executor.execute_command(
+                    "FERRICSTORE.TELEMETRY", "NAMESPACE_USAGE", prefix
+                )
+            ),
+        )
+
+    async def flow_query(
+        self,
+        attrs: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> builtins.list[Any]:
+        return cast(
+            builtins.list[Any],
+            _normalize_admin_response(
+                await self.executor.execute_command(
+                    "FERRICSTORE.TELEMETRY",
+                    "FLOW_QUERY",
+                    *_management_pair_args(attrs, kwargs),
+                )
+            ),
+        )
+
+    async def flow_history(
+        self,
+        id: str,
+        attrs: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> builtins.list[Any]:
+        return cast(
+            builtins.list[Any],
+            _normalize_admin_response(
+                await self.executor.execute_command(
+                    "FERRICSTORE.TELEMETRY",
+                    "FLOW_HISTORY",
+                    id,
+                    *_management_pair_args(attrs, kwargs),
+                )
+            ),
+        )
 
     async def create(
         self,
@@ -1653,6 +1838,39 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         _append_attributes(args, attributes=attributes)
         _append_bool(args, "INCLUDE_COLD", include_cold)
         _append_bool(args, "CONSISTENT_PROJECTION", consistent_projection)
+        return self._records(await self.executor.execute_command(*args))
+
+    async def search(
+        self,
+        type: str,
+        *,
+        state: str | None = None,
+        partition_key: str | None = None,
+        count: int | None = None,
+        from_ms: int | None = None,
+        to_ms: int | None = None,
+        rev: bool | None = None,
+        attributes: dict[str, Any] | None = None,
+        state_meta: dict[str, Any] | None = None,
+        terminal_only: bool | None = None,
+        include_cold: bool | None = None,
+        consistent_projection: bool | None = None,
+    ) -> builtins.list[FlowRecord]:
+        args: builtins.list[Any] = ["FLOW.SEARCH", type]
+        _append_read_options(
+            args,
+            state=state,
+            partition_key=partition_key,
+            count=count,
+            from_ms=from_ms,
+            to_ms=to_ms,
+            rev=rev,
+            terminal_only=terminal_only,
+            include_cold=include_cold,
+            consistent_projection=consistent_projection,
+        )
+        _append_attributes(args, attributes=attributes)
+        _append_search_state_meta(args, state, state_meta)
         return self._records(await self.executor.execute_command(*args))
 
     async def stats(

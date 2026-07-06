@@ -1,9 +1,14 @@
 services:
   ferricstore:
-    image: ${FERRICSTORE_IMAGE:-ghcr.io/ferricstore/ferricstore:0.7.0}
+    image: ${FERRICSTORE_IMAGE:-ghcr.io/ferricstore/ferricstore:0.7.2}
     environment:
       FERRICSTORE_PROTECTED_MODE: "false"
       FERRICSTORE_SHARD_COUNT: "${FERRICSTORE_SHARD_COUNT:-4}"
+      FERRICSTORE_NATIVE_ENABLED: "true"
+      FERRICSTORE_NATIVE_BIND: "0.0.0.0"
+      FERRICSTORE_NATIVE_PORT: "6388"
+      FERRICSTORE_NATIVE_ADVERTISE_HOST: "${FERRICSTORE_NATIVE_ADVERTISE_HOST:-127.0.0.1}"
+      FERRICSTORE_NATIVE_ADVERTISE_PORT: "${FERRICSTORE_NATIVE_ADVERTISE_PORT:-6388}"
     ports:
       - "${FERRICSTORE_PORT:-6388}:6388"
     volumes:

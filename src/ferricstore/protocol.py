@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import socket
 import ssl
 import struct
 import threading
 import time
 import zlib
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, replace
@@ -87,6 +88,8 @@ _I64_MIN = -(1 << 63)
 _DEFAULT_PROTOCOL_LANES = 8
 _DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 _DEFAULT_MAX_DECOMPRESSED_RESPONSE_BYTES = 128 * 1024 * 1024
+_ROUTE_SLOT_COUNT = 1024
+_ROUTE_SLOT_MASK = _ROUTE_SLOT_COUNT - 1
 _COMPACT_HGET_PIPELINE_MODE = 18
 _COMPACT_SISMEMBER_PIPELINE_MODE = 19
 _COMPACT_LRANGE_PIPELINE_MODE = 20
@@ -162,6 +165,8 @@ _TLS_SCHEMES = {"ferrics"}
 _SUPPORTED_SCHEMES = _PLAIN_SCHEMES | _TLS_SCHEMES
 
 _OPCODES = {
+    "HELLO": 0x0001,
+    "AUTH": 0x0002,
     "PING": 0x0003,
     "CLIENT.SETNAME": 0x0004,
     "CLIENT.INFO": 0x0005,
@@ -169,8 +174,13 @@ _OPCODES = {
     "SHARDS": 0x0007,
     "BACKPRESSURE": 0x0008,
     "QUIT": 0x0009,
+    "GOAWAY": 0x000A,
     "OPTIONS": 0x000B,
+    "STARTUP": 0x000C,
+    "WINDOW_UPDATE": 0x000D,
     "PIPELINE": _OP_PIPELINE,
+    "ROUTE_BATCH": 0x000F,
+    "EVENT": 0x0010,
     "SUBSCRIBE_EVENTS": _OP_SUBSCRIBE_EVENTS,
     "UNSUBSCRIBE_EVENTS": _OP_UNSUBSCRIBE_EVENTS,
     "COMMAND_EXEC": _OP_COMMAND_EXEC,
@@ -267,6 +277,7 @@ _OPCODES = {
     "FLOW.STATS": 0x022D,
     "FLOW.ATTRIBUTES": 0x022E,
     "FLOW.ATTRIBUTE_VALUES": 0x022F,
+    "FLOW.SEARCH": 0x0230,
     "FLOW.EFFECT.RESERVE": 0x0240,
     "FLOW.EFFECT.CONFIRM": 0x0241,
     "FLOW.EFFECT.FAIL": 0x0242,
@@ -488,6 +499,120 @@ class ProtocolResponse:
     status: int
     value: Any
     trace: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RoutingTopology:
+    route_epoch: int
+    shard_count: int
+    slots: tuple[dict[str, Any] | None, ...]
+    endpoints: dict[tuple[str, int], dict[str, Any]]
+
+    @classmethod
+    def empty(cls) -> RoutingTopology:
+        return cls(
+            route_epoch=0,
+            shard_count=0,
+            slots=tuple([None] * _ROUTE_SLOT_COUNT),
+            endpoints={},
+        )
+
+    @classmethod
+    def build(cls, payload: Mapping[Any, Any]) -> RoutingTopology:
+        ranges = _map_get(payload, "ranges")
+        if not isinstance(ranges, list):
+            raise FerricStoreError("invalid SHARDS topology payload", raw=payload)
+
+        slots: list[dict[str, Any] | None] = [None] * _ROUTE_SLOT_COUNT
+        endpoints: dict[tuple[str, int], dict[str, Any]] = {}
+
+        for item in ranges:
+            if not isinstance(item, Mapping):
+                raise FerricStoreError("invalid SHARDS range", raw=item)
+            if _text_or_none(_map_get(item, "hint")) == "leader_unknown":
+                raise FerricStoreError("SHARDS range has no leader", raw=item)
+
+            first = _int_or_none(_map_get(item, "first_slot"))
+            last = _int_or_none(_map_get(item, "last_slot"))
+            shard = _int_or_none(_map_get(item, "shard"))
+            lane_id = _int_or_none(_map_get(item, "lane_id"))
+            endpoint = cls._endpoint_from_range(item)
+
+            if (
+                first is None
+                or last is None
+                or shard is None
+                or lane_id is None
+                or first < 0
+                or last < first
+                or last >= _ROUTE_SLOT_COUNT
+            ):
+                raise FerricStoreError("invalid SHARDS range", raw=item)
+
+            endpoint_key = cls.endpoint_key(endpoint)
+            route = {
+                "shard": shard,
+                "lane_id": lane_id,
+                "endpoint_key": endpoint_key,
+                "endpoint": endpoint,
+                "leader_node": endpoint["node"],
+            }
+            for slot in range(first, last + 1):
+                slots[slot] = route
+            endpoints[endpoint_key] = endpoint
+
+        return cls(
+            route_epoch=_int_or_none(_map_get(payload, "route_epoch")) or 0,
+            shard_count=_int_or_none(_map_get(payload, "shard_count")) or 0,
+            slots=tuple(slots),
+            endpoints=endpoints,
+        )
+
+    @staticmethod
+    def endpoint_key(endpoint: Mapping[str, Any]) -> tuple[str, int]:
+        host = _text_or_none(_map_get(endpoint, "host", "native_host"))
+        port = _int_or_none(_map_get(endpoint, "native_port"))
+        if host is None or port is None:
+            raise FerricStoreError("invalid FerricStore endpoint", raw=endpoint)
+        return (host, port)
+
+    @staticmethod
+    def slot_for_key(key: str | bytes) -> int:
+        text = key.decode() if isinstance(key, bytes) else str(key)
+        if text.startswith("f:{"):
+            hash_input = _flow_hash_tag(text[3:], text)
+        elif text.startswith("X:f:{"):
+            hash_input = _flow_hash_tag(text[5:], text)
+        else:
+            hash_input = _hash_tag_or_key(text)
+        return zlib.crc32(hash_input.encode()) & _ROUTE_SLOT_MASK
+
+    def route_key(self, key: str | bytes) -> dict[str, Any]:
+        slot = self.slot_for_key(key)
+        route = self.slots[slot]
+        if route is None:
+            raise FerricStoreError(f"no route for slot {slot}")
+        result = dict(route)
+        result["slot"] = slot
+        return result
+
+    @classmethod
+    def _endpoint_from_range(cls, item: Mapping[Any, Any]) -> dict[str, Any]:
+        endpoint = _map_get(item, "endpoint")
+        raw = endpoint if isinstance(endpoint, Mapping) else item
+        host = _text_or_none(_map_get(raw, "host", "native_host"))
+        port = _int_or_none(_map_get(raw, "native_port"))
+        if host is None or port is None:
+            raise FerricStoreError("invalid SHARDS endpoint", raw=item)
+        result = {
+            "node": _text_or_none(_map_get(raw, "node", "leader_node", "owner_node")) or host,
+            "host": host,
+            "native_port": port,
+        }
+        tls_port = _int_or_none(_map_get(raw, "native_tls_port"))
+        if tls_port is not None:
+            result["native_tls_port"] = tls_port
+        return result
 
 
 def _pipeline_frame_supported(commands: list[ProtocolCommand]) -> bool:
@@ -2492,11 +2617,25 @@ class ProtocolAdapterPool:
         self._cursor = 0
 
     @classmethod
-    def from_url(cls, url: str, **kwargs: Any) -> ProtocolAdapterPool | ProtocolAdapter:
+    def from_url(
+        cls, url: str, **kwargs: Any
+    ) -> ProtocolAdapterPool | ProtocolAdapter | TopologyProtocolAdapterPool:
+        seeds = kwargs.pop("seeds", None)
+        ha_routing = bool(kwargs.pop("ha_routing", False))
+        if seeds is not None or ha_routing:
+            urls = [url]
+            if seeds is not None:
+                urls.extend(list(seeds))
+            return cls.from_urls(urls, **kwargs)
+
         max_connections = int(kwargs.pop("max_connections", 1) or 1)
         if max_connections <= 1:
             return ProtocolAdapter.from_url(url, **kwargs)
         return cls([ProtocolAdapter.from_url(url, **kwargs) for _ in range(max_connections)])
+
+    @classmethod
+    def from_urls(cls, urls: Sequence[str], **kwargs: Any) -> TopologyProtocolAdapterPool:
+        return TopologyProtocolAdapterPool(list(urls), **kwargs)
 
     @property
     def events(self) -> list[Any]:
@@ -2578,6 +2717,334 @@ class ProtocolAdapterPool:
             adapter = self.adapters[self._cursor % len(self.adapters)]
             self._cursor += 1
             return adapter
+
+
+class TopologyProtocolAdapterPool:
+    """Topology-aware native pool backed by the server SHARDS slot table."""
+
+    client: TopologyProtocolAdapterPool
+
+    def __init__(
+        self,
+        urls: Sequence[str],
+        *,
+        endpoint_policy: str | tuple[str, Sequence[str]] = "seed_hosts",
+        trusted_hosts: Sequence[str] | None = None,
+        endpoint_validator: Callable[[Mapping[str, Any]], bool | None] | None = None,
+        warm_connections: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        if not urls:
+            raise ValueError("TopologyProtocolAdapterPool requires at least one seed URL")
+        self.seed_urls = list(urls)
+        self.client = self
+        self.endpoint_policy = endpoint_policy
+        self.endpoint_validator = endpoint_validator
+        self.warm_connections = warm_connections
+        self._tls = bool(kwargs.get("tls")) or any(
+            urlparse(url).scheme.lower() in _TLS_SCHEMES for url in self.seed_urls
+        )
+        self._adapter_kwargs = dict(kwargs)
+        _set_seed_auth_defaults(self.seed_urls, self._adapter_kwargs)
+        self._seed_endpoint_keys = {
+            RoutingTopology.endpoint_key(_endpoint_from_url(url)) for url in self.seed_urls
+        }
+        self._trusted_hosts = _normalized_host_set(list(trusted_hosts or []))
+        self._adapters: dict[tuple[str, int], Any] = {}
+        self._lock = threading.RLock()
+        self.topology = RoutingTopology.empty()
+        self.refresh_topology()
+
+    @property
+    def events(self) -> list[Any]:
+        events: list[Any] = []
+        for adapter in list(self._adapters.values()):
+            adapter_events = getattr(adapter, "events", [])
+            events.extend(adapter_events)
+        return events
+
+    def wait_event(self, timeout: float | None = None) -> Any | None:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            for adapter in list(self._adapters.values()):
+                wait_event = getattr(adapter, "wait_event", None)
+                if not callable(wait_event):
+                    continue
+                event = wait_event(timeout=0.0)
+                if event is not None:
+                    return event
+            if timeout == 0.0:
+                return None
+            wait_for = 0.05
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                wait_for = min(wait_for, remaining)
+            time.sleep(wait_for)
+
+    def close(self) -> None:
+        for adapter in list(self._adapters.values()):
+            close = getattr(adapter, "close", None)
+            if callable(close):
+                close()
+
+    def pipeline(self, transaction: bool = False) -> ProtocolPipeline:
+        if transaction:
+            raise InvalidCommandError("protocol pipeline does not support transaction mode")
+        return ProtocolPipeline(self)
+
+    def refresh_topology(self) -> RoutingTopology:
+        last_error: BaseException | None = None
+        with self._lock:
+            for url in self._refresh_candidate_urls():
+                try:
+                    adapter = self._adapter_for_url(url)
+                    topology = RoutingTopology.build(adapter.execute_command("SHARDS"))
+                    self.topology = topology
+                    if self.warm_connections:
+                        for endpoint in topology.endpoints.values():
+                            with contextlib.suppress(Exception):
+                                self._adapter_for_endpoint(endpoint)
+                    return topology
+                except Exception as exc:
+                    last_error = exc
+                    continue
+        raise FerricStoreError("no FerricStore topology endpoint reachable", raw=last_error)
+
+    def route(self, key: str | bytes) -> dict[str, Any]:
+        route = self.topology.route_key(key)
+        self._validate_endpoint(route["endpoint"])
+        return route
+
+    def execute_command(self, *args: Any) -> Any:
+        route_data = self._route_data(args)
+        if route_data is None:
+            return self._control_adapter().execute_command(*args)
+
+        command, route = route_data
+        adapter = self._adapter_for_endpoint(route["endpoint"])
+        try:
+            return self._execute_protocol_command(adapter, command, route["lane_id"], args)
+        except Exception as exc:
+            if _is_retryable_route_error(exc):
+                with contextlib.suppress(Exception):
+                    self.refresh_topology()
+            raise
+
+    def execute_command_with_trace(self, *args: Any) -> dict[str, Any]:
+        route_data = self._route_data(args)
+        if route_data is None:
+            return cast(dict[str, Any], self._control_adapter().execute_command_with_trace(*args))
+
+        command, route = route_data
+        adapter = self._adapter_for_endpoint(route["endpoint"])
+        if not hasattr(adapter, "_request"):
+            execute_with_trace = getattr(adapter, "execute_command_with_trace", None)
+            if callable(execute_with_trace):
+                return cast(dict[str, Any], execute_with_trace(*args))
+            return {"value": adapter.execute_command(*args), "trace": {}}
+        try:
+            response = adapter._request(
+                command.opcode,
+                int(route["lane_id"]),
+                command.payload,
+                command.flags | _FLAG_TRACE,
+            )
+            return {"value": adapter._response_value(response), "trace": response.trace or {}}
+        except Exception as exc:
+            if _is_retryable_route_error(exc):
+                with contextlib.suppress(Exception):
+                    self.refresh_topology()
+            raise
+
+    def submit_command(self, *args: Any) -> Future[Any]:
+        route_data = self._route_data(args)
+        if route_data is None:
+            return cast(Future[Any], self._control_adapter().submit_command(*args))
+
+        command, route = route_data
+        adapter = self._adapter_for_endpoint(route["endpoint"])
+        if hasattr(adapter, "_submit_request") and hasattr(adapter, "_value_future"):
+            _request_id, response_future = adapter._submit_request(
+                command.opcode,
+                int(route["lane_id"]),
+                command.payload,
+                command.flags,
+            )
+            return cast(Future[Any], adapter._value_future(response_future))
+        return cast(Future[Any], adapter.submit_command(*args))
+
+    def submit_commands(self, commands: list[tuple[Any, ...]]) -> list[Future[Any]]:
+        return [self.submit_command(*command) for command in commands]
+
+    def submit_batch(self, commands: list[tuple[Any, ...]]) -> Future[list[Any]]:
+        return cast(Future[list[Any]], self._control_adapter().submit_batch(commands))
+
+    def submit_mget(self, keys: Sequence[Any]) -> Future[Any]:
+        adapter = self._adapter_for_keys(keys) or self._control_adapter()
+        return cast(Future[Any], adapter.submit_mget(keys))
+
+    def submit_mset_same_value(self, keys: Sequence[Any], value: Any) -> Future[Any]:
+        adapter = self._adapter_for_keys(keys) or self._control_adapter()
+        return cast(Future[Any], adapter.submit_mset_same_value(keys, value))
+
+    def submit_mset_payload(self, payload: bytes) -> Future[Any]:
+        return cast(Future[Any], self._control_adapter().submit_mset_payload(payload))
+
+    def submit_pipeline_payload(self, payload: bytes, count: int) -> Future[list[Any]]:
+        return cast(
+            Future[list[Any]],
+            self._control_adapter().submit_pipeline_payload(payload, count),
+        )
+
+    def submit_flow_many_payload(
+        self, command: str, payload: bytes, count: int
+    ) -> Future[list[Any]]:
+        return cast(
+            Future[list[Any]],
+            self._control_adapter().submit_flow_many_payload(command, payload, count),
+        )
+
+    def submit_flow_value_mget_payload(self, payload: bytes) -> Future[Any]:
+        return cast(Future[Any], self._control_adapter().submit_flow_value_mget_payload(payload))
+
+    def subscribe_flow_wake(self, *args: Any, **kwargs: Any) -> Any:
+        replies = []
+        for adapter in list(self._adapters.values()) or [self._control_adapter()]:
+            subscribe = getattr(adapter, "subscribe_flow_wake", None)
+            if callable(subscribe):
+                replies.append(subscribe(*args, **kwargs))
+        return replies[0] if len(replies) == 1 else replies
+
+    def execute_batch(self, commands: list[tuple[Any, ...]]) -> list[Any]:
+        return cast(list[Any], self._control_adapter().execute_batch(commands))
+
+    def _execute_protocol_command(
+        self, adapter: Any, command: ProtocolCommand, lane_id: int, args: tuple[Any, ...]
+    ) -> Any:
+        if not hasattr(adapter, "_request") or not hasattr(adapter, "_response_value"):
+            return adapter.execute_command(*args)
+        response = adapter._request(command.opcode, int(lane_id), command.payload, command.flags)
+        return adapter._response_value(response)
+
+    def _route_data(self, args: tuple[Any, ...]) -> tuple[ProtocolCommand, dict[str, Any]] | None:
+        if not args:
+            return None
+        try:
+            command = build_protocol_command(*args)
+        except Exception:
+            return None
+        key = self._routing_key(args, command)
+        if key is None:
+            return None
+        return command, self.route(key)
+
+    def _routing_key(self, args: tuple[Any, ...], command: ProtocolCommand) -> str | bytes | None:
+        name = _command_name(args[0])
+        if command.opcode in _CONTROL_OPCODES or name in {"CLUSTER.KEYSLOT", "SHARDS", "ROUTE"}:
+            return None
+        if name in {"MGET", "DEL"}:
+            return self._single_shard_key(args[1:])
+        if name == "MSET":
+            return self._single_shard_key(args[1::2])
+        if not isinstance(command.payload, Mapping):
+            return None
+        for field in (
+            "key",
+            "partition_key",
+            "id",
+            "owner_flow_id",
+            "parent_id",
+            "root_id",
+            "correlation_id",
+            "scope",
+        ):
+            value = _map_get(command.payload, field)
+            if isinstance(value, (str, bytes)):
+                return value
+        keys = _map_get(command.payload, "keys")
+        if isinstance(keys, list):
+            return self._single_shard_key(keys)
+        pairs = _map_get(command.payload, "pairs")
+        if isinstance(pairs, list):
+            return self._single_shard_key(
+                [pair[0] for pair in pairs if isinstance(pair, list) and pair]
+            )
+        return None
+
+    def _single_shard_key(self, keys: Sequence[Any]) -> str | bytes | None:
+        usable = [key for key in keys if isinstance(key, (str, bytes))]
+        if not usable:
+            return None
+        first_slot = RoutingTopology.slot_for_key(usable[0])
+        if all(RoutingTopology.slot_for_key(key) == first_slot for key in usable[1:]):
+            return usable[0]
+        return None
+
+    def _adapter_for_keys(self, keys: Sequence[Any]) -> Any | None:
+        key = self._single_shard_key(keys)
+        if key is None:
+            return None
+        route = self.route(key)
+        return self._adapter_for_endpoint(route["endpoint"])
+
+    def _control_adapter(self) -> Any:
+        for url in self._refresh_candidate_urls():
+            with contextlib.suppress(Exception):
+                return self._adapter_for_url(url)
+        return self._adapter_for_url(self.seed_urls[0])
+
+    def _adapter_for_url(self, url: str) -> Any:
+        endpoint = _endpoint_from_url(url)
+        key = (endpoint["host"], endpoint["native_port"])
+        adapter = self._adapters.get(key)
+        if adapter is None:
+            adapter = ProtocolAdapter.from_url(url, **self._adapter_kwargs)
+            self._adapters[key] = adapter
+        return adapter
+
+    def _adapter_for_endpoint(self, endpoint: Mapping[str, Any]) -> Any:
+        self._validate_endpoint(endpoint)
+        key = RoutingTopology.endpoint_key(endpoint)
+        adapter = self._adapters.get(key)
+        if adapter is None:
+            adapter = ProtocolAdapter.from_url(
+                _url_from_endpoint(endpoint, tls=self._tls),
+                **self._adapter_kwargs,
+            )
+            self._adapters[key] = adapter
+        return adapter
+
+    def _validate_endpoint(self, endpoint: Mapping[str, Any]) -> None:
+        host = _text_or_none(_map_get(endpoint, "host", "native_host"))
+        if host is None:
+            raise FerricStoreError("invalid learned endpoint", raw=endpoint)
+        allowed = False
+        policy = self.endpoint_policy
+        if policy in {"any", "none"}:
+            allowed = True
+        elif policy == "seed_hosts":
+            allowed = (
+                RoutingTopology.endpoint_key(endpoint) in self._seed_endpoint_keys
+                or host.lower() in self._trusted_hosts
+            )
+        elif isinstance(policy, tuple) and len(policy) == 2 and policy[0] == "allow_hosts":
+            allowed = host.lower() in _normalized_host_set(policy[1])
+        else:
+            raise FerricStoreError(f"invalid endpoint_policy {policy!r}")
+        if not allowed:
+            raise FerricStoreError("unsafe learned endpoint", raw=endpoint)
+        if self.endpoint_validator is not None and not self.endpoint_validator(endpoint):
+            raise FerricStoreError("unsafe learned endpoint", raw=endpoint)
+
+    def _refresh_candidate_urls(self) -> list[str]:
+        urls = list(self.seed_urls)
+        urls.extend(
+            _url_from_endpoint(endpoint, tls=self._tls)
+            for endpoint in self.topology.endpoints.values()
+        )
+        return list(dict.fromkeys(urls))
 
 
 class ProtocolPipeline:
@@ -3133,6 +3600,294 @@ class AsyncProtocolAdapter:
         return replace(response, trace=trace)
 
 
+class AsyncTopologyProtocolAdapterPool:
+    """Async topology-aware native pool backed by the server SHARDS slot table."""
+
+    client: AsyncTopologyProtocolAdapterPool
+
+    def __init__(
+        self,
+        urls: Sequence[str],
+        *,
+        endpoint_policy: str | tuple[str, Sequence[str]] = "seed_hosts",
+        trusted_hosts: Sequence[str] | None = None,
+        endpoint_validator: Callable[[Mapping[str, Any]], bool | None] | None = None,
+        warm_connections: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        if not urls:
+            raise ValueError("AsyncTopologyProtocolAdapterPool requires at least one seed URL")
+        self.seed_urls = list(urls)
+        self.client = self
+        self.endpoint_policy = endpoint_policy
+        self.endpoint_validator = endpoint_validator
+        self.warm_connections = warm_connections
+        self._tls = bool(kwargs.get("tls")) or any(
+            urlparse(url).scheme.lower() in _TLS_SCHEMES for url in self.seed_urls
+        )
+        self._adapter_kwargs = dict(kwargs)
+        _set_seed_auth_defaults(self.seed_urls, self._adapter_kwargs)
+        self._seed_endpoint_keys = {
+            RoutingTopology.endpoint_key(_endpoint_from_url(url)) for url in self.seed_urls
+        }
+        self._trusted_hosts = _normalized_host_set(list(trusted_hosts or []))
+        self._adapters: dict[tuple[str, int], Any] = {}
+        self._lock = asyncio.Lock()
+        self.topology = RoutingTopology.empty()
+
+    @property
+    def events(self) -> list[Any]:
+        events: list[Any] = []
+        for adapter in list(self._adapters.values()):
+            events.extend(getattr(adapter, "events", []))
+        return events
+
+    async def wait_event(self, timeout: float | None = None) -> Any | None:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            for adapter in list(self._adapters.values()):
+                wait_event = getattr(adapter, "wait_event", None)
+                if not callable(wait_event):
+                    continue
+                event = await wait_event(timeout=0.0)
+                if event is not None:
+                    return event
+            if timeout == 0.0:
+                return None
+            wait_for = 0.05
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                wait_for = min(wait_for, remaining)
+            await asyncio.sleep(wait_for)
+
+    async def close(self) -> None:
+        await asyncio.gather(
+            *(
+                adapter.close()
+                for adapter in list(self._adapters.values())
+                if callable(getattr(adapter, "close", None))
+            ),
+            return_exceptions=True,
+        )
+
+    def pipeline(self, transaction: bool = False) -> AsyncProtocolPipeline:
+        if transaction:
+            raise InvalidCommandError("protocol pipeline does not support transaction mode")
+        return AsyncProtocolPipeline(self)
+
+    async def refresh_topology(self) -> RoutingTopology:
+        last_error: BaseException | None = None
+        async with self._lock:
+            for url in self._refresh_candidate_urls():
+                try:
+                    adapter = self._adapter_for_url(url)
+                    topology = RoutingTopology.build(await adapter.execute_command("SHARDS"))
+                    self.topology = topology
+                    if self.warm_connections:
+                        await asyncio.gather(
+                            *(
+                                self._safe_warm_endpoint(endpoint)
+                                for endpoint in topology.endpoints.values()
+                            ),
+                            return_exceptions=True,
+                        )
+                    return topology
+                except Exception as exc:
+                    last_error = exc
+                    continue
+        raise FerricStoreError("no FerricStore topology endpoint reachable", raw=last_error)
+
+    async def route(self, key: str | bytes) -> dict[str, Any]:
+        if not self.topology.endpoints:
+            await self.refresh_topology()
+        route = self.topology.route_key(key)
+        self._validate_endpoint(route["endpoint"])
+        return route
+
+    async def execute_command(self, *args: Any) -> Any:
+        route_data = await self._route_data(args)
+        if route_data is None:
+            return await self._control_adapter().execute_command(*args)
+
+        command, route = route_data
+        adapter = self._adapter_for_endpoint(route["endpoint"])
+        try:
+            return await self._execute_protocol_command(adapter, command, route["lane_id"], args)
+        except Exception as exc:
+            if _is_retryable_route_error(exc):
+                with contextlib.suppress(Exception):
+                    await self.refresh_topology()
+            raise
+
+    async def execute_command_with_trace(self, *args: Any) -> dict[str, Any]:
+        route_data = await self._route_data(args)
+        if route_data is None:
+            return cast(
+                dict[str, Any],
+                await self._control_adapter().execute_command_with_trace(*args),
+            )
+
+        command, route = route_data
+        adapter = self._adapter_for_endpoint(route["endpoint"])
+        if not hasattr(adapter, "_request"):
+            execute_with_trace = getattr(adapter, "execute_command_with_trace", None)
+            if callable(execute_with_trace):
+                return cast(dict[str, Any], await execute_with_trace(*args))
+            return {"value": await adapter.execute_command(*args), "trace": {}}
+        try:
+            response = await adapter._request(
+                command.opcode,
+                int(route["lane_id"]),
+                command.payload,
+                command.flags | _FLAG_TRACE,
+            )
+            return {"value": adapter._response_value(response), "trace": response.trace or {}}
+        except Exception as exc:
+            if _is_retryable_route_error(exc):
+                with contextlib.suppress(Exception):
+                    await self.refresh_topology()
+            raise
+
+    async def execute_batch(self, commands: list[tuple[Any, ...]]) -> list[Any]:
+        return cast(list[Any], await self._control_adapter().execute_batch(commands))
+
+    async def _execute_protocol_command(
+        self, adapter: Any, command: ProtocolCommand, lane_id: int, args: tuple[Any, ...]
+    ) -> Any:
+        if not hasattr(adapter, "_request") or not hasattr(adapter, "_response_value"):
+            return await adapter.execute_command(*args)
+        response = await adapter._request(
+            command.opcode,
+            int(lane_id),
+            command.payload,
+            command.flags,
+        )
+        return adapter._response_value(response)
+
+    async def _route_data(
+        self, args: tuple[Any, ...]
+    ) -> tuple[ProtocolCommand, dict[str, Any]] | None:
+        if not args:
+            return None
+        try:
+            command = build_protocol_command(*args)
+        except Exception:
+            return None
+        key = self._routing_key(args, command)
+        if key is None:
+            return None
+        return command, await self.route(key)
+
+    def _routing_key(self, args: tuple[Any, ...], command: ProtocolCommand) -> str | bytes | None:
+        name = _command_name(args[0])
+        if command.opcode in _CONTROL_OPCODES or name in {"CLUSTER.KEYSLOT", "SHARDS", "ROUTE"}:
+            return None
+        if name in {"MGET", "DEL"}:
+            return self._single_shard_key(args[1:])
+        if name == "MSET":
+            return self._single_shard_key(args[1::2])
+        if not isinstance(command.payload, Mapping):
+            return None
+        for field in (
+            "key",
+            "partition_key",
+            "id",
+            "owner_flow_id",
+            "parent_id",
+            "root_id",
+            "correlation_id",
+            "scope",
+        ):
+            value = _map_get(command.payload, field)
+            if isinstance(value, (str, bytes)):
+                return value
+        keys = _map_get(command.payload, "keys")
+        if isinstance(keys, list):
+            return self._single_shard_key(keys)
+        pairs = _map_get(command.payload, "pairs")
+        if isinstance(pairs, list):
+            return self._single_shard_key(
+                [pair[0] for pair in pairs if isinstance(pair, list) and pair]
+            )
+        return None
+
+    def _single_shard_key(self, keys: Sequence[Any]) -> str | bytes | None:
+        usable = [key for key in keys if isinstance(key, (str, bytes))]
+        if not usable:
+            return None
+        first_slot = RoutingTopology.slot_for_key(usable[0])
+        if all(RoutingTopology.slot_for_key(key) == first_slot for key in usable[1:]):
+            return usable[0]
+        return None
+
+    def _control_adapter(self) -> Any:
+        for url in self._refresh_candidate_urls():
+            with contextlib.suppress(Exception):
+                return self._adapter_for_url(url)
+        return self._adapter_for_url(self.seed_urls[0])
+
+    def _adapter_for_url(self, url: str) -> Any:
+        endpoint = _endpoint_from_url(url)
+        key = (endpoint["host"], endpoint["native_port"])
+        adapter = self._adapters.get(key)
+        if adapter is None:
+            adapter = AsyncProtocolAdapter.from_url(url, **self._adapter_kwargs)
+            self._adapters[key] = adapter
+        return adapter
+
+    def _adapter_for_endpoint(self, endpoint: Mapping[str, Any]) -> Any:
+        self._validate_endpoint(endpoint)
+        key = RoutingTopology.endpoint_key(endpoint)
+        adapter = self._adapters.get(key)
+        if adapter is None:
+            adapter = AsyncProtocolAdapter.from_url(
+                _url_from_endpoint(endpoint, tls=self._tls),
+                **self._adapter_kwargs,
+            )
+            self._adapters[key] = adapter
+        return adapter
+
+    async def _safe_warm_endpoint(self, endpoint: Mapping[str, Any]) -> None:
+        adapter = self._adapter_for_endpoint(endpoint)
+        ensure_connected = getattr(adapter, "_ensure_connected", None)
+        if callable(ensure_connected):
+            result = ensure_connected()
+            if inspect.isawaitable(result):
+                await result
+
+    def _validate_endpoint(self, endpoint: Mapping[str, Any]) -> None:
+        host = _text_or_none(_map_get(endpoint, "host", "native_host"))
+        if host is None:
+            raise FerricStoreError("invalid learned endpoint", raw=endpoint)
+        allowed = False
+        policy = self.endpoint_policy
+        if policy in {"any", "none"}:
+            allowed = True
+        elif policy == "seed_hosts":
+            allowed = (
+                RoutingTopology.endpoint_key(endpoint) in self._seed_endpoint_keys
+                or host.lower() in self._trusted_hosts
+            )
+        elif isinstance(policy, tuple) and len(policy) == 2 and policy[0] == "allow_hosts":
+            allowed = host.lower() in _normalized_host_set(policy[1])
+        else:
+            raise FerricStoreError(f"invalid endpoint_policy {policy!r}")
+        if not allowed:
+            raise FerricStoreError("unsafe learned endpoint", raw=endpoint)
+        if self.endpoint_validator is not None and not self.endpoint_validator(endpoint):
+            raise FerricStoreError("unsafe learned endpoint", raw=endpoint)
+
+    def _refresh_candidate_urls(self) -> list[str]:
+        urls = list(self.seed_urls)
+        urls.extend(
+            _url_from_endpoint(endpoint, tls=self._tls)
+            for endpoint in self.topology.endpoints.values()
+        )
+        return list(dict.fromkeys(urls))
+
+
 class AsyncProtocolAdapterPool:
     """Small async protocol socket pool; each socket still multiplexes request lanes."""
 
@@ -3147,11 +3902,25 @@ class AsyncProtocolAdapterPool:
         self._cursor = 0
 
     @classmethod
-    def from_url(cls, url: str, **kwargs: Any) -> AsyncProtocolAdapterPool | AsyncProtocolAdapter:
+    def from_url(
+        cls, url: str, **kwargs: Any
+    ) -> AsyncProtocolAdapterPool | AsyncProtocolAdapter | AsyncTopologyProtocolAdapterPool:
+        seeds = kwargs.pop("seeds", None)
+        ha_routing = bool(kwargs.pop("ha_routing", False))
+        if seeds is not None or ha_routing:
+            urls = [url]
+            if seeds is not None:
+                urls.extend(list(seeds))
+            return cls.from_urls(urls, **kwargs)
+
         max_connections = int(kwargs.pop("max_connections", 1) or 1)
         if max_connections <= 1:
             return AsyncProtocolAdapter.from_url(url, **kwargs)
         return cls([AsyncProtocolAdapter.from_url(url, **kwargs) for _ in range(max_connections)])
+
+    @classmethod
+    def from_urls(cls, urls: Sequence[str], **kwargs: Any) -> AsyncTopologyProtocolAdapterPool:
+        return AsyncTopologyProtocolAdapterPool(list(urls), **kwargs)
 
     @property
     def events(self) -> list[Any]:
@@ -3230,6 +3999,8 @@ def build_protocol_command(*args: Any) -> ProtocolCommand:
         return ProtocolCommand(_OP_COMMAND_EXEC, {"command": raw_name, "args": list(args[2:])}, 1)
 
     if name in {
+        "HELLO",
+        "AUTH",
         "GET",
         "SET",
         "DEL",
@@ -3241,6 +4012,9 @@ def build_protocol_command(*args: Any) -> ProtocolCommand:
         "SHARDS",
         "BACKPRESSURE",
         "QUIT",
+        "STARTUP",
+        "WINDOW_UPDATE",
+        "ROUTE_BATCH",
         "CLIENT.SETNAME",
         "CLIENT.INFO",
         "CAS",
@@ -5154,6 +5928,14 @@ def _require_available(data: bytes, offset: int, size: int) -> None:
 
 def _build_basic_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolCommand:
     opcode = _OPCODES[name]
+    if name in {"HELLO", "STARTUP", "WINDOW_UPDATE"}:
+        return ProtocolCommand(opcode, _generic_option_map(args), 0)
+    if name == "AUTH":
+        payload = {
+            "username": _require_arg(args, 0, name),
+            "password": _require_arg(args, 1, name),
+        }
+        return ProtocolCommand(opcode, payload, 0)
     if name == "PING":
         payload = {"message": args[0]} if args else {}
         return ProtocolCommand(opcode, payload, 0)
@@ -5161,6 +5943,8 @@ def _build_basic_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolC
         return ProtocolCommand(opcode, {}, 0)
     if name == "ROUTE":
         return ProtocolCommand(opcode, {"key": _require_arg(args, 0, name)}, 0)
+    if name == "ROUTE_BATCH":
+        return ProtocolCommand(opcode, {"keys": list(args)}, 0)
     if name == "SHARDS":
         return ProtocolCommand(opcode, {}, 0)
     if name == "BACKPRESSURE":
@@ -5349,7 +6133,7 @@ def _build_basic_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolC
 
 def _build_flow_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolCommand:
     opcode = _OPCODES[name]
-    if _has_flow_command_only_option(args):
+    if _has_flow_command_only_option(name, args):
         return _command_exec_protocol_command(name, args)
     if name == "FLOW.CREATE":
         payload = {"id": _require_arg(args, 0, name)}
@@ -5483,6 +6267,11 @@ def _build_flow_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolCo
         }
         payload.update(_option_map(args[2:]))
         return ProtocolCommand(opcode, payload)
+    if name == "FLOW.SEARCH":
+        payload = {"type": _require_arg(args, 0, name)}
+        payload.update(_option_map(args[1:]))
+        _normalize_flow_search_state_meta_payload(payload)
+        return ProtocolCommand(opcode, payload)
     if name == "FLOW.VALUE.PUT":
         payload = {"value": _require_arg(args, 0, name)}
         payload.update(_option_map(args[1:]))
@@ -5552,8 +6341,26 @@ def _build_flow_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolCo
     raise InvalidCommandError(f"FerricStore protocol transport does not support command {name}")
 
 
-def _has_flow_command_only_option(args: tuple[Any, ...]) -> bool:
-    return any(_command_token(arg) in {"STATE_META", "INDEXED_STATE_META"} for arg in args)
+def _has_flow_command_only_option(name: str, args: tuple[Any, ...]) -> bool:
+    command_only_options = {"INDEXED_STATE_META"}
+    if name != "FLOW.SEARCH":
+        command_only_options.add("STATE_META")
+    return any(_command_token(arg) in command_only_options for arg in args)
+
+
+def _normalize_flow_search_state_meta_payload(payload: dict[str, Any]) -> None:
+    state_meta = payload.get("state_meta")
+    if not isinstance(state_meta, dict) or not state_meta:
+        return
+    if all(isinstance(value, dict) for value in state_meta.values()):
+        return
+
+    state = payload.get("state")
+    if state is None:
+        raise InvalidCommandError(
+            "FLOW.SEARCH STATE_META filters require STATE or nested state metadata"
+        )
+    payload["state_meta"] = {_text(state): state_meta}
 
 
 def _command_exec_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolCommand:
@@ -5679,6 +6486,12 @@ def _flow_fenced_many_payload(
         include_lease=include_lease,
     )
     return payload
+
+
+def _generic_option_map(args: tuple[Any, ...]) -> dict[str, Any]:
+    if len(args) % 2 != 0:
+        raise InvalidCommandError("protocol options require name/value pairs")
+    return {_command_token(args[idx]).lower(): args[idx + 1] for idx in range(0, len(args), 2)}
 
 
 def _option_map(args: tuple[Any, ...]) -> dict[str, Any]:
@@ -5969,6 +6782,105 @@ def _text(value: Any) -> str:
     return str(value)
 
 
+def _text_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode()
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _hash_tag_or_key(key: str) -> str:
+    start = key.find("{")
+    if start < 0:
+        return key
+    end = key.find("}", start + 1)
+    if end > start + 1:
+        return key[start + 1 : end]
+    return key
+
+
+def _flow_hash_tag(rest: str, fallback_key: str) -> str:
+    end = rest.find("}")
+    if end > 0:
+        return rest[:end]
+    return _hash_tag_or_key(fallback_key)
+
+
+def _endpoint_from_url(url: str) -> dict[str, Any]:
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    tls = scheme in _TLS_SCHEMES
+    if scheme not in _SUPPORTED_SCHEMES:
+        raise ValueError(f"unsupported FerricStore URL scheme: {parsed.scheme}")
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (6389 if tls else 6388)
+    endpoint: dict[str, Any] = {
+        "node": host,
+        "host": host,
+        "native_port": port,
+        "tls": tls,
+    }
+    if tls:
+        endpoint["native_tls_port"] = port
+    return endpoint
+
+
+def _url_from_endpoint(endpoint: Mapping[str, Any], *, tls: bool) -> str:
+    host = _text_or_none(_map_get(endpoint, "host", "native_host"))
+    native_port = _int_or_none(_map_get(endpoint, "native_port"))
+    tls_port = _int_or_none(_map_get(endpoint, "native_tls_port"))
+    if host is None or native_port is None:
+        raise FerricStoreError("invalid FerricStore endpoint", raw=endpoint)
+    port = tls_port if tls and tls_port is not None else native_port
+    scheme = "ferrics" if tls else "ferric"
+    return f"{scheme}://{_url_host(host)}:{port}"
+
+
+def _url_host(host: str) -> str:
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
+def _normalized_host_set(hosts: Sequence[str | None]) -> set[str]:
+    return {host.lower() for host in hosts if host}
+
+
+def _set_seed_auth_defaults(urls: Sequence[str], kwargs: dict[str, Any]) -> None:
+    for url in urls:
+        parsed = urlparse(url)
+        if parsed.username and "username" not in kwargs:
+            kwargs["username"] = unquote(parsed.username)
+        if parsed.password and "password" not in kwargs:
+            kwargs["password"] = unquote(parsed.password)
+        if "username" in kwargs and "password" in kwargs:
+            return
+
+
+def _is_retryable_route_error(exc: BaseException) -> bool:
+    if isinstance(exc, (OSError, TimeoutError, FutureTimeoutError)):
+        return True
+    if not isinstance(exc, FerricStoreError):
+        return False
+    message = str(exc).lower()
+    if any(token in message for token in ("connection", "closed", "reroute", "leader")):
+        return True
+    raw = getattr(exc, "raw", None)
+    reason = _optional_text(raw, "reason")
+    return reason is not None and reason.lower() in {"reroute", "leader_changed", "not_leader"}
+
+
 def _require_arg(args: tuple[Any, ...], idx: int, command: str) -> Any:
     if idx >= len(args):
         raise InvalidCommandError(f"{command} is missing argument {idx + 1}")
@@ -6010,10 +6922,16 @@ def _key_bytes(value: Any) -> bytes:
     return str(value).encode()
 
 
-def _map_get(mapping: Any, key: str) -> Any:
+def _map_get(mapping: Any, *keys: str) -> Any:
     if not isinstance(mapping, dict):
         return None
-    return mapping.get(key) if key in mapping else mapping.get(key.encode())
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+        encoded = key.encode()
+        if encoded in mapping:
+            return mapping[encoded]
+    return None
 
 
 def _optional_text(mapping: Any, key: str) -> str | None:

@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
 import time
 import uuid
 from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+import ferricstore.protocol as protocol_module
 from ferricstore import (
     ChildSpec,
     ClaimedFlow,
     CreateItem,
     FencedItem,
+    FerricStoreError,
     FlowClient,
     JsonCodec,
     RetryPolicy,
@@ -50,7 +54,7 @@ _NATIVE_PROTOCOL_COMMANDS: set[str] = set(
     FLOW.INFO FLOW.LIMIT.GET FLOW.LIMIT.LEASE FLOW.LIMIT.LIST FLOW.LIMIT.RELEASE
     FLOW.LIMIT.SPEND FLOW.LIST FLOW.POLICY.GET FLOW.POLICY.SET FLOW.RECLAIM
     FLOW.RETENTION_CLEANUP FLOW.RETRY FLOW.RETRY_MANY FLOW.REWIND
-    FLOW.RUN_STEPS_MANY FLOW.SCHEDULE.CREATE FLOW.SCHEDULE.DELETE
+    FLOW.RUN_STEPS_MANY FLOW.SCHEDULE.CREATE FLOW.SCHEDULE.DELETE FLOW.SEARCH
     FLOW.SCHEDULE.FIRE FLOW.SCHEDULE.FIRE_DUE FLOW.SCHEDULE.GET FLOW.SCHEDULE.LIST
     FLOW.SCHEDULE.PAUSE FLOW.SCHEDULE.RESUME FLOW.SIGNAL FLOW.SPAWN_CHILDREN
     FLOW.START_AND_CLAIM FLOW.STATS FLOW.STEP_CONTINUE FLOW.STUCK FLOW.TERMINALS
@@ -115,8 +119,145 @@ def _client() -> FlowClient:
     )
 
 
+def _topology_client() -> FlowClient:
+    return FlowClient.from_urls(
+        _integration_urls(),
+        codec=JsonCodec(),
+        endpoint_policy=os.environ.get("FERRICSTORE_ENDPOINT_POLICY", "any"),
+    )
+
+
 def _integration_url() -> str:
     return os.environ.get("FERRICSTORE_URL", "ferric://127.0.0.1:6388")
+
+
+def _integration_urls() -> list[str]:
+    raw = os.environ.get("FERRICSTORE_URLS")
+    if not raw:
+        return [_integration_url()]
+    urls = [url.strip() for url in raw.split(",") if url.strip()]
+    return urls or [_integration_url()]
+
+
+def _require_cluster_failure_fixture() -> tuple[str, Path]:
+    if os.environ.get("FERRICSTORE_CLUSTER_FAILURE") != "1":
+        pytest.skip("set FERRICSTORE_CLUSTER_FAILURE=1 to run node-stop integration tests")
+    if len(_integration_urls()) < 3:
+        pytest.skip("node-stop integration requires FERRICSTORE_URLS with at least three seeds")
+
+    compose_file = Path(
+        os.environ.get("FERRICSTORE_CLUSTER_COMPOSE_FILE", "docker-compose.cluster.yml")
+    )
+    if not compose_file.exists():
+        pytest.skip(f"cluster compose file not found: {compose_file}")
+
+    try:
+        subprocess.run(
+            ["docker", "compose", "version"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        pytest.skip(f"docker compose is not available: {exc}")
+
+    return os.environ.get("FERRICSTORE_CLUSTER_COMPOSE_PROJECT", "ferricstore-python-cluster"), (
+        compose_file
+    )
+
+
+def _docker_compose(project: str, compose_file: Path, *args: str, timeout: int = 60) -> None:
+    subprocess.run(
+        ["docker", "compose", "-p", project, "-f", str(compose_file), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _service_from_node(node_name: Any) -> str:
+    text = _text(node_name)
+    if "@" not in text:
+        raise AssertionError(f"cannot derive compose service from node name: {text!r}")
+    host = text.split("@", 1)[1]
+    service = host.split(".", 1)[0]
+    if service not in {"fs0", "fs1", "fs2"}:
+        raise AssertionError(f"unexpected cluster service host in node name: {text!r}")
+    return service
+
+
+def _wait_native_url(url: str, *, timeout: float = 90.0) -> None:
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            client = FlowClient.from_url(url, timeout=1.0)
+            try:
+                if client.command("PING") in (b"PONG", "PONG", True):
+                    return
+            finally:
+                client.close()
+        except Exception as exc:  # pragma: no cover - exercised by Docker integration only
+            last_error = exc
+        time.sleep(0.5)
+    raise AssertionError(f"timed out waiting for FerricStore at {url}: {last_error!r}")
+
+
+def _wait_route_change(
+    client: FlowClient,
+    key: str,
+    old_leader: str,
+    *,
+    timeout: float = 90.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            client.refresh_topology()
+            route = client.route(key)
+            if _text(route["leader_node"]) != old_leader:
+                return route
+        except Exception as exc:  # pragma: no cover - exercised by Docker integration only
+            last_error = exc
+        time.sleep(0.5)
+    raise AssertionError(f"route did not move away from {old_leader}: {last_error!r}")
+
+
+def _cluster_member_count(value: Any) -> int:
+    return len([item for item in _text(value).split(",") if item.strip()])
+
+
+def _wait_cluster_synced(*, timeout: float = 120.0) -> None:
+    deadline = time.monotonic() + timeout
+    last_status: Any = None
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        client = _topology_client()
+        try:
+            status = client.cluster_status()
+            last_status = status
+            shard_members = [
+                _field(value, "members")
+                for key, value in status.items()
+                if str(key).startswith("shard_")
+            ]
+            if (
+                _field(status, "sync_status") == "synced"
+                and shard_members
+                and all(_cluster_member_count(members) >= 3 for members in shard_members)
+            ):
+                return
+        except Exception as exc:  # pragma: no cover - exercised by Docker integration only
+            last_error = exc
+        finally:
+            client.close()
+        time.sleep(0.5)
+    raise AssertionError(
+        f"cluster did not settle after node restore: {last_status!r} {last_error!r}"
+    )
 
 
 def _require_protocol_transport() -> None:
@@ -172,6 +313,33 @@ def _command_catalog_names(value: Any) -> set[str]:
     return names
 
 
+def _opcode_value(value: Any) -> int:
+    if isinstance(value, int):
+        return value
+    return int(_text(value), 0)
+
+
+def _options_opcode_table(value: Any) -> dict[str, int]:
+    raw_opcodes = _field(value, "opcodes")
+    if not isinstance(raw_opcodes, list):
+        raise AssertionError(f"OPTIONS response does not contain opcodes list: {value!r}")
+
+    table: dict[str, int] = {}
+    for item in raw_opcodes:
+        if isinstance(item, dict):
+            name = _field(item, "name")
+            opcode = _field(item, "opcode")
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            name = item[0]
+            opcode = item[1]
+        else:
+            raise AssertionError(f"unexpected OPTIONS opcode entry: {item!r}")
+        if name is None or opcode is None:
+            raise AssertionError(f"OPTIONS opcode entry missing name/opcode: {item!r}")
+        table[_text(name).upper()] = _opcode_value(opcode)
+    return table
+
+
 def _claim_one(
     client: FlowClient,
     flow_type: str,
@@ -196,6 +364,24 @@ def _claim_one(
     )
     assert len(jobs) == 1
     return jobs[0]
+
+
+def _wait_flow_state(
+    client: FlowClient,
+    flow_id: str,
+    partition_key: str,
+    state: str,
+    *,
+    timeout: float = 30.0,
+) -> Any:
+    deadline = time.monotonic() + timeout
+    record: Any = None
+    while time.monotonic() < deadline:
+        record = client.get(flow_id, partition_key=partition_key)
+        if record is not None and record.state == state:
+            return record
+        time.sleep(0.1)
+    raise AssertionError(f"flow {flow_id} did not reach state {state!r}; last={record!r}")
 
 
 def _create_and_claim(
@@ -266,6 +452,16 @@ def test_real_ferricstore_native_protocol_command_coverage_contract() -> None:
         client.close()
 
 
+def test_real_ferricstore_native_options_opcode_table_matches_sdk() -> None:
+    _require_protocol_transport()
+
+    client = _client()
+    try:
+        assert _options_opcode_table(client.command("OPTIONS")) == protocol_module._OPCODES
+    finally:
+        client.close()
+
+
 def test_real_ferricstore_command_and_flow_cycle() -> None:
     client = _client()
     suffix = _suffix()
@@ -303,6 +499,70 @@ def test_real_ferricstore_command_and_flow_cycle() -> None:
         record = client.get(flow_id, partition_key=flow_id)
         assert record is not None
         assert record.state == "completed"
+    finally:
+        with suppress(Exception):
+            client.command("DEL", key)
+        client.close()
+
+
+def test_real_ferricstore_topology_aware_client_routes_kv_and_flow_commands() -> None:
+    _require_protocol_transport()
+
+    client = _topology_client()
+    suffix = _suffix()
+    key = f"py-sdk:topology:{suffix}"
+    flow_type = f"py-sdk-topology-{suffix}"
+    flow_id = f"py-sdk:topology-flow:{suffix}"
+    partition = f"{{py-sdk-topology:{suffix}}}:partition"
+    now = int(time.time() * 1000)
+
+    try:
+        topology = client.refresh_topology()
+        assert topology.endpoints
+        if len(_integration_urls()) >= 3:
+            cluster_status = client.cluster_status()
+            connected = _field(cluster_status, "connected_nodes")
+            assert connected
+            shard_members = [
+                _field(value, "members")
+                for key, value in cluster_status.items()
+                if str(key).startswith("shard_")
+            ]
+            assert any(len(_text(members).split(",")) >= 3 for members in shard_members)
+
+        route = client.route(key)
+        assert route["endpoint"]["host"]
+        assert route["lane_id"] >= 0
+
+        assert client.kv_set(key, {"routed": True}) in (True, b"OK", "OK")
+        assert client.kv_get(key) == {"routed": True}
+
+        assert client.create(
+            flow_id,
+            type=flow_type,
+            state="queued",
+            partition_key=partition,
+            payload={"routed": True},
+            state_meta={"version": "1"},
+            now_ms=now,
+            run_at_ms=now,
+            idempotent=True,
+        )
+        job = _claim_one(client, flow_type, "queued", partition, now_ms=now + 1)
+        assert client.complete(
+            flow_id,
+            lease_token=job.lease_token,
+            fencing_token=job.fencing_token,
+            partition_key=partition,
+            result={"ok": True},
+            state_meta={"version": "2"},
+            now_ms=now + 2,
+        )
+        record = _wait_flow_state(client, flow_id, partition, "completed")
+        assert record.state_meta == {
+            "queued": {"version": "1"},
+            "completed": {"version": "2"},
+        }
     finally:
         with suppress(Exception):
             client.command("DEL", key)
@@ -820,6 +1080,7 @@ def test_real_ferricstore_native_protocol_flow_admin_surface() -> None:
         assert client.install_policy(
             flow_type,
             retry=RetryPolicy(max_retries=2, base_ms=10, max_ms=100, jitter_pct=0),
+            indexed_state_meta="version",
         )
         assert isinstance(client.policy_get(flow_type), dict)
 
@@ -830,6 +1091,7 @@ def test_real_ferricstore_native_protocol_flow_admin_surface() -> None:
             state="attr",
             partition_key=partition,
             attributes={"tenant": "acme", "tier": "gold"},
+            state_meta={"version": "1"},
             now_ms=now,
             run_at_ms=now,
             idempotent=True,
@@ -841,6 +1103,14 @@ def test_real_ferricstore_native_protocol_flow_admin_surface() -> None:
             attributes={"tenant": "acme"},
             consistent_projection=True,
         )
+        search_matches = client.search(
+            flow_type,
+            state="attr",
+            partition_key=partition,
+            state_meta={"version": "1"},
+            consistent_projection=True,
+        )
+        assert any(record.id == attr_id for record in search_matches)
         assert isinstance(
             client.stats(
                 flow_type,
@@ -1896,4 +2166,48 @@ def test_real_ferricstore_named_data_helpers_cover_native_protocol_surface() -> 
         with suppress(Exception):
             if keys:
                 client.delete(*keys)
+        client.close()
+
+
+def test_real_ferricstore_topology_client_reroutes_after_leader_node_stop() -> None:
+    _require_protocol_transport()
+    project, compose_file = _require_cluster_failure_fixture()
+
+    client = _topology_client()
+    suffix = _suffix()
+    key = f"{{py-sdk-failover:{suffix}}}:kv"
+    stopped_service: str | None = None
+    stopped_url: str | None = None
+
+    try:
+        before_route = client.route(key)
+        old_leader = _text(before_route["leader_node"])
+        old_endpoint = before_route["endpoint"]
+        stopped_service = _service_from_node(old_leader)
+        stopped_url = (
+            f"ferric://{_field(old_endpoint, 'host')}:{_field(old_endpoint, 'native_port')}"
+        )
+
+        assert _ok(client.kv_set(key, {"phase": "before"}))
+        assert client.kv_get(key) == {"phase": "before"}
+
+        _docker_compose(project, compose_file, "stop", "-t", "1", stopped_service, timeout=90)
+
+        with pytest.raises((FerricStoreError, OSError, TimeoutError, ConnectionError)):
+            client.kv_set(key, {"phase": "stale-route"})
+
+        after_route = _wait_route_change(client, key, old_leader)
+        assert _text(after_route["leader_node"]) != old_leader
+
+        assert _ok(client.kv_set(key, {"phase": "after"}))
+        assert client.kv_get(key) == {"phase": "after"}
+    finally:
+        if stopped_service is not None:
+            _docker_compose(project, compose_file, "start", stopped_service, timeout=90)
+        if stopped_url is not None:
+            _wait_native_url(stopped_url, timeout=90)
+        if stopped_service is not None:
+            _wait_cluster_synced(timeout=120)
+        with suppress(Exception):
+            client.delete(key)
         client.close()

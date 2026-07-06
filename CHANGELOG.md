@@ -6,6 +6,15 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.3.2
+
+- Updated native protocol coverage for FerricStore `0.7.2`, including opcode parity checks against live `OPTIONS`.
+- Added sync and async `FLOW.SEARCH` helpers with attribute and state metadata filters.
+- Added sync and async management/control-plane helpers for capabilities, ACL, namespace, quota, and telemetry commands.
+- Restricted default learned endpoint trust to exact seed endpoints unless a host is explicitly added to `trusted_hosts`.
+- Made async topology `warm_connections=True` open learned adapters instead of only constructing them.
+- Updated Docker and CI integration defaults to `ghcr.io/ferricstore/ferricstore:0.7.2`.
+
 ## 0.3.1
 
 - Added sync and async native-protocol reconnect handling after heartbeat or idle

@@ -61,6 +61,7 @@ class FakeAsyncExecutor:
             "FLOW.BY_ROOT",
             "FLOW.BY_CORRELATION",
             "FLOW.STUCK",
+            "FLOW.SEARCH",
         }:
             return [record]
         if command in {"FLOW.INFO", "FLOW.POLICY.GET", "FLOW.RETENTION_CLEANUP"}:
@@ -1353,10 +1354,121 @@ def test_async_install_policy_can_set_indexed_state_meta():
     run(main())
 
 
+def test_async_management_wrappers_build_control_plane_commands_and_normalize_responses():
+    async def main():
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
+        executor.responses.extend(
+            [
+                {b"sdk": True, b"flow_observability": True},
+                b"OK",
+                {b"user": b"platform"},
+                [b"default", b"platform"],
+                b"OK",
+                b"OK",
+                {b"prefix": b"tenant:"},
+                {b"prefix": b"tenant:"},
+                [{b"prefix": b"tenant:"}],
+                b"OK",
+                {b"keys": 100, b"bytes": 1024},
+                {b"keys": 100, b"bytes": 1024},
+                {b"keys": 2, b"bytes": 256},
+                {b"cluster": b"ok"},
+                {b"keys": 2},
+                [{b"id": b"f1", b"type": b"order"}],
+                [{b"event": b"created"}],
+            ]
+        )
+
+        assert await client.capabilities() == {"sdk": True, "flow_observability": True}
+        assert await client.acl_set_user("platform", ["on", "+PING", "~tenant:*"]) == "OK"
+        assert await client.acl_get_user("platform") == {"user": "platform"}
+        assert await client.acl_list_users() == ["default", "platform"]
+        assert await client.acl_del_user("platform") == "OK"
+        assert await client.acl_save() == "OK"
+        assert await client.ensure_namespace(
+            "tenant:", {"owner": "platform"}, durability="memory"
+        ) == {"prefix": "tenant:"}
+        assert await client.get_namespace("tenant:") == {"prefix": "tenant:"}
+        assert await client.list_namespaces() == [{"prefix": "tenant:"}]
+        assert await client.delete_namespace("tenant:") == "OK"
+        assert await client.set_quota("tenant:", {"keys": 100}, bytes=1024) == {
+            "keys": 100,
+            "bytes": 1024,
+        }
+        assert await client.get_quota("tenant:") == {"keys": 100, "bytes": 1024}
+        assert await client.quota_usage("tenant:") == {"keys": 2, "bytes": 256}
+        assert await client.cluster_info() == {"cluster": "ok"}
+        assert await client.namespace_usage("tenant:") == {"keys": 2}
+        assert await client.flow_query({"type": "order"}, state="queued") == [
+            {"id": "f1", "type": "order"}
+        ]
+        assert await client.flow_history("f1", {"include": "metadata"}) == [{"event": "created"}]
+
+        assert executor.calls == [
+            ("FERRICSTORE.CAPABILITIES",),
+            ("ACL", "SETUSER", "platform", "on", "+PING", "~tenant:*"),
+            ("ACL", "GETUSER", "platform"),
+            ("ACL", "LIST"),
+            ("ACL", "DELUSER", "platform"),
+            ("ACL", "SAVE"),
+            (
+                "FERRICSTORE.NAMESPACE",
+                "ENSURE",
+                "tenant:",
+                "OWNER",
+                "platform",
+                "DURABILITY",
+                "memory",
+            ),
+            ("FERRICSTORE.NAMESPACE", "GET", "tenant:"),
+            ("FERRICSTORE.NAMESPACE", "LIST"),
+            ("FERRICSTORE.NAMESPACE", "DELETE", "tenant:"),
+            ("FERRICSTORE.QUOTA", "SET", "tenant:", "KEYS", 100, "BYTES", 1024),
+            ("FERRICSTORE.QUOTA", "GET", "tenant:"),
+            ("FERRICSTORE.QUOTA", "USAGE", "tenant:"),
+            ("FERRICSTORE.TELEMETRY", "CLUSTER_INFO"),
+            ("FERRICSTORE.TELEMETRY", "NAMESPACE_USAGE", "tenant:"),
+            ("FERRICSTORE.TELEMETRY", "FLOW_QUERY", "TYPE", "order", "STATE", "queued"),
+            ("FERRICSTORE.TELEMETRY", "FLOW_HISTORY", "f1", "INCLUDE", "metadata"),
+        ]
+
+    run(main())
+
+
 def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     async def main():
         executor = FakeAsyncExecutor()
         client = AsyncFlowClient(executor)
+
+        search_results = await client.search(
+            "order",
+            state="queued",
+            count=10,
+            attributes={"tenant": "acme"},
+            state_meta={"version": 1},
+            terminal_only=True,
+            consistent_projection=True,
+        )
+        assert search_results[0].id == "f1"
+        assert executor.calls[-1] == (
+            "FLOW.SEARCH",
+            "order",
+            "COUNT",
+            10,
+            "STATE",
+            "queued",
+            "TERMINAL_ONLY",
+            "true",
+            "CONSISTENT_PROJECTION",
+            "true",
+            "ATTRIBUTE",
+            "tenant",
+            "acme",
+            "STATE_META",
+            "queued",
+            {"version": 1},
+        )
 
         assert await client.attributes("order", state="queued", count=10) == [
             {"name": "tenant", "count": 3}
