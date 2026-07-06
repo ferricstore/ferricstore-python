@@ -435,6 +435,212 @@ def test_async_topology_pool_warm_connections_opens_learned_adapters(monkeypatch
     assert created["ferric://leader.local:6391"].ensure_connected_calls == 1
 
 
+def test_topology_protocol_adapter_pool_delegates_helper_methods(monkeypatch):
+    created: dict[str, Any] = {}
+
+    class FakeProtocolAdapter:
+        def __init__(self, url, **kwargs):
+            self.url = url
+            self.events = [f"event:{url}"]
+            self.closed = False
+
+        def execute_command(self, *args):
+            if args[0] == "SHARDS":
+                return {
+                    "route_epoch": 1,
+                    "shard_count": 1,
+                    "ranges": [
+                        {
+                            "first_slot": 0,
+                            "last_slot": 1023,
+                            "shard": 0,
+                            "lane_id": 1,
+                            "endpoint": {
+                                "node": "leader@cluster",
+                                "host": "leader.local",
+                                "native_port": 6391,
+                            },
+                        }
+                    ],
+                }
+            return {"url": self.url, "args": args}
+
+        def execute_command_with_trace(self, *args):
+            return {"value": self.execute_command(*args), "trace": {"url": self.url}}
+
+        def wait_event(self, timeout=None):
+            return f"wait:{self.url}"
+
+        def submit_command(self, *args):
+            return _future(("submit_command", self.url, args))
+
+        def submit_batch(self, commands):
+            return _future(("submit_batch", self.url, commands))
+
+        def submit_mget(self, keys):
+            return _future(("submit_mget", self.url, list(keys)))
+
+        def submit_mset_same_value(self, keys, value):
+            return _future(("submit_mset_same_value", self.url, list(keys), value))
+
+        def submit_mset_payload(self, payload):
+            return _future(("submit_mset_payload", self.url, payload))
+
+        def submit_pipeline_payload(self, payload, count):
+            return _future(("submit_pipeline_payload", self.url, payload, count))
+
+        def submit_flow_many_payload(self, command, payload, count):
+            return _future(("submit_flow_many_payload", self.url, command, payload, count))
+
+        def submit_flow_value_mget_payload(self, payload):
+            return _future(("submit_flow_value_mget_payload", self.url, payload))
+
+        def subscribe_flow_wake(self, *args, **kwargs):
+            return ("subscribe_flow_wake", self.url, args, kwargs)
+
+        def execute_batch(self, commands):
+            return [("execute_batch", self.url, commands)]
+
+        def close(self):
+            self.closed = True
+
+    def fake_from_url(url, **kwargs):
+        adapter = FakeProtocolAdapter(url, **kwargs)
+        created[url] = adapter
+        return adapter
+
+    monkeypatch.setattr(ProtocolAdapter, "from_url", fake_from_url)
+
+    pool = ProtocolAdapterPool.from_urls(
+        ["ferric://seed.local:6388"],
+        endpoint_policy="any",
+    )
+
+    assert pool.wait_event(timeout=0) == "wait:ferric://seed.local:6388"
+    with pytest.raises(InvalidCommandError):
+        pool.pipeline(transaction=True)
+    assert pool.pipeline().commands == []
+
+    routed_trace = pool.execute_command_with_trace("SET", "tenant-key", b"value")
+    assert routed_trace["trace"] == {"url": "ferric://leader.local:6391"}
+    control_trace = pool.execute_command_with_trace("PING")
+    assert control_trace["trace"] == {"url": "ferric://seed.local:6388"}
+    assert (
+        pool.submit_command("SET", "tenant-key", b"value").result()[1]
+        == "ferric://leader.local:6391"
+    )
+    assert [
+        item.result()[0] for item in pool.submit_commands([("SET", "tenant-key", b"value")])
+    ] == ["submit_command"]
+    assert pool.submit_batch([("PING",)]).result()[0] == "submit_batch"
+    assert pool.submit_mget(["{tenant}:a", "{tenant}:b"]).result()[0] == "submit_mget"
+    assert pool.submit_mset_same_value(["{tenant}:a", "{tenant}:b"], b"value").result()[0] == (
+        "submit_mset_same_value"
+    )
+    assert pool.submit_mset_payload(b"payload").result()[0] == "submit_mset_payload"
+    assert pool.submit_pipeline_payload(b"payload", 2).result()[0] == "submit_pipeline_payload"
+    assert pool.submit_flow_many_payload("FLOW.CREATE_MANY", b"payload", 2).result()[0] == (
+        "submit_flow_many_payload"
+    )
+    assert pool.submit_flow_value_mget_payload(b"payload").result()[0] == (
+        "submit_flow_value_mget_payload"
+    )
+    assert pool.execute_batch([("PING",)])[0][0] == "execute_batch"
+    subscriptions = pool.subscribe_flow_wake("type", worker="worker-1")
+    assert {item[1] for item in subscriptions} == {
+        "ferric://seed.local:6388",
+        "ferric://leader.local:6391",
+    }
+    assert set(pool.events) == {
+        "event:ferric://seed.local:6388",
+        "event:ferric://leader.local:6391",
+    }
+
+    pool.close()
+    assert all(adapter.closed for adapter in created.values())
+
+
+def test_async_topology_protocol_adapter_pool_delegates_helper_methods(monkeypatch):
+    created: dict[str, Any] = {}
+
+    class FakeAsyncProtocolAdapter:
+        def __init__(self, url, **kwargs):
+            self.url = url
+            self.events = [f"event:{url}"]
+            self.closed = False
+
+        async def execute_command(self, *args):
+            if args[0] == "SHARDS":
+                return {
+                    "route_epoch": 1,
+                    "shard_count": 1,
+                    "ranges": [
+                        {
+                            "first_slot": 0,
+                            "last_slot": 1023,
+                            "shard": 0,
+                            "lane_id": 1,
+                            "endpoint": {
+                                "node": "leader@cluster",
+                                "host": "leader.local",
+                                "native_port": 6391,
+                            },
+                        }
+                    ],
+                }
+            return {"url": self.url, "args": args}
+
+        async def execute_command_with_trace(self, *args):
+            return {"value": await self.execute_command(*args), "trace": {"url": self.url}}
+
+        async def wait_event(self, timeout=None):
+            return f"wait:{self.url}"
+
+        async def execute_batch(self, commands):
+            return [("execute_batch", self.url, commands)]
+
+        async def close(self):
+            self.closed = True
+
+    def fake_from_url(url, **kwargs):
+        adapter = FakeAsyncProtocolAdapter(url, **kwargs)
+        created[url] = adapter
+        return adapter
+
+    monkeypatch.setattr(AsyncProtocolAdapter, "from_url", fake_from_url)
+
+    async def run():
+        pool = protocol_module.AsyncTopologyProtocolAdapterPool(
+            ["ferric://seed.local:6388"],
+            endpoint_policy="any",
+        )
+        assert (await pool.route("tenant-key"))["endpoint"]["host"] == "leader.local"
+        with pytest.raises(InvalidCommandError):
+            pool.pipeline(transaction=True)
+        assert pool.pipeline().commands == []
+
+        routed_trace = await pool.execute_command_with_trace("SET", "tenant-key", b"value")
+        assert routed_trace["trace"] == {"url": "ferric://leader.local:6391"}
+        control_trace = await pool.execute_command_with_trace("PING")
+        assert control_trace["trace"] == {"url": "ferric://seed.local:6388"}
+        assert (await pool.execute_batch([("PING",)]))[0][0] == "execute_batch"
+        assert await pool.wait_event(timeout=0) == "wait:ferric://seed.local:6388"
+        assert set(pool.events) == {
+            "event:ferric://seed.local:6388",
+            "event:ferric://leader.local:6391",
+        }
+        await pool.close()
+
+    asyncio.run(run())
+    assert all(adapter.closed for adapter in created.values())
+
+
+def _future(value: Any) -> Future[Any]:
+    future: Future[Any] = Future()
+    future.set_result(value)
+    return future
+
+
 def test_protocol_adapter_pool_refreshes_topology_after_route_failure_without_replay(
     monkeypatch,
 ):
