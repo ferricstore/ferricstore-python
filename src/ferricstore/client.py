@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import builtins
 import contextlib
+import json
 import threading
 import time
 import zlib
@@ -28,6 +29,8 @@ from ferricstore.types import (
     FencedItem,
     FetchOrComputeResult,
     FlowRecord,
+    FlowStatePolicy,
+    FlowStatePolicyLike,
     GovernanceOverview,
     KeyInfo,
     PubSubMessage,
@@ -35,6 +38,7 @@ from ferricstore.types import (
     RetryPolicy,
     ScheduleResult,
     _normalize_ref_meta,
+    normalize_flow_state_mode,
 )
 
 _AUTO_PARTITION_PREFIX = "__flow_auto__:"
@@ -43,6 +47,50 @@ _AUTO_PARTITION_BUCKETS = 256
 
 def _flow_return(value: Any) -> FlowRecord | bytes:
     return cast(FlowRecord | bytes, value)
+
+
+def _split_flow_state_policy(policy: FlowStatePolicyLike) -> tuple[str | None, RetryPolicy | None]:
+    if isinstance(policy, FlowStatePolicy):
+        return normalize_flow_state_mode(policy.mode), policy.retry
+    if isinstance(policy, RetryPolicy):
+        return None, policy
+    raise TypeError("state policies must be RetryPolicy or FlowStatePolicy")
+
+
+def _json_arg(value: Mapping[str, Any] | str) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def _command_with_request_context(
+    command: str,
+    args: Sequence[Any],
+    request_context: Mapping[str, Any] | None,
+) -> builtins.list[Any]:
+    command_args = [command, *args]
+    if request_context is not None:
+        command_args.extend(["REQUEST_CONTEXT", dict(request_context)])
+    return command_args
+
+
+def _invocation_definition_put_args(definition: Mapping[str, Any] | str) -> builtins.list[Any]:
+    return [_json_arg(definition)]
+
+
+def _invocation_create_args(
+    name: str,
+    attrs: Mapping[str, Any],
+    *,
+    context: Mapping[str, Any] | None = None,
+    idempotency_key: str | None = None,
+) -> builtins.list[Any]:
+    envelope: dict[str, Any] = {"attrs": dict(attrs)}
+    if context is not None:
+        envelope["context"] = dict(context)
+    if idempotency_key is not None:
+        envelope["idempotency_key"] = idempotency_key
+    return [name, _json_arg(envelope)]
 
 
 def _now_ms() -> int:
@@ -920,6 +968,104 @@ class FlowClient(DataCommandsMixin):
                     *_management_pair_args(attrs, kwargs),
                 )
             ),
+        )
+
+    def invocation_definition_put(
+        self,
+        definition: Mapping[str, Any] | str,
+        *,
+        request_context: Mapping[str, Any] | None = None,
+    ) -> Any:
+        return _normalize_admin_response(
+            self.executor.execute_command(
+                *_command_with_request_context(
+                    "INVOCATION.DEFINITION.PUT",
+                    _invocation_definition_put_args(definition),
+                    request_context,
+                )
+            )
+        )
+
+    def invocation_definition_get(
+        self,
+        name: str,
+        *,
+        request_context: Mapping[str, Any] | None = None,
+    ) -> Any:
+        return _normalize_admin_response(
+            self.executor.execute_command(
+                *_command_with_request_context(
+                    "INVOCATION.DEFINITION.GET",
+                    [name],
+                    request_context,
+                )
+            )
+        )
+
+    def invocation_definition_list(
+        self,
+        *,
+        request_context: Mapping[str, Any] | None = None,
+    ) -> Any:
+        return _normalize_admin_response(
+            self.executor.execute_command(
+                *_command_with_request_context(
+                    "INVOCATION.DEFINITION.LIST",
+                    [],
+                    request_context,
+                )
+            )
+        )
+
+    def invocation_create(
+        self,
+        name: str,
+        attrs: Mapping[str, Any],
+        *,
+        context: Mapping[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        request_context: Mapping[str, Any] | None = None,
+    ) -> Any:
+        return _normalize_admin_response(
+            self.executor.execute_command(
+                *_command_with_request_context(
+                    "INVOCATION.CREATE",
+                    _invocation_create_args(
+                        name,
+                        attrs,
+                        context=context,
+                        idempotency_key=idempotency_key,
+                    ),
+                    request_context,
+                )
+            )
+        )
+
+    def invocation_get(
+        self,
+        id: str,
+        *,
+        request_context: Mapping[str, Any] | None = None,
+    ) -> Any:
+        return _normalize_admin_response(
+            self.executor.execute_command(
+                *_command_with_request_context("INVOCATION.GET", [id], request_context)
+            )
+        )
+
+    def invocation_partition_list(
+        self,
+        name: str,
+        *,
+        scope: str | None = None,
+        request_context: Mapping[str, Any] | None = None,
+    ) -> Any:
+        args: builtins.list[Any] = [name]
+        _append(args, "SCOPE", scope)
+        return _normalize_admin_response(
+            self.executor.execute_command(
+                *_command_with_request_context("INVOCATION.PARTITION.LIST", args, request_context)
+            )
         )
 
     def create(
@@ -3175,7 +3321,7 @@ class FlowClient(DataCommandsMixin):
         type: str,
         *,
         retry: RetryPolicy | None = None,
-        states: dict[str, RetryPolicy] | None = None,
+        states: dict[str, FlowStatePolicyLike] | None = None,
         indexed_state_meta: str | None = None,
     ) -> Any:
         args: builtins.list[Any] = ["FLOW.POLICY.SET", type]
@@ -3184,7 +3330,7 @@ class FlowClient(DataCommandsMixin):
             self._append_retry_policy(args, retry)
         for state, policy in (states or {}).items():
             args.extend(["STATE", state])
-            self._append_retry_policy(args, policy)
+            self._append_state_policy(args, policy)
         return self.executor.execute_command(*args)
 
     def policy_get(self, type: str, *, state: str | None = None) -> dict[Any, Any]:
@@ -3726,6 +3872,13 @@ class FlowClient(DataCommandsMixin):
                 policy.exhausted_to,
             ]
         )
+
+    def _append_state_policy(self, args: builtins.list[Any], policy: FlowStatePolicyLike) -> None:
+        mode, retry = _split_flow_state_policy(policy)
+        if mode is not None:
+            args.extend(["MODE", mode.upper()])
+        if retry is not None:
+            self._append_retry_policy(args, retry)
 
     def _record(self, value: dict[Any, Any]) -> FlowRecord:
         raw_payload = value.get("payload") if "payload" in value else value.get(b"payload")

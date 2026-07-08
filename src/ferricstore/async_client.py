@@ -23,9 +23,12 @@ from ferricstore.client import (
     _append_state_meta,
     _append_value_return,
     _auto_partition_key_for_id,
+    _command_with_request_context,
     _expand_many_response,
     _flow_return,
     _has_named_item_values,
+    _invocation_create_args,
+    _invocation_definition_put_args,
     _management_pair_args,
     _management_rule_args,
     _merge_named_map,
@@ -36,6 +39,7 @@ from ferricstore.client import (
     _resolve_include_record,
     _shared_create_many_attributes,
     _shared_create_many_state_meta,
+    _split_flow_state_policy,
 )
 from ferricstore.codecs import Codec, RawCodec
 from ferricstore.commands import AsyncDataCommandsMixin
@@ -51,6 +55,7 @@ from ferricstore.types import (
     FencedItem,
     FetchOrComputeResult,
     FlowRecord,
+    FlowStatePolicyLike,
     GovernanceOverview,
     KeyInfo,
     PubSubMessage,
@@ -632,6 +637,104 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
                     *_management_pair_args(attrs, kwargs),
                 )
             ),
+        )
+
+    async def invocation_definition_put(
+        self,
+        definition: Mapping[str, Any] | str,
+        *,
+        request_context: Mapping[str, Any] | None = None,
+    ) -> Any:
+        return _normalize_admin_response(
+            await self.executor.execute_command(
+                *_command_with_request_context(
+                    "INVOCATION.DEFINITION.PUT",
+                    _invocation_definition_put_args(definition),
+                    request_context,
+                )
+            )
+        )
+
+    async def invocation_definition_get(
+        self,
+        name: str,
+        *,
+        request_context: Mapping[str, Any] | None = None,
+    ) -> Any:
+        return _normalize_admin_response(
+            await self.executor.execute_command(
+                *_command_with_request_context(
+                    "INVOCATION.DEFINITION.GET",
+                    [name],
+                    request_context,
+                )
+            )
+        )
+
+    async def invocation_definition_list(
+        self,
+        *,
+        request_context: Mapping[str, Any] | None = None,
+    ) -> Any:
+        return _normalize_admin_response(
+            await self.executor.execute_command(
+                *_command_with_request_context(
+                    "INVOCATION.DEFINITION.LIST",
+                    [],
+                    request_context,
+                )
+            )
+        )
+
+    async def invocation_create(
+        self,
+        name: str,
+        attrs: Mapping[str, Any],
+        *,
+        context: Mapping[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        request_context: Mapping[str, Any] | None = None,
+    ) -> Any:
+        return _normalize_admin_response(
+            await self.executor.execute_command(
+                *_command_with_request_context(
+                    "INVOCATION.CREATE",
+                    _invocation_create_args(
+                        name,
+                        attrs,
+                        context=context,
+                        idempotency_key=idempotency_key,
+                    ),
+                    request_context,
+                )
+            )
+        )
+
+    async def invocation_get(
+        self,
+        id: str,
+        *,
+        request_context: Mapping[str, Any] | None = None,
+    ) -> Any:
+        return _normalize_admin_response(
+            await self.executor.execute_command(
+                *_command_with_request_context("INVOCATION.GET", [id], request_context)
+            )
+        )
+
+    async def invocation_partition_list(
+        self,
+        name: str,
+        *,
+        scope: str | None = None,
+        request_context: Mapping[str, Any] | None = None,
+    ) -> Any:
+        args: builtins.list[Any] = [name]
+        _append(args, "SCOPE", scope)
+        return _normalize_admin_response(
+            await self.executor.execute_command(
+                *_command_with_request_context("INVOCATION.PARTITION.LIST", args, request_context)
+            )
         )
 
     async def create(
@@ -2279,7 +2382,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         type: str,
         *,
         retry: RetryPolicy | None = None,
-        states: dict[str, RetryPolicy] | None = None,
+        states: dict[str, FlowStatePolicyLike] | None = None,
         indexed_state_meta: str | None = None,
     ) -> Any:
         args: builtins.list[Any] = ["FLOW.POLICY.SET", type]
@@ -2288,7 +2391,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
             self._append_retry_policy(args, retry)
         for state, policy in (states or {}).items():
             args.extend(["STATE", state])
-            self._append_retry_policy(args, policy)
+            self._append_state_policy(args, policy)
         return await self.executor.execute_command(*args)
 
     async def policy_get(self, type: str, *, state: str | None = None) -> dict[Any, Any]:
@@ -2876,6 +2979,13 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
                 policy.exhausted_to,
             ]
         )
+
+    def _append_state_policy(self, args: builtins.list[Any], policy: FlowStatePolicyLike) -> None:
+        mode, retry = _split_flow_state_policy(policy)
+        if mode is not None:
+            args.extend(["MODE", mode.upper()])
+        if retry is not None:
+            self._append_retry_policy(args, retry)
 
     def _record(self, value: dict[Any, Any]) -> FlowRecord:
         raw_payload = value.get("payload") if "payload" in value else value.get(b"payload")

@@ -7,6 +7,7 @@ from ferricstore import (
     Complete,
     ExceptionPolicy,
     FlowClient,
+    FlowStateMode,
     FlowWorkflow,
     RetryPolicy,
     ValueConfig,
@@ -1288,6 +1289,47 @@ def test_workflow_client_retry_policy_is_inherited_and_state_can_override():
     assert "created" in call
     assert default_policy.max_retries in call
     assert state_policy.max_retries in call
+
+
+def test_workflow_fifo_state_policy_installs_mode_and_rejects_priority_transition():
+    class FifoWorkflow(Workflow):
+        type = "fifo-order"
+        initial_state = "created"
+
+        @state("created")
+        def created(self, job):
+            return transition("ready")
+
+        @state("ready", mode=FlowStateMode.FIFO)
+        def ready(self, job):
+            return complete(result=b"done")
+
+    executor = FakeExecutor()
+    workflow = FifoWorkflow(FlowClient(executor))
+    workflow.install_policy()
+
+    call = executor.calls[-1]
+    ready_index = call.index("ready")
+    assert call[ready_index - 1 : ready_index + 3] == (
+        "STATE",
+        "ready",
+        "MODE",
+        "FIFO",
+    )
+
+    job = FlowRecord(
+        id="f1",
+        type="fifo-order",
+        state="created",
+        partition_key="tenant:order",
+        lease_token=b"lease-1",
+        fencing_token=3,
+    )
+
+    with pytest.raises(ValueError, match=r"priority.*fifo"):
+        workflow.apply(job, transition("ready", priority=1), state_name="created")
+
+    assert executor.calls[-1] == call
 
 
 def test_state_rejects_retry_policy_and_retry_alias_together():

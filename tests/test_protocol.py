@@ -1167,6 +1167,52 @@ def test_protocol_module_command_uses_native_command_exec_fallback():
     assert command.payload == {"command": "BF.ADD", "args": ["bf-1", "member-1"]}
 
 
+def test_protocol_command_exec_fallback_can_carry_request_context():
+    command = build_protocol_command(
+        "INVOCATION.CREATE",
+        "send-email",
+        "{}",
+        "REQUEST_CONTEXT",
+        {
+            "subject": "proxy",
+            "tenant": "acme",
+            "scopes": "invocation:create:* tenant:acme",
+        },
+    )
+
+    assert command.opcode == 0x0100
+    assert command.payload == {
+        "command": "INVOCATION.CREATE",
+        "args": ["send-email", "{}"],
+        "request_context": {
+            "subject": "proxy",
+            "tenant": "acme",
+            "scopes": ["invocation:create:*", "tenant:acme"],
+        },
+    }
+
+
+def test_protocol_explicit_command_exec_can_carry_request_context():
+    command = build_protocol_command(
+        "COMMAND_EXEC",
+        "INVOCATION.CREATE",
+        "send-email",
+        "{}",
+        "REQUEST_CONTEXT",
+        {"subject": "proxy", "scopes": ["invocation:create:*", "invocation:create:*"]},
+    )
+
+    assert command.opcode == 0x0100
+    assert command.payload == {
+        "command": "INVOCATION.CREATE",
+        "args": ["send-email", "{}"],
+        "request_context": {
+            "subject": "proxy",
+            "scopes": ["invocation:create:*"],
+        },
+    }
+
+
 def test_protocol_stateful_command_exec_is_not_wrapped_in_pipeline_frame():
     commands = [
         build_protocol_command("MULTI"),
@@ -1986,6 +2032,34 @@ def test_protocol_builds_flow_state_meta_and_indexed_policy_payloads():
         _OP_COMMAND_EXEC,
         {"command": "FLOW.POLICY.SET", "args": ["order", "INDEXED_STATE_META", "version"]},
         1,
+    )
+
+
+def test_protocol_builds_native_flow_policy_state_modes_payload():
+    policy = build_protocol_command(
+        "FLOW.POLICY.SET",
+        "order",
+        "STATE",
+        "queued",
+        "MODE",
+        "FIFO",
+        "MAX_RETRIES",
+        5,
+        "STATE",
+        "ready",
+        "MODE",
+        "PARALLEL",
+    )
+
+    assert policy == ProtocolCommand(
+        protocol_module._OPCODES["FLOW.POLICY.SET"],
+        {
+            "type": "order",
+            "states": {
+                "queued": {"mode": "FIFO", "max_retries": 5},
+                "ready": {"mode": "PARALLEL"},
+            },
+        },
     )
 
 

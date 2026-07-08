@@ -65,6 +65,8 @@ from ferricstore.types import (
     FencedItem,
     FetchOrComputeResult,
     FlowRecord,
+    FlowStateMode,
+    FlowStatePolicy,
     GovernanceOverview,
     KeyInfo,
     PubSubMessage,
@@ -107,7 +109,7 @@ QueueWorker = QueueFlowWorker
 QueueWorkerResult = QueueFlowWorkerResult
 AsyncQueueWorker = AsyncQueueFlowWorker
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 __all__ = [
     "ApprovalResult",
@@ -152,6 +154,8 @@ __all__ = [
     "FlowClient",
     "FlowNotFoundError",
     "FlowRecord",
+    "FlowStateMode",
+    "FlowStatePolicy",
     "FlowWrongStateError",
     "GovernanceOverview",
     "InvalidCommandError",

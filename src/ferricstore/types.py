@@ -99,6 +99,57 @@ class RetryPolicy:
     exhausted_to: str = "failed"
 
 
+class FlowStateMode(str, Enum):
+    """Server scheduling mode for a Flow state."""
+
+    PARALLEL = "parallel"
+    FIFO = "fifo"
+
+
+_FLOW_STATE_MODE_VALUES = {mode.value for mode in FlowStateMode}
+
+
+def normalize_flow_state_mode(
+    value: FlowStateMode | str | None,
+    *,
+    argument: str = "mode",
+) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, FlowStateMode):
+        return value.value
+    if isinstance(value, str):
+        normalized = value.lower()
+        if normalized in _FLOW_STATE_MODE_VALUES:
+            return normalized
+    raise ValueError(
+        f"{argument} must be FlowStateMode.PARALLEL, FlowStateMode.FIFO, 'parallel', or 'fifo'"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FlowStatePolicy:
+    """Per-state Flow policy.
+
+    ``mode`` controls state scheduling. ``FIFO`` is opt-in per state; omitting
+    mode leaves the server default of ``PARALLEL``.
+    """
+
+    mode: FlowStateMode | str | None = None
+    retry: RetryPolicy | None = None
+
+    @classmethod
+    def fifo(cls, *, retry: RetryPolicy | None = None) -> FlowStatePolicy:
+        return cls(mode=FlowStateMode.FIFO, retry=retry)
+
+    @classmethod
+    def parallel(cls, *, retry: RetryPolicy | None = None) -> FlowStatePolicy:
+        return cls(mode=FlowStateMode.PARALLEL, retry=retry)
+
+
+FlowStatePolicyLike = RetryPolicy | FlowStatePolicy
+
+
 @dataclass(frozen=True, slots=True)
 class BudgetPolicy:
     """Workflow-state budget reservation policy.

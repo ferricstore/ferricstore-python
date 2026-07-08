@@ -1,3 +1,4 @@
+import json
 import threading
 import zlib
 from concurrent.futures import Future
@@ -8,6 +9,8 @@ from ferricstore import (
     BackpressurePolicy,
     FlowAlreadyExistsError,
     FlowClient,
+    FlowStateMode,
+    FlowStatePolicy,
     JsonCodec,
     OverloadedError,
     QueueFlowWorker,
@@ -3460,6 +3463,39 @@ def test_install_policy_can_set_indexed_state_meta():
     assert call[state_index : state_index + 4] == ("STATE", "queued", "MAX_RETRIES", 5)
 
 
+def test_install_policy_can_set_fifo_and_parallel_state_modes():
+    executor = FakeExecutor()
+    client = FlowClient(executor)
+
+    client.install_policy(
+        "order",
+        states={
+            "queued": FlowStatePolicy(
+                mode=FlowStateMode.FIFO,
+                retry=RetryPolicy(max_retries=5),
+            ),
+            "ready": FlowStatePolicy(mode=FlowStateMode.PARALLEL),
+        },
+    )
+
+    call = executor.calls[-1]
+    queued_index = call.index("queued")
+    ready_index = call.index("ready")
+    assert call[queued_index - 1 : queued_index + 4] == (
+        "STATE",
+        "queued",
+        "MODE",
+        "FIFO",
+        "MAX_RETRIES",
+    )
+    assert call[ready_index - 1 : ready_index + 3] == (
+        "STATE",
+        "ready",
+        "MODE",
+        "PARALLEL",
+    )
+
+
 def test_flow_record_decodes_state_meta_and_indexed_state_meta():
     record = FlowRecord.from_resp(
         {
@@ -3558,6 +3594,67 @@ def test_management_wrappers_build_control_plane_commands_and_normalize_response
         ("FERRICSTORE.TELEMETRY", "FLOW_QUERY", "TYPE", "order", "STATE", "queued"),
         ("FERRICSTORE.TELEMETRY", "FLOW_HISTORY", "f1", "INCLUDE", "metadata"),
     ]
+
+
+def test_invocation_helpers_build_narrow_commands_and_request_context():
+    executor = FakeExecutor()
+    client = FlowClient(executor)
+    executor.responses.extend(
+        [
+            {b"name": b"send-email"},
+            {b"name": b"send-email"},
+            [{b"name": b"send-email"}],
+            {b"invocation_id": b"inv-1"},
+            {b"id": b"inv-1"},
+            [{b"scope": b"tenant:acme"}],
+        ]
+    )
+
+    assert client.invocation_definition_put(
+        {"name": "send-email", "acl": {"scope_required": True}}
+    ) == {"name": "send-email"}
+    assert client.invocation_definition_get("send-email") == {"name": "send-email"}
+    assert client.invocation_definition_list() == [{"name": "send-email"}]
+    assert client.invocation_create(
+        "send-email",
+        {"tenant": "acme"},
+        context={"subject": "user-1"},
+        idempotency_key="idem-1",
+        request_context={
+            "subject": "proxy",
+            "tenant": "acme",
+            "scopes": ["invocation:create:*"],
+        },
+    ) == {"invocation_id": "inv-1"}
+    assert client.invocation_get("inv-1") == {"id": "inv-1"}
+    assert client.invocation_partition_list("send-email", scope="tenant:acme") == [
+        {"scope": "tenant:acme"}
+    ]
+
+    definition = json.loads(executor.calls[0][1])
+    assert definition == {"acl": {"scope_required": True}, "name": "send-email"}
+
+    create_call = executor.calls[3]
+    assert create_call[:2] == ("INVOCATION.CREATE", "send-email")
+    assert json.loads(create_call[2]) == {
+        "attrs": {"tenant": "acme"},
+        "context": {"subject": "user-1"},
+        "idempotency_key": "idem-1",
+    }
+    assert create_call[3:] == (
+        "REQUEST_CONTEXT",
+        {
+            "subject": "proxy",
+            "tenant": "acme",
+            "scopes": ["invocation:create:*"],
+        },
+    )
+    assert executor.calls[5] == (
+        "INVOCATION.PARTITION.LIST",
+        "send-email",
+        "SCOPE",
+        "tenant:acme",
+    )
 
 
 def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():

@@ -20,10 +20,14 @@ from ferricstore.types import (
     ExceptionPolicy,
     FencedItem,
     FlowRecord,
+    FlowStateMode,
+    FlowStatePolicy,
+    FlowStatePolicyLike,
     RetryPolicy,
     ValueConfig,
     WorkerConfig,
     normalize_exception_policy,
+    normalize_flow_state_mode,
     resolve_worker_connection_counts,
 )
 from ferricstore.worker import QueueFlowWorkerResult
@@ -1028,7 +1032,7 @@ class AsyncQueueClient:
         *,
         retry_policy: RetryPolicy | None = None,
         retry: RetryPolicy | None = None,
-        states: dict[str, RetryPolicy] | None = None,
+        states: dict[str, FlowStatePolicyLike] | None = None,
         indexed_state_meta: str | None = None,
     ) -> Any:
         if retry_policy is not None and retry is not None:
@@ -1648,6 +1652,7 @@ class AsyncWorkflow:
             value_max_bytes if value_max_bytes is not None else self.value_config.value_max_bytes
         )
         self.handlers: dict[str, AsyncWorkflowHandler] = {}
+        self.state_modes: dict[str, str] = {}
         self.error_modes: dict[str, AsyncErrorMode] = {}
         self.retry_policies: dict[str, RetryPolicy] = {}
         self.budget_policies: dict[str, BudgetPolicy] = {}
@@ -1661,6 +1666,7 @@ class AsyncWorkflow:
         self,
         state_name: str,
         *,
+        mode: FlowStateMode | str | None = None,
         exception_policy: AsyncErrorMode | None = None,
         on_error: AsyncErrorMode | None = None,
         retry_policy: RetryPolicy | None = None,
@@ -1668,6 +1674,7 @@ class AsyncWorkflow:
     ) -> Callable[[AsyncWorkflowHandler], AsyncWorkflowHandler]:
         return self.on(
             state_name,
+            mode=mode,
             exception_policy=exception_policy,
             on_error=on_error,
             retry_policy=retry_policy,
@@ -1678,6 +1685,7 @@ class AsyncWorkflow:
         self,
         state_name: str,
         *,
+        mode: FlowStateMode | str | None = None,
         exception_policy: AsyncErrorMode | None = None,
         on_error: AsyncErrorMode | None = None,
         retry_policy: RetryPolicy | None = None,
@@ -1695,9 +1703,14 @@ class AsyncWorkflow:
             if exception_policy is not None or on_error is not None
             else self.on_error
         )
+        resolved_mode = normalize_flow_state_mode(mode)
 
         def decorate(handler: AsyncWorkflowHandler) -> AsyncWorkflowHandler:
             self.handlers[state_name] = handler
+            if resolved_mode is not None:
+                self.state_modes[state_name] = resolved_mode
+            else:
+                self.state_modes.pop(state_name, None)
             self.error_modes[state_name] = resolved_on_error
             if retry_policy is not None:
                 self.retry_policies[state_name] = retry_policy
@@ -1727,7 +1740,13 @@ class AsyncWorkflow:
             if retry is not None
             else self.retry_policy
         )
-        kwargs: dict[str, Any] = {"retry": resolved_retry_policy, "states": self.retry_policies}
+        state_policies: dict[str, FlowStatePolicyLike] = {}
+        for state_name in set(self.state_modes) | set(self.retry_policies):
+            state_policies[state_name] = FlowStatePolicy(
+                mode=self.state_modes.get(state_name),
+                retry=self.retry_policies.get(state_name),
+            )
+        kwargs: dict[str, Any] = {"retry": resolved_retry_policy, "states": state_policies}
         if indexed_state_meta is not None:
             kwargs["indexed_state_meta"] = indexed_state_meta
         return await self.client.install_policy(self.type, **kwargs)
@@ -1998,6 +2017,11 @@ class AsyncWorkflow:
     ) -> None:
         partition_key = self._uniform_partition_key(jobs)
         if isinstance(outcome, Transition):
+            if (
+                self.state_modes.get(outcome.to_state) == FlowStateMode.FIFO.value
+                and outcome.priority is not None
+            ):
+                raise ValueError("priority is not supported for fifo state")
             items = [
                 FencedItem(
                     id=job.id,
@@ -2251,7 +2275,7 @@ class AsyncWorkflowClient:
         *,
         retry_policy: RetryPolicy | None = None,
         retry: RetryPolicy | None = None,
-        states: dict[str, RetryPolicy] | None = None,
+        states: dict[str, FlowStatePolicyLike] | None = None,
         indexed_state_meta: str | None = None,
     ) -> Any:
         if retry_policy is not None and retry is not None:

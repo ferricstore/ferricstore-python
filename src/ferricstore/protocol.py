@@ -3992,11 +3992,11 @@ def build_protocol_command(*args: Any) -> ProtocolCommand:
 
     name = _command_name(args[0])
     if name not in _OPCODES:
-        return ProtocolCommand(_OP_COMMAND_EXEC, {"command": name, "args": list(args[1:])}, 1)
+        return _command_exec_protocol_command(name, args[1:])
 
     if name == "COMMAND_EXEC":
         raw_name = _command_name(_require_arg(args, 1, name))
-        return ProtocolCommand(_OP_COMMAND_EXEC, {"command": raw_name, "args": list(args[2:])}, 1)
+        return _command_exec_protocol_command(raw_name, args[2:])
 
     if name in {
         "HELLO",
@@ -6128,7 +6128,7 @@ def _build_basic_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolC
         "FERRICSTORE.CONFIG",
     }:
         return ProtocolCommand(opcode, {"args": list(args)})
-    return ProtocolCommand(_OP_COMMAND_EXEC, {"command": name, "args": list(args)}, 1)
+    return _command_exec_protocol_command(name, args)
 
 
 def _build_flow_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolCommand:
@@ -6286,7 +6286,10 @@ def _build_flow_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolCo
         return ProtocolCommand(opcode, payload)
     if name in {"FLOW.POLICY.SET", "FLOW.POLICY.GET", "FLOW.RECLAIM"}:
         payload = {"type": _require_arg(args, 0, name)}
-        payload.update(_option_map(args[1:]))
+        if name == "FLOW.POLICY.SET":
+            payload.update(_flow_policy_set_option_map(args[1:]))
+        else:
+            payload.update(_option_map(args[1:]))
         return ProtocolCommand(opcode, payload)
     if name in {
         "FLOW.SCHEDULE.CREATE",
@@ -6363,8 +6366,99 @@ def _normalize_flow_search_state_meta_payload(payload: dict[str, Any]) -> None:
     payload["state_meta"] = {_text(state): state_meta}
 
 
+_FLOW_POLICY_FIELD_NAMES = {
+    "INDEXED_ATTRIBUTES": "indexed_attributes",
+    "MODE": "mode",
+}
+
+
+def _flow_policy_set_option_map(args: tuple[Any, ...]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    states: dict[str, dict[str, Any]] = {}
+    current_state: Any = None
+    current_args: list[Any] = []
+
+    def flush_current() -> None:
+        nonlocal current_args
+        if current_state is None:
+            payload.update(_flow_policy_option_map(tuple(current_args)))
+        else:
+            states[_text(current_state)] = _flow_policy_option_map(tuple(current_args))
+        current_args = []
+
+    idx = 0
+    while idx < len(args):
+        token = _command_token(args[idx])
+        if token == "STATE":
+            flush_current()
+            current_state = _require_arg(args, idx + 1, "STATE")
+            idx += 2
+            continue
+        current_args.extend([args[idx], _require_arg(args, idx + 1, token)])
+        idx += 2
+
+    flush_current()
+    if states:
+        payload["states"] = states
+    return payload
+
+
+def _flow_policy_option_map(args: tuple[Any, ...]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    idx = 0
+    while idx < len(args):
+        token = _command_token(args[idx])
+        mapped_field = _FLOW_POLICY_FIELD_NAMES.get(token) or _FIELD_NAMES.get(token)
+        if mapped_field is None:
+            raise InvalidCommandError(
+                f"FerricStore protocol transport does not support option {token}"
+            )
+        payload[mapped_field] = _require_arg(args, idx + 1, token)
+        idx += 2
+    return payload
+
+
 def _command_exec_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolCommand:
-    return ProtocolCommand(_OP_COMMAND_EXEC, {"command": name, "args": list(args)}, 1)
+    command_args = list(args)
+    payload: dict[str, Any] = {"command": name, "args": command_args}
+
+    if len(command_args) >= 2 and _command_token(command_args[-2]) == "REQUEST_CONTEXT":
+        request_context = _normalize_request_context(command_args[-1])
+        payload["args"] = command_args[:-2]
+        if request_context:
+            payload["request_context"] = request_context
+
+    return ProtocolCommand(_OP_COMMAND_EXEC, payload, 1)
+
+
+def _normalize_request_context(context: Any) -> dict[str, Any] | None:
+    if not isinstance(context, Mapping):
+        return None
+
+    payload: dict[str, Any] = {}
+    subject = _text_or_none(_map_get(context, "subject"))
+    tenant = _text_or_none(_map_get(context, "tenant"))
+    scopes = _normalize_request_context_scopes(_map_get(context, "scopes"))
+
+    if subject:
+        payload["subject"] = subject
+    if tenant:
+        payload["tenant"] = tenant
+    if scopes:
+        payload["scopes"] = scopes
+    return payload or None
+
+
+def _normalize_request_context_scopes(scopes: Any) -> list[str]:
+    if scopes is None:
+        return []
+    if isinstance(scopes, (str, bytes)):
+        values = _text(scopes).split()
+    elif isinstance(scopes, Sequence):
+        values = [_text(value) for value in scopes if value is not None and value != ""]
+    else:
+        return []
+    return list(dict.fromkeys(value for value in values if value))
 
 
 def _flow_create_many_payload(args: tuple[Any, ...]) -> dict[str, Any]:

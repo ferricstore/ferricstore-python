@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import json
 import zlib
 
 import pytest
@@ -9,6 +10,8 @@ from ferricstore import (
     BackpressurePolicy,
     FlowAlreadyExistsError,
     FlowClient,
+    FlowStateMode,
+    FlowStatePolicy,
     JsonCodec,
     OverloadedError,
     StaleLeaseError,
@@ -1354,6 +1357,34 @@ def test_async_install_policy_can_set_indexed_state_meta():
     run(main())
 
 
+def test_async_install_policy_can_set_fifo_state_mode():
+    async def main():
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
+
+        await client.install_policy(
+            "order",
+            states={
+                "queued": FlowStatePolicy(
+                    mode=FlowStateMode.FIFO,
+                    retry=RetryPolicy(max_retries=5),
+                )
+            },
+        )
+
+        call = executor.calls[-1]
+        state_index = call.index("STATE")
+        assert call[state_index : state_index + 5] == (
+            "STATE",
+            "queued",
+            "MODE",
+            "FIFO",
+            "MAX_RETRIES",
+        )
+
+    run(main())
+
+
 def test_async_management_wrappers_build_control_plane_commands_and_normalize_responses():
     async def main():
         executor = FakeAsyncExecutor()
@@ -1432,6 +1463,70 @@ def test_async_management_wrappers_build_control_plane_commands_and_normalize_re
             ("FERRICSTORE.TELEMETRY", "FLOW_QUERY", "TYPE", "order", "STATE", "queued"),
             ("FERRICSTORE.TELEMETRY", "FLOW_HISTORY", "f1", "INCLUDE", "metadata"),
         ]
+
+    run(main())
+
+
+def test_async_invocation_helpers_build_narrow_commands_and_request_context():
+    async def main():
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
+        executor.responses.extend(
+            [
+                {b"name": b"send-email"},
+                {b"name": b"send-email"},
+                [{b"name": b"send-email"}],
+                {b"invocation_id": b"inv-1"},
+                {b"id": b"inv-1"},
+                [{b"scope": b"tenant:acme"}],
+            ]
+        )
+
+        assert await client.invocation_definition_put(
+            {"name": "send-email", "acl": {"scope_required": True}}
+        ) == {"name": "send-email"}
+        assert await client.invocation_definition_get("send-email") == {"name": "send-email"}
+        assert await client.invocation_definition_list() == [{"name": "send-email"}]
+        assert await client.invocation_create(
+            "send-email",
+            {"tenant": "acme"},
+            context={"subject": "user-1"},
+            idempotency_key="idem-1",
+            request_context={
+                "subject": "proxy",
+                "tenant": "acme",
+                "scopes": ["invocation:create:*"],
+            },
+        ) == {"invocation_id": "inv-1"}
+        assert await client.invocation_get("inv-1") == {"id": "inv-1"}
+        assert await client.invocation_partition_list("send-email", scope="tenant:acme") == [
+            {"scope": "tenant:acme"}
+        ]
+
+        definition = json.loads(executor.calls[0][1])
+        assert definition == {"acl": {"scope_required": True}, "name": "send-email"}
+
+        create_call = executor.calls[3]
+        assert create_call[:2] == ("INVOCATION.CREATE", "send-email")
+        assert json.loads(create_call[2]) == {
+            "attrs": {"tenant": "acme"},
+            "context": {"subject": "user-1"},
+            "idempotency_key": "idem-1",
+        }
+        assert create_call[3:] == (
+            "REQUEST_CONTEXT",
+            {
+                "subject": "proxy",
+                "tenant": "acme",
+                "scopes": ["invocation:create:*"],
+            },
+        )
+        assert executor.calls[5] == (
+            "INVOCATION.PARTITION.LIST",
+            "send-email",
+            "SCOPE",
+            "tenant:acme",
+        )
 
     run(main())
 

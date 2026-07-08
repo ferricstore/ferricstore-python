@@ -22,10 +22,14 @@ from ferricstore.types import (
     ExceptionPolicy,
     FencedItem,
     FlowRecord,
+    FlowStateMode,
+    FlowStatePolicy,
+    FlowStatePolicyLike,
     RetryPolicy,
     ValueConfig,
     WorkerConfig,
     normalize_exception_policy,
+    normalize_flow_state_mode,
     resolve_worker_connection_counts,
 )
 
@@ -39,6 +43,7 @@ def _is_protocol_url(value: str) -> bool:
 @dataclass(frozen=True, slots=True)
 class StateConfig:
     name: str
+    mode: str | None = None
     lease_ms: int = 30_000
     claim_payload: bool = True
     claim_record: bool = True
@@ -1137,6 +1142,7 @@ def fail(
 def state(
     name: str,
     *,
+    mode: FlowStateMode | str | None = None,
     lease_ms: int = 30_000,
     claim_payload: bool = True,
     claim_record: bool = True,
@@ -1158,10 +1164,12 @@ def state(
         argument="exception_policy" if exception_policy is not None else "on_error",
     )
     resolved_retry_policy = retry_policy if retry_policy is not None else retry
+    resolved_mode = normalize_flow_state_mode(mode)
 
     def decorate(fn: Handler) -> Handler:
         cast(Any, fn).__ferric_state__ = StateConfig(
             name=name,
+            mode=resolved_mode,
             lease_ms=lease_ms,
             claim_payload=claim_payload,
             claim_record=claim_record,
@@ -1333,11 +1341,13 @@ class Workflow:
             if retry is not None
             else self.retry_policy
         )
-        state_policies = {
-            config.name: config.retry
-            for config in self._states.values()
-            if config.retry is not None
-        }
+        state_policies: dict[str, FlowStatePolicyLike] = {}
+        for config in self._states.values():
+            if config.mode is not None or config.retry is not None:
+                state_policies[config.name] = FlowStatePolicy(
+                    mode=config.mode,
+                    retry=config.retry,
+                )
         kwargs: dict[str, Any] = {"retry": resolved_retry_policy, "states": state_policies}
         if indexed_state_meta is not None:
             kwargs["indexed_state_meta"] = indexed_state_meta
@@ -1681,6 +1691,7 @@ class Workflow:
             outcome = complete(result=outcome)
 
         if isinstance(outcome, Transition):
+            self._validate_transition_policy(outcome)
             return self.client.transition(
                 job.id,
                 from_state=job.state,
@@ -1740,6 +1751,15 @@ class Workflow:
             )
         raise FerricStoreError(f"unknown workflow outcome: {outcome!r}")
 
+    def _validate_transition_policy(self, outcome: Transition) -> None:
+        target = self._states.get(outcome.to_state)
+        if (
+            target is not None
+            and target.mode == FlowStateMode.FIFO.value
+            and outcome.priority is not None
+        ):
+            raise ValueError("priority is not supported for fifo state")
+
     def _apply_uniform_batch(
         self,
         jobs: Sequence[FlowRecord | ClaimedFlow],
@@ -1783,6 +1803,7 @@ class Workflow:
             outcome = complete(result=outcome)
 
         if isinstance(outcome, Transition):
+            self._validate_transition_policy(outcome)
             from_state = self._uniform_current_state(jobs)
             if from_state is None:
                 if materialize:
@@ -2024,6 +2045,7 @@ class FlowWorkflow(Workflow):
         self,
         name: str,
         *,
+        mode: FlowStateMode | str | None = None,
         lease_ms: int = 30_000,
         claim_payload: bool = True,
         claim_record: bool = True,
@@ -2041,6 +2063,7 @@ class FlowWorkflow(Workflow):
                 raise ValueError(f"duplicate workflow state: {name!r}")
             handler = state(
                 name,
+                mode=mode,
                 lease_ms=lease_ms,
                 claim_payload=claim_payload,
                 claim_record=claim_record,
@@ -2196,7 +2219,7 @@ class WorkflowClient:
         *,
         retry_policy: RetryPolicy | None = None,
         retry: RetryPolicy | None = None,
-        states: dict[str, RetryPolicy] | None = None,
+        states: dict[str, FlowStatePolicyLike] | None = None,
         indexed_state_meta: str | None = None,
     ) -> Any:
         if retry_policy is not None and retry is not None:

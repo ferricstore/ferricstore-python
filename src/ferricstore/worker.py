@@ -14,6 +14,7 @@ from ferricstore.types import (
     ClaimedFlow,
     ExceptionPolicy,
     FlowRecord,
+    FlowStatePolicyLike,
     RetryPolicy,
     ValueConfig,
     WorkerConfig,
@@ -1492,7 +1493,7 @@ class QueueClient:
         *,
         retry_policy: RetryPolicy | None = None,
         retry: RetryPolicy | None = None,
-        states: dict[str, RetryPolicy] | None = None,
+        states: dict[str, FlowStatePolicyLike] | None = None,
         indexed_state_meta: str | None = None,
     ) -> Any:
         if retry_policy is not None and retry is not None:

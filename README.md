@@ -2,7 +2,7 @@
 
 Python SDK for FerricStore and FerricFlow.
 
-Status: public alpha `0.3.2`. APIs may change before `1.0`, but the SDK is
+Status: public alpha `0.3.3`. APIs may change before `1.0`, but the SDK is
 tested against command construction, queue/workflow handlers, leases, retries,
 history, indexed attributes, named values, idempotent create, worker loops,
 async flows, and local FerricStore integration scenarios.
@@ -79,6 +79,17 @@ stats = flow.stats("email", attributes={"tenant": "acme"})
 ```
 
 Attributes are not payload bytes. Use named values/value refs for large data.
+
+FIFO Flow state policy is opt-in per state:
+
+```python
+from ferricstore import FlowStatePolicy
+
+flow.install_policy("email", states={"queued": FlowStatePolicy.fifo()})
+emails.enqueue("email-3", payload=b"welcome", partition_key="tenant-a:email")
+```
+
+FIFO states require a `partition_key`; priority is for parallel states.
 
 ### 4. Run a queue worker
 

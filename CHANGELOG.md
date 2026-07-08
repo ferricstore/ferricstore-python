@@ -6,6 +6,12 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.3.3
+
+- Added Flow state mode policy support for FerricStore `0.7.5`, including FIFO/PARALLEL state policy command frames.
+- Added sync and async Enterprise invocation helpers over the public native command contract.
+- Updated Docker integration defaults to `ghcr.io/ferricstore/ferricstore:0.7.5`.
+
 ## 0.3.2
 
 - Updated native protocol coverage for FerricStore `0.7.2`, including opcode parity checks against live `OPTIONS`.

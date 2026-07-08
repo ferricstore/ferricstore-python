@@ -27,7 +27,7 @@ The SDK only opens FerricStore native protocol connections from URLs. Use `ferri
 | Attribute discovery | `attributes`, `attribute_values` |
 | Schedules | `schedule_create`, `schedule_get`, `schedule_fire`, `schedule_pause`, `schedule_resume`, `schedule_delete`, `schedule_fire_due`, `schedule_list` |
 | Governance | `effect_reserve`, `effect_confirm`, `effect_fail`, `effect_compensate`, `effect_get`, `governance_ledger`, `approval_request`, `approval_approve`, `approval_reject`, `approval_get`, `approval_list`, `governance_overview`, `circuit_open`, `circuit_close`, `circuit_get`, `budget_reserve`, `budget_commit`, `budget_release`, `budget_get`, `budget_list`, `limit_lease`, `limit_spend`, `limit_release`, `limit_get`, `limit_list` |
-| Management reads/writes | `capabilities`, `acl_*`, `ensure_namespace`, `get_namespace`, `list_namespaces`, `delete_namespace`, `set_quota`, `get_quota`, `quota_usage`, `cluster_info`, `namespace_usage`, `flow_query`, `flow_history` |
+| Management reads/writes | `capabilities`, `acl_*`, `ensure_namespace`, `get_namespace`, `list_namespaces`, `delete_namespace`, `set_quota`, `get_quota`, `quota_usage`, `cluster_info`, `namespace_usage`, `flow_query`, `flow_history`, `invocation_*` |
 | Policy/cleanup | `install_policy`, `policy_get`, `retention_cleanup` |
 
 `from_url` uses the native FerricStore protocol adapter.
@@ -638,18 +638,45 @@ The public result classes are `ScheduleResult`, `EffectResult`,
 
 ## `install_policy`
 
-Installs retry policy globally or per state.
+Installs retry policy globally or per state. State mode policy is also
+supported; FIFO is opt-in per state and requires explicit `partition_key` when
+records enter that state.
 
 ```python
-from ferricstore import RetryPolicy
+from ferricstore import FlowStatePolicy, RetryPolicy
 
 client.install_policy(
     "order",
     retry=RetryPolicy(max_retries=3, backoff="fixed", base_ms=100, max_ms=1_000),
     states={
         "charge": RetryPolicy(max_retries=10, backoff="exponential", base_ms=1_000, max_ms=86_400_000),
+        "dispatch": FlowStatePolicy.fifo(),
     },
 )
+```
+
+## Enterprise invocation helpers
+
+Invocation helpers build narrow public native commands instead of exposing an
+arbitrary command surface:
+
+```python
+client.invocation_definition_put(
+    {
+        "name": "send-email",
+        "acl": {"scope_required": True},
+        "partition": {"key": "tenant:{tenant}:invocation:send-email"},
+    }
+)
+
+created = client.invocation_create(
+    "send-email",
+    {"tenant": "acme"},
+    context={"subject": "user-1"},
+    request_context={"subject": "platform", "tenant": "acme"},
+)
+client.invocation_get(created["invocation_id"])
+client.invocation_partition_list("send-email", scope="tenant:acme")
 ```
 
 ## `policy_get`

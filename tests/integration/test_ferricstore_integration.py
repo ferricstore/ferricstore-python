@@ -19,6 +19,8 @@ from ferricstore import (
     FencedItem,
     FerricStoreError,
     FlowClient,
+    FlowStateMode,
+    FlowStatePolicy,
     JsonCodec,
     RetryPolicy,
 )
@@ -612,6 +614,187 @@ def test_real_ferricstore_state_meta_policy_and_flow_cycle() -> None:
             "accept": {"version": "1", "owner": "risk"},
             "completed": {"version": "3"},
         }
+    finally:
+        client.close()
+
+
+def test_real_ferricstore_fifo_state_policy_edges() -> None:
+    client = _client()
+    suffix = _suffix()
+    parallel_type = f"py-sdk-fifo-default-parallel-{suffix}"
+    fifo_type = f"py-sdk-fifo-policy-{suffix}"
+    partition = f"py-sdk:fifo:{suffix}:partition"
+    now = int(time.time() * 1000)
+
+    try:
+        for name in ("first", "second"):
+            assert client.create(
+                f"py-sdk:fifo-default:{suffix}:{name}",
+                type=parallel_type,
+                state="queued",
+                partition_key=partition,
+                payload={"name": name},
+                priority=1,
+                now_ms=now,
+                run_at_ms=now,
+            )
+
+        default_parallel = client.claim_flows(
+            parallel_type,
+            state="queued",
+            worker="py-sdk-default-parallel-worker",
+            partition_key=partition,
+            limit=2,
+            priority=1,
+            now_ms=now + 1,
+        )
+        assert len(default_parallel) == 2
+
+        assert client.install_policy(
+            fifo_type,
+            states={
+                "queued": FlowStatePolicy(mode=FlowStateMode.FIFO),
+                "start": FlowStatePolicy(mode=FlowStateMode.PARALLEL),
+            },
+        )
+        queued_policy = client.policy_get(fifo_type, state="queued")
+        start_policy = client.policy_get(fifo_type, state="start")
+        assert _text(_field(queued_policy, "mode")).lower() == "fifo"
+        assert _text(_field(start_policy, "mode")).lower() == "parallel"
+
+        with pytest.raises(FerricStoreError, match="partition_key is required for fifo state"):
+            client.create(
+                f"py-sdk:fifo-no-partition:{suffix}",
+                type=fifo_type,
+                state="queued",
+                payload={"bad": "missing-partition"},
+                now_ms=now + 10,
+                run_at_ms=now + 10,
+            )
+
+        with pytest.raises(FerricStoreError, match="priority is not supported for fifo state"):
+            client.create(
+                f"py-sdk:fifo-priority:{suffix}",
+                type=fifo_type,
+                state="queued",
+                partition_key=partition,
+                payload={"bad": "priority"},
+                priority=1,
+                now_ms=now + 11,
+                run_at_ms=now + 11,
+            )
+
+        transition_id = f"py-sdk:fifo-transition:{suffix}"
+        assert client.create(
+            transition_id,
+            type=fifo_type,
+            state="start",
+            payload={"step": "start"},
+            now_ms=now + 20,
+            run_at_ms=now + 20,
+        )
+        start_jobs = client.claim_flows(
+            fifo_type,
+            state="start",
+            worker="py-sdk-fifo-transition-worker",
+            limit=1,
+            priority=None,
+            now_ms=now + 21,
+        )
+        assert len(start_jobs) == 1
+        start_job = start_jobs[0]
+        assert start_job.partition_key is not None
+
+        with pytest.raises(FerricStoreError, match="partition_key is required for fifo state"):
+            client.transition(
+                transition_id,
+                from_state=start_job.state,
+                to_state="queued",
+                lease_token=start_job.lease_token,
+                fencing_token=start_job.fencing_token,
+                priority=None,
+                now_ms=now + 22,
+                run_at_ms=now + 22,
+            )
+
+        assert client.transition(
+            transition_id,
+            from_state=start_job.state,
+            to_state="queued",
+            lease_token=start_job.lease_token,
+            fencing_token=start_job.fencing_token,
+            partition_key=start_job.partition_key,
+            priority=None,
+            now_ms=now + 23,
+            run_at_ms=now + 23,
+        )
+
+        queued = client.claim_flows(
+            fifo_type,
+            state="queued",
+            worker="py-sdk-fifo-queued-worker",
+            partition_key=start_job.partition_key,
+            limit=1,
+            priority=None,
+            now_ms=now + 24,
+        )
+        assert [job.id for job in queued] == [transition_id]
+    finally:
+        client.close()
+
+
+def test_real_ferricstore_claim_due_partition_keys_decode_claim_data() -> None:
+    client = _client()
+    suffix = _suffix()
+    flow_type = f"py-sdk-claim-partitions-{suffix}"
+    partition_a = f"py-sdk:claim:{suffix}:a"
+    partition_b = f"py-sdk:claim:{suffix}:b"
+    partition_c = f"py-sdk:claim:{suffix}:c"
+    now = int(time.time() * 1000)
+
+    try:
+        for partition, name in ((partition_a, "a"), (partition_b, "b"), (partition_c, "c")):
+            assert client.create(
+                f"py-sdk:claim:{suffix}:{name}",
+                type=flow_type,
+                state="queued",
+                partition_key=partition,
+                payload={"partition": name},
+                now_ms=now,
+                run_at_ms=now,
+            )
+
+        jobs = client.claim_flows(
+            flow_type,
+            state="queued",
+            worker="py-sdk-claim-partition-worker",
+            partition_keys=[partition_a, partition_b],
+            limit=10,
+            priority=None,
+            now_ms=now + 1,
+        )
+
+        assert {job.partition_key for job in jobs} == {partition_a, partition_b}
+        assert {job.id for job in jobs} == {
+            f"py-sdk:claim:{suffix}:a",
+            f"py-sdk:claim:{suffix}:b",
+        }
+        for job in jobs:
+            assert isinstance(job.lease_token, bytes)
+            assert job.lease_token
+            assert isinstance(job.fencing_token, int)
+            assert job.fencing_token > 0
+
+        remaining = client.claim_flows(
+            flow_type,
+            state="queued",
+            worker="py-sdk-claim-partition-worker",
+            partition_key=partition_c,
+            limit=10,
+            priority=None,
+            now_ms=now + 2,
+        )
+        assert [job.partition_key for job in remaining] == [partition_c]
     finally:
         client.close()
 
