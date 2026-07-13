@@ -1,7 +1,11 @@
+import threading
+import time
+from collections import deque
 from concurrent.futures import Future
 
 import pytest
 
+import ferricstore.worker as worker_module
 from ferricstore import ExceptionPolicy, QueueClient, RetryPolicy, ValueConfig, WorkerConfig
 from ferricstore.types import ClaimedFlow, resolve_worker_connection_counts
 from ferricstore.worker import QueueFlowWorker, QueueFlowWorkerResult
@@ -24,15 +28,15 @@ class FakeFlowClient:
 
     def complete_jobs(self, jobs, **kwargs):
         self.completed.append((list(jobs), kwargs))
-        return []
+        return [b"OK"] * len(jobs)
 
     def retry_many(self, partition_key, jobs, **kwargs):
         self.retried.append((partition_key, list(jobs), kwargs))
-        return []
+        return [b"OK"] * len(jobs)
 
     def fail_many(self, partition_key, jobs, **kwargs):
         self.failed.append((partition_key, list(jobs), kwargs))
-        return []
+        return [b"OK"] * len(jobs)
 
     def enqueue(self, id, **kwargs):
         self.enqueued = getattr(self, "enqueued", [])
@@ -112,6 +116,120 @@ class FakeWakeFlowClient(FakeFlowClient):
         return self.events.pop(0)
 
 
+def test_flow_worker_validates_completion_clients_before_opening_owned_clients(monkeypatch):
+    opened: list[str] = []
+
+    def from_url(url, **_kwargs):
+        opened.append(url)
+        return FakeFlowClient([])
+
+    monkeypatch.setattr(worker_module.FlowClient, "from_url", staticmethod(from_url))
+
+    with pytest.raises(ValueError, match="completion_clients must be non-empty"):
+        QueueFlowWorker(
+            "ferric://seed.local:6388",
+            type="email",
+            completion_clients=[],
+        )
+
+    assert opened == []
+
+
+def test_flow_worker_closes_first_owned_client_when_second_connection_fails(monkeypatch):
+    opened: list[FakeFlowClient] = []
+
+    def from_url(_url, **_kwargs):
+        if opened:
+            raise OSError("claim connection failed")
+        client = FakeFlowClient([])
+        client.closed = False
+        opened.append(client)
+        return client
+
+    monkeypatch.setattr(worker_module.FlowClient, "from_url", staticmethod(from_url))
+
+    with pytest.raises(OSError, match="claim connection failed"):
+        QueueFlowWorker("ferric://seed.local:6388", type="email")
+
+    assert len(opened) == 1
+    assert opened[0].closed is True
+
+
+@pytest.mark.parametrize("constructor", ["direct", "from_url"])
+def test_queue_client_closes_first_owned_client_when_second_connection_fails(
+    monkeypatch, constructor
+):
+    opened: list[FakeFlowClient] = []
+
+    def from_url(_url, **_kwargs):
+        if opened:
+            raise OSError("claim connection failed")
+        client = FakeFlowClient([])
+        client.closed = False
+        opened.append(client)
+        return client
+
+    monkeypatch.setattr(worker_module.FlowClient, "from_url", staticmethod(from_url))
+
+    with pytest.raises(OSError, match="claim connection failed"):
+        if constructor == "direct":
+            QueueClient("ferric://seed.local:6388")
+        else:
+            QueueClient.from_url("ferric://seed.local:6388")
+
+    assert len(opened) == 1
+    assert opened[0].closed is True
+
+
+def test_flow_worker_rolls_back_all_owned_resources_after_late_startup_failure(monkeypatch):
+    opened: list[FakeFlowClient] = []
+    executors = []
+
+    class FailingSubscriptionClient(FakeFlowClient):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.closed = False
+
+        def subscribe_flow_wake(self, *_args, **_kwargs):
+            raise OSError("subscription failed")
+
+        def wait_event(self, timeout=None):
+            return None
+
+    class FakeExecutor:
+        def __init__(self, max_workers):
+            self.max_workers = max_workers
+            self.shutdown_called = False
+            executors.append(self)
+
+        def shutdown(self, *, wait, cancel_futures):
+            assert wait is False
+            assert cancel_futures is True
+            self.shutdown_called = True
+
+    def from_url(_url, **_kwargs):
+        client = FailingSubscriptionClient()
+        opened.append(client)
+        return client
+
+    monkeypatch.setattr(worker_module.FlowClient, "from_url", staticmethod(from_url))
+    monkeypatch.setattr(worker_module, "ThreadPoolExecutor", FakeExecutor)
+
+    with pytest.raises(OSError, match="subscription failed"):
+        QueueFlowWorker(
+            "ferric://seed.local:6388",
+            type="email",
+            concurrency=2,
+            complete_async_depth=1,
+            protocol_wake_hints=True,
+        )
+
+    assert len(opened) == 2
+    assert all(client.closed for client in opened)
+    assert len(executors) == 2
+    assert all(executor.shutdown_called for executor in executors)
+
+
 def test_flow_worker_drains_same_partition_group_while_batches_are_full():
     client = FakeFlowClient(
         [
@@ -141,6 +259,160 @@ def test_flow_worker_drains_same_partition_group_while_batches_are_full():
         "bucket-0",
         "bucket-0",
     ]
+
+
+def test_flow_worker_stop_before_thread_loop_starts_is_not_overwritten():
+    entered = threading.Event()
+    release = threading.Event()
+
+    class DelayedWorker(QueueFlowWorker):
+        def _run_loop(self, handler, *, batch_handler):
+            entered.set()
+            release.wait()
+            super()._run_loop(handler, batch_handler=batch_handler)
+
+    worker = DelayedWorker(FakeFlowClient([]), type="email", idle_sleep_s=0.001)
+    worker.start(lambda _job: None)
+    assert entered.wait(1)
+    worker.stop()
+    release.set()
+
+    worker.join(timeout=0.2)
+    stopped_before_cleanup = not worker.is_running and not worker._thread.is_alive()
+    if not stopped_before_cleanup:
+        worker.stop()
+        worker.join(timeout=0.2)
+
+    assert stopped_before_cleanup
+
+
+def test_flow_worker_close_has_bounded_wait_for_blocking_claim():
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingClient(FakeFlowClient):
+        def claim_flows(self, type, **kwargs):
+            self.claim_calls.append((type, kwargs))
+            entered.set()
+            release.wait()
+            return []
+
+    worker = QueueFlowWorker(BlockingClient([]), type="email", block_ms=60_000)
+    worker.start(lambda _job: None)
+    assert entered.wait(1)
+
+    with pytest.raises(TimeoutError, match="close timed out"):
+        worker.close(timeout=0.01)
+
+    release.set()
+    worker.close(timeout=1)
+    assert worker.is_running is False
+
+
+def test_flow_worker_close_waits_for_caller_managed_run_thread():
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingClient(FakeFlowClient):
+        def claim_flows(self, type, **kwargs):
+            self.claim_calls.append((type, kwargs))
+            entered.set()
+            release.wait()
+            return []
+
+    client = BlockingClient([])
+    worker = QueueFlowWorker(
+        client,
+        type="email",
+        block_ms=60_000,
+    )
+    worker._owns_client = True
+    run_thread = threading.Thread(target=worker.run_forever, args=(lambda _job: None,))
+    run_thread.start()
+    assert entered.wait(1)
+
+    try:
+        with pytest.raises(TimeoutError, match="close timed out"):
+            worker.close(timeout=0.01)
+        assert getattr(client, "closed", False) is False
+        assert run_thread.is_alive()
+    finally:
+        release.set()
+        run_thread.join(1)
+        if not getattr(client, "closed", False):
+            worker.close(timeout=1)
+
+    assert getattr(client, "closed", False) is True
+    assert worker.is_running is False
+
+
+def test_flow_worker_close_deadline_includes_pending_completions():
+    worker = QueueFlowWorker(FakeFlowClient([]), type="email")
+    pending: Future[QueueFlowWorkerResult] = Future()
+    worker._pending_completions.append(pending)
+    release = threading.Timer(
+        0.15,
+        lambda: pending.set_result(QueueFlowWorkerResult(completed=1)),
+    )
+    release.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match="close timed out"):
+            worker.close(timeout=0.01)
+        assert time.monotonic() - started < 0.1
+    finally:
+        if not pending.done():
+            pending.set_result(QueueFlowWorkerResult(completed=1))
+        release.cancel()
+        worker.close(timeout=1)
+
+
+def test_flow_worker_close_does_not_confuse_completion_timeout_with_deadline():
+    worker = QueueFlowWorker(FakeFlowClient([]), type="email")
+    failed: Future[QueueFlowWorkerResult] = Future()
+    failed.set_exception(TimeoutError("completion operation timed out"))
+    worker._pending_completions.append(failed)
+
+    with pytest.raises(TimeoutError, match="completion operation timed out"):
+        worker.close(timeout=1)
+
+    assert not worker._pending_completions
+    worker.close(timeout=1)
+
+
+def test_flow_worker_close_deadline_includes_standalone_run_once_executor_work():
+    entered = threading.Event()
+    release = threading.Event()
+    job = ClaimedFlow("f1", b"lease-1", 1, partition_key="p1")
+    worker = QueueFlowWorker(
+        FakeFlowClient([[job]]),
+        type="email",
+        concurrency=2,
+        batch_size=1,
+    )
+
+    def handler(_job):
+        entered.set()
+        release.wait()
+        return b"done"
+
+    run_thread = threading.Thread(target=worker.run_once, args=(handler,))
+    run_thread.start()
+    assert entered.wait(1)
+    delayed_release = threading.Timer(0.2, release.set)
+    delayed_release.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match="close timed out"):
+            worker.close(timeout=0.01)
+        assert time.monotonic() - started < 0.1
+    finally:
+        release.set()
+        delayed_release.cancel()
+        run_thread.join(1)
+
+    worker.close(timeout=1)
+    assert run_thread.is_alive() is False
 
 
 def test_flow_worker_fuses_complete_and_next_claim_on_sync_hot_path():
@@ -358,6 +630,43 @@ def test_flow_worker_prefetches_blocking_claims_with_protocol_future_client():
     assert len(client.future_claim_calls) == 3
     assert [call[1]["block_ms"] for call in client.future_claim_calls] == [5000, 5000, 5000]
     assert client.completed == [([job], {"result": "ok", "independent": True})]
+
+
+def test_flow_worker_close_preserves_and_finishes_prefetched_claim_ownership():
+    first_job = ClaimedFlow("flow-1", b"lease-1", 1, partition_key="bucket-0")
+    second_job = ClaimedFlow("flow-2", b"lease-2", 2, partition_key="bucket-0")
+    first: Future[list[ClaimedFlow]] = Future()
+    first.set_result([first_job])
+    second: Future[list[ClaimedFlow]] = Future()
+    third: Future[list[ClaimedFlow]] = Future()
+    client = FakeFutureClaimFlowClient([first, second, third])
+    handled: list[str] = []
+    worker = QueueFlowWorker(
+        client,
+        type="email",
+        state="queued",
+        batch_size=1,
+        block_ms=5_000,
+        claim_prefetch=2,
+        idle_sleep_s=0,
+    )
+
+    worker.run_once(lambda job: handled.append(job.id) or "ok")
+
+    try:
+        with pytest.raises(TimeoutError, match="close timed out"):
+            worker.close(timeout=0.01)
+        assert second.cancelled() is False
+        assert third.cancelled() is False
+    finally:
+        if not second.done():
+            second.set_result([second_job])
+        if not third.done():
+            third.set_result([])
+        worker.close(timeout=1)
+
+    assert handled == ["flow-1", "flow-2"]
+    assert [jobs for jobs, _kwargs in client.completed] == [[first_job], [second_job]]
 
 
 def test_flow_worker_blocks_on_all_owned_partitions_by_default():
@@ -624,6 +933,127 @@ def test_flow_worker_start_stop_join_tracks_stats():
     assert worker.is_running is False
 
 
+def test_flow_worker_begin_run_is_atomic_across_concurrent_callers():
+    worker = QueueFlowWorker(FakeFlowClient([]), type="email")
+    barrier = threading.Barrier(3)
+    original_reset = worker._terminal_state.reset
+    successes: list[None] = []
+    errors: list[BaseException] = []
+
+    def synchronized_reset() -> None:
+        time.sleep(0.05)
+        original_reset()
+
+    worker._terminal_state.reset = synchronized_reset  # type: ignore[method-assign]
+
+    def begin() -> None:
+        barrier.wait(timeout=1)
+        try:
+            worker._begin_run()
+            successes.append(None)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=begin) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=1)
+    for thread in threads:
+        thread.join(1)
+
+    worker.stop()
+    worker.close()
+    assert len(successes) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert str(errors[0]) == "worker already running"
+
+
+def test_flow_worker_close_cannot_finish_before_inflight_start_transition():
+    worker = QueueFlowWorker(FakeFlowClient([]), type="email")
+    reset_entered = threading.Event()
+    release_reset = threading.Event()
+    close_done = threading.Event()
+    original_reset = worker._terminal_state.reset
+
+    def blocked_reset() -> None:
+        reset_entered.set()
+        assert release_reset.wait(1)
+        original_reset()
+
+    worker._terminal_state.reset = blocked_reset  # type: ignore[method-assign]
+    begin_thread = threading.Thread(target=worker._begin_run)
+    begin_thread.start()
+    assert reset_entered.wait(1)
+
+    close_thread = threading.Thread(target=lambda: (worker.close(), close_done.set()))
+    close_thread.start()
+    close_finished_during_start = close_done.wait(0.05)
+    release_reset.set()
+    begin_thread.join(1)
+    close_thread.join(1)
+
+    assert close_finished_during_start is False
+    assert close_done.is_set()
+    assert worker.is_running is False
+
+
+def test_flow_worker_close_timeout_bounds_owned_blocking_client_cleanup():
+    class SlowCloseClient(FakeFlowClient):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.close_entered = threading.Event()
+            self.close_finished = threading.Event()
+            self.release_close = threading.Event()
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            self.close_entered.set()
+            self.release_close.wait(1)
+            self.close_finished.set()
+
+    client = SlowCloseClient()
+    worker = QueueFlowWorker(client, type="email")
+    worker._owns_client = True
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match="close timed out"):
+            worker.close(timeout=0.01)
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.1
+        assert client.close_entered.wait(1)
+    finally:
+        client.release_close.set()
+
+    assert client.close_finished.wait(1)
+    worker.close(timeout=1)
+    assert client.close_calls == 1
+    assert worker._owns_client is False
+
+
+def test_flow_worker_pending_completion_queue_has_constant_time_head_drains():
+    worker = QueueFlowWorker(FakeFlowClient([]), type="email")
+
+    assert isinstance(worker._pending_completions, deque)
+
+    worker.close()
+
+
+def test_flow_worker_join_propagates_background_failure():
+    client = FakeFlowClient([[object()]])
+    worker = QueueFlowWorker(
+        client,
+        type="email",
+        exception_policy=ExceptionPolicy.RAISE,
+        idle_sleep_s=0,
+    )
+    worker.start(lambda _job: (_ for _ in ()).throw(RuntimeError("background boom")))
+
+    with pytest.raises(RuntimeError, match="background boom"):
+        worker.join(timeout=1)
+
+
 def test_flow_worker_close_merges_async_completion_stats():
     client = FakeFlowClient([[object()]])
     worker = QueueFlowWorker(
@@ -691,6 +1121,102 @@ def test_flow_worker_preserves_distinct_failure_messages_in_batch_retry():
     assert client.retried[1][2]["error"] == "boom-f2"
 
 
+def test_flow_worker_handler_fanout_keeps_only_a_bounded_pending_window():
+    class TrackedFuture(Future):
+        def __init__(self, executor, value):
+            super().__init__()
+            self.executor = executor
+            self.consumed = False
+            self.set_result(value)
+
+        def result(self, timeout=None):
+            if not self.consumed:
+                self.consumed = True
+                self.executor.pending -= 1
+            return super().result(timeout)
+
+    class TrackingExecutor:
+        def __init__(self):
+            self.pending = 0
+            self.max_pending = 0
+
+        def submit(self, operation, item):
+            self.pending += 1
+            self.max_pending = max(self.max_pending, self.pending)
+            return TrackedFuture(self, operation(item))
+
+    jobs = [ClaimedFlow(f"f{index}", b"lease", index, partition_key="p1") for index in range(100)]
+    worker = QueueFlowWorker(FakeFlowClient([]), type="email", concurrency=4)
+    assert worker._executor is not None
+    worker._executor.shutdown(wait=True)
+    executor = TrackingExecutor()
+    worker._executor = executor
+
+    handled = worker._run_handlers(jobs, lambda job: job.id)
+
+    worker._executor = None
+    assert handled.failures == []
+    assert handled.jobs == jobs
+    assert executor.max_pending <= 4
+
+
+def test_flow_worker_pipelines_distinct_failures_as_one_mutation_batch():
+    jobs = [
+        ClaimedFlow("f1", b"lease-1", 1, partition_key="p1"),
+        ClaimedFlow("f2", b"lease-2", 2, partition_key="p1"),
+    ]
+
+    class MutationClient(FakeFlowClient):
+        def __init__(self) -> None:
+            super().__init__([jobs])
+            self.mutation_batches = []
+
+        def apply_job_mutations(self, mutations):
+            self.mutation_batches.append(list(mutations))
+            return [b"OK"] * len(mutations)
+
+    client = MutationClient()
+    worker = QueueFlowWorker(client, type="email", batch_size=2, on_error="retry")
+
+    result = worker.run_once(lambda job: (_ for _ in ()).throw(RuntimeError(f"boom-{job.id}")))
+
+    assert result.retried == 2
+    assert len(client.mutation_batches) == 1
+    assert [mutation.kind.value for mutation in client.mutation_batches[0]] == [
+        "retry",
+        "retry",
+    ]
+    assert [mutation.options["error"] for mutation in client.mutation_batches[0]] == [
+        "boom-f1",
+        "boom-f2",
+    ]
+
+
+def test_flow_worker_does_not_conflate_bool_and_int_completion_results():
+    jobs = [
+        ClaimedFlow("bool", b"lease-1", 1, partition_key="p1"),
+        ClaimedFlow("int", b"lease-2", 2, partition_key="p1"),
+    ]
+
+    class TypedResultClient(FakeFlowClient):
+        def __init__(self) -> None:
+            super().__init__([jobs])
+            self.result_batches = []
+
+        def complete_job_results(self, items):
+            self.result_batches.append(list(items))
+            return [b"OK"] * len(items)
+
+    client = TypedResultClient()
+    worker = QueueFlowWorker(client, type="typed", batch_size=2)
+
+    result = worker.run_once(lambda job: job.id == "bool" if job.id == "bool" else 1)
+
+    assert result.completed == 2
+    assert client.completed == []
+    assert [value for _job, value in client.result_batches[0]] == [True, 1]
+
+
 def test_queue_client_creates_queue_and_delegates_flow_commands():
     client = FakeFlowClient([])
     queue_client = QueueClient(client)
@@ -747,17 +1273,21 @@ def test_queue_client_from_url_creates_bounded_command_and_claim_pools(monkeypat
 
     queue_client = QueueClient.from_url(
         "ferric://example:6388",
-        worker_config=WorkerConfig(workers=3),
+        worker_config=WorkerConfig(workers=3, claim_connections=2),
     )
 
     worker = queue_client.queue(type="email").worker()
 
-    assert calls == [("ferric://example:6388", {"max_connections": 1})]
+    assert calls == [
+        ("ferric://example:6388", {"max_connections": 1}),
+        ("ferric://example:6388", {"max_connections": 2}),
+    ]
     assert worker.client is queue_client.flow
     assert worker.claim_client is queue_client.claim_flow
+    assert queue_client.claim_flow is not queue_client.flow
 
 
-def test_queue_client_from_protocol_url_reuses_multiplexed_claim_client(monkeypatch):
+def test_queue_client_from_protocol_url_separates_command_and_claim_clients(monkeypatch):
     calls = []
 
     def from_url(url, **kwargs):
@@ -775,14 +1305,13 @@ def test_queue_client_from_protocol_url_reuses_multiplexed_claim_client(monkeypa
     )
     worker = queue_client.queue(type="email").worker()
 
-    assert len(calls) == 1
-    assert calls[0][1] == {"max_connections": 1}
-    assert queue_client.claim_flow is queue_client.flow
+    assert [kwargs["max_connections"] for _url, kwargs, _client in calls] == [1, 3]
+    assert queue_client.claim_flow is not queue_client.flow
     assert worker.client is queue_client.flow
-    assert worker.claim_client is queue_client.flow
+    assert worker.claim_client is queue_client.claim_flow
 
 
-def test_flow_worker_from_protocol_url_reuses_multiplexed_claim_client(monkeypatch):
+def test_flow_worker_from_protocol_url_creates_bounded_claim_client(monkeypatch):
     calls = []
 
     def from_url(url, **kwargs):
@@ -799,11 +1328,14 @@ def test_flow_worker_from_protocol_url_reuses_multiplexed_claim_client(monkeypat
         type="email",
         state="queued",
         concurrency=50,
+        claim_connections=3,
     )
 
-    assert len(calls) == 1
-    assert calls[0][1] == {"max_connections": 1}
-    assert worker.claim_client is worker.client
+    assert [(url, kwargs) for url, kwargs, _client in calls] == [
+        ("ferric://example:6388", {"max_connections": 1}),
+        ("ferric://example:6388", {"max_connections": 3}),
+    ]
+    assert worker.claim_client is not worker.client
 
 
 def test_queue_worker_config_at_queue_time_resizes_claim_pool(monkeypatch):
@@ -824,12 +1356,12 @@ def test_queue_worker_config_at_queue_time_resizes_claim_pool(monkeypatch):
         worker_config=WorkerConfig(workers=16),
     ).worker()
 
-    assert calls[0][1]["max_connections"] == 1
+    assert [kwargs["max_connections"] for _url, kwargs, _client in calls] == [1, 1, 16]
     assert worker.client is queue_client.flow
-    assert worker.claim_client is queue_client.flow
+    assert worker.claim_client is calls[-1][2]
 
 
-def test_queue_worker_config_does_not_resize_protocol_claim_pool(monkeypatch):
+def test_queue_worker_config_reuses_matching_claim_pool(monkeypatch):
     calls = []
 
     def from_url(url, **kwargs):
@@ -846,11 +1378,15 @@ def test_queue_worker_config_does_not_resize_protocol_claim_pool(monkeypatch):
         type="email",
         worker_config=WorkerConfig(workers=16),
     ).worker()
+    second_worker = queue_client.queue(
+        type="sms",
+        worker_config=WorkerConfig(workers=16),
+    ).worker()
 
-    assert len(calls) == 1
-    assert calls[0][1] == {"max_connections": 1}
+    assert [kwargs["max_connections"] for _url, kwargs, _client in calls] == [1, 1, 16]
     assert worker.client is queue_client.flow
-    assert worker.claim_client is queue_client.flow
+    assert worker.claim_client is calls[-1][2]
+    assert second_worker.claim_client is worker.claim_client
 
 
 def test_protocol_queue_client_respects_explicit_command_connections(monkeypatch):
@@ -870,9 +1406,8 @@ def test_protocol_queue_client_respects_explicit_command_connections(monkeypatch
         worker_config=WorkerConfig(workers=16, command_connections=3),
     )
 
-    assert len(calls) == 1
-    assert calls[0][1] == {"max_connections": 3}
-    assert queue_client.claim_flow is queue_client.flow
+    assert [kwargs["max_connections"] for _url, kwargs, _client in calls] == [3, 16]
+    assert queue_client.claim_flow is not queue_client.flow
 
 
 def test_queue_client_close_does_not_close_externally_owned_clients():
@@ -884,6 +1419,123 @@ def test_queue_client_close_does_not_close_externally_owned_clients():
 
     assert not hasattr(flow, "closed")
     assert not hasattr(claim_flow, "closed")
+
+
+def test_queue_client_close_attempts_every_owned_resource_after_failure():
+    closed = []
+
+    class CloseClient(FakeFlowClient):
+        def __init__(self, name, *, fail_once=False):
+            super().__init__([])
+            self.name = name
+            self.fail_once = fail_once
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            closed.append(self.name)
+            if self.fail_once and self.close_calls == 1:
+                raise RuntimeError(f"{self.name} close failed")
+
+    flow = CloseClient("flow")
+    claim = CloseClient("claim")
+    extra = CloseClient("extra", fail_once=True)
+    client = QueueClient(flow, claim_client=claim)
+    client._owns_flow = True
+    client._owns_claim_flow = True
+    client._owned_extra_claim_flows.append(extra)
+    client._claim_flows_by_size[99] = extra
+
+    with pytest.raises(RuntimeError, match="extra close failed"):
+        client.close()
+
+    assert closed == ["extra", "claim", "flow"]
+    assert client._owned_extra_claim_flows == [extra]
+    assert client._claim_flows_by_size == {}
+    assert client._owns_claim_flow is False
+    assert client._owns_flow is False
+
+    client.close()
+
+    assert closed == ["extra", "claim", "flow", "extra"]
+    assert client._owned_extra_claim_flows == []
+
+
+def test_queue_client_close_prevents_new_owned_claim_pools(monkeypatch):
+    opened: list[FakeFlowClient] = []
+
+    def from_url(_url, **_kwargs):
+        client = FakeFlowClient([])
+        opened.append(client)
+        return client
+
+    monkeypatch.setattr(worker_module.FlowClient, "from_url", staticmethod(from_url))
+    client = QueueClient.from_url("ferric://seed.local:6388")
+    client.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        client.queue(type="email", worker_config=WorkerConfig(workers=4))
+
+    assert len(opened) == 2
+
+
+def test_queue_client_close_waits_for_inflight_owned_claim_pool_creation(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    close_done = threading.Event()
+    opened: list[FakeFlowClient] = []
+    errors: list[BaseException] = []
+
+    def from_url(_url, **_kwargs):
+        entered.set()
+        if not release.wait(timeout=2):
+            raise TimeoutError("claim-pool test release timed out")
+        client = FakeFlowClient([])
+        client.closed = False
+        opened.append(client)
+        return client
+
+    monkeypatch.setattr(worker_module.FlowClient, "from_url", staticmethod(from_url))
+    flow = FakeFlowClient([])
+    claim_flow = FakeFlowClient([])
+    client = QueueClient(flow, claim_client=claim_flow)
+    client._url = "ferric://seed.local:6388"
+    client._claim_client_explicit = False
+    client._owns_flow = True
+    client._owns_claim_flow = True
+
+    def create_queue() -> None:
+        try:
+            client.queue(type="email", worker_config=WorkerConfig(workers=4))
+        except BaseException as exc:
+            errors.append(exc)
+
+    def close_client() -> None:
+        try:
+            client.close()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            close_done.set()
+
+    create_thread = threading.Thread(target=create_queue)
+    close_thread = threading.Thread(target=close_client)
+    create_thread.start()
+    assert entered.wait(timeout=1)
+    close_thread.start()
+
+    close_waited = not close_done.wait(timeout=0.05)
+    release.set()
+    create_thread.join(timeout=1)
+    close_thread.join(timeout=1)
+
+    assert close_waited is True
+    assert not create_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert errors == []
+    assert len(opened) == 1
+    assert opened[0].closed is True
+    assert client._owned_extra_claim_flows == []
 
 
 def test_worker_connection_counts_reject_zero_limits():

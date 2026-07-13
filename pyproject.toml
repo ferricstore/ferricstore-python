@@ -43,6 +43,7 @@ dev = [
   "pytest-cov>=6,<8",
   "ruff>=0.15,<1",
   "mypy>=1.11",
+  "msgpack>=1.2.1,<2",
   "twine>=6,<7",
 ]
 

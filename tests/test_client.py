@@ -1,10 +1,17 @@
+import contextlib
 import json
+import logging
 import threading
+import time
 import zlib
+from collections import deque
 from concurrent.futures import Future
+from typing import Any
 
 import pytest
 
+import ferricstore
+import ferricstore.client as client_module
 from ferricstore import (
     BackpressurePolicy,
     FlowAlreadyExistsError,
@@ -17,7 +24,13 @@ from ferricstore import (
     StaleLeaseError,
 )
 from ferricstore.backpressure import BackpressureController
-from ferricstore.errors import FerricStoreError, classify_server_error, map_exception
+from ferricstore.errors import (
+    FerricStoreError,
+    InvalidCommandError,
+    classify_server_error,
+    map_exception,
+)
+from ferricstore.protocol import ProtocolAdapterPool
 from ferricstore.types import (
     ApprovalResult,
     ChildSpec,
@@ -34,6 +47,12 @@ from ferricstore.types import (
     RetryPolicy,
     ScheduleResult,
 )
+
+
+def test_package_all_exports_public_workflow_and_queue_flow_types():
+    expected = {"FlowWorkflow", "AsyncQueueFlow", "AsyncQueueFlowWorker"}
+
+    assert expected <= set(ferricstore.__all__)
 
 
 class FakeExecutor:
@@ -181,6 +200,288 @@ class FakeExecutor:
         except Exception as exc:
             future.set_exception(exc)
         return future
+
+
+def test_transaction_suspends_heartbeat_until_exec():
+    class TransactionExecutor:
+        def __init__(self) -> None:
+            self.paused = 0
+            self.calls: list[tuple[Any, ...]] = []
+
+        def pause_heartbeat(self) -> None:
+            self.paused += 1
+
+        def resume_heartbeat(self) -> None:
+            self.paused -= 1
+
+        def execute_command(self, *args: Any) -> Any:
+            self.calls.append(args)
+            return b"OK"
+
+    executor = TransactionExecutor()
+    client = FlowClient(executor)
+
+    client.multi()
+    assert executor.paused == 1
+    client.command("SET", "key", "value")
+    assert executor.paused == 1
+    client.transaction_exec()
+
+    assert executor.paused == 0
+    assert executor.calls == [
+        ("MULTI",),
+        ("COMMAND_EXEC", "SET", "key", "value"),
+        ("EXEC",),
+    ]
+
+
+def test_transaction_state_machine_accepts_byte_command_names():
+    executor = FakeExecutor()
+    executor.responses.extend([b"OK", b"QUEUED", [b"OK"]])
+    client = FlowClient(executor)
+
+    client.command(b"MULTI")
+    client.command(b"SET", b"key", b"value")
+    client.command(b"EXEC")
+
+    assert executor.calls == [
+        (b"MULTI",),
+        ("COMMAND_EXEC", b"SET", b"key", b"value"),
+        (b"EXEC",),
+    ]
+
+
+def test_pubsub_cleanup_failure_unsubscribes_patterns_and_invalidates_session():
+    class SessionExecutor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Any, ...]] = []
+            self.invalidated = False
+            self.closed = False
+
+        def execute_command(self, *args: Any) -> Any:
+            self.calls.append(args)
+            if args[0] == "UNSUBSCRIBE":
+                raise FerricStoreError("unsubscribe failed")
+            return b"OK"
+
+        def invalidate(self) -> None:
+            self.invalidated = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    class RootExecutor:
+        def __init__(self, session: SessionExecutor) -> None:
+            self.session = session
+
+        def execute_command(self, *_args: Any) -> Any:
+            return b"OK"
+
+        def acquire_session(self) -> SessionExecutor:
+            return self.session
+
+    session = SessionExecutor()
+    pubsub = FlowClient(RootExecutor(session)).pubsub_session()
+    pubsub.subscribe("jobs")
+
+    with pytest.raises(FerricStoreError, match="unsubscribe failed"):
+        pubsub.close()
+
+    assert ("UNSUBSCRIBE",) in session.calls
+    assert ("PUNSUBSCRIBE",) in session.calls
+    assert session.invalidated
+    assert session.closed
+
+
+def test_autobatch_rejects_response_cardinality_mismatch():
+    client = object.__new__(client_module.AutobatchFlowClient)
+    futures = [Future(), Future()]
+    group = [client_module._BatchOp("create", (), {}, future) for future in futures]
+
+    client._complete_group(group, [b"only-one"])
+
+    for future in futures:
+        with pytest.raises(FerricStoreError, match="cardinality"):
+            future.result()
+
+
+def test_autobatch_preserves_order_across_noncontiguous_batch_keys():
+    client = object.__new__(client_module.AutobatchFlowClient)
+    flushed: list[list[str]] = []
+    client._flush_group = lambda group: flushed.append(  # type: ignore[method-assign]
+        [op.args["name"] for op in group]
+    )
+    ops = [
+        client_module._BatchOp("complete", ("a",), {"name": "a1"}, Future()),
+        client_module._BatchOp("complete", ("b",), {"name": "b1"}, Future()),
+        client_module._BatchOp("complete", ("a",), {"name": "a2"}, Future()),
+    ]
+
+    client._flush_ops(ops)
+
+    assert flushed == [["a1"], ["b1"], ["a2"]]
+
+
+def test_autobatch_rejects_non_positive_pending_capacity() -> None:
+    client = FlowClient(FakeExecutor())
+
+    with pytest.raises(ValueError, match="max_pending must be positive"):
+        client.autobatch(max_pending=0)
+
+    autobatch = client.autobatch(max_pending=3)
+    try:
+        assert autobatch.max_pending == 3
+        assert isinstance(autobatch._pending, deque)
+    finally:
+        autobatch.close()
+
+
+def test_autobatch_pending_queue_is_bounded_and_constant_time_at_the_front() -> None:
+    client = object.__new__(client_module.AutobatchFlowClient)
+    client._condition = threading.Condition()
+    client._pending = deque()
+    client._closed = False
+    client.max_pending = 1
+    first = client_module._BatchOp("create", (), {}, Future())
+    second = client_module._BatchOp("create", (), {}, Future())
+    client._pending.append(first)
+    enqueue_started = threading.Event()
+    enqueue_finished = threading.Event()
+
+    def enqueue() -> None:
+        enqueue_started.set()
+        client._enqueue(second)
+        enqueue_finished.set()
+
+    producer = threading.Thread(target=enqueue)
+    producer.start()
+    assert enqueue_started.wait(1)
+    assert enqueue_finished.wait(0.05) is False
+    assert isinstance(client._pending, deque)
+    assert len(client._pending) == client.max_pending
+
+    with client._condition:
+        assert client._pending.popleft() is first
+        client._condition.notify_all()
+
+    producer.join(1)
+    assert enqueue_finished.is_set()
+    assert list(client._pending) == [second]
+
+
+def test_backpressure_shared_state_is_scoped():
+    policy = BackpressurePolicy(
+        base_delay_ms=0,
+        max_delay_ms=0,
+        jitter=0,
+        shared=True,
+    )
+    cluster_a = BackpressureController(policy, scope=("cluster", "a"))
+    cluster_a_peer = BackpressureController(policy, scope=("cluster", "a"))
+    cluster_b = BackpressureController(policy, scope=("cluster", "b"))
+
+    cluster_a._record_overload_delay(0, retry_after_ms=100)
+
+    assert cluster_a_peer._wait_delay() > 0
+    assert cluster_b._wait_delay() == 0
+
+
+def test_flow_clients_do_not_share_backpressure_across_executors():
+    first = FlowClient(FakeExecutor())
+    second = FlowClient(FakeExecutor())
+
+    assert first.backpressure._state is not second.backpressure._state
+
+
+def test_backpressure_retry_budget_has_elapsed_time_limit():
+    controller = BackpressureController(
+        BackpressurePolicy(
+            max_retries=None,
+            max_elapsed_ms=10,
+            base_delay_ms=0,
+            max_delay_ms=0,
+            shared=False,
+        )
+    )
+
+    assert controller.can_retry(0, elapsed_s=0.009)
+    assert not controller.can_retry(0, elapsed_s=0.010)
+
+
+def test_backpressure_retry_budget_rejects_wait_that_would_overrun(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("ferricstore.backpressure.time.sleep", sleeps.append)
+    controller = BackpressureController(
+        BackpressurePolicy(
+            max_retries=None,
+            max_elapsed_ms=10,
+            base_delay_ms=0,
+            max_delay_ms=0,
+            jitter=0,
+            shared=False,
+        )
+    )
+
+    allowed = controller.record_overload(0, retry_after_ms=20, elapsed_s=0.009)
+
+    assert allowed is False
+    assert sleeps == []
+
+
+def test_rejected_backpressure_delay_does_not_block_later_requests():
+    controller = BackpressureController(
+        BackpressurePolicy(
+            max_retries=None,
+            max_elapsed_ms=10,
+            base_delay_ms=0,
+            max_delay_ms=0,
+            jitter=0,
+            shared=False,
+        )
+    )
+
+    allowed = controller.record_overload(0, retry_after_ms=60_000, elapsed_s=0.009)
+
+    assert allowed is False
+    assert controller._wait_delay() == 0
+
+
+def test_shared_backpressure_wait_respects_each_request_elapsed_budget(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr("ferricstore.backpressure.time.sleep", sleeps.append)
+    policy = BackpressurePolicy(
+        max_elapsed_ms=10,
+        base_delay_ms=0,
+        max_delay_ms=0,
+        jitter=0,
+        shared=True,
+    )
+    first = BackpressureController(policy, scope=("budget", "shared"))
+    peer = BackpressureController(policy, scope=("budget", "shared"))
+    first._record_overload_delay(0, retry_after_ms=60_000)
+
+    assert peer.before_request(elapsed_s=0.0) is False
+    assert sleeps == []
+
+
+def test_shared_backpressure_wait_observes_extensions_while_sleeping(monkeypatch):
+    now = [100.0]
+    sleeps: list[float] = []
+    controller = BackpressureController(BackpressurePolicy(jitter=0, shared=False))
+    controller._state.blocked_until = 101.0
+
+    monkeypatch.setattr("ferricstore.backpressure.time.monotonic", lambda: now[0])
+
+    def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+        if len(sleeps) == 1:
+            controller._state.blocked_until = now[0] + 2.0
+
+    monkeypatch.setattr("ferricstore.backpressure.time.sleep", sleep)
+
+    assert controller.before_request(elapsed_s=0.0)
+    assert sleeps == [1.0, 2.0]
 
 
 class RejectRichClaimReturnExecutor(FakeExecutor):
@@ -790,6 +1091,180 @@ def test_transaction_context_uses_named_helpers_inside_multi():
     ]
 
 
+def test_transaction_context_uses_connection_affine_executor_session():
+    class SessionExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class PoolExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.session = SessionExecutor()
+
+        def acquire_session(self):
+            return self.session
+
+    executor = PoolExecutor()
+    executor.session.responses.extend(["OK", "QUEUED", ["OK"]])
+    client = FlowClient(executor)
+
+    with client.transaction() as tx:
+        assert tx.set("k", "v") == "QUEUED"
+
+    assert executor.calls == []
+    assert executor.session.calls == [
+        ("MULTI",),
+        ("COMMAND_EXEC", "SET", "k", b"v"),
+        ("EXEC",),
+    ]
+    assert executor.session.closed
+
+
+def test_transaction_exec_failure_discards_before_releasing_affine_session():
+    class SessionExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.closed = False
+            self.invalidated = False
+
+        def execute_command(self, *args):
+            self.calls.append(args)
+            if args[0] == "EXEC":
+                raise FerricStoreError("exec failed")
+            return b"OK"
+
+        def close(self):
+            self.closed = True
+
+        def invalidate(self):
+            self.invalidated = True
+
+    class PoolExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.session = SessionExecutor()
+
+        def acquire_session(self):
+            return self.session
+
+    executor = PoolExecutor()
+    client = FlowClient(executor)
+
+    with pytest.raises(FerricStoreError, match="exec failed"), client.transaction():
+        pass
+
+    assert executor.session.calls == [("MULTI",), ("EXEC",), ("DISCARD",)]
+    assert executor.session.invalidated
+    assert executor.session.closed
+
+
+def test_transaction_preserves_exec_failure_when_session_close_also_fails():
+    class SessionExecutor(FakeExecutor):
+        def execute_command(self, *args):
+            self.calls.append(args)
+            if args[0] == "EXEC":
+                raise FerricStoreError("primary exec failure")
+            return b"OK"
+
+        def close(self):
+            raise RuntimeError("secondary close failure")
+
+        def invalidate(self):
+            pass
+
+    class PoolExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.session = SessionExecutor()
+
+        def acquire_session(self):
+            return self.session
+
+    transaction = FlowClient(PoolExecutor()).transaction()
+    with (
+        pytest.raises(FerricStoreError, match="primary exec failure") as raised,
+        transaction,
+    ):
+        pass
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert "secondary close failure" in str(raised.value.__cause__)
+    assert transaction._active_client is None
+    assert not transaction._owns_client
+
+
+def test_transaction_preserves_body_failure_when_discard_also_fails():
+    class SessionExecutor(FakeExecutor):
+        def execute_command(self, *args):
+            self.calls.append(args)
+            if args[0] == "DISCARD":
+                raise FerricStoreError("secondary discard failure")
+            return b"OK"
+
+        def close(self):
+            pass
+
+        def invalidate(self):
+            pass
+
+    class PoolExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.session = SessionExecutor()
+
+        def acquire_session(self):
+            return self.session
+
+    transaction = FlowClient(PoolExecutor()).transaction()
+    with pytest.raises(ValueError, match="primary body failure") as raised, transaction:
+        raise ValueError("primary body failure")
+
+    assert isinstance(raised.value.__cause__, FerricStoreError)
+    assert "secondary discard failure" in str(raised.value.__cause__)
+    assert transaction._active_client is None
+    assert not transaction._owns_client
+
+
+def test_pubsub_uses_connection_affine_executor_session():
+    class SessionExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.closed = False
+            self.events = [{b"kind": b"message", b"channel": b"jobs", b"message": b"one"}]
+
+        def wait_event(self, timeout=None):
+            return self.events.pop(0) if self.events else None
+
+        def close(self):
+            self.closed = True
+
+    class PoolExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.session = SessionExecutor()
+
+        def acquire_session(self):
+            return self.session
+
+    executor = PoolExecutor()
+    client = FlowClient(executor)
+    pubsub = client.pubsub_session()
+
+    pubsub.subscribe("jobs")
+    message = pubsub.get_message(timeout=0)
+    pubsub.close()
+
+    assert message is not None
+    assert message.channel == "jobs"
+    assert executor.calls == []
+    assert executor.session.calls[0] == ("SUBSCRIBE", "jobs")
+    assert executor.session.closed
+
+
 def test_signal_builds_flow_signal_command_with_guards_and_values():
     executor = AckExecutor()
     client = FlowClient(executor)
@@ -966,6 +1441,12 @@ def test_map_exception_preserves_known_errors_and_maps_server_errors():
     known = FerricStoreError("known")
     assert map_exception(known) is known
 
+    raw = {"message": "ERR flow already exists"}
+    generic_server_error = FerricStoreError("ERR flow already exists", raw=raw)
+    reclassified = map_exception(generic_server_error)
+    assert isinstance(reclassified, FlowAlreadyExistsError)
+    assert reclassified.raw is raw
+
     class ResponseError(Exception):
         pass
 
@@ -1055,6 +1536,59 @@ def test_enqueue_many_groups_no_partition_items_by_auto_bucket():
             assert bucket == f"__flow_auto__:{zlib.crc32(id.encode()) % 256}"
 
 
+def test_enqueue_many_uses_bounded_concurrent_fanout_for_safe_executors():
+    class ThreadCheckingCodec:
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+
+        def encode(self, value: Any) -> bytes:
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                time.sleep(0.001)
+                return bytes(value)
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+        def decode(self, value: bytes | None) -> bytes | None:
+            return value
+
+    class ConcurrentExecutor:
+        supports_concurrent_fanout = True
+
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+
+        def execute_command(self, *args: Any) -> list[bytes]:
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                time.sleep(0.01)
+                item_args = args[args.index("ITEMS") + 1 :]
+                return [id.encode() for id in item_args[0::2]]
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    executor = ConcurrentExecutor()
+    codec = ThreadCheckingCodec()
+    client = FlowClient(executor, codec=codec)
+    items = [CreateItem(f"fanout-{idx}", b"payload") for idx in range(64)]
+
+    assert client.enqueue_many(items, type="order", now_ms=100) == [
+        item.id.encode() for item in items
+    ]
+    assert 1 < executor.max_active <= 16
+    assert codec.max_active == 1
+
+
 def test_enqueue_many_groups_per_item_partition_keys_without_mixed_frame():
     executor = PerItemAckExecutor()
     client = FlowClient(executor)
@@ -1078,6 +1612,25 @@ def test_enqueue_many_groups_per_item_partition_keys_without_mixed_frame():
     by_partition = {call[1]: call for call in executor.calls}
     tenant_a_items = by_partition["tenant:a"][by_partition["tenant:a"].index("ITEMS") + 1 :]
     assert tenant_a_items[0::2] == ("flow-0", "flow-2")
+
+
+def test_run_steps_many_preserves_explicit_empty_partition_key():
+    assert FlowClient._run_steps_many_items(
+        [CreateItem("flow-0", partition_key="")], "parent-partition"
+    ) == [{"id": "flow-0", "partition_key": ""}]
+
+
+def test_enqueue_many_preserves_explicit_empty_partition_group():
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor)
+
+    assert client.enqueue_many(
+        [CreateItem("flow-0", b"payload", partition_key="")],
+        type="order",
+        now_ms=100,
+    ) == [b"OK"]
+
+    assert executor.calls[0][1] == ""
 
 
 def test_submit_create_many_uses_executor_submit_command():
@@ -1124,6 +1677,45 @@ def test_submit_create_many_uses_executor_submit_command():
             b"payload",
         )
     ]
+
+
+def test_submit_create_many_cancellation_race_is_quiet(caplog: pytest.LogCaptureFixture) -> None:
+    class SubmitExecutor:
+        def __init__(self) -> None:
+            self.source: Future[Any] = Future()
+
+        def submit_command(self, *_args: Any) -> Future[Any]:
+            return self.source
+
+    executor = SubmitExecutor()
+    client = FlowClient(executor)
+    decode_entered = threading.Event()
+    release_decode = threading.Event()
+    original_decode = client._records_or_response
+
+    def blocked_decode(response: Any) -> Any:
+        decode_entered.set()
+        assert release_decode.wait(1)
+        return original_decode(response)
+
+    client._records_or_response = blocked_decode  # type: ignore[method-assign]
+    target = client.submit_create_many(
+        None,
+        [CreateItem("flow-1", b"payload", partition_key="tenant")],
+        type="order",
+        return_ok_on_success=True,
+    )
+    caplog.set_level(logging.ERROR, logger="concurrent.futures")
+    source_thread = threading.Thread(target=lambda: executor.source.set_result([b"OK"]))
+    source_thread.start()
+    assert decode_entered.wait(1)
+    assert target.cancel()
+    release_decode.set()
+    source_thread.join(1)
+
+    assert source_thread.is_alive() is False
+    assert target.cancelled()
+    assert caplog.records == []
 
 
 def test_enqueue_many_passes_retention_ttl_ms_to_auto_bucket_batches():
@@ -1498,6 +2090,31 @@ def test_value_mget_normalizes_omission_metadata_recursively():
     assert executor.calls[-1] == ("FLOW.VALUE.MGET", "ref-a", "MAX_BYTES", 10)
 
 
+def test_value_mget_rejects_partial_responses():
+    executor = FakeExecutor()
+    executor.responses = [[]]
+    client = FlowClient(executor)
+
+    with pytest.raises(FerricStoreError, match="expected 1"):
+        client.value_mget(["ref-a"])
+
+
+def test_flow_client_preserves_falsey_custom_codec():
+    class FalseyCodec:
+        def __bool__(self) -> bool:
+            return False
+
+        def encode(self, value: Any) -> bytes:
+            return str(value).encode()
+
+        def decode(self, value: bytes | None) -> Any:
+            return value
+
+    codec = FalseyCodec()
+
+    assert FlowClient(FakeExecutor(), codec=codec).codec is codec
+
+
 def test_get_can_request_selected_named_values():
     executor = FakeExecutor()
     client = FlowClient(executor)
@@ -1865,6 +2482,28 @@ def test_claim_flows_future_uses_protocol_submit_and_decodes_items():
         "BLOCK",
         5000,
     )
+
+
+def test_claim_future_cannot_drop_a_lease_after_wire_submission():
+    source: Future[Any] = Future()
+
+    class Executor:
+        def submit_command(self, *_args: Any) -> Future[Any]:
+            return source
+
+    future = FlowClient(Executor()).claim_flows_future("order", worker="worker-1")
+
+    assert future.cancel() is False
+    assert source.cancelled() is False
+    source.set_result([[b"f1", b"tenant:1", b"lease", 7]])
+    assert future.result(timeout=1) == [
+        ClaimedFlow(
+            id="f1",
+            partition_key="tenant:1",
+            lease_token=b"lease",
+            fencing_token=7,
+        )
+    ]
 
 
 def test_claim_due_can_scan_multiple_partitions():
@@ -2556,6 +3195,24 @@ def test_create_many_rejects_mixed_item_state_meta_instead_of_dropping_it():
     assert executor.calls == []
 
 
+def test_create_many_rejects_partially_populated_item_state_meta():
+    executor = FakeExecutor()
+    client = FlowClient(executor)
+
+    with pytest.raises(ValueError, match="shared state_meta"):
+        client.create_many(
+            "tenant:1",
+            [
+                CreateItem("f1", b"p1", state_meta={"version": 1}),
+                CreateItem("f2", b"p2"),
+            ],
+            type="order",
+            now_ms=100,
+        )
+
+    assert executor.calls == []
+
+
 def test_create_many_reuses_identical_item_attributes_as_shared_attributes():
     executor = FakeExecutor()
     client = FlowClient(executor)
@@ -2588,6 +3245,24 @@ def test_create_many_rejects_mixed_item_attributes_instead_of_dropping_them():
             [
                 CreateItem("f1", b"p1", attributes={"tenant": "acme"}),
                 CreateItem("f2", b"p2", attributes={"tenant": "other"}),
+            ],
+            type="order",
+            now_ms=100,
+        )
+
+    assert executor.calls == []
+
+
+def test_create_many_rejects_partially_populated_item_attributes():
+    executor = FakeExecutor()
+    client = FlowClient(executor)
+
+    with pytest.raises(ValueError, match="shared attributes"):
+        client.create_many(
+            "tenant:1",
+            [
+                CreateItem("f1", b"p1", attributes={"tenant": "acme"}),
+                CreateItem("f2", b"p2"),
             ],
             type="order",
             now_ms=100,
@@ -2698,6 +3373,36 @@ def test_spawn_children_uses_extended_items_for_per_child_named_values():
         "profile",
         "profile-ref",
     )
+
+
+def test_extended_many_items_preserve_explicit_empty_partition_keys():
+    executor = FakeExecutor()
+    client = FlowClient(executor)
+
+    client.create_many(
+        None,
+        [
+            CreateItem("f1", b"p1", partition_key="", values={"value": b"one"}),
+            CreateItem("f2", b"p2", partition_key="tenant:2"),
+        ],
+        type="order",
+        now_ms=100,
+    )
+    create_call = executor.calls[-1]
+    create_items = create_call.index("ITEMS_EXT") + 2
+    assert create_call[create_items : create_items + 3] == ("f1", "", b"p1")
+
+    client.spawn_children(
+        "parent-1",
+        [
+            ChildSpec("c1", "email", b"p1", partition_key="", values={"value": b"one"}),
+            ChildSpec("c2", "audit", b"p2", partition_key="tenant:2"),
+        ],
+        now_ms=100,
+    )
+    spawn_call = executor.calls[-1]
+    spawn_items = spawn_call.index("ITEMS_EXT") + 2
+    assert spawn_call[spawn_items : spawn_items + 4] == ("c1", "", "email", b"p1")
 
 
 def test_spawn_children_exposes_parent_guards_and_child_policies():
@@ -2913,6 +3618,63 @@ def test_autobatch_close_timeout_does_not_hang():
     client.close(timeout=1)
 
 
+def test_autobatch_never_takes_more_than_max_batch():
+    client = object.__new__(client_module.AutobatchFlowClient)
+    client.max_batch = 2
+    client.max_delay_s = 0.0
+    client._condition = threading.Condition()
+    client._closed = False
+    client._pending = deque(
+        client_module._BatchOp("test", (index,), {}, Future()) for index in range(5)
+    )
+
+    batch = client._take_batch()
+
+    assert len(batch) == 2
+    assert len(client._pending) == 3
+
+
+def test_autobatch_caps_batches_at_server_many_limit():
+    client = FlowClient(FakeExecutor()).autobatch(max_batch=5_000, max_delay_ms=0)
+
+    assert client.max_batch == 1_000
+
+    client.close()
+
+
+def test_expand_many_response_rejects_wrong_length_lists():
+    with pytest.raises(FerricStoreError, match="2 items"):
+        client_module._expand_many_response([b"OK"], 2)
+
+
+def test_autobatch_cancelled_future_does_not_kill_worker():
+    executor = BlockingExecutor()
+    client = FlowClient(executor).autobatch(max_batch=10, max_delay_ms=0)
+
+    cancelled = client.create_async(
+        "f1",
+        type="order",
+        payload=b"p1",
+        partition_key="p1",
+        return_record=False,
+    )
+    assert executor.entered.wait(1)
+    assert cancelled.cancel()
+    executor.release.set()
+
+    survivor = client.create_async(
+        "f2",
+        type="order",
+        payload=b"p2",
+        partition_key="p2",
+        return_record=False,
+    )
+
+    assert survivor.result(timeout=1) == b"OK"
+    assert client._worker.is_alive()
+    client.close(timeout=1)
+
+
 def test_autobatch_complete_uses_complete_many_independent_for_ack_calls():
     executor = PerItemAckExecutor()
     client = FlowClient(executor).autobatch(max_batch=10, max_delay_ms=5)
@@ -2944,6 +3706,205 @@ def test_autobatch_complete_uses_complete_many_independent_for_ack_calls():
     assert executor.calls[0][0] == "FLOW.COMPLETE_MANY"
     assert executor.calls[0][1] == "MIXED"
     assert "INDEPENDENT" in executor.calls[0]
+
+
+def test_autobatch_does_not_group_bool_and_int_results():
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor, codec=JsonCodec()).autobatch(
+        max_batch=10,
+        max_delay_ms=20,
+    )
+
+    bool_future = client.complete_async(
+        "bool",
+        lease_token=b"lease-1",
+        fencing_token=1,
+        partition_key="p1",
+        result=True,
+    )
+    int_future = client.complete_async(
+        "int",
+        lease_token=b"lease-2",
+        fencing_token=2,
+        partition_key="p1",
+        result=1,
+    )
+    client.flush()
+
+    assert bool_future.result() == b"OK"
+    assert int_future.result() == b"OK"
+    completion_calls = [call for call in executor.calls if call[0] == "FLOW.COMPLETE_MANY"]
+    assert len(completion_calls) == 2
+    assert {call[call.index("RESULT") + 1] for call in completion_calls} == {b"true", b"1"}
+    client.close()
+
+
+def test_autobatch_does_not_merge_distinct_mutable_payloads_after_mutation():
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor, codec=JsonCodec()).autobatch(
+        max_batch=10,
+        max_delay_ms=50,
+    )
+    first_payload = [1]
+
+    first = client.complete_async(
+        "first",
+        lease_token=b"lease-1",
+        fencing_token=1,
+        partition_key="tenant",
+        payload=first_payload,
+    )
+    first_payload[0] = 2
+    second = client.complete_async(
+        "second",
+        lease_token=b"lease-2",
+        fencing_token=2,
+        partition_key="tenant",
+        payload=[1],
+    )
+    client.flush()
+
+    assert first.result() == b"OK"
+    assert second.result() == b"OK"
+    calls = [call for call in executor.calls if call[0] == "FLOW.COMPLETE_MANY"]
+    assert len(calls) == 2
+    assert {call[call.index("PAYLOAD") + 1] for call in calls} == {b"[1]", b"[2]"}
+    client.close()
+
+
+def test_autobatch_completion_callback_can_flush_reentrantly():
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor).autobatch(max_batch=10, max_delay_ms=20)
+    callback_done = threading.Event()
+    callback_errors: list[BaseException] = []
+    future = client.complete_async(
+        "flow-1",
+        lease_token=b"lease",
+        fencing_token=1,
+        partition_key="tenant",
+        result=b"ok",
+    )
+
+    def flush_from_callback(_future: Future[Any]) -> None:
+        try:
+            client.flush()
+        except BaseException as exc:
+            callback_errors.append(exc)
+        finally:
+            callback_done.set()
+
+    future.add_done_callback(flush_from_callback)
+    try:
+        assert callback_done.wait(1), "autobatch callback deadlocked its dispatcher"
+        assert callback_errors == []
+    finally:
+        with contextlib.suppress(TimeoutError):
+            client.close(timeout=0.1)
+
+
+def test_autobatch_reentrant_flush_publishes_the_whole_completed_group():
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor).autobatch(max_batch=10, max_delay_ms=20)
+    callback_done = threading.Event()
+    callback_observations: list[tuple[bool, Any]] = []
+    first = client.complete_async(
+        "flow-1",
+        lease_token=b"lease-1",
+        fencing_token=1,
+        partition_key="tenant",
+        result=b"ok",
+    )
+    second = client.complete_async(
+        "flow-2",
+        lease_token=b"lease-2",
+        fencing_token=2,
+        partition_key="tenant",
+        result=b"ok",
+    )
+
+    def flush_from_first_callback(_future: Future[Any]) -> None:
+        try:
+            client.flush()
+            callback_observations.append(
+                (second.done(), second.result(timeout=0.05) if second.done() else None)
+            )
+        finally:
+            callback_done.set()
+
+    first.add_done_callback(flush_from_first_callback)
+    try:
+        assert callback_done.wait(1), "autobatch callback deadlocked its dispatcher"
+        assert callback_observations == [(True, b"OK")]
+    finally:
+        with contextlib.suppress(TimeoutError):
+            client.close(timeout=0.1)
+
+
+def test_autobatch_completion_callback_can_submit_synchronous_work():
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor).autobatch(max_batch=10, max_delay_ms=20)
+    callback_done = threading.Event()
+    callback_results: list[Any] = []
+    future = client.complete_async(
+        "flow-1",
+        lease_token=b"lease-1",
+        fencing_token=1,
+        partition_key="tenant",
+        result=b"first",
+    )
+
+    def submit_from_callback(_future: Future[Any]) -> None:
+        try:
+            callback_results.append(
+                client.complete(
+                    "flow-2",
+                    lease_token=b"lease-2",
+                    fencing_token=2,
+                    partition_key="tenant",
+                    result=b"second",
+                )
+            )
+        except BaseException as exc:
+            callback_results.append(exc)
+        finally:
+            callback_done.set()
+
+    future.add_done_callback(submit_from_callback)
+    try:
+        assert callback_done.wait(1), "autobatch callback deadlocked its dispatcher"
+        assert callback_results == [b"OK"]
+    finally:
+        with contextlib.suppress(TimeoutError):
+            client.close(timeout=0.1)
+
+
+def test_autobatch_completion_callback_can_close_without_self_joining():
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor).autobatch(max_batch=10, max_delay_ms=20)
+    callback_done = threading.Event()
+    callback_errors: list[BaseException] = []
+    future = client.complete_async(
+        "flow-1",
+        lease_token=b"lease",
+        fencing_token=1,
+        partition_key="tenant",
+        result=b"ok",
+    )
+
+    def close_from_callback(_future: Future[Any]) -> None:
+        try:
+            client.close()
+        except BaseException as exc:
+            callback_errors.append(exc)
+        finally:
+            callback_done.set()
+
+    future.add_done_callback(close_from_callback)
+    assert callback_done.wait(1)
+    client.close(timeout=1)
+
+    assert callback_errors == []
+    assert client._worker.is_alive() is False
 
 
 def test_autobatch_create_preserves_per_item_named_values():
@@ -3369,6 +4330,20 @@ def test_command_pipeline_maps_native_execute_batch_errors():
 
     with pytest.raises(FlowAlreadyExistsError):
         client.pipeline().command("FLOW.CREATE", "f1").execute()
+
+
+def test_command_pipeline_rejects_wrong_batch_cardinality():
+    class BatchExecutor:
+        def execute_command(self, *args):
+            return b"OK"
+
+        def execute_batch(self, commands):
+            return []
+
+    client = FlowClient(BatchExecutor())
+
+    with pytest.raises(FerricStoreError, match="returned 0 items; expected 1"):
+        client.pipeline().command("GET", "key").execute()
 
 
 def test_server_errors_are_typed():
@@ -3988,3 +4963,267 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
         "TTL_MS",
         1000,
     )
+
+
+def test_manual_transaction_commands_fail_fast_on_rotating_pool():
+    class Adapter:
+        def execute_command(self, *_args: Any) -> bytes:
+            return b"OK"
+
+        def close(self) -> None:
+            pass
+
+    client = FlowClient(ProtocolAdapterPool([Adapter(), Adapter()]))
+
+    with pytest.raises(InvalidCommandError, match=r"transaction\(\)"):
+        client.multi()
+    with pytest.raises(InvalidCommandError, match=r"transaction\(\)"):
+        client.watch("key")
+
+
+def test_transaction_key_acquires_routed_affine_session():
+    class Session:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Any, ...]] = []
+
+        def execute_command(self, *args: Any) -> bytes:
+            self.calls.append(args)
+            return b"OK"
+
+        def close(self) -> None:
+            pass
+
+    class Executor:
+        def __init__(self) -> None:
+            self.key: str | bytes | None = None
+            self.session = Session()
+
+        def execute_command(self, *_args: Any) -> bytes:
+            raise AssertionError("transaction should use its affine session")
+
+        def acquire_session_for_key(self, key: str | bytes) -> Session:
+            self.key = key
+            return self.session
+
+    executor = Executor()
+    client = FlowClient(executor)
+
+    with client.transaction(key="tenant:{42}") as transaction:
+        transaction.command("SET", "tenant:{42}", b"value")
+
+    assert executor.key == "tenant:{42}"
+    assert executor.session.calls == [
+        ("MULTI",),
+        ("COMMAND_EXEC", "SET", "tenant:{42}", b"value"),
+        ("EXEC",),
+    ]
+
+
+def test_transaction_validates_key_and_all_watches_before_acquiring_session():
+    class Executor:
+        def __init__(self) -> None:
+            self.session_keys: tuple[str | bytes, ...] | None = None
+            self.calls: list[tuple[Any, ...]] = []
+
+        def execute_command(self, *args: Any) -> bytes:
+            self.calls.append(args)
+            return b"OK"
+
+        def acquire_session_for_keys(self, keys: tuple[str | bytes, ...]) -> Any:
+            self.session_keys = keys
+            raise InvalidCommandError("transaction keys must hash to the same slot")
+
+    executor = Executor()
+    client = FlowClient(executor)
+
+    with (
+        pytest.raises(InvalidCommandError, match="same slot"),
+        client.transaction(key="a", watch=["b"]),
+    ):
+        pass
+
+    assert executor.session_keys == ("a", "b")
+    assert executor.calls == []
+
+
+def test_transaction_cleans_watch_if_multi_fails():
+    class Session:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Any, ...]] = []
+            self.invalidated = False
+
+        def execute_command(self, *args: Any) -> bytes:
+            self.calls.append(args)
+            if args[0] == "MULTI":
+                raise FerricStoreError("MULTI failed")
+            return b"OK"
+
+        def close(self) -> None:
+            pass
+
+        def invalidate(self) -> None:
+            self.invalidated = True
+
+    class Executor:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        def execute_command(self, *_args: Any) -> bytes:
+            return b"OK"
+
+        def acquire_session_for_key(self, _key: str | bytes) -> Session:
+            return self.session
+
+    executor = Executor()
+    client = FlowClient(executor)
+
+    with (
+        pytest.raises(FerricStoreError, match="MULTI failed"),
+        client.transaction(watch=["tenant:{42}"]),
+    ):
+        pass
+
+    assert executor.session.calls == [
+        ("WATCH", "tenant:{42}"),
+        ("MULTI",),
+        ("UNWATCH",),
+    ]
+    assert executor.session.invalidated
+
+
+def test_queue_worker_rejects_partial_independent_completion_result():
+    jobs = [
+        ClaimedFlow("ok", b"lease-1", 1, partition_key="p1"),
+        ClaimedFlow("stale", b"lease-2", 2, partition_key="p1"),
+    ]
+
+    class Client:
+        def claim_flows(self, *_args: Any, **_kwargs: Any) -> list[ClaimedFlow]:
+            return jobs
+
+        def complete_jobs(self, *_args: Any, **_kwargs: Any) -> list[Any]:
+            return [b"OK", FerricStoreError("fencing token mismatch")]
+
+    worker = QueueFlowWorker(Client(), type="jobs", partition_key="p1", batch_size=2)
+
+    with pytest.raises(FerricStoreError, match="fencing token mismatch"):
+        worker.run_once(lambda _job: b"done")
+
+
+def test_queue_worker_batches_distinct_completion_results():
+    jobs = [ClaimedFlow(str(index), b"lease", index, partition_key="p1") for index in range(100)]
+
+    class Client:
+        def __init__(self) -> None:
+            self.single_calls = 0
+            self.batch_calls: list[list[tuple[ClaimedFlow, Any]]] = []
+
+        def claim_flows(self, *_args: Any, **_kwargs: Any) -> list[ClaimedFlow]:
+            return jobs
+
+        def complete(self, *_args: Any, **_kwargs: Any) -> bytes:
+            self.single_calls += 1
+            return b"OK"
+
+        def complete_job_results(self, items: list[tuple[ClaimedFlow, Any]]) -> list[bytes]:
+            self.batch_calls.append(items)
+            return [b"OK"] * len(items)
+
+    client = Client()
+    worker = QueueFlowWorker(client, type="jobs", partition_key="p1", batch_size=100)
+
+    result = worker.run_once(lambda job: job.id)
+
+    assert result.completed == 100
+    assert client.single_calls == 0
+    assert len(client.batch_calls) == 1
+    assert [value for _job, value in client.batch_calls[0]] == [str(index) for index in range(100)]
+
+
+def test_autobatch_raises_per_item_independent_error():
+    class PartialExecutor:
+        def execute_command(self, *args: Any) -> Any:
+            if args[0] == "FLOW.COMPLETE_MANY":
+                return [b"OK", FerricStoreError("stale lease")]
+            return b"OK"
+
+    client = FlowClient(PartialExecutor()).autobatch(max_batch=2, max_delay_ms=20)
+    barrier = threading.Barrier(2)
+    outcomes: list[Any] = [None, None]
+
+    def complete_one(index: int) -> None:
+        barrier.wait()
+        try:
+            outcomes[index] = client.complete(
+                f"flow-{index}",
+                lease_token=b"lease",
+                fencing_token=index,
+                partition_key=f"p{index}",
+                return_record=False,
+            )
+        except BaseException as exc:
+            outcomes[index] = exc
+
+    threads = [threading.Thread(target=complete_one, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1)
+    client.close()
+
+    assert sum(value == b"OK" for value in outcomes) == 1
+    errors = [value for value in outcomes if isinstance(value, FerricStoreError)]
+    assert len(errors) == 1
+    assert "stale lease" in str(errors[0])
+
+
+def test_claim_future_retries_legacy_compact_return_mode():
+    class Executor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Any, ...]] = []
+
+        def execute_command(self, *_args: Any) -> Any:
+            raise AssertionError("future path must remain non-blocking")
+
+        def submit_command(self, *args: Any) -> Future[Any]:
+            self.calls.append(args)
+            future: Future[Any] = Future()
+            if len(self.calls) == 1:
+                future.set_exception(
+                    FerricStoreError("FLOW CLAIM return must be records, jobs, or jobs_compact")
+                )
+            else:
+                future.set_result([[b"f1", b"p1", b"lease", 7]])
+            return future
+
+    executor = Executor()
+    client = FlowClient(executor)
+
+    jobs = client.claim_flows_future("jobs", worker="w1").result(timeout=1)
+
+    assert [job.id for job in jobs] == ["f1"]
+    assert executor.calls[0][executor.calls[0].index("RETURN") + 1] == "JOBS_COMPACT_ATTRS"
+    assert executor.calls[1][executor.calls[1].index("RETURN") + 1] == "JOBS_COMPACT"
+
+
+def test_complete_and_claim_rejects_partial_completion_result():
+    class Executor:
+        def execute_command(self, *_args: Any) -> Any:
+            return b"OK"
+
+        def execute_batch(self, _commands: list[tuple[Any, ...]]) -> list[Any]:
+            return [[b"OK", FerricStoreError("stale lease")], []]
+
+    client = FlowClient(Executor())
+    jobs = [
+        ClaimedFlow("ok", b"lease-1", 1, partition_key="p1"),
+        ClaimedFlow("stale", b"lease-2", 2, partition_key="p1"),
+    ]
+
+    with pytest.raises(FerricStoreError, match="stale lease"):
+        client.complete_flows_and_claim_flows(
+            jobs,
+            type="jobs",
+            worker="w1",
+            partition_key="p1",
+        )

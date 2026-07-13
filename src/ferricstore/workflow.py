@@ -1,17 +1,31 @@
 from __future__ import annotations
 
 import builtins
+import contextlib
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from ferricstore.batch_core import BatchValueMatcher
 from ferricstore.client import FlowClient
 from ferricstore.errors import FerricStoreError
+from ferricstore.lifecycle_core import (
+    SyncCloseCoordinator,
+    SyncCloseTaskRegistry,
+    close_resources_sync,
+    raise_primary_with_cleanup,
+)
+from ferricstore.mutation_core import (
+    JobMutation,
+    MutationBatchPlan,
+    MutationKind,
+)
 from ferricstore.types import (
     BudgetPolicy,
     BudgetResult,
@@ -32,8 +46,22 @@ from ferricstore.types import (
     normalize_flow_state_mode,
     resolve_worker_connection_counts,
 )
+from ferricstore.worker_core import (
+    CloseDeadline,
+    CloseTimeoutError,
+    SyncWorkerRunGate,
+    WorkerInvocationTracker,
+    WorkerTerminalState,
+    validate_many_result,
+)
+from ferricstore.workflow_core import pop_workflow_partition_key, workflow_partition_key
 
 _PROTOCOL_URL_SCHEMES = {"ferric", "ferrics"}
+
+
+def _close_resource_safely(resource: Any) -> None:
+    with contextlib.suppress(BaseException):
+        resource.close()
 
 
 def _is_protocol_url(value: str) -> bool:
@@ -378,7 +406,7 @@ class WorkflowFlowCommands:
         fencing_token: int | None = None,
         partition_key: str | None | object = _CURRENT_PARTITION,
         **kwargs: Any,
-    ) -> FlowRecord:
+    ) -> FlowRecord | ClaimedFlow:
         return self.client.step_continue(
             id or self._ctx.id,
             lease_token=lease_token or self._ctx.lease_token,
@@ -565,7 +593,7 @@ class WorkflowBudget:
 
     __slots__ = (
         "_closed",
-        "_committed",
+        "_result",
         "amount",
         "attribute_prefix",
         "ctx",
@@ -596,13 +624,21 @@ class WorkflowBudget:
         self.attribute_prefix = attribute_prefix
         self.reservation: BudgetResult | None = None
         self._closed = False
-        self._committed = False
+        self._result: BudgetResult | None = None
 
     @property
     def reservation_id(self) -> str:
         if self.reservation is None or self.reservation.reservation_id is None:
             raise FerricStoreError("budget reservation has not been opened")
         return self.reservation.reservation_id
+
+    @property
+    def is_open(self) -> bool:
+        return (
+            not self._closed
+            and self.reservation is not None
+            and self.reservation.reservation_id is not None
+        )
 
     def __enter__(self) -> WorkflowBudget:
         self.reservation = self.ctx.client.budget_reserve(
@@ -611,6 +647,7 @@ class WorkflowBudget:
             limit=self.limit,
             window_ms=self.window_ms,
         )
+        _ = self.reservation_id
         self.ctx._record_budget_result(self.attribute_prefix, self.reservation)
         return self
 
@@ -618,9 +655,23 @@ class WorkflowBudget:
         if self._closed:
             return
         if exc_type is None:
-            self.commit(self.amount)
+            try:
+                self.commit(self.amount)
+            except BaseException as primary:
+                cleanup_error: BaseException | None = None
+                if self.is_open:
+                    try:
+                        self.release()
+                    except BaseException as cleanup:
+                        cleanup_error = cleanup
+                raise_primary_with_cleanup(primary, primary.__traceback__, cleanup_error)
         else:
-            self.release()
+            try:
+                self.release()
+            except BaseException as cleanup:
+                if exc is not None:
+                    raise_primary_with_cleanup(exc, tb, cleanup)
+                raise
 
     def commit(
         self,
@@ -628,6 +679,10 @@ class WorkflowBudget:
         *,
         usage: dict[str, Any] | None = None,
     ) -> BudgetResult:
+        if self._closed:
+            if self._result is None:
+                raise FerricStoreError("budget reservation is already closed")
+            return self._result
         actual = self.amount if actual_amount is None else actual_amount
         result = self.ctx.client.budget_commit(
             self.scope,
@@ -636,13 +691,18 @@ class WorkflowBudget:
             usage=usage if usage is not None else {self.usage_key: actual},
         )
         self._closed = True
-        self._committed = True
+        self._result = result
         self.ctx._record_budget_result(self.attribute_prefix, result)
         return result
 
     def release(self) -> BudgetResult:
+        if self._closed:
+            if self._result is None:
+                raise FerricStoreError("budget reservation is already closed")
+            return self._result
         result = self.ctx.client.budget_release(self.scope, self.reservation_id)
         self._closed = True
+        self._result = result
         self.ctx._record_budget_result(self.attribute_prefix, result)
         return result
 
@@ -758,7 +818,10 @@ class WorkflowEffect:
         try:
             result = func(*args, **kwargs)
         except Exception as exc:
-            self.fail(error=str(exc), reason=exc.__class__.__name__)
+            try:
+                self.fail(error=str(exc), reason=exc.__class__.__name__)
+            except BaseException as cleanup:
+                raise_primary_with_cleanup(exc, exc.__traceback__, cleanup)
             raise
         self.confirm(external_id=self._resolve_external_id(result))
         return result
@@ -779,10 +842,15 @@ class WorkflowEffect:
         if exc_type is None:
             self.confirm()
         else:
-            self.fail(
-                error=str(exc) if exc is not None else None,
-                reason=exc_type.__name__ if exc_type is not None else None,
-            )
+            try:
+                self.fail(
+                    error=str(exc) if exc is not None else None,
+                    reason=exc_type.__name__ if exc_type is not None else None,
+                )
+            except BaseException as cleanup:
+                if exc is not None:
+                    raise_primary_with_cleanup(exc, tb, cleanup)
+                raise
 
     def _resolve_external_id(self, result: Any) -> str | None:
         if callable(self.external_id):
@@ -929,7 +997,7 @@ class WorkflowContext:
 
         if pending_refs:
             fetched = self.client.value_mget(pending_refs, max_bytes=self._value_max_bytes())
-            for name, value in zip(pending_names, fetched, strict=False):
+            for name, value in zip(pending_names, fetched, strict=True):
                 values[name] = value
                 if use_local_cache:
                     self._value_cache[name] = value
@@ -1233,9 +1301,7 @@ class Workflow:
             }
 
     def create(self, id: str, *, payload: Any = None, **attrs: Any) -> FlowRecord | bytes:
-        partition_key = attrs.pop("partition_key", None) or self.partition_key(attrs)
-        for name in self.partition_by:
-            attrs.pop(name, None)
+        partition_key = self._resolve_partition_key(attrs)
         return self.client.create(
             id,
             type=self.type,
@@ -1246,9 +1312,7 @@ class Workflow:
         )
 
     def enqueue(self, id: str, *, payload: Any = None, **attrs: Any) -> FlowRecord | bytes:
-        partition_key = attrs.pop("partition_key", None) or self.partition_key(attrs)
-        for name in self.partition_by:
-            attrs.pop(name, None)
+        partition_key = self._resolve_partition_key(attrs)
         return self.client.enqueue(
             id,
             type=self.type,
@@ -1267,9 +1331,7 @@ class Workflow:
         initial_state: str | None = None,
         **attrs: Any,
     ) -> FlowRecord:
-        partition_key = attrs.pop("partition_key", None) or self.partition_key(attrs)
-        for name in self.partition_by:
-            attrs.pop(name, None)
+        partition_key = self._resolve_partition_key(attrs)
         return self.client.start_and_claim(
             id,
             type=self.type,
@@ -1305,9 +1367,7 @@ class Workflow:
         result: Any = None,
         **attrs: Any,
     ) -> bytes:
-        partition_key = attrs.pop("partition_key", None) or self.partition_key(attrs)
-        for name in self.partition_by:
-            attrs.pop(name, None)
+        partition_key = self._resolve_partition_key(attrs)
         return self.client.run_steps_many(
             items,
             type=self.type,
@@ -1321,9 +1381,14 @@ class Workflow:
         )
 
     def partition_key(self, attrs: dict[str, Any]) -> str | None:
-        if not self.partition_by:
-            return None
-        return ":".join(str(attrs[name]) for name in self.partition_by)
+        return workflow_partition_key(attrs, self.partition_by)
+
+    def _resolve_partition_key(self, attrs: dict[str, Any]) -> str | None:
+        return pop_workflow_partition_key(
+            attrs,
+            self.partition_by,
+            resolver=self.partition_key,
+        )
 
     def install_policy(
         self,
@@ -1607,8 +1672,9 @@ class Workflow:
             planned.append((job, state_name, outcome))
 
         _first_job, first_state, first_outcome = planned[0]
+        first_matcher = BatchValueMatcher(first_outcome)
         if all(
-            state_name == first_state and outcome == first_outcome
+            state_name == first_state and first_matcher.matches(outcome)
             for _job, state_name, outcome in planned
         ):
             return cast(
@@ -1636,6 +1702,7 @@ class Workflow:
 
         handler = self._handler_for(state_name)
         mixed_outcomes: builtins.list[Outcome] | None = None
+        first_matcher: BatchValueMatcher | None = None
 
         for idx, job in enumerate(jobs):
             ctx = self.context(job, state_name)
@@ -1646,10 +1713,11 @@ class Workflow:
 
             if idx == 0:
                 first_outcome = outcome
+                first_matcher = BatchValueMatcher(outcome)
                 continue
 
             if mixed_outcomes is None:
-                if outcome == first_outcome:
+                if first_matcher is not None and first_matcher.matches(outcome):
                     continue
                 mixed_outcomes = [first_outcome for _ in range(idx)]
 
@@ -1663,15 +1731,120 @@ class Workflow:
                 materialize=materialize,
             )
 
+        normalized_outcomes = [
+            outcome
+            if isinstance(outcome, (Transition, Complete, Retry, Fail))
+            else complete(result=outcome)
+            for outcome in mixed_outcomes
+        ]
+        apply_job_mutations = getattr(self.client, "apply_job_mutations", None)
+        if not self._states[state_name].return_record and callable(apply_job_mutations):
+            plan = MutationBatchPlan.build(
+                self._job_mutation(job, outcome)
+                for job, outcome in zip(jobs, normalized_outcomes, strict=True)
+            )
+            response = apply_job_mutations(plan.mutations)
+            values = validate_many_result(
+                response,
+                len(plan),
+                operation="Flow workflow mutation batch",
+            )
+            if materialize:
+                return cast(builtins.list[FlowRecord | bytes], values)
+            return len(plan)
+
+        complete_job_mutations = getattr(self.client, "complete_job_mutations", None)
+        if (
+            not self._states[state_name].return_record
+            and callable(complete_job_mutations)
+            and all(isinstance(outcome, Complete) for outcome in normalized_outcomes)
+        ):
+            response = complete_job_mutations(
+                [
+                    (
+                        cast(ClaimedFlow, job),
+                        self._complete_mutation_options(cast(Complete, outcome)),
+                    )
+                    for job, outcome in zip(jobs, normalized_outcomes, strict=True)
+                ]
+            )
+            values = validate_many_result(
+                response,
+                len(jobs),
+                operation="FLOW.COMPLETE batch",
+            )
+            if materialize:
+                return cast(builtins.list[FlowRecord | bytes], values)
+            return len(jobs)
+
         if materialize:
             return [
                 self.apply(job, outcome, state_name=state_name)
-                for job, outcome in zip(jobs, mixed_outcomes, strict=False)
+                for job, outcome in zip(jobs, normalized_outcomes, strict=True)
             ]
 
-        for job, outcome in zip(jobs, mixed_outcomes, strict=False):
+        for job, outcome in zip(jobs, normalized_outcomes, strict=True):
             self.apply(job, outcome, state_name=state_name)
         return len(jobs)
+
+    @staticmethod
+    def _complete_mutation_options(outcome: Complete) -> dict[str, Any]:
+        return {
+            "result": outcome.result,
+            "payload": outcome.payload,
+            "ttl_ms": outcome.ttl_ms,
+            "values": outcome.values,
+            "value_refs": outcome.value_refs,
+            "drop_values": outcome.drop_values,
+            "override_values": outcome.override_values,
+            "attributes_merge": outcome.attributes_merge,
+            "state_meta": outcome.state_meta,
+        }
+
+    def _job_mutation(
+        self,
+        job: FlowRecord | ClaimedFlow,
+        outcome: Outcome,
+    ) -> JobMutation:
+        if isinstance(outcome, Complete):
+            return JobMutation(
+                MutationKind.COMPLETE,
+                job,
+                self._complete_mutation_options(outcome),
+            )
+        common = {
+            "payload": outcome.payload,
+            "values": outcome.values,
+            "value_refs": outcome.value_refs,
+            "drop_values": outcome.drop_values,
+            "override_values": outcome.override_values,
+            "attributes_merge": outcome.attributes_merge,
+            "state_meta": outcome.state_meta,
+        }
+        if isinstance(outcome, Transition):
+            self._validate_transition_policy(outcome)
+            return JobMutation(
+                MutationKind.TRANSITION,
+                job,
+                {
+                    **common,
+                    "from_state": job.state,
+                    "to_state": outcome.to_state,
+                    "run_at_ms": outcome.run_at_ms,
+                    "priority": outcome.priority,
+                },
+            )
+        if isinstance(outcome, Retry):
+            return JobMutation(
+                MutationKind.RETRY,
+                job,
+                {**common, "error": outcome.error, "run_at_ms": outcome.run_at_ms},
+            )
+        return JobMutation(
+            MutationKind.FAIL,
+            job,
+            {**common, "error": outcome.error, "ttl_ms": outcome.ttl_ms},
+        )
 
     def apply(
         self,
@@ -1827,9 +2000,14 @@ class Workflow:
                 state_meta=outcome.state_meta,
                 independent=True,
             )
+            values = self._batch_response_list(
+                response,
+                len(jobs),
+                operation="FLOW.TRANSITION_MANY",
+            )
             if not materialize:
                 return len(jobs)
-            return self._batch_response_list(response, len(jobs))
+            return values
 
         if isinstance(outcome, Complete):
             response = self.client.complete_many(
@@ -1846,9 +2024,14 @@ class Workflow:
                 state_meta=outcome.state_meta,
                 independent=True,
             )
+            values = self._batch_response_list(
+                response,
+                len(jobs),
+                operation="FLOW.COMPLETE_MANY",
+            )
             if not materialize:
                 return len(jobs)
-            return self._batch_response_list(response, len(jobs))
+            return values
 
         if isinstance(outcome, Retry):
             response = self.client.retry_many(
@@ -1865,9 +2048,14 @@ class Workflow:
                 state_meta=outcome.state_meta,
                 independent=True,
             )
+            values = self._batch_response_list(
+                response,
+                len(jobs),
+                operation="FLOW.RETRY_MANY",
+            )
             if not materialize:
                 return len(jobs)
-            return self._batch_response_list(response, len(jobs))
+            return values
 
         if isinstance(outcome, Fail):
             response = self.client.fail_many(
@@ -1884,9 +2072,14 @@ class Workflow:
                 state_meta=outcome.state_meta,
                 independent=True,
             )
+            values = self._batch_response_list(
+                response,
+                len(jobs),
+                operation="FLOW.FAIL_MANY",
+            )
             if not materialize:
                 return len(jobs)
-            return self._batch_response_list(response, len(jobs))
+            return values
 
         raise FerricStoreError(f"unknown workflow outcome: {outcome!r}")
 
@@ -1902,13 +2095,24 @@ class Workflow:
             if budget is not None:
                 budget.__enter__()
             outcome = handler(ctx)
-        except Exception as exc:
             if budget is not None:
-                budget.release()
+                budget.commit()
+        except BaseException as exc:
+            cleanup_error: BaseException | None = None
+            if budget is not None and budget.is_open:
+                try:
+                    budget.release()
+                except BaseException as cleanup:
+                    cleanup_error = cleanup
+            if cleanup_error is not None:
+                try:
+                    raise_primary_with_cleanup(exc, exc.__traceback__, cleanup_error)
+                except BaseException as preserved:
+                    exc = preserved
+            if not isinstance(exc, Exception):
+                raise exc
             outcome = self._exception_outcome(job, exc, state_name=state_name)
             return self._merge_governance_attributes(outcome, ctx._governance_attributes)
-        if budget is not None:
-            budget.commit()
         return self._merge_governance_attributes(outcome, ctx._governance_attributes)
 
     @staticmethod
@@ -1968,10 +2172,16 @@ class Workflow:
         return None
 
     @staticmethod
-    def _batch_response_list(response: Any, count: int) -> builtins.list[FlowRecord | bytes]:
-        if isinstance(response, list):
-            return response
-        return [response] * count
+    def _batch_response_list(
+        response: Any,
+        count: int,
+        *,
+        operation: str = "Flow many command",
+    ) -> builtins.list[FlowRecord | bytes]:
+        return cast(
+            builtins.list[FlowRecord | bytes],
+            validate_many_result(response, count, operation=operation),
+        )
 
     def _stamp_compact_jobs(
         self,
@@ -2025,13 +2235,41 @@ class FlowWorkflow(Workflow):
         worker_config: WorkerConfig | None = None,
         value_config: ValueConfig | None = None,
     ) -> None:
-        self.client = FlowClient.from_url(client) if isinstance(client, str) else client
-        if claim_client is None:
-            self.claim_client = self.client
-        else:
-            self.claim_client = (
-                FlowClient.from_url(claim_client) if isinstance(claim_client, str) else claim_client
+        command_pool_size, claim_pool_size = resolve_worker_connection_counts(
+            worker_config=worker_config,
+            default_workers=1,
+        )
+        command_max_connections = (
+            1
+            if worker_config is None or worker_config.command_connections is None
+            else command_pool_size
+        )
+        with contextlib.ExitStack() as rollback:
+            self._owns_client = isinstance(client, str)
+            self.client = (
+                FlowClient.from_url(client, max_connections=command_max_connections)
+                if isinstance(client, str)
+                else client
             )
+            if self._owns_client:
+                rollback.callback(_close_resource_safely, self.client)
+            if claim_client is None:
+                self.claim_client = (
+                    FlowClient.from_url(client, max_connections=claim_pool_size)
+                    if isinstance(client, str)
+                    else self.client
+                )
+                self._owns_claim_client = isinstance(client, str)
+            else:
+                self.claim_client = (
+                    FlowClient.from_url(claim_client, max_connections=claim_pool_size)
+                    if isinstance(claim_client, str)
+                    else claim_client
+                )
+                self._owns_claim_client = isinstance(claim_client, str)
+            if self._owns_claim_client and self.claim_client is not self.client:
+                rollback.callback(_close_resource_safely, self.claim_client)
+            rollback.pop_all()
         self.type = type
         self.initial_state = initial_state
         self.partition_by = tuple(partition_by)
@@ -2040,6 +2278,28 @@ class FlowWorkflow(Workflow):
         self.value_config = value_config or ValueConfig()
         self._states: dict[str, StateConfig] = {}
         self._handlers: dict[str, Handler] = {}
+        self._close_coordinator = SyncCloseCoordinator()
+
+    def close(self) -> None:
+        self._close_coordinator.run(self._close_owned_clients)
+
+    def _close_owned_clients(self) -> None:
+        resources: list[Callable[[], Any]] = []
+        if self._owns_claim_client and self.claim_client is not self.client:
+
+            def close_claim_client() -> None:
+                self.claim_client.close()
+                self._owns_claim_client = False
+
+            resources.append(close_claim_client)
+        if self._owns_client:
+
+            def close_client() -> None:
+                self.client.close()
+                self._owns_client = False
+
+            resources.append(close_client)
+        close_resources_sync(resources)
 
     def state(
         self,
@@ -2131,27 +2391,44 @@ class WorkflowClient:
         self._base_url_kwargs: dict[str, Any] = {}
         self._claim_client_explicit = claim_client is not None
         self._owned_extra_claim_flows: builtins.list[FlowClient] = []
+        self._claim_flows_by_size: dict[int, FlowClient] = {}
+        self._claim_pool_lock = threading.Lock()
         self._claim_pool_size = claim_pool_size
-        self.flow = (
-            FlowClient.from_url(client, max_connections=command_max_connections)
-            if isinstance(client, str)
-            else client
-        )
-        if claim_client is None:
-            self.claim_flow = self.flow
-        else:
-            self.claim_flow = (
-                FlowClient.from_url(claim_client, max_connections=claim_pool_size)
-                if isinstance(claim_client, str)
-                else claim_client
+        with contextlib.ExitStack() as rollback:
+            self.flow = (
+                FlowClient.from_url(client, max_connections=command_max_connections)
+                if isinstance(client, str)
+                else client
             )
+            owns_flow = _owns_clients or isinstance(client, str)
+            if owns_flow:
+                rollback.callback(_close_resource_safely, self.flow)
+            if claim_client is None:
+                self.claim_flow = (
+                    FlowClient.from_url(client, max_connections=claim_pool_size)
+                    if isinstance(client, str)
+                    else self.flow
+                )
+            else:
+                self.claim_flow = (
+                    FlowClient.from_url(claim_client, max_connections=claim_pool_size)
+                    if isinstance(claim_client, str)
+                    else claim_client
+                )
+            owns_claim_flow = self.claim_flow is not self.flow and (
+                _owns_clients or isinstance(client, str) or isinstance(claim_client, str)
+            )
+            if owns_claim_flow:
+                rollback.callback(_close_resource_safely, self.claim_flow)
+            rollback.pop_all()
         self.retry_policy = retry_policy
         self.worker_config = worker_config
         self.value_config = value_config or ValueConfig()
-        self._owns_flow = _owns_clients or isinstance(client, str)
-        self._owns_claim_flow = (_owns_clients and self.claim_flow is not self.flow) or isinstance(
-            claim_client, str
-        )
+        self._owns_flow = owns_flow
+        self._owns_claim_flow = owns_claim_flow
+        self._close_coordinator = SyncCloseCoordinator()
+        if self.claim_flow is not self.flow:
+            self._claim_flows_by_size[claim_pool_size] = self.claim_flow
 
     @classmethod
     def from_url(
@@ -2163,7 +2440,7 @@ class WorkflowClient:
         value_config: ValueConfig | None = None,
         **kwargs: Any,
     ) -> WorkflowClient:
-        command_pool_size, _claim_pool_size = resolve_worker_connection_counts(
+        command_pool_size, claim_pool_size = resolve_worker_connection_counts(
             worker_config=worker_config,
             default_workers=1,
         )
@@ -2172,24 +2449,55 @@ class WorkflowClient:
             command_kwargs.setdefault("max_connections", 1)
         else:
             command_kwargs.setdefault("max_connections", command_pool_size)
-        instance = cls(
-            FlowClient.from_url(url, **command_kwargs),
-            retry_policy=retry_policy,
-            worker_config=worker_config,
-            value_config=value_config,
-            _owns_clients=True,
-        )
+        claim_kwargs = dict(kwargs)
+        claim_kwargs["max_connections"] = claim_pool_size
+        with contextlib.ExitStack() as rollback:
+            flow = FlowClient.from_url(url, **command_kwargs)
+            rollback.callback(_close_resource_safely, flow)
+            claim_flow = FlowClient.from_url(url, **claim_kwargs)
+            rollback.callback(_close_resource_safely, claim_flow)
+            instance = cls(
+                flow,
+                claim_client=claim_flow,
+                retry_policy=retry_policy,
+                worker_config=worker_config,
+                value_config=value_config,
+                _owns_clients=True,
+            )
+            rollback.pop_all()
         instance._url = url
         instance._base_url_kwargs = dict(kwargs)
         instance._claim_client_explicit = False
-        instance._claim_pool_size = 1
+        instance._claim_pool_size = claim_pool_size
+        instance._claim_flows_by_size = {claim_pool_size: instance.claim_flow}
         return instance
 
     def _claim_flow_for_worker_config(
         self,
         worker_config: WorkerConfig | None,
     ) -> FlowClient:
-        return self.claim_flow
+        def resolve_claim_flow() -> FlowClient:
+            with self._claim_pool_lock:
+                if self._claim_client_explicit or self._url is None:
+                    return self.claim_flow
+                _, claim_pool_size = resolve_worker_connection_counts(
+                    worker_config=worker_config,
+                    default_workers=1,
+                )
+                existing = self._claim_flows_by_size.get(claim_pool_size)
+                if existing is not None:
+                    return existing
+                claim_kwargs = dict(self._base_url_kwargs)
+                claim_kwargs["max_connections"] = claim_pool_size
+                claim_flow = FlowClient.from_url(self._url, **claim_kwargs)
+                self._claim_flows_by_size[claim_pool_size] = claim_flow
+                self._owned_extra_claim_flows.append(claim_flow)
+                return claim_flow
+
+        return self._close_coordinator.run_while_open(
+            resolve_claim_flow,
+            closed_message="workflow client is closed",
+        )
 
     def workflow(
         self,
@@ -2240,13 +2548,38 @@ class WorkflowClient:
         return getattr(self.flow, name)
 
     def close(self) -> None:
-        for claim_flow in self._owned_extra_claim_flows:
-            claim_flow.close()
-        self._owned_extra_claim_flows.clear()
+        self._close_coordinator.run(self._close_owned_clients)
+
+    def _close_owned_clients(self) -> None:
+        extra_claim_flows = tuple(self._owned_extra_claim_flows)
+        self._claim_flows_by_size.clear()
+        resources: list[Callable[[], Any]] = []
+        for extra_claim_flow in extra_claim_flows:
+
+            def close_extra_claim_flow(flow: FlowClient = extra_claim_flow) -> None:
+                flow.close()
+                self._owned_extra_claim_flows[:] = [
+                    candidate
+                    for candidate in self._owned_extra_claim_flows
+                    if candidate is not flow
+                ]
+
+            resources.append(close_extra_claim_flow)
         if self._owns_claim_flow and self.claim_flow is not self.flow:
-            self.claim_flow.close()
+
+            def close_claim_flow() -> None:
+                self.claim_flow.close()
+                self._owns_claim_flow = False
+
+            resources.append(close_claim_flow)
         if self._owns_flow:
-            self.flow.close()
+
+            def close_flow() -> None:
+                self.flow.close()
+                self._owns_flow = False
+
+            resources.append(close_flow)
+        close_resources_sync(resources)
 
 
 class WorkflowWorker:
@@ -2324,49 +2657,111 @@ class WorkflowWorker:
         self._state_cursor = 0
         self._partition_cursor = 0
         self._running = False
+        self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._active_thread: threading.Thread | None = None
+        self._run_gate = SyncWorkerRunGate(closing_message="workflow worker is closing")
+        self._terminal_state = WorkerTerminalState()
+        self._invocations = WorkerInvocationTracker()
+        self._close_operations = SyncCloseTaskRegistry()
         self._totals = WorkflowWorkerResult()
         self._apply_executor = (
             ThreadPoolExecutor(max_workers=apply_async_depth) if apply_async_depth > 0 else None
         )
-        self._pending_applies: builtins.list[Future[int]] = []
+        self._pending_applies: deque[Future[int]] = deque()
 
     def run(self) -> None:
         self.run_forever()
 
     def run_forever(self) -> None:
+        self._begin_run(active_thread=threading.current_thread())
         self._run_loop()
 
     def start(self, *, daemon: bool = True) -> WorkflowWorker:
-        if self._thread is not None and self._thread.is_alive():
-            raise RuntimeError("workflow worker already started")
+        def start_thread() -> None:
+            if self._thread is not None and self._thread.is_alive():
+                raise RuntimeError("workflow worker already started")
+            self._prepare_run()
+            thread = threading.Thread(target=self._thread_entry, daemon=daemon)
+            self._thread = thread
+            try:
+                thread.start()
+            except BaseException:
+                self._thread = None
+                self._running = False
+                raise
 
-        self._thread = threading.Thread(target=self._run_loop, daemon=daemon)
-        self._thread.start()
+        self._run_gate.run_while_open(start_thread)
         return self
 
     def join(self, timeout: float | None = None) -> WorkflowWorkerResult:
-        if self._thread is not None:
-            self._thread.join(timeout)
+        threads = self._run_gate.synchronized(
+            lambda: list(
+                dict.fromkeys(
+                    thread for thread in (self._thread, self._active_thread) if thread is not None
+                )
+            )
+        )
+        for thread in threads:
+            thread.join(timeout)
+        if all(not thread.is_alive() for thread in threads):
+            self._terminal_state.raise_if_failed()
         return self.stats
 
     @property
     def is_running(self) -> bool:
-        return self._running
+        return self._run_gate.synchronized(lambda: self._running)
 
     @property
     def stats(self) -> WorkflowWorkerResult:
         return self._totals
 
-    def _run_loop(self) -> None:
+    def _prepare_run(self, *, active_thread: threading.Thread | None = None) -> None:
+        running_thread = self._active_thread
+        if self._running or (
+            running_thread is not None
+            and running_thread is not active_thread
+            and running_thread.is_alive()
+        ):
+            raise RuntimeError("workflow worker already running")
+        self._terminal_state.reset()
+        self._stop_event.clear()
         self._running = True
+        if active_thread is not None:
+            self._active_thread = active_thread
+
+    def _begin_run(self, *, active_thread: threading.Thread | None = None) -> None:
+        self._run_gate.run_while_open(lambda: self._prepare_run(active_thread=active_thread))
+
+    def _thread_entry(self) -> None:
+        try:
+            self._run_loop()
+        except BaseException as exc:
+            self._terminal_state.capture(exc)
+
+    def _run_loop(self) -> None:
+        active_thread = threading.current_thread()
+
+        def enter_loop() -> None:
+            running_thread = self._active_thread
+            if (
+                running_thread is not None
+                and running_thread is not active_thread
+                and running_thread.is_alive()
+            ):
+                raise RuntimeError("workflow worker already running")
+            self._active_thread = active_thread
+            if not self._running and not self._stop_event.is_set():
+                self._running = True
+
+        self._run_gate.synchronized(enter_loop)
         idle_sleep_s = self.idle_sleep_s
         try:
-            while self._running:
+            while self._running and not self._stop_event.is_set():
                 result = self.run_once()
                 self._totals = self._merge_results(self._totals, result)
                 if result.claimed == 0:
-                    time.sleep(idle_sleep_s)
+                    self._stop_event.wait(idle_sleep_s)
                     idle_sleep_s = min(
                         self.max_idle_sleep_s,
                         max(idle_sleep_s * 2, self.idle_sleep_s),
@@ -2374,26 +2769,89 @@ class WorkflowWorker:
                 else:
                     idle_sleep_s = self.idle_sleep_s
         finally:
-            self._running = False
+
+            def finish_loop() -> None:
+                self._running = False
+                if self._active_thread is active_thread:
+                    self._active_thread = None
+
+            self._run_gate.synchronized(finish_loop)
 
     def stop(self) -> None:
-        self._running = False
+        def stop_running() -> None:
+            self._running = False
+            self._stop_event.set()
 
-    def close(self) -> WorkflowWorkerResult:
-        self.stop()
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join()
-        result = self.flush()
-        self._totals = self._merge_results(self._totals, result)
+        self._run_gate.synchronized(stop_running)
+
+    def close(self, timeout: float | None = 5.0) -> WorkflowWorkerResult:
+        deadline = CloseDeadline.start(timeout)
+        timeout_message = "workflow worker close timed out"
+
+        def begin_close() -> list[threading.Thread]:
+            self._running = False
+            self._stop_event.set()
+            return list(
+                dict.fromkeys(
+                    thread for thread in (self._thread, self._active_thread) if thread is not None
+                )
+            )
+
+        threads = self._run_gate.begin_close(begin_close)
+        self._invocations.begin_close()
+        for thread in threads:
+            deadline.join_thread(thread, f"{timeout_message} waiting for the worker thread")
+        self._invocations.wait_for_idle(deadline, timeout_message)
+        error = self._terminal_state.error()
+        result = WorkflowWorkerResult()
+        try:
+            result = self._drain_pending_applies(block=True, deadline=deadline)
+            self._totals = self._merge_results(self._totals, result)
+        except CloseTimeoutError:
+            raise
+        except BaseException as exc:
+            if error is None:
+                error = exc
         if self._apply_executor is not None:
-            self._apply_executor.shutdown(wait=True)
-            self._apply_executor = None
+            try:
+                deadline.check(timeout_message)
+                executor = self._apply_executor
+                self._close_operations.run(
+                    executor,
+                    lambda: executor.shutdown(wait=True),
+                    lambda future: deadline.future_result(future, timeout_message),
+                )
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+            else:
+                self._apply_executor = None
+        deadline.check(timeout_message)
+        if error is not None:
+            raise error
         return result
 
     def flush(self) -> WorkflowWorkerResult:
         return self._drain_pending_applies(block=True)
 
     def run_once(self) -> WorkflowWorkerResult:
+        if not self._begin_invocation():
+            return WorkflowWorkerResult()
+        try:
+            return self._run_once()
+        finally:
+            self._invocations.end()
+
+    def _begin_invocation(self) -> bool:
+        try:
+            self._invocations.begin("workflow worker is closing")
+        except RuntimeError:
+            if self._stop_event.is_set() and threading.current_thread() is self._active_thread:
+                return False
+            raise
+        return True
+
+    def _run_once(self) -> WorkflowWorkerResult:
         result = self._drain_pending_applies(block=False)
         if self._should_claim_any_state():
             return self._merge_results(result, self._run_once_any_state())
@@ -2553,24 +3011,46 @@ class WorkflowWorker:
         *,
         block: bool,
         limit: int | None = None,
+        deadline: CloseDeadline | None = None,
     ) -> WorkflowWorkerResult:
         if not self._pending_applies:
             return WorkflowWorkerResult()
 
-        drained = WorkflowWorkerResult()
+        applied_total = 0
         count = 0
-        while self._pending_applies and (limit is None or count < limit):
-            ready_index = None
-            for idx, future in enumerate(self._pending_applies):
-                if block or future.done():
-                    ready_index = idx
-                    break
-            if ready_index is None:
-                break
-            future = self._pending_applies.pop(ready_index)
-            drained = self._merge_results(drained, WorkflowWorkerResult(applied=future.result()))
-            count += 1
-        return drained
+        if block:
+            while self._pending_applies and (limit is None or count < limit):
+                future = self._pending_applies[0]
+                try:
+                    applied = (
+                        deadline.future_result(future, "workflow worker close timed out")
+                        if deadline is not None
+                        else future.result()
+                    )
+                except CloseTimeoutError:
+                    raise
+                except BaseException:
+                    self._pending_applies.popleft()
+                    raise
+                self._pending_applies.popleft()
+                applied_total += applied
+                count += 1
+        else:
+            retained: deque[Future[int]] = deque()
+            while self._pending_applies:
+                future = self._pending_applies.popleft()
+                if future.done() and (limit is None or count < limit):
+                    try:
+                        applied_total += future.result()
+                    except BaseException:
+                        retained.extend(self._pending_applies)
+                        self._pending_applies = retained
+                        raise
+                    count += 1
+                else:
+                    retained.append(future)
+            self._pending_applies = retained
+        return WorkflowWorkerResult(applied=applied_total)
 
     @staticmethod
     def _merge_results(

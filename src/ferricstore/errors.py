@@ -103,6 +103,10 @@ def _str_field(message: str, name: str) -> str | None:
 
 def map_exception(exc: Exception) -> Exception:
     if isinstance(exc, FerricStoreError):
+        if type(exc) is FerricStoreError:
+            classified = classify_server_error(exc.message, raw=exc.raw)
+            if type(classified) is not FerricStoreError:
+                return classified
         return exc
 
     name = exc.__class__.__name__

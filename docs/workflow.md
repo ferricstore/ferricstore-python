@@ -155,7 +155,10 @@ def call_model(ctx):
 ```
 
 If the handler raises, the context manager releases the unused reservation.
-For async workflows, use `async with ctx.budget(...)`.
+For async workflows, use `async with ctx.budget(...)`. The first successful
+`commit()` or `release()` is terminal and repeated settlement calls return that
+same result without issuing a contradictory command. If an async release
+operation itself is cancelled, a later `release()` can retry it.
 
 Use `ctx.effect(...)` when a state performs an external side effect and you
 want effect fencing plus circuit-breaker accounting around that call:

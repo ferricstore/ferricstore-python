@@ -67,13 +67,15 @@ Guidance:
 | Sync client | One client per process/service component is usually enough; use multiple clients for isolated pools. |
 
 The SDK URL transport is native-only. Use `ferric://` or `ferrics://`; tune
-`max_connections` and `lanes` only after measuring.
+`max_connections` and `lanes` only after measuring. Both values must be
+positive. In topology mode, `max_connections` is allocated per discovered
+endpoint, so calculate the cluster-wide connection budget accordingly.
 
 Connection sizing defaults:
 
 | Runtime | Starting point |
 | --- | --- |
-| Protocol queue/workflow workers | Leave `command_connections` / `claim_connections` unset. Claim traffic reuses the same multiplexed connection. |
+| Protocol queue/workflow workers | Leave `command_connections` / `claim_connections` unset initially. Worker facades isolate claims in a bounded claim pool. |
 | Protocol high-throughput services | Try `max_connections=2` or higher `lanes` only after measuring. |
 | Web/API producers | Bound local concurrency and retries; do not create a client per request. |
 | Dedicated benchmark clients | Use a larger pool only when the benchmark is intentionally driving many in-flight batches. |
@@ -343,7 +345,7 @@ For sync workers:
 ```python
 worker.stop()
 stats = worker.join(timeout=30)
-worker.close()
+worker.close(timeout=30)
 ```
 
 For async workers:
@@ -351,7 +353,7 @@ For async workers:
 ```python
 worker.stop()
 stats = await worker.join()
-await worker.close()
+await worker.close(timeout=30)
 ```
 
 Shutdown goal:
@@ -363,6 +365,23 @@ Shutdown goal:
 
 If your service manager sends `SIGTERM`, wire it to `stop()` and give the worker
 enough termination grace time for normal handler p99.
+
+Sync and async `close()` raise `TimeoutError` when the shared shutdown deadline
+expires (five seconds by default). They do not tear down resources still in use.
+For sync workers, the same deadline includes public standalone `run_once()` work
+and its executor tasks; once closing begins, new runs are rejected.
+In particular, async shutdown does not cancel a claim after it has been sent:
+the response may already contain a committed lease. It waits for that response
+and terminally handles any returned jobs. Size the timeout above the configured
+blocking-claim duration, or catch `TimeoutError` and call `close()` again after
+the in-flight claim has returned.
+
+High-level `QueueClient` and `WorkflowClient` shutdown is retryable as well:
+all owned resources are attempted, successfully closed resources are forgotten,
+and only resources whose close failed remain owned for the next `close()` call.
+If a workload-specific claim pool is being opened concurrently, sync shutdown
+waits for that construction and includes the new pool in the same owned-resource
+cleanup. New workloads are rejected after shutdown begins.
 
 ## Observability
 
@@ -394,6 +413,12 @@ Backpressure should happen before FerricStore becomes the bottleneck:
 - use downstream semaphores for external APIs
 - use rate-limit commands for tenant/request limits
 - avoid unbounded local queues around `enqueue_many`
+
+Safe producer writes retry server-declared overloads with exponential backoff.
+The default `BackpressurePolicy` limits an overload retry chain to 30 seconds,
+and shared pressure is scoped to one endpoint or pool. Timeouts and disconnects
+are not retried automatically because the server may already have committed the
+write.
 
 For async apps, avoid spawning unlimited tasks that all call the SDK. Use bounded
 producer/consumer queues or semaphores.

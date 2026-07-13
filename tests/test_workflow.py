@@ -1,3 +1,7 @@
+import threading
+import time
+from collections import deque
+
 import pytest
 
 import ferricstore.workflow as workflow_module
@@ -20,10 +24,13 @@ from ferricstore import (
     WorkflowWorker,
     complete,
     fail,
+    retry,
     state,
     transition,
 )
-from ferricstore.types import FlowRecord
+from ferricstore.codecs import JsonCodec
+from ferricstore.errors import FerricStoreError
+from ferricstore.types import ClaimedFlow, FlowRecord
 
 
 class FakeExecutor:
@@ -295,6 +302,23 @@ def test_workflow_create_uses_partition_by():
     assert "tenant:order" in executor.calls[0]
 
 
+def test_workflow_create_preserves_explicit_empty_partition_key():
+    executor = FakeExecutor()
+    workflow = OrderWorkflow(FlowClient(executor))
+
+    workflow.create(
+        "f1",
+        tenant_id="tenant",
+        order_id="order",
+        partition_key="",
+        payload=b"p",
+        now_ms=100,
+    )
+
+    call = executor.calls[0]
+    assert call[call.index("PARTITION") + 1] == ""
+
+
 def test_workflow_create_allows_custom_initial_state():
     executor = FakeExecutor()
     workflow = OrderWorkflow(FlowClient(executor))
@@ -518,6 +542,97 @@ def test_handle_claimed_batch_count_uses_many_without_materializing_results():
     assert count == 2
     assert executor.calls[1][0] == "FLOW.TRANSITION_MANY"
     assert executor.calls[1][2:4] == ("running", "next")
+
+
+def test_handle_claimed_batch_count_rejects_partial_independent_result():
+    class PartialExecutor(FakeExecutor):
+        def execute_command(self, *args):
+            if args[0] == "FLOW.TRANSITION_MANY":
+                self.calls.append(args)
+                return [b"OK", FerricStoreError("stale lease")]
+            return super().execute_command(*args)
+
+    executor = PartialExecutor()
+    executor.claim_state = b"running"
+    executor.claim_run_state = None
+    executor.claim_ids = [b"f1", b"f2"]
+    workflow = CompactWorkflow(FlowClient(executor))
+    jobs = workflow.claim_due("created", worker="w1", partition_key="tenant:order", limit=2)
+
+    with pytest.raises(FerricStoreError, match="stale lease"):
+        workflow.handle_claimed_batch_count("created", jobs)
+
+
+def test_workflow_pipelines_distinct_completion_results_in_one_batch():
+    class BatchExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.batches = []
+
+        def execute_batch(self, commands):
+            self.batches.append(list(commands))
+            return [b"OK"] * len(commands)
+
+    class DistinctResultWorkflow(Workflow):
+        type = "order"
+        initial_state = "created"
+
+        @state("created", claim_payload=False, return_record=False)
+        def created(self, job):
+            return complete(result=job.id)
+
+    executor = BatchExecutor()
+    workflow = DistinctResultWorkflow(FlowClient(executor))
+    jobs = [
+        FlowRecord(
+            id=f"f{index}",
+            type="order",
+            state="running",
+            run_state="created",
+            partition_key="tenant:order",
+            lease_token=b"lease",
+            fencing_token=index,
+        )
+        for index in range(100)
+    ]
+
+    assert workflow.handle_claimed_batch_count("created", jobs) == 100
+    assert len(executor.batches) == 1
+    assert len(executor.batches[0]) == 100
+    assert all(command[0] == "FLOW.COMPLETE" for command in executor.batches[0])
+
+
+def test_workflow_does_not_conflate_bool_and_int_completion_results():
+    class BatchExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.batches = []
+
+        def execute_batch(self, commands):
+            self.batches.append(list(commands))
+            return [b"OK"] * len(commands)
+
+    class TypedResultWorkflow(Workflow):
+        type = "typed"
+        initial_state = "created"
+
+        @state("created", claim_payload=False, return_record=False)
+        def created(self, job):
+            return complete(result=True if job.id == "bool" else 1)
+
+    executor = BatchExecutor()
+    workflow = TypedResultWorkflow(FlowClient(executor, codec=JsonCodec()))
+    jobs = [
+        ClaimedFlow("bool", b"lease-1", 1, partition_key="p1", run_state="created"),
+        ClaimedFlow("int", b"lease-2", 2, partition_key="p1", run_state="created"),
+    ]
+
+    assert workflow.handle_claimed_batch_count("created", jobs) == 2
+    assert len(executor.batches) == 1
+    assert [command[command.index("RESULT") + 1] for command in executor.batches[0]] == [
+        b"true",
+        b"1",
+    ]
 
 
 def test_handle_claimed_batch_count_chunks_many_commands_at_server_limit():
@@ -877,6 +992,190 @@ def test_workflow_worker_start_stop_join_tracks_stats():
     assert worker.is_running is False
 
 
+def test_workflow_worker_close_has_bounded_wait():
+    entered = threading.Event()
+    release = threading.Event()
+    workflow = OrderWorkflow(FlowClient(FakeExecutor()))
+    worker = WorkflowWorker(workflow, state="created", idle_sleep_s=0.001)
+
+    def blocking_run_once():
+        entered.set()
+        release.wait()
+        return workflow_module.WorkflowWorkerResult()
+
+    worker.run_once = blocking_run_once
+    worker.start()
+    assert entered.wait(1)
+
+    with pytest.raises(TimeoutError, match="close timed out"):
+        worker.close(timeout=0.01)
+
+    release.set()
+    worker.close(timeout=1)
+
+
+def test_workflow_worker_pending_apply_queue_has_constant_time_head_drains():
+    workflow = OrderWorkflow(FlowClient(FakeExecutor()))
+    worker = WorkflowWorker(workflow, state="created", apply_async_depth=1)
+
+    assert isinstance(worker._pending_applies, deque)
+
+    worker.close()
+
+
+def test_workflow_worker_close_waits_for_caller_managed_run_thread():
+    entered = threading.Event()
+    release = threading.Event()
+    workflow = OrderWorkflow(FlowClient(FakeExecutor()))
+    worker = WorkflowWorker(workflow, state="created", idle_sleep_s=0.001)
+
+    def blocking_run_once():
+        entered.set()
+        release.wait()
+        return workflow_module.WorkflowWorkerResult()
+
+    worker.run_once = blocking_run_once
+    run_thread = threading.Thread(target=worker.run_forever)
+    run_thread.start()
+    assert entered.wait(1)
+
+    try:
+        with pytest.raises(TimeoutError, match="close timed out"):
+            worker.close(timeout=0.01)
+        assert run_thread.is_alive()
+    finally:
+        release.set()
+        run_thread.join(1)
+
+    worker.close(timeout=1)
+    assert worker.is_running is False
+
+
+def test_workflow_worker_close_deadline_includes_standalone_run_once():
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingWorkflow(Workflow):
+        type = "blocking-order"
+        initial_state = "created"
+
+        @state("created")
+        def created(self, _job):
+            entered.set()
+            release.wait()
+            return complete()
+
+    workflow = BlockingWorkflow(FlowClient(FakeExecutor()))
+    worker = WorkflowWorker(workflow, state="created", idle_sleep_s=0.001)
+    run_thread = threading.Thread(target=worker.run_once)
+    run_thread.start()
+    assert entered.wait(1)
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match="close timed out"):
+            worker.close(timeout=0.01)
+        assert time.monotonic() - started < 0.1
+    finally:
+        release.set()
+        run_thread.join(1)
+
+    worker.close(timeout=1)
+    assert run_thread.is_alive() is False
+
+
+def test_workflow_worker_rejects_second_caller_managed_run():
+    entered = threading.Event()
+    release = threading.Event()
+    second_done = threading.Event()
+    second_errors: list[BaseException] = []
+    workflow = OrderWorkflow(FlowClient(FakeExecutor()))
+    worker = WorkflowWorker(workflow, state="created", idle_sleep_s=0.001)
+
+    def blocking_run_once():
+        entered.set()
+        release.wait()
+        return workflow_module.WorkflowWorkerResult()
+
+    def run_second() -> None:
+        try:
+            worker.run_forever()
+        except BaseException as exc:
+            second_errors.append(exc)
+        finally:
+            second_done.set()
+
+    worker.run_once = blocking_run_once
+    first_thread = threading.Thread(target=worker.run_forever)
+    first_thread.start()
+    assert entered.wait(1)
+    second_thread = threading.Thread(target=run_second)
+    second_thread.start()
+
+    second_finished_while_first_was_running = second_done.wait(0.05)
+    worker.stop()
+    release.set()
+    first_thread.join(1)
+    second_thread.join(1)
+
+    assert second_finished_while_first_was_running
+    assert len(second_errors) == 1
+    assert isinstance(second_errors[0], RuntimeError)
+    assert str(second_errors[0]) == "workflow worker already running"
+
+
+def test_workflow_worker_join_propagates_background_failure():
+    workflow = OrderWorkflow(FlowClient(FakeExecutor()))
+    worker = WorkflowWorker(workflow, state="created", idle_sleep_s=0)
+
+    def fail() -> workflow_module.WorkflowWorkerResult:
+        raise RuntimeError("background boom")
+
+    worker.run_once = fail
+    worker.start()
+
+    with pytest.raises(RuntimeError, match="background boom"):
+        worker.join(timeout=1)
+
+
+def test_workflow_pipelines_heterogeneous_outcomes_as_one_mutation_batch():
+    class MutationClient:
+        def __init__(self) -> None:
+            self.mutation_batches = []
+
+        def apply_job_mutations(self, mutations):
+            self.mutation_batches.append(list(mutations))
+            return [b"OK"] * len(mutations)
+
+    class MixedWorkflow(Workflow):
+        type = "mixed"
+        initial_state = "created"
+
+        @state("created", claim_payload=False, claim_record=False, return_record=False)
+        def created(self, ctx):
+            if ctx.id == "transition":
+                return transition("next")
+            if ctx.id == "retry":
+                return retry(error="later")
+            return fail(error="terminal")
+
+    client = MutationClient()
+    workflow = MixedWorkflow(client)
+    jobs = [
+        ClaimedFlow("transition", b"lease-1", 1, partition_key="p1"),
+        ClaimedFlow("retry", b"lease-2", 2, partition_key="p1"),
+        ClaimedFlow("fail", b"lease-3", 3, partition_key="p1"),
+    ]
+
+    assert workflow.handle_claimed_batch_count("created", jobs) == 3
+    assert len(client.mutation_batches) == 1
+    assert [mutation.kind.value for mutation in client.mutation_batches[0]] == [
+        "transition",
+        "retry",
+        "fail",
+    ]
+
+
 def test_workflow_on_error_raise_propagates():
     class RaisingWorkflow(Workflow):
         type = "order"
@@ -1186,6 +1485,277 @@ def test_workflow_context_budget_allows_explicit_actual_usage():
     assert 7 in transition_call
 
 
+def test_workflow_budget_reserve_failure_preserves_error_and_skips_release():
+    class ReserveFailExecutor(FakeExecutor):
+        def execute_command(self, *args):
+            if args[0] == "FLOW.BUDGET.RESERVE":
+                self.calls.append(args)
+                raise RuntimeError("budget reserve failed")
+            return super().execute_command(*args)
+
+    executor = ReserveFailExecutor()
+    workflow = BudgetPolicyWorkflow(FlowClient(executor))
+    job = FlowRecord(
+        id="f1",
+        type="budget-order",
+        state="created",
+        partition_key="tenant-a",
+        lease_token=b"lease-1",
+        fencing_token=3,
+    )
+
+    workflow.handle(job)
+
+    assert [call[0] for call in executor.calls] == ["FLOW.BUDGET.RESERVE", "FLOW.RETRY"]
+    retry_call = executor.calls[-1]
+    assert retry_call[retry_call.index("ERROR") + 1] == b"budget reserve failed"
+
+
+def test_workflow_budget_commit_failure_releases_and_uses_error_policy():
+    class CommitFailExecutor(FakeExecutor):
+        def execute_command(self, *args):
+            if args[0] == "FLOW.BUDGET.COMMIT":
+                self.calls.append(args)
+                raise RuntimeError("budget commit failed")
+            return super().execute_command(*args)
+
+    executor = CommitFailExecutor()
+    workflow = BudgetPolicyWorkflow(FlowClient(executor))
+    job = FlowRecord(
+        id="f1",
+        type="budget-order",
+        state="created",
+        partition_key="tenant-a",
+        lease_token=b"lease-1",
+        fencing_token=3,
+    )
+
+    workflow.handle(job)
+
+    assert [call[0] for call in executor.calls] == [
+        "FLOW.BUDGET.RESERVE",
+        "FLOW.BUDGET.COMMIT",
+        "FLOW.BUDGET.RELEASE",
+        "FLOW.RETRY",
+    ]
+    retry_call = executor.calls[-1]
+    assert retry_call[retry_call.index("ERROR") + 1] == b"budget commit failed"
+
+
+def test_workflow_budget_commit_error_remains_primary_when_release_fails():
+    class SettlementFailExecutor(FakeExecutor):
+        def execute_command(self, *args):
+            if args[0] in {"FLOW.BUDGET.COMMIT", "FLOW.BUDGET.RELEASE"}:
+                self.calls.append(args)
+                action = "commit" if args[0].endswith("COMMIT") else "release"
+                raise RuntimeError(f"budget {action} failed")
+            return super().execute_command(*args)
+
+    class CommitFailWorkflow(Workflow):
+        type = "budget-order"
+        initial_state = "created"
+
+        @state(
+            "created",
+            on_error="raise",
+            budget=BudgetPolicy(scope="tenant-a", amount=10),
+        )
+        def created(self, _ctx):
+            return complete()
+
+    executor = SettlementFailExecutor()
+    workflow = CommitFailWorkflow(FlowClient(executor))
+    job = FlowRecord(
+        id="f1",
+        type="budget-order",
+        state="created",
+        partition_key="tenant-a",
+        lease_token=b"lease-1",
+        fencing_token=3,
+    )
+
+    with pytest.raises(RuntimeError, match="budget commit failed") as raised:
+        workflow.handle(job)
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "budget release failed"
+
+
+def test_workflow_budget_context_releases_after_clean_body_commit_failure():
+    class CommitFailExecutor(FakeExecutor):
+        def execute_command(self, *args):
+            if args[0] == "FLOW.BUDGET.COMMIT":
+                self.calls.append(args)
+                raise RuntimeError("budget commit failed")
+            return super().execute_command(*args)
+
+    executor = CommitFailExecutor()
+    workflow = OrderWorkflow(FlowClient(executor))
+    ctx = WorkflowContext(
+        workflow,
+        FlowRecord(
+            id="f1",
+            type="order",
+            state="created",
+            partition_key="tenant-a",
+            lease_token=b"lease-1",
+            fencing_token=3,
+        ),
+        "created",
+    )
+
+    with pytest.raises(RuntimeError, match="budget commit failed"), ctx.budget("tenant-a", 10):
+        pass
+
+    assert [call[0] for call in executor.calls] == [
+        "FLOW.BUDGET.RESERVE",
+        "FLOW.BUDGET.COMMIT",
+        "FLOW.BUDGET.RELEASE",
+    ]
+
+
+def test_workflow_budget_settlement_is_idempotent_and_mutually_exclusive():
+    executor = FakeExecutor()
+    workflow = OrderWorkflow(FlowClient(executor))
+    ctx = WorkflowContext(
+        workflow,
+        FlowRecord(
+            id="f1",
+            type="order",
+            state="created",
+            partition_key="tenant-a",
+            lease_token=b"lease-1",
+            fencing_token=3,
+        ),
+        "created",
+    )
+
+    committed_budget = ctx.budget("tenant-a", 10)
+    committed_budget.__enter__()
+    committed = committed_budget.commit(7)
+    assert committed_budget.commit(9) is committed
+    assert committed_budget.release() is committed
+
+    released_budget = ctx.budget("tenant-a", 10)
+    released_budget.__enter__()
+    released = released_budget.release()
+    assert released_budget.release() is released
+    assert released_budget.commit(7) is released
+
+    assert [call[0] for call in executor.calls] == [
+        "FLOW.BUDGET.RESERVE",
+        "FLOW.BUDGET.COMMIT",
+        "FLOW.BUDGET.RESERVE",
+        "FLOW.BUDGET.RELEASE",
+    ]
+
+
+def test_workflow_budget_release_failure_does_not_mask_handler_failure():
+    class ReleaseFailExecutor(FakeExecutor):
+        def execute_command(self, *args):
+            if args[0] == "FLOW.BUDGET.RELEASE":
+                self.calls.append(args)
+                raise RuntimeError("budget release failed")
+            return super().execute_command(*args)
+
+    class FailingBudgetWorkflow(Workflow):
+        type = "budget-order"
+        initial_state = "created"
+
+        @state(
+            "created",
+            on_error="raise",
+            budget=BudgetPolicy(scope="tenant-a", amount=10),
+        )
+        def created(self, _ctx):
+            raise ValueError("handler failed")
+
+    executor = ReleaseFailExecutor()
+    workflow = FailingBudgetWorkflow(FlowClient(executor))
+    job = FlowRecord(
+        id="f1",
+        type="budget-order",
+        state="created",
+        partition_key="tenant-a",
+        lease_token=b"lease-1",
+        fencing_token=3,
+    )
+
+    with pytest.raises(ValueError, match="handler failed") as raised:
+        workflow.handle(job)
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "budget release failed"
+
+
+def test_workflow_budget_context_cleanup_does_not_mask_body_failure():
+    class ReleaseFailExecutor(FakeExecutor):
+        def execute_command(self, *args):
+            if args[0] == "FLOW.BUDGET.RELEASE":
+                self.calls.append(args)
+                raise RuntimeError("budget release failed")
+            return super().execute_command(*args)
+
+    class ManualFailWorkflow(Workflow):
+        type = "budget-order"
+        initial_state = "created"
+
+        @state("created", on_error="raise")
+        def created(self, ctx):
+            with ctx.budget("tenant-a", 10):
+                raise ValueError("budget body failed")
+
+    workflow = ManualFailWorkflow(FlowClient(ReleaseFailExecutor()))
+    job = FlowRecord(
+        id="f1",
+        type="budget-order",
+        state="created",
+        partition_key="tenant-a",
+        lease_token=b"lease-1",
+        fencing_token=3,
+    )
+
+    with pytest.raises(ValueError, match="budget body failed") as raised:
+        workflow.handle(job)
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "budget release failed"
+
+
+def test_workflow_effect_cleanup_does_not_mask_body_failure():
+    class FailReportExecutor(FakeExecutor):
+        def execute_command(self, *args):
+            if args[0] == "FLOW.EFFECT.FAIL":
+                self.calls.append(args)
+                raise RuntimeError("effect fail reporting failed")
+            return super().execute_command(*args)
+
+    class ManualFailWorkflow(Workflow):
+        type = "effect-order"
+        initial_state = "created"
+
+        @state("created", on_error="raise")
+        def created(self, ctx):
+            with ctx.effect("charge", "payment.charge"):
+                raise ValueError("effect body failed")
+
+    workflow = ManualFailWorkflow(FlowClient(FailReportExecutor()))
+    job = FlowRecord(
+        id="f1",
+        type="effect-order",
+        state="created",
+        partition_key="tenant-a",
+        lease_token=b"lease-1",
+        fencing_token=3,
+    )
+
+    with pytest.raises(ValueError, match="effect body failed") as raised:
+        workflow.handle(job)
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "effect fail reporting failed"
+
+
 def test_workflow_context_effect_decorator_reserves_and_confirms():
     executor = FakeExecutor()
     workflow = EffectWorkflow(FlowClient(executor))
@@ -1368,7 +1938,7 @@ def test_workflow_client_worker_and_value_config_are_inherited_and_overridable()
     assert workflow.value_config.local_cache is True
 
 
-def test_workflow_client_from_url_reuses_native_claim_client(monkeypatch):
+def test_workflow_client_from_url_creates_bounded_claim_client(monkeypatch):
     calls = []
 
     def from_url(url, **kwargs):
@@ -1382,7 +1952,7 @@ def test_workflow_client_from_url_reuses_native_claim_client(monkeypatch):
 
     client = WorkflowClient.from_url(
         "ferric://example:6388",
-        worker_config=WorkerConfig(workers=4),
+        worker_config=WorkerConfig(workers=4, claim_connections=2),
     )
     workflow = client.workflow(type="order", initial_state="created")
 
@@ -1394,14 +1964,16 @@ def test_workflow_client_from_url_reuses_native_claim_client(monkeypatch):
 
     assert [(url, kwargs) for url, kwargs, _client in calls] == [
         ("ferric://example:6388", {"max_connections": 1}),
+        ("ferric://example:6388", {"max_connections": 2}),
     ]
     assert jobs
     assert workflow.client is client.flow
     assert workflow.claim_client is client.claim_flow
-    assert client.flow.executor._executor.calls[0][0] == "FLOW.CLAIM_DUE"
+    assert client.claim_flow.executor._executor.calls[0][0] == "FLOW.CLAIM_DUE"
+    assert client.claim_flow is not client.flow
 
 
-def test_workflow_client_from_protocol_url_reuses_multiplexed_claim_client(monkeypatch):
+def test_workflow_client_from_protocol_url_separates_command_and_claim_clients(monkeypatch):
     calls = []
 
     def from_url(url, **kwargs):
@@ -1419,13 +1991,13 @@ def test_workflow_client_from_protocol_url_reuses_multiplexed_claim_client(monke
     )
     workflow = client.workflow(type="order", initial_state="created")
 
-    assert len(calls) == 1
-    assert calls[0][1] == {"max_connections": 1}
+    assert [kwargs["max_connections"] for _url, kwargs, _client in calls] == [1, 4]
     assert workflow.client is client.flow
-    assert workflow.claim_client is client.flow
+    assert workflow.claim_client is client.claim_flow
+    assert client.claim_flow is not client.flow
 
 
-def test_workflow_worker_config_at_workflow_time_keeps_native_claim_client(monkeypatch):
+def test_workflow_worker_config_at_workflow_time_resizes_claim_client(monkeypatch):
     calls = []
 
     def from_url(url, **kwargs):
@@ -1444,9 +2016,9 @@ def test_workflow_worker_config_at_workflow_time_keeps_native_claim_client(monke
         worker_config=WorkerConfig(workers=16),
     )
 
-    assert calls[0][1]["max_connections"] == 1
+    assert [kwargs["max_connections"] for _url, kwargs, _client in calls] == [1, 1, 16]
     assert workflow.client is client.flow
-    assert workflow.claim_client is client.flow
+    assert workflow.claim_client is calls[-1][2]
 
 
 def test_workflow_client_close_does_not_close_externally_owned_clients():
@@ -1461,6 +2033,158 @@ def test_workflow_client_close_does_not_close_externally_owned_clients():
 
     assert flow_executor.closed is False
     assert claim_executor.closed is False
+
+
+def test_workflow_client_close_retries_only_failed_owned_clients():
+    class CloseExecutor(FakeExecutor):
+        def __init__(self, *, fail_once: bool = False) -> None:
+            super().__init__()
+            self.close_calls = 0
+            self.fail_once = fail_once
+
+        def close(self):
+            self.close_calls += 1
+            if self.fail_once and self.close_calls == 1:
+                raise RuntimeError("transient close failure")
+            self.closed = True
+
+    flow_executor = CloseExecutor(fail_once=True)
+    claim_executor = CloseExecutor()
+    client = WorkflowClient(
+        FlowClient(flow_executor),
+        claim_client=FlowClient(claim_executor),
+    )
+    client._owns_flow = True
+    client._owns_claim_flow = True
+
+    with pytest.raises(RuntimeError, match="transient close failure"):
+        client.close()
+    client.close()
+
+    assert flow_executor.close_calls == 2
+    assert claim_executor.close_calls == 1
+    assert flow_executor.closed is True
+    assert claim_executor.closed is True
+
+
+def test_workflow_client_close_prevents_new_owned_claim_pools(monkeypatch):
+    opened: list[FlowClient] = []
+
+    def from_url(_url, **_kwargs):
+        client = FlowClient(FakeExecutor())
+        opened.append(client)
+        return client
+
+    monkeypatch.setattr(workflow_module.FlowClient, "from_url", staticmethod(from_url))
+    client = WorkflowClient.from_url("ferric://seed.local:6388")
+    client.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        client.workflow(
+            type="order",
+            initial_state="created",
+            worker_config=WorkerConfig(workers=4),
+        )
+
+    assert len(opened) == 2
+
+
+def test_workflow_client_close_waits_for_inflight_owned_claim_pool_creation(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    close_done = threading.Event()
+    opened: list[FakeExecutor] = []
+    errors: list[BaseException] = []
+
+    def from_url(_url, **_kwargs):
+        entered.set()
+        if not release.wait(timeout=2):
+            raise TimeoutError("claim-pool test release timed out")
+        executor = FakeExecutor()
+        opened.append(executor)
+        return FlowClient(executor)
+
+    monkeypatch.setattr(workflow_module.FlowClient, "from_url", staticmethod(from_url))
+    client = WorkflowClient(
+        FlowClient(FakeExecutor()),
+        claim_client=FlowClient(FakeExecutor()),
+    )
+    client._url = "ferric://seed.local:6388"
+    client._claim_client_explicit = False
+    client._owns_flow = True
+    client._owns_claim_flow = True
+
+    def create_workflow() -> None:
+        try:
+            client.workflow(
+                type="order",
+                initial_state="created",
+                worker_config=WorkerConfig(workers=4),
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    def close_client() -> None:
+        try:
+            client.close()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            close_done.set()
+
+    create_thread = threading.Thread(target=create_workflow)
+    close_thread = threading.Thread(target=close_client)
+    create_thread.start()
+    assert entered.wait(timeout=1)
+    close_thread.start()
+
+    close_waited = not close_done.wait(timeout=0.05)
+    release.set()
+    create_thread.join(timeout=1)
+    close_thread.join(timeout=1)
+
+    assert close_waited is True
+    assert not create_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert errors == []
+    assert len(opened) == 1
+    assert opened[0].closed is True
+    assert client._owned_extra_claim_flows == []
+
+
+@pytest.mark.parametrize(
+    "constructor",
+    ["workflow_client", "workflow_client_from_url", "flow_workflow"],
+)
+def test_sync_workflow_owned_construction_rolls_back_first_client(monkeypatch, constructor):
+    class OwnedClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    opened: list[OwnedClient] = []
+
+    def from_url(_url, **_kwargs):
+        if opened:
+            raise OSError("claim connection failed")
+        client = OwnedClient()
+        opened.append(client)
+        return client
+
+    monkeypatch.setattr(workflow_module.FlowClient, "from_url", staticmethod(from_url))
+
+    with pytest.raises(OSError, match="claim connection failed"):
+        if constructor == "workflow_client":
+            WorkflowClient("ferric://seed.local:6388")
+        elif constructor == "workflow_client_from_url":
+            WorkflowClient.from_url("ferric://seed.local:6388")
+        else:
+            FlowWorkflow("ferric://seed.local:6388", type="order")
+
+    assert len(opened) == 1
+    assert opened[0].closed is True
 
 
 def test_class_workflow_worker_config_exception_policy_is_inherited():

@@ -1,13 +1,26 @@
 from __future__ import annotations
 
 import builtins
+import contextlib
 import inspect
+import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any, cast
 from urllib.parse import urlparse
 
 from ferricstore.adapters import AsyncCommandExecutor
-from ferricstore.backpressure import BackpressureController, BackpressurePolicy
+from ferricstore.backpressure import (
+    BackpressureController,
+    BackpressurePolicy,
+    backpressure_scope_for,
+)
+from ferricstore.batch_core import (
+    CreateManyGroup,
+    CreateManyPlan,
+    ordered_batch_executor,
+    require_batch_items,
+    run_async_fanout,
+)
 from ferricstore.client import (
     FlowClient,
     _append,
@@ -23,12 +36,20 @@ from ferricstore.client import (
     _append_state_meta,
     _append_value_return,
     _auto_partition_key_for_id,
+    _claim_due_command_args,
+    _claim_return_compat_args,
+    _claim_return_mode_unsupported,
     _command_with_request_context,
+    _complete_command_args,
+    _complete_jobs_command_args,
+    _complete_many_args,
     _expand_many_response,
+    _fail_command_args,
     _flow_return,
     _has_named_item_values,
     _invocation_create_args,
     _invocation_definition_put_args,
+    _job_mutation_command_args,
     _management_pair_args,
     _management_rule_args,
     _merge_named_map,
@@ -37,13 +58,20 @@ from ferricstore.client import (
     _ok_response,
     _parse_kv_response,
     _resolve_include_record,
+    _retry_command_args,
+    _run_steps_many_args,
     _shared_create_many_attributes,
     _shared_create_many_state_meta,
     _split_flow_state_policy,
+    _step_continue_args,
+    _transition_command_args,
 )
 from ferricstore.codecs import Codec, RawCodec
+from ferricstore.command_core import normalize_command_name
 from ferricstore.commands import AsyncDataCommandsMixin
-from ferricstore.errors import OverloadedError, map_exception
+from ferricstore.errors import FerricStoreError, InvalidCommandError, OverloadedError, map_exception
+from ferricstore.lifecycle_core import await_cancellation_safe, raise_primary_with_cleanup
+from ferricstore.mutation_core import JobMutation, MutationKind
 from ferricstore.types import (
     ApprovalResult,
     BudgetResult,
@@ -64,6 +92,7 @@ from ferricstore.types import (
     ScheduleResult,
     _normalize_ref_meta,
 )
+from ferricstore.worker_core import validate_many_result
 
 
 class _AsyncErrorMappingExecutor:
@@ -107,13 +136,17 @@ class AsyncCommandPipeline:
 
     async def execute(self) -> builtins.list[Any]:
         raw_executor = getattr(self.client.executor, "_executor", self.client.executor)
-        execute_batch = getattr(raw_executor, "execute_batch", None)
+        execute_batch = ordered_batch_executor(raw_executor)
         if callable(execute_batch):
             try:
                 result = execute_batch(self.commands)
                 if inspect.isawaitable(result):
                     result = await result
-                self.results = list(result)
+                self.results = require_batch_items(
+                    result,
+                    len(self.commands),
+                    operation="executor batch",
+                )
             except Exception as exc:
                 mapped = map_exception(exc)
                 if mapped is exc:
@@ -130,18 +163,29 @@ class AsyncPubSubSession:
 
     def __init__(self, client: AsyncFlowClient) -> None:
         self.client = client
+        self._active_client: AsyncFlowClient | None = None
+        self._owns_client = False
+
+    async def _session_client(self) -> AsyncFlowClient:
+        if self._active_client is None:
+            self._active_client, self._owns_client = await self.client._acquire_session_client()
+        return self._active_client
 
     async def subscribe(self, *channels: str) -> Any:
-        return await self.client.subscribe(*channels)
+        session_client = await self._session_client()
+        return await session_client.subscribe(*channels)
 
     async def unsubscribe(self, *channels: str) -> Any:
-        return await self.client.unsubscribe(*channels)
+        session_client = await self._session_client()
+        return await session_client.unsubscribe(*channels)
 
     async def psubscribe(self, *patterns: str) -> Any:
-        return await self.client.psubscribe(*patterns)
+        session_client = await self._session_client()
+        return await session_client.psubscribe(*patterns)
 
     async def punsubscribe(self, *patterns: str) -> Any:
-        return await self.client.punsubscribe(*patterns)
+        session_client = await self._session_client()
+        return await session_client.punsubscribe(*patterns)
 
     async def get_message(
         self,
@@ -149,10 +193,11 @@ class AsyncPubSubSession:
         timeout: float | None = None,
         decode: bool = True,
     ) -> PubSubMessage | None:
-        event = await self.client.wait_event(timeout=timeout)
+        session_client = await self._session_client()
+        event = await session_client.wait_event(timeout=timeout)
         if event is None:
             return None
-        decoder = self.client.codec.decode if decode else None
+        decoder = session_client.codec.decode if decode else None
         return PubSubMessage.from_event(event, decode=decoder)
 
     async def listen(
@@ -168,20 +213,68 @@ class AsyncPubSubSession:
             yield message
 
     async def close(self) -> None:
-        await self.unsubscribe()
-        await self.punsubscribe()
+        if self._active_client is None:
+            return
+        error: BaseException | None = None
+        for cleanup in (self.unsubscribe, self.punsubscribe):
+            try:
+                await cleanup()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+        if error is not None:
+            with contextlib.suppress(BaseException):
+                await self._active_client._invalidate_connection()
+        try:
+            if self._owns_client:
+                await self._active_client.close()
+        except BaseException as exc:
+            if error is None:
+                error = exc
+        finally:
+            self._active_client = None
+            self._owns_client = False
+        if error is not None:
+            raise error
 
 
 class AsyncTransactionSession:
     """Async transaction context around native MULTI/EXEC/DISCARD."""
 
-    def __init__(self, client: AsyncFlowClient) -> None:
+    def __init__(
+        self,
+        client: AsyncFlowClient,
+        *,
+        key: str | bytes | None = None,
+        watch: Sequence[str] | None = None,
+    ) -> None:
         self.client = client
+        self.key = key
+        self.watch_keys = list(watch or ())
+        self._active_client: AsyncFlowClient | None = None
+        self._owns_client = False
         self.closed = False
 
     async def __aenter__(self) -> AsyncFlowClient:
-        await self.client.multi()
-        return self.client
+        session_keys = ((self.key,) if self.key is not None else ()) + tuple(self.watch_keys)
+        session_client, owns_client = await self.client._acquire_session_client(session_keys)
+        self._active_client = session_client
+        self._owns_client = owns_client
+        try:
+            if self.watch_keys:
+                await session_client.watch(*self.watch_keys)
+            await session_client.multi()
+        except BaseException as primary:
+            if self.watch_keys:
+                with contextlib.suppress(BaseException):
+                    await session_client.unwatch()
+            cleanup_error: BaseException | None = None
+            try:
+                await self._release(invalidate=True)
+            except BaseException as cleanup:
+                cleanup_error = cleanup
+            raise_primary_with_cleanup(primary, primary.__traceback__, cleanup_error)
+        return session_client
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         if self.closed:
@@ -189,15 +282,56 @@ class AsyncTransactionSession:
         if exc_type is None:
             await self.execute()
         else:
-            await self.discard()
+            try:
+                await self.discard()
+            except BaseException as cleanup:
+                raise_primary_with_cleanup(exc, tb, cleanup)
 
     async def execute(self) -> Any:
         self.closed = True
-        return await self.client.transaction_exec()
+        session_client = self._active_client or self.client
+        try:
+            result = await session_client.transaction_exec()
+        except BaseException as primary:
+            cleanup_error: BaseException | None = None
+            try:
+                await session_client.discard()
+            except BaseException as cleanup:
+                cleanup_error = cleanup
+            try:
+                await self._release(invalidate=True)
+            except BaseException as cleanup:
+                if cleanup_error is None:
+                    cleanup_error = cleanup
+            raise_primary_with_cleanup(primary, primary.__traceback__, cleanup_error)
+        await self._release()
+        return result
 
     async def discard(self) -> Any:
         self.closed = True
-        return await self.client.discard()
+        session_client = self._active_client or self.client
+        try:
+            result = await session_client.discard()
+        except BaseException as primary:
+            cleanup_error: BaseException | None = None
+            try:
+                await self._release(invalidate=True)
+            except BaseException as cleanup:
+                cleanup_error = cleanup
+            raise_primary_with_cleanup(primary, primary.__traceback__, cleanup_error)
+        await self._release()
+        return result
+
+    async def _release(self, *, invalidate: bool = False) -> None:
+        active_client = self._active_client
+        owns_client = self._owns_client
+        self._active_client = None
+        self._owns_client = False
+        if invalidate and active_client is not None:
+            with contextlib.suppress(BaseException):
+                await await_cancellation_safe(active_client._invalidate_connection())
+        if active_client is not None and owns_client:
+            await await_cancellation_safe(active_client.close())
 
 
 class AsyncFlowClient(AsyncDataCommandsMixin):
@@ -216,8 +350,11 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
                 "use AsyncFlowClient.from_url(...) instead of passing FlowClient"
             )
         self.executor = _AsyncErrorMappingExecutor(executor)
-        self.codec = codec or RawCodec()
-        self.backpressure = BackpressureController(backpressure)
+        self.codec = codec if codec is not None else RawCodec()
+        self.backpressure = BackpressureController(
+            backpressure,
+            scope=backpressure_scope_for(executor),
+        )
         self._transaction_mode = False
 
     @classmethod
@@ -264,32 +401,72 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         )
 
     async def close(self) -> None:
+        if self._transaction_mode:
+            self._transaction_mode = False
+            await self._set_heartbeat_paused(False)
         close = getattr(self.executor, "close", None)
         if callable(close):
             result = close()
             if inspect.isawaitable(result):
                 await result
 
+    async def _invalidate_connection(self) -> None:
+        raw_executor = getattr(self.executor, "_executor", self.executor)
+        invalidate = getattr(raw_executor, "invalidate", None)
+        if not callable(invalidate):
+            return
+        result = invalidate()
+        if inspect.isawaitable(result):
+            await result
+
     async def command(self, *args: Any) -> Any:
         if not args:
             return await self.executor.execute_command(*args)
 
-        name = str(args[0]).upper()
+        name = normalize_command_name(args[0])
         tx_control = name in {"MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH"}
+        raw_executor = getattr(self.executor, "_executor", self.executor)
+        if tx_control and getattr(raw_executor, "requires_explicit_session", False):
+            raise InvalidCommandError(
+                "connection-affine transaction commands require client.transaction()"
+            )
+        starting_transaction = name == "MULTI" and not self._transaction_mode
+        ending_transaction = name in {"EXEC", "DISCARD"} and self._transaction_mode
+
+        if starting_transaction:
+            await self._set_heartbeat_paused(True)
 
         try:
             if self._transaction_mode and not tx_control:
                 result = await self.executor.execute_command("COMMAND_EXEC", args[0], *args[1:])
             else:
                 result = await self.executor.execute_command(*args)
+        except BaseException:
+            if starting_transaction:
+                await self._set_heartbeat_paused(False)
+            raise
         finally:
             if name in {"EXEC", "DISCARD"}:
                 self._transaction_mode = False
+                if ending_transaction:
+                    await self._set_heartbeat_paused(False)
 
         if name == "MULTI":
             self._transaction_mode = True
 
         return result
+
+    async def _set_heartbeat_paused(self, paused: bool) -> None:
+        method = getattr(
+            self.executor,
+            "pause_heartbeat" if paused else "resume_heartbeat",
+            None,
+        )
+        if not callable(method):
+            return
+        result = method()
+        if inspect.isawaitable(result):
+            await result
 
     async def refresh_topology(self) -> Any:
         refresh = getattr(self.executor, "refresh_topology", None)
@@ -312,11 +489,71 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
     def pipeline(self) -> AsyncCommandPipeline:
         return AsyncCommandPipeline(self)
 
-    def transaction(self) -> AsyncTransactionSession:
-        return AsyncTransactionSession(self)
+    def transaction(
+        self,
+        key: str | bytes | None = None,
+        *,
+        watch: Sequence[str] | None = None,
+    ) -> AsyncTransactionSession:
+        return AsyncTransactionSession(self, key=key, watch=watch)
 
     def pubsub_session(self) -> AsyncPubSubSession:
         return AsyncPubSubSession(self)
+
+    async def _acquire_session_client(
+        self,
+        keys: Sequence[str | bytes] | None = None,
+    ) -> tuple[AsyncFlowClient, bool]:
+        raw_executor = getattr(self.executor, "_executor", self.executor)
+        session_keys = tuple(keys or ())
+        acquire_session = getattr(raw_executor, "acquire_session_for_keys", None)
+        if callable(acquire_session) and session_keys:
+            session_executor = acquire_session(session_keys)
+            if inspect.isawaitable(session_executor):
+                session_executor = await session_executor
+            session_client = AsyncFlowClient(session_executor, codec=self.codec)
+            session_client.backpressure = self.backpressure
+            return session_client, True
+        acquire_session = None
+        if session_keys:
+            acquire_session = getattr(raw_executor, "acquire_session_for_key", None)
+        if not callable(acquire_session):
+            acquire_session = getattr(raw_executor, "acquire_session", None)
+        if not callable(acquire_session):
+            return self, False
+        session_executor = acquire_session(session_keys[0]) if session_keys else acquire_session()
+        if inspect.isawaitable(session_executor):
+            session_executor = await session_executor
+        session_client = AsyncFlowClient(session_executor, codec=self.codec)
+        session_client.backpressure = self.backpressure
+        return session_client, True
+
+    async def subscribe_flow_wake(
+        self,
+        type: str,
+        *,
+        state: str | None = None,
+        states: builtins.list[str] | None = None,
+        partition_key: str | None = None,
+        partition_keys: builtins.list[str] | None = None,
+        priority: int | None = 0,
+        limit: int | None = None,
+    ) -> Any:
+        subscribe = getattr(self.executor, "subscribe_flow_wake", None)
+        if not callable(subscribe):
+            raise RuntimeError("FLOW_WAKE subscriptions require protocol executor event support")
+        result = subscribe(
+            type,
+            state=state,
+            states=states,
+            partition_key=partition_key,
+            partition_keys=partition_keys,
+            priority=priority,
+            limit=limit,
+        )
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
     async def wait_event(self, timeout: float | None = None) -> Any | None:
         wait_event = getattr(self.executor, "wait_event", None)
@@ -864,6 +1101,39 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         response = await self.executor.execute_command(*args)
         return await self._record_or_get(response, id, partition_key)
 
+    async def run_steps_many(
+        self,
+        items: builtins.list[str | dict[str, Any] | CreateItem],
+        *,
+        type: str,
+        states: Sequence[str] | None = None,
+        steps: int | None = None,
+        worker: str,
+        lease_ms: int = 30_000,
+        now_ms: int | None = None,
+        payload: Any = None,
+        result: Any = None,
+        partition_key: str | None = None,
+        retention_ttl_ms: int | None = None,
+    ) -> bytes:
+        if not items:
+            return b"OK"
+        args = _run_steps_many_args(
+            self.codec,
+            items,
+            type=type,
+            states=states,
+            steps=steps,
+            worker=worker,
+            lease_ms=lease_ms,
+            now_ms=now_ms,
+            payload=payload,
+            result=result,
+            partition_key=partition_key,
+            retention_ttl_ms=retention_ttl_ms,
+        )
+        return cast(bytes, _flow_return(await self.executor.execute_command(*args)))
+
     async def enqueue_many(
         self,
         items: builtins.list[CreateItem],
@@ -886,7 +1156,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         if not items:
             return []
 
-        if partition_key is not None or any(item.partition_key is not None for item in items):
+        if partition_key is not None:
             return await self.create_many(
                 partition_key,
                 items,
@@ -905,20 +1175,16 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
                 state_meta=state_meta,
             )
 
-        grouped: dict[str, builtins.list[tuple[int, CreateItem]]] = {}
-        for idx, item in enumerate(items):
-            grouped.setdefault(_auto_partition_key_for_id(item.id), []).append((idx, item))
+        plan = CreateManyPlan.build(items, now_ms=now_ms, clock=_now_ms)
 
-        results: builtins.list[Any] = [None] * len(items)
-        for bucket, indexed_items in grouped.items():
-            group_items = [item for _idx, item in indexed_items]
-            response = await self.create_many(
-                bucket,
-                group_items,
+        async def create_group(group: CreateManyGroup) -> Any:
+            return await self.create_many(
+                group.partition_key,
+                group.items,
                 type=type,
                 state=state,
                 run_at_ms=run_at_ms,
-                now_ms=now_ms,
+                now_ms=plan.now_ms,
                 priority=priority,
                 idempotent=idempotent,
                 independent=independent,
@@ -929,13 +1195,15 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
                 attributes=attributes,
                 state_meta=state_meta,
             )
-            for (idx, _item), item_result in zip(
-                indexed_items,
-                _expand_many_response(response, len(indexed_items)),
-                strict=False,
-            ):
-                results[idx] = item_result
-        return results
+
+        raw_executor = getattr(self.executor, "_executor", self.executor)
+        responses = await run_async_fanout(
+            plan.groups,
+            create_group,
+            concurrent=getattr(raw_executor, "supports_concurrent_fanout", False) is True,
+        )
+
+        return plan.merge(responses, _expand_many_response)
 
     async def create_many(
         self,
@@ -1000,7 +1268,13 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
                 item_partition = item.partition_key if mixed else None
                 item_values = _merge_named_map(values, item.values)
                 item_refs = _merge_named_map(value_refs, item.value_refs)
-                args.extend([item.id, item_partition or "-", self.codec.encode(item.payload)])
+                args.extend(
+                    [
+                        item.id,
+                        item_partition if item_partition is not None else "-",
+                        self.codec.encode(item.payload),
+                    ]
+                )
                 _append_named_counts(args, self.codec, item_values, item_refs)
         else:
             _append_named_values(args, self.codec, values=values, value_refs=value_refs)
@@ -1046,13 +1320,14 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         args: builtins.list[Any] = ["FLOW.VALUE.MGET", *refs]
         _append(args, "MAX_BYTES", max_bytes)
         response = await self.executor.execute_command(*args)
+        items = require_batch_items(response, len(refs), operation="FLOW.VALUE.MGET")
         return [
             _normalize_ref_meta(value)
             if isinstance(value, dict)
             else value
             if value is None
             else self.codec.decode(value)
-            for value in response
+            for value in items
         ]
 
     async def signal(
@@ -1123,56 +1398,41 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         include_attributes: bool = True,
     ) -> builtins.list[FlowRecord] | builtins.list[ClaimedFlow]:
         include_record = _resolve_include_record(include_record, job_only)
-        args: builtins.list[Any] = ["FLOW.CLAIM_DUE", type]
-        if state is not None and states is not None:
-            raise ValueError("state and states are mutually exclusive")
-        if states is not None:
-            if not states:
-                raise ValueError("states must be non-empty")
-            for item in states:
-                if not isinstance(item, str) or item == "":
-                    raise ValueError("states must contain non-empty strings")
-                _append(args, "STATE", item)
-        else:
-            _append(args, "STATE", state)
-        args.extend(
-            [
-                "WORKER",
-                worker,
-                "LEASE_MS",
-                lease_ms,
-                "LIMIT",
-                limit,
-            ]
+        args = _claim_due_command_args(
+            type,
+            state=state,
+            states=states,
+            worker=worker,
+            partition_key=partition_key,
+            partition_keys=partition_keys,
+            lease_ms=lease_ms,
+            limit=limit,
+            priority=priority,
+            now_ms=now_ms,
+            block_ms=block_ms,
+            reclaim_expired=reclaim_expired,
+            reclaim_ratio=reclaim_ratio,
+            include_record=include_record,
+            payload=payload,
+            payload_max_bytes=payload_max_bytes,
+            values=values,
+            value_max_bytes=value_max_bytes,
+            include_state=include_state,
+            include_attributes=include_attributes,
         )
-        _append(args, "NOW", now_ms)
-        if partition_key is not None and partition_keys is not None:
-            raise ValueError("partition_key and partition_keys are mutually exclusive")
-        _append(args, "PARTITION", partition_key)
-        if partition_keys is not None:
-            if not partition_keys:
-                raise ValueError("partition_keys must be non-empty")
-            args.extend(["PARTITIONS", len(partition_keys), *partition_keys])
-        _append(args, "PRIORITY", priority)
-        if not include_record:
-            if include_state and include_attributes:
-                return_mode = "JOBS_COMPACT_STATE_ATTRS"
-            elif include_state:
-                return_mode = "JOBS_COMPACT_STATE"
-            elif include_attributes:
-                return_mode = "JOBS_COMPACT_ATTRS"
-            else:
-                return_mode = "JOBS_COMPACT"
-            _append(args, "RETURN", return_mode)
-        _append(args, "BLOCK", block_ms)
-        _append_payload_read(args, payload, payload_max_bytes)
-        _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
-        _append_bool(args, "RECLAIM_EXPIRED", reclaim_expired)
-        _append(args, "RECLAIM_RATIO", reclaim_ratio)
-        response = await self.executor.execute_command(*args)
+        response = await self._execute_claim_command(args)
         if include_record:
             return self._records(response)
         return ClaimedFlow.from_compact_rows(response)
+
+    async def _execute_claim_command(self, args: builtins.list[Any]) -> Any:
+        try:
+            return await self.executor.execute_command(*args)
+        except FerricStoreError as exc:
+            compat_args = _claim_return_compat_args(args)
+            if compat_args is not None and _claim_return_mode_unsupported(exc):
+                return await self.executor.execute_command(*compat_args)
+            raise
 
     async def claim_flows(
         self,
@@ -1267,7 +1527,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
             _append(args, "RETURN", "JOBS_COMPACT_ATTRS" if include_attributes else "JOBS_COMPACT")
         _append_payload_read(args, payload, payload_max_bytes)
         _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
-        response = await self.executor.execute_command(*args)
+        response = await self._execute_claim_command(args)
         if include_record:
             return self._records(response)
         return ClaimedFlow.from_compact_rows(response)
@@ -1319,36 +1579,25 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         priority: int | None = None,
         return_record: bool = False,
     ) -> FlowRecord | bytes:
-        now_ms = now_ms if now_ms is not None else _now_ms()
-        args: builtins.list[Any] = [
-            "FLOW.TRANSITION",
-            id,
-            from_state,
-            to_state,
-            "LEASE_TOKEN",
-            lease_token,
-            "FENCING",
-            fencing_token,
-            "NOW",
-            now_ms,
-        ]
-        _append(args, "PARTITION", partition_key)
-        _append_encoded(args, "PAYLOAD", self.codec, payload)
-        _append(args, "RUN_AT", run_at_ms if run_at_ms is not None else now_ms)
-        _append(args, "PRIORITY", priority)
-        _append_attributes(
-            args,
-            attributes_merge=attributes_merge,
-            attributes_delete=attributes_delete,
-        )
-        _append_state_meta(args, state_meta)
-        _append_named_values(
-            args,
+        args = _transition_command_args(
             self.codec,
+            id,
+            from_state=from_state,
+            to_state=to_state,
+            lease_token=lease_token,
+            fencing_token=fencing_token,
+            partition_key=partition_key,
+            payload=payload,
             values=values,
             value_refs=value_refs,
             drop_values=drop_values,
             override_values=override_values,
+            attributes_merge=attributes_merge,
+            attributes_delete=attributes_delete,
+            state_meta=state_meta,
+            run_at_ms=run_at_ms,
+            now_ms=now_ms,
+            priority=priority,
         )
         response = await self.executor.execute_command(*args)
         if not return_record:
@@ -1375,38 +1624,32 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         state_meta: dict[str, Any] | None = None,
         now_ms: int | None = None,
         worker: str | None = None,
-    ) -> FlowRecord:
-        args: builtins.list[Any] = [
-            "FLOW.STEP_CONTINUE",
-            id,
-            lease_token,
-            from_state,
-            to_state,
-            "FENCING",
-            fencing_token,
-            "LEASE_MS",
-            lease_ms,
-            "NOW",
-            now_ms if now_ms is not None else _now_ms(),
-        ]
-        _append(args, "PARTITION", partition_key)
-        _append(args, "WORKER", worker)
-        _append_encoded(args, "PAYLOAD", self.codec, payload)
-        _append_attributes(
-            args,
-            attributes_merge=attributes_merge,
-            attributes_delete=attributes_delete,
-        )
-        _append_state_meta(args, state_meta)
-        _append_named_values(
-            args,
+        return_job: bool = False,
+    ) -> FlowRecord | ClaimedFlow:
+        args = _step_continue_args(
             self.codec,
+            id,
+            lease_token=lease_token,
+            from_state=from_state,
+            to_state=to_state,
+            fencing_token=fencing_token,
+            lease_ms=lease_ms,
+            partition_key=partition_key,
+            payload=payload,
             values=values,
             value_refs=value_refs,
             drop_values=drop_values,
             override_values=override_values,
+            attributes_merge=attributes_merge,
+            attributes_delete=attributes_delete,
+            state_meta=state_meta,
+            now_ms=now_ms,
+            worker=worker,
+            return_job=return_job,
         )
         response = await self.executor.execute_command(*args)
+        if return_job:
+            return ClaimedFlow.from_resp(response)
         return await self._record_or_get(response, id, partition_key)
 
     async def complete_many(
@@ -1426,34 +1669,29 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = None,
+        return_ok_on_success: bool = False,
     ) -> builtins.list[FlowRecord] | Any:
         if not items:
             return []
 
-        args: builtins.list[Any] = [
-            "FLOW.COMPLETE_MANY",
-            "MIXED" if partition_key is None else partition_key,
-        ]
-        _append_encoded(args, "RESULT", self.codec, result)
-        _append_encoded(args, "PAYLOAD", self.codec, payload)
-        _append(args, "TTL", ttl_ms)
-        _append(args, "NOW", now_ms if now_ms is not None else _now_ms())
-        _append_bool(args, "INDEPENDENT", independent)
-        _append_attributes(
-            args,
-            attributes_merge=attributes_merge,
-            attributes_delete=attributes_delete,
-        )
-        _append_state_meta(args, state_meta)
-        _append_named_values(
-            args,
+        args = _complete_many_args(
             self.codec,
+            partition_key,
+            items,
+            result=result,
+            payload=payload,
             values=values,
             value_refs=value_refs,
             drop_values=drop_values,
             override_values=override_values,
+            attributes_merge=attributes_merge,
+            attributes_delete=attributes_delete,
+            state_meta=state_meta,
+            ttl_ms=ttl_ms,
+            now_ms=now_ms,
+            independent=independent,
+            return_ok_on_success=return_ok_on_success,
         )
-        self._append_claimed_items(args, partition_key, items, "FLOW.COMPLETE_MANY")
         return self._records_or_response(await self.executor.execute_command(*args))
 
     async def complete_jobs(
@@ -1465,6 +1703,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         ttl_ms: int | None = None,
         now_ms: int | None = None,
         independent: bool | None = True,
+        return_ok_on_success: bool = False,
     ) -> builtins.list[FlowRecord] | Any:
         if not jobs:
             return []
@@ -1484,7 +1723,122 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
             ttl_ms=ttl_ms,
             now_ms=now_ms,
             independent=independent,
+            return_ok_on_success=return_ok_on_success,
         )
+
+    async def complete_flows_and_claim_flows(
+        self,
+        jobs: builtins.list[ClaimedFlow],
+        *,
+        result: Any = None,
+        payload: Any = None,
+        ttl_ms: int | None = None,
+        now_ms: int | None = None,
+        independent: bool | None = True,
+        type: str,
+        state: str | None = None,
+        states: builtins.list[str] | None = None,
+        worker: str,
+        partition_key: str | None = None,
+        partition_keys: builtins.list[str] | None = None,
+        lease_ms: int = 30_000,
+        limit: int = 100,
+        priority: int | None = 0,
+        claim_now_ms: int | None = None,
+        block_ms: int | None = None,
+        reclaim_expired: bool | None = None,
+        reclaim_ratio: int | None = None,
+        include_state: bool = False,
+        include_attributes: bool = True,
+    ) -> builtins.list[ClaimedFlow]:
+        """Complete claimed flows and claim more in one async transport round trip."""
+        if not jobs:
+            return await self.claim_flows(
+                type,
+                state=state,
+                states=states,
+                worker=worker,
+                partition_key=partition_key,
+                partition_keys=partition_keys,
+                lease_ms=lease_ms,
+                limit=limit,
+                priority=priority,
+                now_ms=claim_now_ms,
+                block_ms=block_ms,
+                reclaim_expired=reclaim_expired,
+                reclaim_ratio=reclaim_ratio,
+                include_state=include_state,
+                include_attributes=include_attributes,
+            )
+
+        complete_args = _complete_jobs_command_args(
+            self.codec,
+            jobs,
+            result=result,
+            payload=payload,
+            ttl_ms=ttl_ms,
+            now_ms=now_ms,
+            independent=independent,
+        )
+        claim_args = _claim_due_command_args(
+            type,
+            state=state,
+            states=states,
+            worker=worker,
+            partition_key=partition_key,
+            partition_keys=partition_keys,
+            lease_ms=lease_ms,
+            limit=limit,
+            priority=priority,
+            now_ms=claim_now_ms,
+            block_ms=block_ms,
+            reclaim_expired=reclaim_expired,
+            reclaim_ratio=reclaim_ratio,
+            include_record=False,
+            include_state=include_state,
+            include_attributes=include_attributes,
+        )
+        responses = await self._execute_command_batch([tuple(complete_args), tuple(claim_args)])
+        if len(responses) != 2:
+            raise FerricStoreError(
+                "complete-and-claim batch returned invalid response cardinality",
+                raw=responses,
+            )
+        validate_many_result(
+            responses[0],
+            len(jobs),
+            operation="FLOW.COMPLETE_MANY",
+        )
+        return ClaimedFlow.from_compact_rows(responses[1])
+
+    async def complete_jobs_and_claim_jobs(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> builtins.list[ClaimedFlow]:
+        return await self.complete_flows_and_claim_flows(*args, **kwargs)
+
+    async def _execute_command_batch(
+        self,
+        commands: builtins.list[tuple[Any, ...]],
+    ) -> builtins.list[Any]:
+        execute_batch = getattr(self.executor, "execute_batch", None)
+        if callable(execute_batch):
+            try:
+                result = execute_batch(commands)
+                if inspect.isawaitable(result):
+                    result = await result
+                return require_batch_items(
+                    result,
+                    len(commands),
+                    operation="executor batch",
+                )
+            except Exception as exc:
+                mapped = map_exception(exc)
+                if mapped is exc:
+                    raise
+                raise mapped from exc
+        return [await self.command(*command) for command in commands]
 
     async def complete(
         self,
@@ -1506,37 +1860,73 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         now_ms: int | None = None,
         return_record: bool = False,
     ) -> FlowRecord | bytes:
-        args: builtins.list[Any] = [
-            "FLOW.COMPLETE",
-            id,
-            lease_token,
-            "FENCING",
-            fencing_token,
-            "NOW",
-            now_ms if now_ms is not None else _now_ms(),
-        ]
-        _append(args, "PARTITION", partition_key)
-        _append_encoded(args, "RESULT", self.codec, result)
-        _append_encoded(args, "PAYLOAD", self.codec, payload)
-        _append(args, "TTL", ttl_ms)
-        _append_attributes(
-            args,
-            attributes_merge=attributes_merge,
-            attributes_delete=attributes_delete,
-        )
-        _append_state_meta(args, state_meta)
-        _append_named_values(
-            args,
+        args = _complete_command_args(
             self.codec,
+            id,
+            lease_token=lease_token,
+            fencing_token=fencing_token,
+            partition_key=partition_key,
+            result=result,
+            payload=payload,
             values=values,
             value_refs=value_refs,
             drop_values=drop_values,
             override_values=override_values,
+            attributes_merge=attributes_merge,
+            attributes_delete=attributes_delete,
+            state_meta=state_meta,
+            ttl_ms=ttl_ms,
+            now_ms=now_ms,
         )
         response = await self.executor.execute_command(*args)
         if not return_record:
             return _flow_return(response)
         return await self._record_or_get(response, id, partition_key)
+
+    async def complete_job_results(
+        self,
+        items: builtins.list[tuple[ClaimedFlow, Any]],
+        *,
+        now_ms: int | None = None,
+    ) -> builtins.list[Any]:
+        """Pipeline distinct completion results in one transport write/round trip."""
+        return await self.complete_job_mutations(
+            [(job, {"result": result}) for job, result in items],
+            now_ms=now_ms,
+        )
+
+    async def complete_job_mutations(
+        self,
+        items: builtins.list[tuple[ClaimedFlow, Mapping[str, Any]]],
+        *,
+        now_ms: int | None = None,
+    ) -> builtins.list[Any]:
+        """Pipeline per-job completion fields without losing item-level errors."""
+        return await self.apply_job_mutations(
+            [JobMutation(MutationKind.COMPLETE, job, options) for job, options in items],
+            now_ms=now_ms,
+        )
+
+    async def apply_job_mutations(
+        self,
+        mutations: Sequence[JobMutation],
+        *,
+        now_ms: int | None = None,
+    ) -> builtins.list[Any]:
+        """Apply heterogeneous fenced mutations in one routed transport batch."""
+        if not mutations:
+            return []
+        batch_now_ms = now_ms if now_ms is not None else _now_ms()
+        commands = [
+            tuple(_job_mutation_command_args(self.codec, mutation, now_ms=batch_now_ms))
+            for mutation in mutations
+        ]
+        responses = await self._execute_command_batch(commands)
+        return validate_many_result(
+            responses,
+            len(mutations),
+            operation="Flow mutation batch",
+        )
 
     async def transition_many(
         self,
@@ -1612,32 +2002,23 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         now_ms: int | None = None,
         return_record: bool = False,
     ) -> FlowRecord | bytes:
-        args: builtins.list[Any] = [
-            "FLOW.RETRY",
-            id,
-            lease_token,
-            "FENCING",
-            fencing_token,
-            "NOW",
-            now_ms if now_ms is not None else _now_ms(),
-        ]
-        _append(args, "PARTITION", partition_key)
-        _append_encoded(args, "ERROR", self.codec, error)
-        _append_encoded(args, "PAYLOAD", self.codec, payload)
-        _append(args, "RUN_AT", run_at_ms)
-        _append_attributes(
-            args,
-            attributes_merge=attributes_merge,
-            attributes_delete=attributes_delete,
-        )
-        _append_state_meta(args, state_meta)
-        _append_named_values(
-            args,
+        args = _retry_command_args(
             self.codec,
+            id,
+            lease_token=lease_token,
+            fencing_token=fencing_token,
+            partition_key=partition_key,
+            error=error,
+            payload=payload,
             values=values,
             value_refs=value_refs,
             drop_values=drop_values,
             override_values=override_values,
+            attributes_merge=attributes_merge,
+            attributes_delete=attributes_delete,
+            state_meta=state_meta,
+            run_at_ms=run_at_ms,
+            now_ms=now_ms,
         )
         response = await self.executor.execute_command(*args)
         if not return_record:
@@ -1711,32 +2092,23 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
         now_ms: int | None = None,
         return_record: bool = False,
     ) -> FlowRecord | bytes:
-        args: builtins.list[Any] = [
-            "FLOW.FAIL",
-            id,
-            lease_token,
-            "FENCING",
-            fencing_token,
-            "NOW",
-            now_ms if now_ms is not None else _now_ms(),
-        ]
-        _append(args, "PARTITION", partition_key)
-        _append_encoded(args, "ERROR", self.codec, error)
-        _append_encoded(args, "PAYLOAD", self.codec, payload)
-        _append(args, "TTL", ttl_ms)
-        _append_attributes(
-            args,
-            attributes_merge=attributes_merge,
-            attributes_delete=attributes_delete,
-        )
-        _append_state_meta(args, state_meta)
-        _append_named_values(
-            args,
+        args = _fail_command_args(
             self.codec,
+            id,
+            lease_token=lease_token,
+            fencing_token=fencing_token,
+            partition_key=partition_key,
+            error=error,
+            payload=payload,
             values=values,
             value_refs=value_refs,
             drop_values=drop_values,
             override_values=override_values,
+            attributes_merge=attributes_merge,
+            attributes_delete=attributes_delete,
+            state_meta=state_meta,
+            ttl_ms=ttl_ms,
+            now_ms=now_ms,
         )
         response = await self.executor.execute_command(*args)
         if not return_record:
@@ -2211,7 +2583,7 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
                 args.extend(
                     [
                         child.id,
-                        child.partition_key or "-",
+                        child.partition_key if child.partition_key is not None else "-",
                         child.type,
                         self.codec.encode(child.payload),
                     ]
@@ -3024,14 +3396,26 @@ class AsyncFlowClient(AsyncDataCommandsMixin):
 
     async def _execute_producer_write(self, *args: Any) -> Any:
         attempt = 0
+        started = time.monotonic()
         while True:
-            await self.backpressure.before_request_async()
+            elapsed_s = time.monotonic() - started
+            if not await self.backpressure.before_request_async(elapsed_s=elapsed_s):
+                raise OverloadedError("client backpressure wait exceeds max_elapsed_ms")
             try:
                 result = await self.executor.execute_command(*args)
                 self.backpressure.record_success()
                 return result
             except OverloadedError as exc:
-                if not self.backpressure.can_retry(attempt):
+                elapsed_s = time.monotonic() - started
+                if not self.backpressure.can_retry(
+                    attempt,
+                    elapsed_s=elapsed_s,
+                ):
                     raise
-                await self.backpressure.record_overload_async(attempt, exc.retry_after_ms)
+                if not await self.backpressure.record_overload_async(
+                    attempt,
+                    exc.retry_after_ms,
+                    elapsed_s=elapsed_s,
+                ):
+                    raise
                 attempt += 1

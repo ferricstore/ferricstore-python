@@ -1,115 +1,234 @@
-from ferricstore.adapters import AsyncCommandExecutor, CommandExecutor
-from ferricstore.async_client import (
-    AsyncCommandPipeline,
-    AsyncFlowClient,
-    AsyncPubSubSession,
-    AsyncTransactionSession,
-)
-from ferricstore.async_worker import (
-    AsyncQueue,
-    AsyncQueueClient,
-    AsyncQueueFlowWorker,
-    AsyncWorkflow,
-    AsyncWorkflowBudget,
-    AsyncWorkflowClient,
-    AsyncWorkflowContext,
-    AsyncWorkflowEffect,
-    AsyncWorkflowWorkerResult,
-)
-from ferricstore.async_worker import (
-    AsyncQueueFlow as AsyncQueueFlow,
-)
-from ferricstore.backpressure import BackpressurePolicy
-from ferricstore.client import (
-    AutobatchFlowClient,
-    CommandPipeline,
-    FlowClient,
-    PubSubSession,
-    TransactionSession,
-)
-from ferricstore.codecs import Codec, JsonCodec, RawCodec
-from ferricstore.errors import (
-    FerricStoreError,
-    FlowAlreadyExistsError,
-    FlowNotFoundError,
-    FlowWrongStateError,
-    InvalidCommandError,
-    LockHeldError,
-    LockNotOwnedError,
-    OverloadedError,
-    StaleLeaseError,
-)
-from ferricstore.protocol import (
-    AsyncProtocolAdapter,
-    AsyncProtocolAdapterPool,
-    AsyncProtocolPipeline,
-    AsyncTopologyProtocolAdapterPool,
-    ProtocolAdapter,
-    ProtocolAdapterPool,
-    ProtocolCommand,
-    ProtocolPipeline,
-    RoutingTopology,
-    TopologyProtocolAdapterPool,
-)
-from ferricstore.types import (
-    ApprovalResult,
-    BudgetPolicy,
-    BudgetResult,
-    ChildSpec,
-    CircuitBreakerStatus,
-    ClaimedFlow,
-    ClaimedItem,
-    CreateItem,
-    EffectResult,
-    ExceptionPolicy,
-    FencedItem,
-    FetchOrComputeResult,
-    FlowRecord,
-    FlowStateMode,
-    FlowStatePolicy,
-    GovernanceOverview,
-    KeyInfo,
-    PubSubMessage,
-    RateLimitResult,
-    RetryPolicy,
-    ScheduleResult,
-    ValueConfig,
-    WorkerConfig,
-)
-from ferricstore.worker import (
-    Queue,
-    QueueClient,
-    QueueFlowWorker,
-    QueueFlowWorkerResult,
-    Worker,
-)
-from ferricstore.workflow import (
-    Complete,
-    Fail,
-    Retry,
-    Transition,
-    Workflow,
-    WorkflowBudget,
-    WorkflowClient,
-    WorkflowContext,
-    WorkflowEffect,
-    WorkflowWorker,
-    WorkflowWorkerResult,
-    complete,
-    fail,
-    retry,
-    state,
-    transition,
-)
-from ferricstore.workflow import (
-    FlowWorkflow as FlowWorkflow,
-)
+from __future__ import annotations
 
-QueueWorker = QueueFlowWorker
-QueueWorkerResult = QueueFlowWorkerResult
-AsyncQueueWorker = AsyncQueueFlowWorker
+from importlib import import_module
+from typing import TYPE_CHECKING, Any
 
 __version__ = "0.3.3"
+
+_EXPORTS: dict[str, tuple[str, str]] = {
+    "ApprovalResult": ("ferricstore.types", "ApprovalResult"),
+    "AsyncCommandExecutor": ("ferricstore.adapters", "AsyncCommandExecutor"),
+    "AsyncCommandPipeline": ("ferricstore.async_client", "AsyncCommandPipeline"),
+    "AsyncFlowClient": ("ferricstore.async_client", "AsyncFlowClient"),
+    "AsyncProtocolAdapter": ("ferricstore.protocol", "AsyncProtocolAdapter"),
+    "AsyncProtocolAdapterPool": ("ferricstore.protocol", "AsyncProtocolAdapterPool"),
+    "AsyncProtocolPipeline": ("ferricstore.protocol", "AsyncProtocolPipeline"),
+    "AsyncPubSubSession": ("ferricstore.async_client", "AsyncPubSubSession"),
+    "AsyncQueue": ("ferricstore.async_worker", "AsyncQueue"),
+    "AsyncQueueClient": ("ferricstore.async_worker", "AsyncQueueClient"),
+    "AsyncQueueFlow": ("ferricstore.async_worker", "AsyncQueueFlow"),
+    "AsyncQueueFlowWorker": ("ferricstore.async_worker", "AsyncQueueFlowWorker"),
+    "AsyncQueueWorker": ("ferricstore.async_worker", "AsyncQueueFlowWorker"),
+    "AsyncTopologyProtocolAdapterPool": (
+        "ferricstore.protocol",
+        "AsyncTopologyProtocolAdapterPool",
+    ),
+    "AsyncTransactionSession": ("ferricstore.async_client", "AsyncTransactionSession"),
+    "AsyncWorkflow": ("ferricstore.async_worker", "AsyncWorkflow"),
+    "AsyncWorkflowBudget": ("ferricstore.async_worker", "AsyncWorkflowBudget"),
+    "AsyncWorkflowClient": ("ferricstore.async_worker", "AsyncWorkflowClient"),
+    "AsyncWorkflowContext": ("ferricstore.async_worker", "AsyncWorkflowContext"),
+    "AsyncWorkflowEffect": ("ferricstore.async_worker", "AsyncWorkflowEffect"),
+    "AsyncWorkflowWorkerResult": (
+        "ferricstore.async_worker",
+        "AsyncWorkflowWorkerResult",
+    ),
+    "AutobatchFlowClient": ("ferricstore.client", "AutobatchFlowClient"),
+    "BackpressurePolicy": ("ferricstore.backpressure", "BackpressurePolicy"),
+    "BudgetPolicy": ("ferricstore.types", "BudgetPolicy"),
+    "BudgetResult": ("ferricstore.types", "BudgetResult"),
+    "ChildSpec": ("ferricstore.types", "ChildSpec"),
+    "CircuitBreakerStatus": ("ferricstore.types", "CircuitBreakerStatus"),
+    "ClaimedFlow": ("ferricstore.types", "ClaimedFlow"),
+    "ClaimedItem": ("ferricstore.types", "ClaimedItem"),
+    "Codec": ("ferricstore.codecs", "Codec"),
+    "CommandExecutor": ("ferricstore.adapters", "CommandExecutor"),
+    "CommandPipeline": ("ferricstore.client", "CommandPipeline"),
+    "Complete": ("ferricstore.workflow", "Complete"),
+    "CreateItem": ("ferricstore.types", "CreateItem"),
+    "EffectResult": ("ferricstore.types", "EffectResult"),
+    "ExceptionPolicy": ("ferricstore.types", "ExceptionPolicy"),
+    "Fail": ("ferricstore.workflow", "Fail"),
+    "FencedItem": ("ferricstore.types", "FencedItem"),
+    "FerricStoreError": ("ferricstore.errors", "FerricStoreError"),
+    "FetchOrComputeResult": ("ferricstore.types", "FetchOrComputeResult"),
+    "FlowAlreadyExistsError": ("ferricstore.errors", "FlowAlreadyExistsError"),
+    "FlowClient": ("ferricstore.client", "FlowClient"),
+    "FlowNotFoundError": ("ferricstore.errors", "FlowNotFoundError"),
+    "FlowRecord": ("ferricstore.types", "FlowRecord"),
+    "FlowStateMode": ("ferricstore.types", "FlowStateMode"),
+    "FlowStatePolicy": ("ferricstore.types", "FlowStatePolicy"),
+    "FlowWorkflow": ("ferricstore.workflow", "FlowWorkflow"),
+    "FlowWrongStateError": ("ferricstore.errors", "FlowWrongStateError"),
+    "GovernanceOverview": ("ferricstore.types", "GovernanceOverview"),
+    "InvalidCommandError": ("ferricstore.errors", "InvalidCommandError"),
+    "JsonCodec": ("ferricstore.codecs", "JsonCodec"),
+    "KeyInfo": ("ferricstore.types", "KeyInfo"),
+    "LockHeldError": ("ferricstore.errors", "LockHeldError"),
+    "LockNotOwnedError": ("ferricstore.errors", "LockNotOwnedError"),
+    "OverloadedError": ("ferricstore.errors", "OverloadedError"),
+    "ProtocolAdapter": ("ferricstore.protocol", "ProtocolAdapter"),
+    "ProtocolAdapterPool": ("ferricstore.protocol", "ProtocolAdapterPool"),
+    "ProtocolCommand": ("ferricstore.protocol", "ProtocolCommand"),
+    "ProtocolPipeline": ("ferricstore.protocol", "ProtocolPipeline"),
+    "PubSubMessage": ("ferricstore.types", "PubSubMessage"),
+    "PubSubSession": ("ferricstore.client", "PubSubSession"),
+    "Queue": ("ferricstore.worker", "Queue"),
+    "QueueClient": ("ferricstore.worker", "QueueClient"),
+    "QueueFlowWorker": ("ferricstore.worker", "QueueFlowWorker"),
+    "QueueFlowWorkerResult": ("ferricstore.worker", "QueueFlowWorkerResult"),
+    "QueueWorker": ("ferricstore.worker", "QueueFlowWorker"),
+    "QueueWorkerResult": ("ferricstore.worker", "QueueFlowWorkerResult"),
+    "RateLimitResult": ("ferricstore.types", "RateLimitResult"),
+    "RawCodec": ("ferricstore.codecs", "RawCodec"),
+    "Retry": ("ferricstore.workflow", "Retry"),
+    "RetryPolicy": ("ferricstore.types", "RetryPolicy"),
+    "RoutingTopology": ("ferricstore.protocol", "RoutingTopology"),
+    "ScheduleResult": ("ferricstore.types", "ScheduleResult"),
+    "StaleLeaseError": ("ferricstore.errors", "StaleLeaseError"),
+    "TopologyProtocolAdapterPool": ("ferricstore.protocol", "TopologyProtocolAdapterPool"),
+    "TransactionSession": ("ferricstore.client", "TransactionSession"),
+    "Transition": ("ferricstore.workflow", "Transition"),
+    "ValueConfig": ("ferricstore.types", "ValueConfig"),
+    "Worker": ("ferricstore.worker", "Worker"),
+    "WorkerConfig": ("ferricstore.types", "WorkerConfig"),
+    "Workflow": ("ferricstore.workflow", "Workflow"),
+    "WorkflowBudget": ("ferricstore.workflow", "WorkflowBudget"),
+    "WorkflowClient": ("ferricstore.workflow", "WorkflowClient"),
+    "WorkflowContext": ("ferricstore.workflow", "WorkflowContext"),
+    "WorkflowEffect": ("ferricstore.workflow", "WorkflowEffect"),
+    "WorkflowWorker": ("ferricstore.workflow", "WorkflowWorker"),
+    "WorkflowWorkerResult": ("ferricstore.workflow", "WorkflowWorkerResult"),
+    "complete": ("ferricstore.workflow", "complete"),
+    "fail": ("ferricstore.workflow", "fail"),
+    "retry": ("ferricstore.workflow", "retry"),
+    "state": ("ferricstore.workflow", "state"),
+    "transition": ("ferricstore.workflow", "transition"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    try:
+        module_name, attribute_name = _EXPORTS[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    value = getattr(import_module(module_name), attribute_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
+
+
+if TYPE_CHECKING:
+    from ferricstore.adapters import AsyncCommandExecutor, CommandExecutor
+    from ferricstore.async_client import (
+        AsyncCommandPipeline,
+        AsyncFlowClient,
+        AsyncPubSubSession,
+        AsyncTransactionSession,
+    )
+    from ferricstore.async_worker import (
+        AsyncQueue,
+        AsyncQueueClient,
+        AsyncQueueFlow,
+        AsyncQueueFlowWorker,
+        AsyncWorkflow,
+        AsyncWorkflowBudget,
+        AsyncWorkflowClient,
+        AsyncWorkflowContext,
+        AsyncWorkflowEffect,
+        AsyncWorkflowWorkerResult,
+    )
+    from ferricstore.backpressure import BackpressurePolicy
+    from ferricstore.client import (
+        AutobatchFlowClient,
+        CommandPipeline,
+        FlowClient,
+        PubSubSession,
+        TransactionSession,
+    )
+    from ferricstore.codecs import Codec, JsonCodec, RawCodec
+    from ferricstore.errors import (
+        FerricStoreError,
+        FlowAlreadyExistsError,
+        FlowNotFoundError,
+        FlowWrongStateError,
+        InvalidCommandError,
+        LockHeldError,
+        LockNotOwnedError,
+        OverloadedError,
+        StaleLeaseError,
+    )
+    from ferricstore.protocol import (
+        AsyncProtocolAdapter,
+        AsyncProtocolAdapterPool,
+        AsyncProtocolPipeline,
+        AsyncTopologyProtocolAdapterPool,
+        ProtocolAdapter,
+        ProtocolAdapterPool,
+        ProtocolCommand,
+        ProtocolPipeline,
+        RoutingTopology,
+        TopologyProtocolAdapterPool,
+    )
+    from ferricstore.types import (
+        ApprovalResult,
+        BudgetPolicy,
+        BudgetResult,
+        ChildSpec,
+        CircuitBreakerStatus,
+        ClaimedFlow,
+        ClaimedItem,
+        CreateItem,
+        EffectResult,
+        ExceptionPolicy,
+        FencedItem,
+        FetchOrComputeResult,
+        FlowRecord,
+        FlowStateMode,
+        FlowStatePolicy,
+        GovernanceOverview,
+        KeyInfo,
+        PubSubMessage,
+        RateLimitResult,
+        RetryPolicy,
+        ScheduleResult,
+        ValueConfig,
+        WorkerConfig,
+    )
+    from ferricstore.worker import (
+        Queue,
+        QueueClient,
+        QueueFlowWorker,
+        QueueFlowWorkerResult,
+        Worker,
+    )
+    from ferricstore.workflow import (
+        Complete,
+        Fail,
+        FlowWorkflow,
+        Retry,
+        Transition,
+        Workflow,
+        WorkflowBudget,
+        WorkflowClient,
+        WorkflowContext,
+        WorkflowEffect,
+        WorkflowWorker,
+        WorkflowWorkerResult,
+        complete,
+        fail,
+        retry,
+        state,
+        transition,
+    )
+
+    QueueWorker = QueueFlowWorker
+    QueueWorkerResult = QueueFlowWorkerResult
+    AsyncQueueWorker = AsyncQueueFlowWorker
+
 
 __all__ = [
     "ApprovalResult",
@@ -122,6 +241,8 @@ __all__ = [
     "AsyncPubSubSession",
     "AsyncQueue",
     "AsyncQueueClient",
+    "AsyncQueueFlow",
+    "AsyncQueueFlowWorker",
     "AsyncQueueWorker",
     "AsyncTopologyProtocolAdapterPool",
     "AsyncTransactionSession",
@@ -156,6 +277,7 @@ __all__ = [
     "FlowRecord",
     "FlowStateMode",
     "FlowStatePolicy",
+    "FlowWorkflow",
     "FlowWrongStateError",
     "GovernanceOverview",
     "InvalidCommandError",
@@ -172,6 +294,8 @@ __all__ = [
     "PubSubSession",
     "Queue",
     "QueueClient",
+    "QueueFlowWorker",
+    "QueueFlowWorkerResult",
     "QueueWorker",
     "QueueWorkerResult",
     "RateLimitResult",

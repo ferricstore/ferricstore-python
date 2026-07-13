@@ -104,6 +104,18 @@ Batch commands normally return `OK`. With `independent=True`, the server returns
 per-item outcomes such as `OK` or an error for each item; the SDK preserves that
 shape so callers can see which items succeeded.
 
+`enqueue_many` groups auto-partitioned items before writing. Native sync and
+async transports send independent groups with an ordered, bounded fanout of at
+most 16 calls. Injected custom executors remain sequential unless they explicitly
+set `supports_concurrent_fanout = True`, which should only be done when concurrent
+`execute_command` calls are safe.
+
+Async `pipeline()` calls preserve command order within each routed destination,
+including compact Flow mutation groups that cannot share one wire frame. The
+lower-level `execute_batch()` transport hook retains bounded concurrency because
+its groups are treated as independent; custom adapters can expose
+`execute_batch_ordered()` when they support the stronger pipeline contract.
+
 ## `value_put`
 
 Stores a reusable value and returns server metadata/reference.

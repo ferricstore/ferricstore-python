@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 import ferricstore.async_worker as async_worker_module
+import ferricstore.workflow as workflow_module
 from ferricstore import (
     AsyncFlowClient,
     AsyncQueueClient,
@@ -10,13 +11,18 @@ from ferricstore import (
     AsyncQueueFlowWorker,
     AsyncWorkflow,
     AsyncWorkflowClient,
+    AsyncWorkflowContext,
     AsyncWorkflowEffect,
     BudgetPolicy,
+    ChildSpec,
     ExceptionPolicy,
+    FerricStoreError,
     RetryPolicy,
     ValueConfig,
     WorkerConfig,
     complete,
+    fail,
+    retry,
     transition,
 )
 from ferricstore.types import ClaimedFlow
@@ -107,6 +113,209 @@ class ValueClaimExecutor(FakeExecutor):
         return b"OK"
 
 
+def test_async_queue_worker_standalone_run_once_does_not_prefetch_leased_jobs():
+    class FusedClient:
+        def __init__(self) -> None:
+            self.claim_calls = 0
+            self.fused_calls = 0
+            self.complete_calls = 0
+
+        async def claim_flows(self, *_args, **_kwargs):
+            self.claim_calls += 1
+            return [ClaimedFlow("first", b"lease-1", 1, partition_key="p1")]
+
+        async def complete_flows_and_claim_flows(self, jobs, **_kwargs):
+            self.fused_calls += 1
+            assert [job.id for job in jobs] == ["first"]
+            return [ClaimedFlow("second", b"lease-2", 2, partition_key="p1")]
+
+        async def complete_jobs(self, *_args, **_kwargs):
+            self.complete_calls += 1
+
+    async def run() -> None:
+        client = FusedClient()
+        worker = AsyncQueueFlowWorker(
+            client,
+            type="order",
+            partition_key="p1",
+            fuse_complete_claim=True,
+        )
+
+        result = await worker.run_once(lambda _job: b"done")
+
+        assert result.claimed == 1
+        assert result.completed == 1
+        assert client.claim_calls == 1
+        assert client.fused_calls == 0
+        assert client.complete_calls == 1
+        assert worker._prefetched_jobs == []
+
+    asyncio.run(run())
+
+
+def test_async_queue_worker_handler_fanout_creates_only_bounded_workers(monkeypatch):
+    original_gather = asyncio.gather
+    gather_widths = []
+
+    async def tracking_gather(*awaitables, **kwargs):
+        gather_widths.append(len(awaitables))
+        return await original_gather(*awaitables, **kwargs)
+
+    monkeypatch.setattr(async_worker_module.asyncio, "gather", tracking_gather)
+
+    async def run():
+        worker = AsyncQueueFlowWorker(
+            AsyncFlowClient(FakeExecutor()),
+            type="email",
+            concurrency=4,
+        )
+        jobs = [
+            ClaimedFlow(f"f{index}", b"lease", index, partition_key="p1") for index in range(100)
+        ]
+
+        handled = await worker._run_handlers(jobs, lambda job: job.id)
+
+        assert handled.failures == []
+        assert handled.jobs == jobs
+
+    asyncio.run(run())
+    assert gather_widths
+    assert max(gather_widths) <= 4
+
+
+def test_async_queue_worker_fused_claim_advances_partition_cursor():
+    class FusedClient:
+        def __init__(self) -> None:
+            self.claim_targets = []
+            self.fused_targets = []
+            self.completed = []
+
+        async def claim_flows(self, *_args, **kwargs):
+            self.claim_targets.append(kwargs.get("partition_key"))
+            return [ClaimedFlow("first", b"lease-1", 1, partition_key="p1")]
+
+        async def complete_flows_and_claim_flows(self, _jobs, **kwargs):
+            self.fused_targets.append(kwargs.get("partition_key"))
+            return [ClaimedFlow("second", b"lease-2", 2, partition_key="p2")]
+
+        async def complete_jobs(self, jobs, **_kwargs):
+            self.completed.extend(job.id for job in jobs)
+            return [b"OK"] * len(jobs)
+
+    async def run() -> None:
+        client = FusedClient()
+        worker = AsyncQueueFlowWorker(
+            client,
+            type="order",
+            partition_keys=["p1", "p2"],
+            claim_partition_batch_size=1,
+            fuse_complete_claim=True,
+        )
+
+        seen: list[str] = []
+
+        async def handler(job: ClaimedFlow) -> bytes:
+            seen.append(job.id)
+            if job.id == "second":
+                worker.stop()
+            return b"done"
+
+        await asyncio.wait_for(worker.run_forever(handler), timeout=1)
+
+        assert client.claim_targets == ["p1"]
+        assert client.fused_targets == ["p2"]
+        assert client.completed == ["second"]
+        assert seen == ["first", "second"]
+
+    asyncio.run(run())
+
+
+def test_async_queue_worker_subscribes_to_protocol_wake_hints():
+    class WakeClient:
+        def __init__(self) -> None:
+            self.subscriptions = []
+
+        async def claim_flows(self, *_args, **_kwargs):
+            return []
+
+        async def subscribe_flow_wake(self, *args, **kwargs):
+            self.subscriptions.append((args, kwargs))
+            return b"OK"
+
+        async def wait_event(self, timeout=None):
+            return None
+
+    async def run() -> None:
+        client = WakeClient()
+        worker = AsyncQueueFlowWorker(
+            client,
+            type="order",
+            state="queued",
+            protocol_wake_hints=True,
+        )
+
+        await worker._subscribe_protocol_wake_hints()
+
+        assert worker._protocol_wake_hints_enabled
+        assert client.subscriptions == [
+            (
+                ("order",),
+                {
+                    "state": "queued",
+                    "states": None,
+                    "partition_key": None,
+                    "partition_keys": None,
+                    "priority": 0,
+                    "limit": 10,
+                },
+            )
+        ]
+
+    asyncio.run(run())
+
+
+def test_async_queue_worker_retries_failed_wake_subscription():
+    class WakeClient:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def subscribe_flow_wake(self, *_args, **_kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("temporary subscription failure")
+            return b"OK"
+
+        async def wait_event(self, timeout=None):
+            return None
+
+    async def run() -> None:
+        client = WakeClient()
+        worker = AsyncQueueFlowWorker(
+            client,
+            type="order",
+            protocol_wake_hints=True,
+        )
+
+        with pytest.raises(RuntimeError, match="temporary"):
+            await worker._subscribe_protocol_wake_hints()
+        assert not worker._protocol_wake_hints_subscribed
+
+        await worker._subscribe_protocol_wake_hints()
+
+        assert client.attempts == 2
+        assert worker._protocol_wake_hints_enabled
+
+    asyncio.run(run())
+
+
+def test_async_worker_config_exposes_shared_scheduler_fast_paths():
+    assert {
+        "max_idle_sleep_s",
+        "protocol_wake_hints",
+        "fuse_complete_claim",
+    } <= async_worker_module.ASYNC_QUEUE_WORKER_CONFIG_KEYS
+
+
 def test_async_flow_client_uses_async_executor_commands():
     async def run():
         executor = FakeExecutor()
@@ -193,16 +402,20 @@ def test_async_queue_client_from_url_creates_bounded_command_and_claim_pools(mon
 
     client = AsyncQueueClient.from_url(
         "ferric://example:6388",
-        worker_config=WorkerConfig(workers=4),
+        worker_config=WorkerConfig(workers=4, claim_connections=2),
     )
     worker = client.queue(type="email").worker()._build_worker(0)
 
-    assert calls == [("ferric://example:6388", {"max_connections": 1})]
+    assert calls == [
+        ("ferric://example:6388", {"max_connections": 1}),
+        ("ferric://example:6388", {"max_connections": 2}),
+    ]
     assert worker.client is client.flow
     assert worker.claim_client is client.claim_flow
+    assert client.claim_flow is not client.flow
 
 
-def test_async_queue_client_from_protocol_url_reuses_multiplexed_claim_client(monkeypatch):
+def test_async_queue_client_from_protocol_url_separates_command_and_claim_clients(monkeypatch):
     calls = []
 
     def from_url(url, **kwargs):
@@ -220,14 +433,13 @@ def test_async_queue_client_from_protocol_url_reuses_multiplexed_claim_client(mo
     )
     worker = client.queue(type="email").worker()._build_worker(0)
 
-    assert len(calls) == 1
-    assert calls[0][1] == {"max_connections": 1}
-    assert client.claim_flow is client.flow
+    assert [kwargs["max_connections"] for _url, kwargs, _client in calls] == [1, 4]
+    assert client.claim_flow is not client.flow
     assert worker.client is client.flow
-    assert worker.claim_client is client.flow
+    assert worker.claim_client is client.claim_flow
 
 
-def test_async_queue_worker_config_at_queue_time_keeps_native_claim_client(monkeypatch):
+def test_async_queue_worker_config_at_queue_time_resizes_claim_client(monkeypatch):
     calls = []
 
     def from_url(url, **kwargs):
@@ -249,12 +461,12 @@ def test_async_queue_worker_config_at_queue_time_keeps_native_claim_client(monke
         ._build_worker(0)
     )
 
-    assert calls[0][1]["max_connections"] == 1
+    assert [kwargs["max_connections"] for _url, kwargs, _client in calls] == [1, 1, 64]
     assert worker.client is client.flow
-    assert worker.claim_client is client.flow
+    assert worker.claim_client is calls[-1][2]
 
 
-def test_async_queue_worker_config_does_not_resize_protocol_claim_pool(monkeypatch):
+def test_async_queue_worker_config_reuses_matching_claim_pool(monkeypatch):
     calls = []
 
     def from_url(url, **kwargs):
@@ -275,11 +487,19 @@ def test_async_queue_worker_config_does_not_resize_protocol_claim_pool(monkeypat
         .worker()
         ._build_worker(0)
     )
+    second_worker = (
+        client.queue(
+            type="sms",
+            worker_config=WorkerConfig(workers=64),
+        )
+        .worker()
+        ._build_worker(0)
+    )
 
-    assert len(calls) == 1
-    assert calls[0][1] == {"max_connections": 1}
+    assert [kwargs["max_connections"] for _url, kwargs, _client in calls] == [1, 1, 64]
     assert worker.client is client.flow
-    assert worker.claim_client is client.flow
+    assert worker.claim_client is calls[-1][2]
+    assert second_worker.claim_client is worker.claim_client
 
 
 def test_async_queue_client_close_does_not_close_externally_owned_clients():
@@ -295,6 +515,116 @@ def test_async_queue_client_close_does_not_close_externally_owned_clients():
 
         assert flow_executor.closed is False
         assert claim_executor.closed is False
+
+    asyncio.run(run())
+
+
+def test_async_queue_client_close_attempts_every_owned_resource_after_failure():
+    class CloseExecutor(FakeExecutor):
+        def __init__(self, name, closed, *, fail_once=False):
+            super().__init__()
+            self.name = name
+            self.closed_names = closed
+            self.fail_once = fail_once
+            self.close_calls = 0
+
+        async def close(self):
+            self.close_calls += 1
+            self.closed_names.append(self.name)
+            if self.fail_once and self.close_calls == 1:
+                raise RuntimeError(f"{self.name} close failed")
+            self.closed = True
+
+    async def run():
+        closed = []
+        flow_executor = CloseExecutor("flow", closed)
+        claim_executor = CloseExecutor("claim", closed)
+        extra_executor = CloseExecutor("extra", closed, fail_once=True)
+        flow = AsyncFlowClient(flow_executor)
+        claim = AsyncFlowClient(claim_executor)
+        extra = AsyncFlowClient(extra_executor)
+        client = AsyncQueueClient(flow, claim_client=claim)
+        client._owns_flow = True
+        client._owns_claim_flow = True
+        client._owned_extra_claim_flows.append(extra)
+        client._claim_flows_by_size[99] = extra
+
+        with pytest.raises(RuntimeError, match="extra close failed"):
+            await client.close()
+
+        assert set(closed) == {"extra", "claim", "flow"}
+        assert client._owned_extra_claim_flows == [extra]
+        assert client._claim_flows_by_size == {}
+        assert client._owns_claim_flow is False
+        assert client._owns_flow is False
+
+        await client.close()
+
+        assert extra_executor.close_calls == 2
+        assert claim_executor.close_calls == 1
+        assert flow_executor.close_calls == 1
+        assert client._owned_extra_claim_flows == []
+
+    asyncio.run(run())
+
+
+def test_async_queue_client_cancelled_close_can_be_rejoined():
+    class BlockingCloseExecutor(FakeExecutor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def close(self):
+            self.entered.set()
+            await self.release.wait()
+            self.closed = True
+
+    async def run():
+        executor = BlockingCloseExecutor()
+        client = AsyncQueueClient(AsyncFlowClient(executor))
+        client._owns_flow = True
+
+        first = asyncio.create_task(client.close())
+        await executor.entered.wait()
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        second = asyncio.create_task(client.close())
+        try:
+            await asyncio.sleep(0)
+            assert second.done() is False
+        finally:
+            executor.release.set()
+            await second
+
+        assert executor.closed is True
+
+    asyncio.run(run())
+
+
+def test_async_queue_client_close_prevents_new_owned_claim_pools(monkeypatch):
+    async def run():
+        opened: list[AsyncFlowClient] = []
+
+        def from_url(_url, **_kwargs):
+            client = AsyncFlowClient(FakeExecutor())
+            opened.append(client)
+            return client
+
+        monkeypatch.setattr(
+            async_worker_module.AsyncFlowClient,
+            "from_url",
+            staticmethod(from_url),
+        )
+        client = AsyncQueueClient.from_url("ferric://seed.local:6388")
+        await client.close()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            client.queue(type="email", worker_config=WorkerConfig(workers=4))
+
+        assert len(opened) == 2
 
     asyncio.run(run())
 
@@ -322,13 +652,64 @@ def test_async_workflow_client_creates_workflow_and_delegates_flow_commands():
         client = AsyncWorkflowClient(AsyncFlowClient(executor))
         workflow = client.workflow(type="order", states=["queued"], initial_state="queued")
 
-        await workflow.start("o1", payload=b"payload")
+        await workflow.start_flow("o1", payload=b"payload")
         assert executor.calls[0][:4] == ("FLOW.CREATE", "o1", "TYPE", "order")
         assert "STATE" in executor.calls[0]
         assert "queued" in executor.calls[0]
 
         assert await client.command("PING") == b"OK"
         assert executor.calls[-1] == ("PING",)
+
+    asyncio.run(run())
+
+
+def test_async_workflow_rejects_duplicate_state_handlers():
+    workflow = AsyncWorkflow(FakeExecutor(), type="order", states=["queued"])
+
+    @workflow.on("queued")
+    async def first(_ctx):
+        return complete()
+
+    with pytest.raises(ValueError, match="duplicate workflow state"):
+
+        @workflow.on("queued")
+        async def duplicate(_ctx):
+            return complete()
+
+
+def test_async_workflow_has_explicit_worker_start_and_deprecates_ambiguous_start():
+    class EmptyClient:
+        async def claim_flows(self, *_args, **_kwargs):
+            return []
+
+    async def run() -> None:
+        workflow = AsyncWorkflow(EmptyClient(), type="order", states=["queued"])
+
+        @workflow.on("queued")
+        async def queued(_ctx):
+            return complete()
+
+        tasks = workflow.start_workers()
+        assert isinstance(tasks, list)
+        workflow.stop()
+        await workflow.close()
+
+        flow_workflow = AsyncWorkflow(FakeExecutor(), type="order", states=["queued"])
+        with pytest.warns(DeprecationWarning, match="start_flow"):
+            assert await flow_workflow.start("o1", payload=b"payload") == b"OK"
+        await flow_workflow.close()
+
+        legacy_workers = AsyncWorkflow(EmptyClient(), type="order", states=["queued"])
+
+        @legacy_workers.on("queued")
+        async def legacy_queued(_ctx):
+            return complete()
+
+        with pytest.warns(DeprecationWarning, match="start_workers"):
+            legacy_tasks = legacy_workers.start()
+        assert isinstance(legacy_tasks, list)
+        legacy_workers.stop()
+        await legacy_workers.close()
 
     asyncio.run(run())
 
@@ -412,6 +793,409 @@ def test_async_workflow_budget_policy_reserves_commits_and_stamps_attributes():
         assert complete_call[0] == "FLOW.COMPLETE_MANY"
         assert "governance_budget_scope" in complete_call
         assert "governance_budget_status" in complete_call
+
+    asyncio.run(run())
+
+
+def test_async_workflow_budget_reserve_failure_preserves_policy_and_skips_release():
+    class ReserveFailExecutor(FakeExecutor):
+        async def execute_command(self, *args):
+            if args[0] == "FLOW.BUDGET.RESERVE":
+                self.calls.append(args)
+                raise RuntimeError("budget reserve failed")
+            return await super().execute_command(*args)
+
+    async def run():
+        executor = ReserveFailExecutor()
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(executor),
+            type="order",
+            states=["queued"],
+            batch_size=1,
+        )
+
+        @workflow.state("queued", budget=BudgetPolicy(scope="tenant-a", amount=10))
+        async def queued(_ctx):
+            return complete()
+
+        result = await workflow.run_once()
+
+        assert result.applied == 1
+        assert [call[0] for call in executor.calls] == [
+            "FLOW.CLAIM_DUE",
+            "FLOW.BUDGET.RESERVE",
+            "FLOW.RETRY_MANY",
+        ]
+        retry_call = executor.calls[-1]
+        assert retry_call[retry_call.index("ERROR") + 1] == b"budget reserve failed"
+
+    asyncio.run(run())
+
+
+def test_async_workflow_budget_commit_failure_releases_and_uses_error_policy():
+    class CommitFailExecutor(FakeExecutor):
+        async def execute_command(self, *args):
+            if args[0] == "FLOW.BUDGET.COMMIT":
+                self.calls.append(args)
+                raise RuntimeError("budget commit failed")
+            return await super().execute_command(*args)
+
+    async def run():
+        executor = CommitFailExecutor()
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(executor),
+            type="order",
+            states=["queued"],
+            batch_size=1,
+        )
+
+        @workflow.state("queued", budget=BudgetPolicy(scope="tenant-a", amount=10))
+        async def queued(_ctx):
+            return complete()
+
+        result = await workflow.run_once()
+
+        assert result.applied == 1
+        assert [call[0] for call in executor.calls] == [
+            "FLOW.CLAIM_DUE",
+            "FLOW.BUDGET.RESERVE",
+            "FLOW.BUDGET.COMMIT",
+            "FLOW.BUDGET.RELEASE",
+            "FLOW.RETRY_MANY",
+        ]
+        retry_call = executor.calls[-1]
+        assert retry_call[retry_call.index("ERROR") + 1] == b"budget commit failed"
+
+    asyncio.run(run())
+
+
+def test_async_workflow_budget_commit_error_remains_primary_when_release_fails():
+    class SettlementFailExecutor(FakeExecutor):
+        async def execute_command(self, *args):
+            if args[0] in {"FLOW.BUDGET.COMMIT", "FLOW.BUDGET.RELEASE"}:
+                self.calls.append(args)
+                action = "commit" if args[0].endswith("COMMIT") else "release"
+                raise RuntimeError(f"budget {action} failed")
+            return await super().execute_command(*args)
+
+    async def run():
+        executor = SettlementFailExecutor()
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(executor),
+            type="order",
+            states=["queued"],
+            batch_size=1,
+            exception_policy=ExceptionPolicy.RAISE,
+        )
+
+        @workflow.state("queued", budget=BudgetPolicy(scope="tenant-a", amount=10))
+        async def queued(_ctx):
+            return complete()
+
+        with pytest.raises(RuntimeError, match="budget commit failed") as raised:
+            await workflow.run_once()
+
+        assert isinstance(raised.value.__cause__, RuntimeError)
+        assert str(raised.value.__cause__) == "budget release failed"
+
+    asyncio.run(run())
+
+
+def test_async_workflow_budget_context_releases_after_clean_body_commit_failure():
+    class CommitFailExecutor(FakeExecutor):
+        async def execute_command(self, *args):
+            if args[0] == "FLOW.BUDGET.COMMIT":
+                self.calls.append(args)
+                raise RuntimeError("budget commit failed")
+            return await super().execute_command(*args)
+
+    async def run():
+        executor = CommitFailExecutor()
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(executor),
+            type="order",
+            states=["queued"],
+            exception_policy=ExceptionPolicy.RAISE,
+        )
+        ctx = AsyncWorkflowContext(
+            workflow,
+            ClaimedFlow("f1", b"lease", 1, partition_key="p1"),
+            "queued",
+        )
+
+        with pytest.raises(RuntimeError, match="budget commit failed"):
+            async with ctx.budget("tenant-a", 10):
+                pass
+
+        assert [call[0] for call in executor.calls] == [
+            "FLOW.BUDGET.RESERVE",
+            "FLOW.BUDGET.COMMIT",
+            "FLOW.BUDGET.RELEASE",
+        ]
+
+    asyncio.run(run())
+
+
+def test_async_workflow_budget_release_waits_for_inflight_commit():
+    class BlockingCommitExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.commit_started = asyncio.Event()
+            self.commit_allowed = asyncio.Event()
+            self.commit_finished = False
+            self.release_before_commit = False
+
+        async def execute_command(self, *args):
+            if args[0] == "FLOW.BUDGET.COMMIT":
+                result = await super().execute_command(*args)
+                self.commit_started.set()
+                await self.commit_allowed.wait()
+                self.commit_finished = True
+                return result
+            if args[0] == "FLOW.BUDGET.RELEASE":
+                self.release_before_commit = not self.commit_finished
+            return await super().execute_command(*args)
+
+    async def run():
+        executor = BlockingCommitExecutor()
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(executor),
+            type="order",
+            states=["queued"],
+        )
+        ctx = AsyncWorkflowContext(
+            workflow,
+            ClaimedFlow("f1", b"lease", 1, partition_key="p1"),
+            "queued",
+        )
+        budget = ctx.budget("tenant-a", 10)
+        await budget.__aenter__()
+
+        commit_caller = asyncio.create_task(budget.commit())
+        await executor.commit_started.wait()
+        commit_caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await commit_caller
+
+        release_caller = asyncio.create_task(budget.release())
+        await asyncio.sleep(0)
+        assert executor.release_before_commit is False
+
+        executor.commit_allowed.set()
+        await release_caller
+        assert executor.release_before_commit is False
+        assert [call[0] for call in executor.calls] == [
+            "FLOW.BUDGET.RESERVE",
+            "FLOW.BUDGET.COMMIT",
+        ]
+
+    asyncio.run(run())
+
+
+def test_async_workflow_budget_releases_when_commit_operation_is_cancelled():
+    class CancelledCommitExecutor(FakeExecutor):
+        async def execute_command(self, *args):
+            if args[0] == "FLOW.BUDGET.COMMIT":
+                self.calls.append(args)
+                raise asyncio.CancelledError
+            return await super().execute_command(*args)
+
+    async def run():
+        executor = CancelledCommitExecutor()
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(executor),
+            type="order",
+            states=["queued"],
+            batch_size=1,
+        )
+
+        @workflow.state("queued", budget=BudgetPolicy(scope="tenant-a", amount=10))
+        async def queued(_ctx):
+            return complete()
+
+        with pytest.raises(asyncio.CancelledError):
+            await workflow.run_once()
+
+        assert [call[0] for call in executor.calls] == [
+            "FLOW.CLAIM_DUE",
+            "FLOW.BUDGET.RESERVE",
+            "FLOW.BUDGET.COMMIT",
+            "FLOW.BUDGET.RELEASE",
+        ]
+
+    asyncio.run(run())
+
+
+def test_async_workflow_budget_release_retries_after_operation_cancellation():
+    class CancelFirstReleaseExecutor(FakeExecutor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_calls = 0
+
+        async def execute_command(self, *args):
+            if args[0] == "FLOW.BUDGET.RELEASE":
+                self.release_calls += 1
+                if self.release_calls == 1:
+                    self.calls.append(args)
+                    raise asyncio.CancelledError
+            return await super().execute_command(*args)
+
+    async def run():
+        executor = CancelFirstReleaseExecutor()
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(executor),
+            type="order",
+            states=["queued"],
+        )
+        ctx = AsyncWorkflowContext(
+            workflow,
+            ClaimedFlow("f1", b"lease", 1, partition_key="p1"),
+            "queued",
+        )
+        budget = ctx.budget("tenant-a", 10)
+        await budget.__aenter__()
+
+        with pytest.raises(asyncio.CancelledError):
+            await budget.release()
+        result = await budget.release()
+
+        assert result.status == "released"
+        assert executor.release_calls == 2
+
+    asyncio.run(run())
+
+
+def test_async_workflow_budget_release_failure_does_not_mask_handler_failure():
+    class ReleaseFailExecutor(FakeExecutor):
+        async def execute_command(self, *args):
+            if args[0] == "FLOW.BUDGET.RELEASE":
+                self.calls.append(args)
+                raise RuntimeError("budget release failed")
+            return await super().execute_command(*args)
+
+    async def run():
+        executor = ReleaseFailExecutor()
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(executor),
+            type="order",
+            states=["queued"],
+            batch_size=1,
+            exception_policy=ExceptionPolicy.RAISE,
+        )
+
+        @workflow.state("queued", budget=BudgetPolicy(scope="tenant-a", amount=10))
+        async def queued(_ctx):
+            raise ValueError("handler failed")
+
+        with pytest.raises(ValueError, match="handler failed") as raised:
+            await workflow.run_once()
+
+        assert isinstance(raised.value.__cause__, RuntimeError)
+        assert str(raised.value.__cause__) == "budget release failed"
+
+    asyncio.run(run())
+
+
+def test_async_workflow_budget_context_cleanup_does_not_mask_body_failure():
+    class ReleaseFailExecutor(FakeExecutor):
+        async def execute_command(self, *args):
+            if args[0] == "FLOW.BUDGET.RELEASE":
+                self.calls.append(args)
+                raise RuntimeError("budget release failed")
+            return await super().execute_command(*args)
+
+    async def run():
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(ReleaseFailExecutor()),
+            type="order",
+            states=["queued"],
+            exception_policy=ExceptionPolicy.RAISE,
+        )
+
+        @workflow.on("queued")
+        async def queued(ctx):
+            async with ctx.budget("tenant-a", 10):
+                raise ValueError("budget body failed")
+
+        with pytest.raises(ValueError, match="budget body failed") as raised:
+            await workflow.run_once()
+
+        assert isinstance(raised.value.__cause__, RuntimeError)
+        assert str(raised.value.__cause__) == "budget release failed"
+
+    asyncio.run(run())
+
+
+def test_async_workflow_effect_cleanup_does_not_mask_body_failure():
+    class FailReportExecutor(FakeExecutor):
+        async def execute_command(self, *args):
+            if args[0] == "FLOW.EFFECT.FAIL":
+                self.calls.append(args)
+                raise RuntimeError("effect fail reporting failed")
+            return await super().execute_command(*args)
+
+    async def run():
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(FailReportExecutor()),
+            type="order",
+            states=["queued"],
+            exception_policy=ExceptionPolicy.RAISE,
+        )
+
+        @workflow.on("queued")
+        async def queued(ctx):
+            async with ctx.effect("charge", "payment.charge"):
+                raise ValueError("effect body failed")
+
+        with pytest.raises(ValueError, match="effect body failed") as raised:
+            await workflow.run_once()
+
+        assert isinstance(raised.value.__cause__, RuntimeError)
+        assert str(raised.value.__cause__) == "effect fail reporting failed"
+
+    asyncio.run(run())
+
+
+def test_async_workflow_budget_release_completes_after_caller_cancellation():
+    class BlockingReleaseExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.release_started = asyncio.Event()
+            self.release_allowed = asyncio.Event()
+
+        async def execute_command(self, *args):
+            if args[0] == "FLOW.BUDGET.RELEASE":
+                self.release_started.set()
+                await self.release_allowed.wait()
+            return await super().execute_command(*args)
+
+    async def run():
+        executor = BlockingReleaseExecutor()
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(executor),
+            type="order",
+            states=["queued"],
+        )
+        ctx = AsyncWorkflowContext(
+            workflow,
+            ClaimedFlow("f1", b"lease", 1, partition_key="p1"),
+            "queued",
+        )
+        budget = ctx.budget("tenant-a", 10)
+        await budget.__aenter__()
+
+        release_task = asyncio.create_task(budget.release())
+        await executor.release_started.wait()
+        release_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await release_task
+
+        executor.release_allowed.set()
+        for _ in range(10):
+            if budget._closed:
+                break
+            await asyncio.sleep(0)
+        assert budget._closed is True
 
     asyncio.run(run())
 
@@ -574,6 +1358,372 @@ def test_async_workflow_context_effect_decorator_fails_on_exception():
     asyncio.run(run())
 
 
+def test_async_workflow_effect_fail_waits_for_cancelled_confirm_caller():
+    class BlockingConfirmExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.confirm_started = asyncio.Event()
+            self.confirm_allowed = asyncio.Event()
+
+        async def execute_command(self, *args):
+            if args[0] == "FLOW.EFFECT.CONFIRM":
+                self.confirm_started.set()
+                await self.confirm_allowed.wait()
+            return await super().execute_command(*args)
+
+    async def run():
+        executor = BlockingConfirmExecutor()
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(executor),
+            type="order",
+            states=["queued"],
+        )
+        ctx = AsyncWorkflowContext(
+            workflow,
+            ClaimedFlow("f1", b"lease", 1, partition_key="p1"),
+            "queued",
+        )
+        effect = ctx.effect("charge", "payment.charge")
+        await effect.reserve()
+
+        confirm_caller = asyncio.create_task(effect.confirm(external_id="ch_1"))
+        await executor.confirm_started.wait()
+        confirm_caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await confirm_caller
+
+        fail_caller = asyncio.create_task(effect.fail(error="cancelled"))
+        await asyncio.sleep(0)
+        fail_completed_before_confirm = fail_caller.done()
+        executor.confirm_allowed.set()
+        result = await fail_caller
+
+        assert fail_completed_before_confirm is False
+        assert result.status == "confirmed"
+        assert [call[0] for call in executor.calls] == [
+            "FLOW.EFFECT.RESERVE",
+            "FLOW.EFFECT.CONFIRM",
+        ]
+
+    asyncio.run(run())
+
+
+def test_async_workflow_effect_fails_after_confirm_operation_failure():
+    class ConfirmFailExecutor(FakeExecutor):
+        async def execute_command(self, *args):
+            if args[0] == "FLOW.EFFECT.CONFIRM":
+                self.calls.append(args)
+                raise RuntimeError("confirm unavailable")
+            return await super().execute_command(*args)
+
+    async def run():
+        executor = ConfirmFailExecutor()
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(executor),
+            type="order",
+            states=["queued"],
+        )
+        ctx = AsyncWorkflowContext(
+            workflow,
+            ClaimedFlow("f1", b"lease", 1, partition_key="p1"),
+            "queued",
+        )
+        effect = ctx.effect("charge", "payment.charge")
+
+        with pytest.raises(RuntimeError, match="confirm unavailable"):
+            await effect.confirm()
+        result = await effect.fail(error="confirmation failed")
+
+        assert result.status == "failed"
+        assert [call[0] for call in executor.calls] == [
+            "FLOW.EFFECT.RESERVE",
+            "FLOW.EFFECT.CONFIRM",
+            "FLOW.EFFECT.FAIL",
+        ]
+
+    asyncio.run(run())
+
+
+def test_async_workflow_effect_shares_reservation_and_terminal_operation():
+    class BlockingReserveExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.reserve_started = asyncio.Event()
+            self.reserve_allowed = asyncio.Event()
+
+        async def execute_command(self, *args):
+            if args[0] == "FLOW.EFFECT.RESERVE":
+                self.reserve_started.set()
+                await self.reserve_allowed.wait()
+            return await super().execute_command(*args)
+
+    async def run():
+        executor = BlockingReserveExecutor()
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(executor),
+            type="order",
+            states=["queued"],
+        )
+        ctx = AsyncWorkflowContext(
+            workflow,
+            ClaimedFlow("f1", b"lease", 1, partition_key="p1"),
+            "queued",
+        )
+        effect = ctx.effect("charge", "payment.charge")
+
+        confirm = asyncio.create_task(effect.confirm())
+        await executor.reserve_started.wait()
+        report_failure = asyncio.create_task(effect.fail(error="concurrent failure"))
+        await asyncio.sleep(0)
+        executor.reserve_allowed.set()
+        confirmed, reported = await asyncio.gather(confirm, report_failure)
+
+        assert confirmed.status == reported.status
+        operations = [call[0] for call in executor.calls]
+        assert operations.count("FLOW.EFFECT.RESERVE") == 1
+        assert (
+            sum(
+                operations.count(operation)
+                for operation in ("FLOW.EFFECT.CONFIRM", "FLOW.EFFECT.FAIL")
+            )
+            == 1
+        )
+
+    asyncio.run(run())
+
+
+def test_async_worker_caches_reference_fingerprint_while_coalescing_results():
+    class CountingDict(dict[str, int]):
+        def __init__(self) -> None:
+            super().__init__((str(index), index) for index in range(1_000))
+            self.visited = 0
+
+        def items(self):
+            self.visited += len(self)
+            return super().items()
+
+    jobs = [ClaimedFlow(f"f{index}", b"lease", index, partition_key="p1") for index in range(32)]
+    values = [CountingDict() for _ in jobs]
+
+    handled = AsyncQueueFlowWorker._handled_from_results(
+        [(job, True, value) for job, value in zip(jobs, values, strict=True)]
+    )
+
+    assert handled.mixed_results is None
+    assert values[0].visited == len(values[0])
+
+
+def test_async_workflow_close_is_terminal_and_idempotent_before_start():
+    class OwnedClient:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def claim_flows(self, *_args, **_kwargs):
+            return []
+
+        async def close(self):
+            self.close_calls += 1
+
+    async def run() -> None:
+        client = OwnedClient()
+        workflow = AsyncWorkflow(client, type="order", states=["queued"])
+        workflow._owns_client = True
+
+        @workflow.on("queued")
+        async def queued(_ctx):
+            return complete()
+
+        await workflow.close()
+        await workflow.close()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            workflow.start_workers()
+        assert client.close_calls == 1
+
+    asyncio.run(run())
+
+
+def test_async_workflow_close_continues_after_caller_cancellation():
+    class BlockingOwnedClient:
+        def __init__(self) -> None:
+            self.close_calls = 0
+            self.close_started = asyncio.Event()
+            self.close_allowed = asyncio.Event()
+
+        async def claim_flows(self, *_args, **_kwargs):
+            return []
+
+        async def close(self):
+            self.close_calls += 1
+            self.close_started.set()
+            await self.close_allowed.wait()
+
+    async def run() -> None:
+        client = BlockingOwnedClient()
+        workflow = AsyncWorkflow(client, type="order", states=["queued"])
+        workflow._owns_client = True
+
+        caller = asyncio.create_task(workflow.close(timeout=None))
+        await client.close_started.wait()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+        retry = asyncio.create_task(workflow.close(timeout=None))
+        await asyncio.sleep(0)
+        client.close_allowed.set()
+        await retry
+
+        assert client.close_calls == 1
+        with pytest.raises(RuntimeError, match="closed"):
+            workflow.start_workers()
+
+    asyncio.run(run())
+
+
+def test_async_workflow_close_retries_only_resources_that_failed():
+    class RetryCloseClient:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def claim_flows(self, *_args, **_kwargs):
+            return []
+
+        async def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("transient close failure")
+
+    async def run() -> None:
+        client = RetryCloseClient()
+        workflow = AsyncWorkflow(client, type="order", states=["queued"])
+        workflow._owns_client = True
+
+        with pytest.raises(RuntimeError, match="transient close failure"):
+            await workflow.close()
+        assert workflow._owns_client is True
+
+        await workflow.close()
+        await workflow.close()
+
+        assert client.close_calls == 2
+        assert workflow._owns_client is False
+
+    asyncio.run(run())
+
+
+def test_async_workflow_rejects_invalid_close_timeout_without_closing():
+    class EmptyClient:
+        async def claim_flows(self, *_args, **_kwargs):
+            return []
+
+    async def run() -> None:
+        workflow = AsyncWorkflow(EmptyClient(), type="order", states=["queued"])
+
+        @workflow.on("queued")
+        async def queued(_ctx):
+            return complete()
+
+        with pytest.raises(ValueError, match="non-negative"):
+            await workflow.close(timeout=-1)
+
+        tasks = workflow.start_workers()
+        assert isinstance(tasks, list)
+        workflow.stop()
+        await workflow.close()
+
+    asyncio.run(run())
+
+
+def test_async_workflow_partition_by_applies_to_single_and_batch_producers():
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def enqueue(self, id, **kwargs):
+            self.calls.append(("enqueue", id, kwargs))
+            return b"OK"
+
+        async def enqueue_many(self, items, **kwargs):
+            self.calls.append(("enqueue_many", items, kwargs))
+            return [b"OK"] * len(items)
+
+        async def run_steps_many(self, items, **kwargs):
+            self.calls.append(("run_steps_many", items, kwargs))
+            return b"OK"
+
+    async def run() -> None:
+        client = RecordingClient()
+        workflow = AsyncWorkflow(
+            client,
+            type="order",
+            states=["queued"],
+            partition_by=("tenant_id", "order_id"),
+        )
+
+        await workflow.enqueue("one", tenant_id="tenant-a", order_id=7)
+        await workflow.enqueue_many(
+            ["two", "three"],
+            tenant_id="tenant-a",
+            order_id=7,
+        )
+        await workflow.run_steps_many(
+            ["four"],
+            states=["queued"],
+            worker="inline",
+            tenant_id="tenant-a",
+            order_id=7,
+        )
+
+        assert [call[2]["partition_key"] for call in client.calls] == [
+            "tenant-a:7",
+            "tenant-a:7",
+            "tenant-a:7",
+        ]
+        assert all(
+            "tenant_id" not in call[2] and "order_id" not in call[2] for call in client.calls
+        )
+
+    asyncio.run(run())
+
+
+def test_async_workflow_partition_by_honors_explicit_partition_without_attributes():
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.kwargs = None
+
+        async def enqueue(self, _id, **kwargs):
+            self.kwargs = kwargs
+            return b"OK"
+
+    async def run() -> None:
+        client = RecordingClient()
+        workflow = AsyncWorkflow(
+            client,
+            type="order",
+            states=["queued"],
+            partition_by=("tenant_id", "order_id"),
+        )
+
+        await workflow.enqueue("one", partition_key="manual")
+
+        assert client.kwargs is not None
+        assert client.kwargs["partition_key"] == "manual"
+
+    asyncio.run(run())
+
+
+def test_async_workflow_client_exposes_partition_by_configuration():
+    client = AsyncWorkflowClient(AsyncFlowClient(FakeExecutor()))
+
+    workflow = client.workflow(
+        type="order",
+        partition_by=("tenant_id", "order_id"),
+    )
+
+    assert workflow.partition_by == ("tenant_id", "order_id")
+
+
 def test_async_workflow_client_from_url_creates_bounded_command_and_claim_pools(monkeypatch):
     async def run():
         calls = []
@@ -591,20 +1741,22 @@ def test_async_workflow_client_from_url_creates_bounded_command_and_claim_pools(
 
         client = AsyncWorkflowClient.from_url(
             "ferric://example:6388",
-            worker_config=WorkerConfig(workers=4),
+            worker_config=WorkerConfig(workers=4, claim_connections=2),
         )
         workflow = client.workflow(type="order", states=["queued"], initial_state="queued")
 
         assert [(url, kwargs) for url, kwargs, _client in calls] == [
             ("ferric://example:6388", {"max_connections": 1}),
+            ("ferric://example:6388", {"max_connections": 2}),
         ]
         assert workflow.client is client.flow
         assert workflow.claim_client is client.claim_flow
+        assert client.claim_flow is not client.flow
 
     asyncio.run(run())
 
 
-def test_async_workflow_client_from_protocol_url_reuses_multiplexed_claim_client(monkeypatch):
+def test_async_workflow_client_from_protocol_url_separates_command_and_claim_clients(monkeypatch):
     async def run():
         calls = []
 
@@ -625,10 +1777,10 @@ def test_async_workflow_client_from_protocol_url_reuses_multiplexed_claim_client
         )
         workflow = client.workflow(type="order", states=["queued"], initial_state="queued")
 
-        assert len(calls) == 1
-        assert calls[0][1] == {"max_connections": 1}
+        assert [kwargs["max_connections"] for _url, kwargs, _client in calls] == [1, 4]
         assert workflow.client is client.flow
-        assert workflow.claim_client is client.flow
+        assert workflow.claim_client is client.claim_flow
+        assert client.claim_flow is not client.flow
 
     asyncio.run(run())
 
@@ -656,9 +1808,9 @@ def test_async_workflow_worker_config_at_workflow_time_resizes_claim_pool(monkey
             worker_config=WorkerConfig(workers=64),
         )
 
-        assert calls[0][1]["max_connections"] == 1
+        assert [kwargs["max_connections"] for _url, kwargs, _client in calls] == [1, 1, 64]
         assert workflow.client is client.flow
-        assert workflow.claim_client is client.flow
+        assert workflow.claim_client is calls[-1][2]
 
     asyncio.run(run())
 
@@ -676,6 +1828,41 @@ def test_async_workflow_client_close_does_not_close_externally_owned_clients():
 
         assert flow_executor.closed is False
         assert claim_executor.closed is False
+
+    asyncio.run(run())
+
+
+def test_async_workflow_client_close_retries_only_failed_owned_clients():
+    class CloseExecutor(FakeExecutor):
+        def __init__(self, *, fail_once: bool = False) -> None:
+            super().__init__()
+            self.close_calls = 0
+            self.fail_once = fail_once
+
+        async def close(self):
+            self.close_calls += 1
+            if self.fail_once and self.close_calls == 1:
+                raise RuntimeError("transient close failure")
+            self.closed = True
+
+    async def run():
+        flow_executor = CloseExecutor(fail_once=True)
+        claim_executor = CloseExecutor()
+        client = AsyncWorkflowClient(
+            AsyncFlowClient(flow_executor),
+            claim_client=AsyncFlowClient(claim_executor),
+        )
+        client._owns_flow = True
+        client._owns_claim_flow = True
+
+        with pytest.raises(RuntimeError, match="transient close failure"):
+            await client.close()
+        await client.close()
+
+        assert flow_executor.close_calls == 2
+        assert claim_executor.close_calls == 1
+        assert flow_executor.closed is True
+        assert claim_executor.closed is True
 
     asyncio.run(run())
 
@@ -717,6 +1904,277 @@ def test_async_queue_worker_start_stop_join_tracks_stats():
         assert stats.claimed == 1
         assert stats.completed == 1
         assert worker.is_running is False
+
+    asyncio.run(run())
+
+
+def test_async_queue_worker_start_then_immediate_close_cannot_resurrect_loop():
+    class EmptyClient:
+        async def claim_flows(self, *_args, **_kwargs):
+            return []
+
+    async def run():
+        worker = AsyncQueueFlowWorker(
+            EmptyClient(),
+            type="email",
+            idle_sleep_s=0.001,
+        )
+        worker.start(lambda _job: b"done")
+
+        await asyncio.wait_for(worker.close(), timeout=0.2)
+
+        assert worker.is_running is False
+
+    asyncio.run(run())
+
+
+def test_async_queue_worker_close_preserves_in_flight_claim_until_response():
+    class BlockingClient:
+        def __init__(self) -> None:
+            self.claim_started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.cancelled = False
+
+        async def claim_flows(self, *_args, **_kwargs):
+            self.claim_started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            return []
+
+    async def run():
+        client = BlockingClient()
+        worker = AsyncQueueFlowWorker(client, type="email", block_ms=60_000)
+        worker.start(lambda _job: b"done")
+        await client.claim_started.wait()
+
+        with pytest.raises(TimeoutError, match="close timed out"):
+            await worker.close(timeout=0.01)
+
+        assert client.cancelled is False
+        client.release.set()
+        await worker.close(timeout=0.2)
+
+        assert worker.is_running is False
+
+    asyncio.run(run())
+
+
+def test_async_queue_worker_close_waits_for_caller_managed_run_task():
+    class BlockingClient:
+        def __init__(self) -> None:
+            self.claim_started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.closed = False
+
+        async def claim_flows(self, *_args, **_kwargs):
+            self.claim_started.set()
+            await self.release.wait()
+            return []
+
+        async def close(self) -> None:
+            self.closed = True
+
+    async def run():
+        client = BlockingClient()
+        worker = AsyncQueueFlowWorker(
+            client,
+            type="email",
+            block_ms=60_000,
+            close_client=True,
+        )
+        run_task = asyncio.create_task(worker.run_forever(lambda _job: b"done"))
+        await client.claim_started.wait()
+
+        try:
+            with pytest.raises(TimeoutError, match="close timed out"):
+                await worker.close(timeout=0.01)
+            assert client.closed is False
+            assert run_task.done() is False
+        finally:
+            client.release.set()
+            await asyncio.wait_for(run_task, timeout=0.2)
+            if not client.closed:
+                await worker.close(timeout=0.2)
+
+        assert client.closed is True
+        assert worker.is_running is False
+
+    asyncio.run(run())
+
+
+def test_async_queue_worker_close_cleans_owned_client_before_task_error():
+    class OwnedClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def claim_flows(self, *_args, **_kwargs):
+            return [ClaimedFlow("f1", b"lease", 1, partition_key="p1")]
+
+        async def close(self):
+            self.closed = True
+
+    async def run():
+        client = OwnedClient()
+        worker = AsyncQueueFlowWorker(
+            client,
+            type="email",
+            exception_policy=ExceptionPolicy.RAISE,
+            close_client=True,
+        )
+
+        async def fail(_job):
+            raise RuntimeError("handler failed")
+
+        task = worker.start(fail)
+        await asyncio.wait({task})
+
+        with pytest.raises(RuntimeError, match="handler failed"):
+            await worker.close()
+        assert client.closed is True
+
+    asyncio.run(run())
+
+
+def test_async_queue_worker_rejects_partial_independent_completion_result():
+    jobs = [
+        ClaimedFlow("ok", b"lease-1", 1, partition_key="p1"),
+        ClaimedFlow("stale", b"lease-2", 2, partition_key="p1"),
+    ]
+
+    class PartialClient:
+        async def claim_flows(self, *_args, **_kwargs):
+            return jobs
+
+        async def complete_jobs(self, *_args, **_kwargs):
+            return [b"OK", FerricStoreError("fencing token mismatch")]
+
+    async def run():
+        worker = AsyncQueueFlowWorker(
+            PartialClient(), type="email", partition_key="p1", batch_size=2
+        )
+        with pytest.raises(FerricStoreError, match="fencing token mismatch"):
+            await worker.run_once(lambda _job: b"done")
+
+    asyncio.run(run())
+
+
+def test_async_queue_worker_batches_distinct_completion_results():
+    jobs = [ClaimedFlow(str(index), b"lease", index, partition_key="p1") for index in range(100)]
+
+    class Client:
+        def __init__(self) -> None:
+            self.single_calls = 0
+            self.batch_calls = []
+
+        async def claim_flows(self, *_args, **_kwargs):
+            return jobs
+
+        async def complete(self, *_args, **_kwargs):
+            self.single_calls += 1
+            return b"OK"
+
+        async def complete_job_results(self, items):
+            self.batch_calls.append(items)
+            return [b"OK"] * len(items)
+
+    async def run():
+        client = Client()
+        worker = AsyncQueueFlowWorker(client, type="email", partition_key="p1", batch_size=100)
+
+        result = await worker.run_once(lambda job: job.id)
+
+        assert result.completed == 100
+        assert client.single_calls == 0
+        assert len(client.batch_calls) == 1
+
+    asyncio.run(run())
+
+
+def test_async_queue_worker_does_not_conflate_bool_and_int_results():
+    jobs = [
+        ClaimedFlow("bool", b"lease-1", 1, partition_key="p1"),
+        ClaimedFlow("int", b"lease-2", 2, partition_key="p1"),
+    ]
+
+    class Client:
+        def __init__(self) -> None:
+            self.uniform_calls = []
+            self.result_batches = []
+
+        async def claim_flows(self, *_args, **_kwargs):
+            return jobs
+
+        async def complete_jobs(self, claimed, **kwargs):
+            self.uniform_calls.append((claimed, kwargs))
+            return [b"OK"] * len(claimed)
+
+        async def complete_job_results(self, items):
+            self.result_batches.append(list(items))
+            return [b"OK"] * len(items)
+
+    async def run():
+        client = Client()
+        worker = AsyncQueueFlowWorker(client, type="typed", batch_size=2)
+
+        result = await worker.run_once(lambda job: True if job.id == "bool" else 1)
+
+        assert result.completed == 2
+        assert client.uniform_calls == []
+        assert [value for _job, value in client.result_batches[0]] == [True, 1]
+
+    asyncio.run(run())
+
+
+def test_async_queue_worker_fusion_uses_claim_client_and_stops_before_extra_claim():
+    first = ClaimedFlow("first", b"lease-1", 1, partition_key="p1")
+    second = ClaimedFlow("second", b"lease-2", 2, partition_key="p1")
+
+    class CommandClient:
+        def __init__(self) -> None:
+            self.completed = []
+
+        async def complete_jobs(self, jobs, **_kwargs):
+            self.completed.extend(job.id for job in jobs)
+            return [b"OK"] * len(jobs)
+
+    class ClaimClient:
+        def __init__(self) -> None:
+            self.claim_calls = 0
+            self.fused_calls = 0
+
+        async def claim_flows(self, *_args, **_kwargs):
+            self.claim_calls += 1
+            return [first]
+
+        async def complete_flows_and_claim_flows(self, jobs, **_kwargs):
+            self.fused_calls += 1
+            assert jobs == [first]
+            return [second]
+
+    async def run():
+        command = CommandClient()
+        claim = ClaimClient()
+        worker = AsyncQueueFlowWorker(
+            command,
+            claim_client=claim,
+            type="email",
+            partition_key="p1",
+            fuse_complete_claim=True,
+        )
+
+        async def handler(job):
+            if job.id == "second":
+                worker.stop()
+            return b"done"
+
+        await asyncio.wait_for(worker.run_forever(handler), timeout=1)
+
+        assert claim.claim_calls == 1
+        assert claim.fused_calls == 1
+        assert command.completed == ["second"]
 
     asyncio.run(run())
 
@@ -910,16 +2368,216 @@ def test_async_queue_flow_join_surfaces_later_worker_error():
     asyncio.run(run())
 
 
+def test_async_queue_flow_close_attempts_owned_clients_after_worker_failure():
+    class OwnedClient:
+        def __init__(self, name, closed):
+            self.name = name
+            self.closed = closed
+
+        async def close(self):
+            self.closed.append(self.name)
+
+    class FailingWorker:
+        def stop(self):
+            pass
+
+        async def close(self):
+            raise RuntimeError("worker close failed")
+
+    async def run():
+        closed = []
+        client = OwnedClient("client", closed)
+        claim_client = OwnedClient("claim", closed)
+        queue = AsyncQueueFlow(
+            client,
+            claim_client=claim_client,
+            type="email",
+            workers=1,
+        )
+        queue._owns_client = True
+        queue._owns_claim_client = True
+        queue._workers = [FailingWorker()]
+
+        with pytest.raises(RuntimeError, match="worker close failed"):
+            await queue.close()
+
+        assert set(closed) == {"client", "claim"}
+        assert queue._workers == []
+        assert queue._owns_client is False
+        assert queue._owns_claim_client is False
+
+    asyncio.run(run())
+
+
+def test_async_queue_flow_closes_workers_before_owned_clients():
+    class OwnedClient:
+        def __init__(self, name, events):
+            self.name = name
+            self.events = events
+
+        async def close(self):
+            self.events.append(self.name)
+
+    class BlockingWorker:
+        def __init__(self, started, allowed, events):
+            self.started = started
+            self.allowed = allowed
+            self.events = events
+
+        def stop(self):
+            pass
+
+        async def close(self):
+            self.started.set()
+            await self.allowed.wait()
+            self.events.append("worker")
+
+    async def run():
+        events = []
+        started = asyncio.Event()
+        allowed = asyncio.Event()
+        client = OwnedClient("client", events)
+        claim_client = OwnedClient("claim", events)
+        queue = AsyncQueueFlow(client, claim_client=claim_client, type="email")
+        queue._owns_client = True
+        queue._owns_claim_client = True
+        queue._workers = [BlockingWorker(started, allowed, events)]
+
+        close_task = asyncio.create_task(queue.close())
+        await started.wait()
+        await asyncio.sleep(0)
+        assert events == []
+
+        allowed.set()
+        await close_task
+        assert events[0] == "worker"
+        assert set(events[1:]) == {"client", "claim"}
+
+    asyncio.run(run())
+
+
+def test_async_queue_flow_close_continues_in_order_after_caller_cancellation():
+    class OwnedClient:
+        def __init__(self, name, events):
+            self.name = name
+            self.events = events
+
+        async def close(self):
+            self.events.append(self.name)
+
+    class BlockingWorker:
+        def __init__(self, started, allowed, events):
+            self.started = started
+            self.allowed = allowed
+            self.events = events
+
+        def stop(self):
+            pass
+
+        async def close(self):
+            self.started.set()
+            await self.allowed.wait()
+            self.events.append("worker")
+
+    async def run():
+        events = []
+        started = asyncio.Event()
+        allowed = asyncio.Event()
+        client = OwnedClient("client", events)
+        claim_client = OwnedClient("claim", events)
+        queue = AsyncQueueFlow(client, claim_client=claim_client, type="email")
+        queue._owns_client = True
+        queue._owns_claim_client = True
+        queue._workers = [BlockingWorker(started, allowed, events)]
+
+        caller = asyncio.create_task(queue.close())
+        await started.wait()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        assert events == []
+
+        allowed.set()
+        await queue.close()
+        assert events[0] == "worker"
+        assert set(events[1:]) == {"client", "claim"}
+
+    asyncio.run(run())
+
+
+def test_async_queue_flow_close_timeout_is_retryable_without_closing_clients():
+    class OwnedClient:
+        def __init__(self, name, closed):
+            self.name = name
+            self.closed = closed
+
+        async def close(self):
+            self.closed.append(self.name)
+
+    class TimeoutOnceWorker:
+        def __init__(self):
+            self.close_calls = 0
+
+        def stop(self):
+            pass
+
+        async def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise TimeoutError("worker close timed out")
+
+    async def run():
+        closed = []
+        client = OwnedClient("client", closed)
+        claim_client = OwnedClient("claim", closed)
+        worker = TimeoutOnceWorker()
+        queue = AsyncQueueFlow(client, claim_client=claim_client, type="email")
+        queue._owns_client = True
+        queue._owns_claim_client = True
+        queue._workers = [worker]
+
+        with pytest.raises(TimeoutError, match="timed out"):
+            await queue.close()
+
+        assert closed == []
+        assert queue._workers == [worker]
+        assert queue._owns_client is True
+        assert queue._owns_claim_client is True
+
+        await queue.close()
+        assert set(closed) == {"client", "claim"}
+        assert worker.close_calls == 2
+
+    asyncio.run(run())
+
+
+def test_async_queue_flow_cannot_restart_after_close():
+    async def run():
+        queue = AsyncQueueFlow(AsyncFlowClient(FakeExecutor()), type="email")
+        await queue.close()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            queue.start(lambda _job: b"done")
+
+    asyncio.run(run())
+
+
 def test_async_queue_worker_preserves_distinct_failure_messages():
     async def run():
         class TwoJobExecutor(FakeExecutor):
+            def __init__(self):
+                super().__init__()
+                self.batches = []
+
             async def execute_command(self, *args):
                 self.calls.append(args)
                 if args[0] == "FLOW.CLAIM_DUE":
                     return [[b"f1", b"p1", b"lease-1", 1], [b"f2", b"p1", b"lease-2", 2]]
-                if args[0] == "FLOW.RETRY_MANY":
-                    return [b"OK"]
                 return b"OK"
+
+            async def execute_batch(self, commands):
+                self.batches.append(list(commands))
+                return [b"OK"] * len(commands)
 
         executor = TwoJobExecutor()
         client = AsyncFlowClient(executor)
@@ -936,9 +2594,54 @@ def test_async_queue_worker_preserves_distinct_failure_messages():
 
         result = await worker.run_once(handler)
 
-        retry_calls = [call for call in executor.calls if call[0] == "FLOW.RETRY_MANY"]
         assert result.retried == 2
-        assert [call[call.index("ERROR") + 1] for call in retry_calls] == [b"boom-f1", b"boom-f2"]
+        assert len(executor.batches) == 1
+        assert [call[0] for call in executor.batches[0]] == ["FLOW.RETRY", "FLOW.RETRY"]
+        assert [call[call.index("ERROR") + 1] for call in executor.batches[0]] == [
+            b"boom-f1",
+            b"boom-f2",
+        ]
+
+    asyncio.run(run())
+
+
+def test_async_workflow_pipelines_heterogeneous_outcomes_as_one_mutation_batch():
+    class MutationClient:
+        def __init__(self) -> None:
+            self.mutation_batches = []
+
+        async def claim_flows(self, *_args, **_kwargs):
+            return [
+                ClaimedFlow("transition", b"lease-1", 1, partition_key="p1"),
+                ClaimedFlow("retry", b"lease-2", 2, partition_key="p1"),
+                ClaimedFlow("fail", b"lease-3", 3, partition_key="p1"),
+            ]
+
+        async def apply_job_mutations(self, mutations):
+            self.mutation_batches.append(list(mutations))
+            return [b"OK"] * len(mutations)
+
+    async def run():
+        client = MutationClient()
+        workflow = AsyncWorkflow(client, type="order", states=["queued"], batch_size=3)
+
+        @workflow.on("queued")
+        async def queued(ctx):
+            if ctx.id == "transition":
+                return transition("next")
+            if ctx.id == "retry":
+                return retry(error="later")
+            return fail(error="terminal")
+
+        result = await workflow.run_once(state="queued")
+
+        assert result.applied == 3
+        assert len(client.mutation_batches) == 1
+        assert [mutation.kind.value for mutation in client.mutation_batches[0]] == [
+            "transition",
+            "retry",
+            "fail",
+        ]
 
     asyncio.run(run())
 
@@ -987,6 +2690,205 @@ def test_async_workflow_simple_api_batches_transition_and_complete():
             "FLOW.TRANSITION_MANY",
             "FLOW.CLAIM_DUE",
             "FLOW.COMPLETE_MANY",
+        ]
+
+    asyncio.run(run())
+
+
+def test_async_workflow_raise_waits_for_active_siblings_and_leaves_no_orphans():
+    async def run():
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(FakeExecutor()),
+            type="order",
+            states=["queued"],
+            concurrency=2,
+            exception_policy=ExceptionPolicy.RAISE,
+        )
+        sibling_started = asyncio.Event()
+        failure_raised = asyncio.Event()
+        release_sibling = asyncio.Event()
+        sibling_finished = False
+
+        @workflow.on("queued")
+        async def queued(ctx):
+            nonlocal sibling_finished
+            if ctx.id == "failing":
+                await sibling_started.wait()
+                failure_raised.set()
+                raise RuntimeError("primary handler failure")
+            sibling_started.set()
+            await release_sibling.wait()
+            sibling_finished = True
+            return complete()
+
+        jobs = [
+            ClaimedFlow("failing", b"lease-1", 1, partition_key="p1"),
+            ClaimedFlow("sibling", b"lease-2", 2, partition_key="p1"),
+        ]
+        task = asyncio.create_task(workflow._handle_claimed_batch("queued", jobs))
+        caught = None
+        try:
+            await sibling_started.wait()
+            await failure_raised.wait()
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.02)
+        finally:
+            release_sibling.set()
+            [caught] = await asyncio.gather(task, return_exceptions=True)
+
+        assert isinstance(caught, RuntimeError)
+        assert str(caught) == "primary handler failure"
+        assert sibling_finished is True
+
+    asyncio.run(run())
+
+
+def test_async_workflow_close_preserves_in_flight_claim_until_response():
+    class BlockingClient:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.cancelled = False
+
+        async def claim_flows(self, *_args, **_kwargs):
+            self.started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            return []
+
+    async def run() -> None:
+        client = BlockingClient()
+        workflow = AsyncWorkflow(
+            client,
+            type="order",
+            states=["queued"],
+            block_ms=60_000,
+        )
+
+        @workflow.on("queued")
+        async def handle(_ctx):
+            return complete()
+
+        workflow.start_workers()
+        await client.started.wait()
+        with pytest.raises(TimeoutError, match="close timed out"):
+            await workflow.close(timeout=0.01)
+        assert client.cancelled is False
+        client.release.set()
+        await workflow.close(timeout=0.2)
+
+    asyncio.run(run())
+
+
+def test_async_workflow_close_cleans_owned_client_before_task_error():
+    class OwnedClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def claim_flows(self, *_args, **_kwargs):
+            return [ClaimedFlow("f1", b"lease", 1, partition_key="p1")]
+
+        async def close(self):
+            self.closed = True
+
+    async def run() -> None:
+        client = OwnedClient()
+        workflow = AsyncWorkflow(
+            client,
+            type="order",
+            states=["queued"],
+            exception_policy=ExceptionPolicy.RAISE,
+        )
+        workflow._owns_client = True
+
+        @workflow.on("queued")
+        async def fail(_ctx):
+            raise RuntimeError("handler failed")
+
+        tasks = workflow.start_workers()
+        assert isinstance(tasks, list)
+        await asyncio.wait(tasks)
+
+        with pytest.raises(RuntimeError, match="handler failed"):
+            await workflow.close()
+        assert client.closed is True
+
+    asyncio.run(run())
+
+
+def test_async_workflow_rejects_partial_independent_mutation_result():
+    class PartialExecutor(FakeExecutor):
+        async def execute_command(self, *args):
+            self.calls.append(args)
+            if args[0] == "FLOW.CLAIM_DUE":
+                return [
+                    [b"f1", b"p1", b"lease-1", 1],
+                    [b"f2", b"p1", b"lease-2", 2],
+                ]
+            if args[0] == "FLOW.COMPLETE_MANY":
+                return [b"OK", FerricStoreError("stale lease")]
+            return b"OK"
+
+    async def run():
+        workflow = AsyncWorkflow(
+            AsyncFlowClient(PartialExecutor()),
+            type="order",
+            states=["queued"],
+            batch_size=2,
+        )
+
+        @workflow.on("queued")
+        async def queued(_job):
+            return complete(result=b"done")
+
+        with pytest.raises(FerricStoreError, match="stale lease"):
+            await workflow.run_once(state="queued")
+
+    asyncio.run(run())
+
+
+def test_async_workflow_pipelines_distinct_completion_results_in_one_batch():
+    class DistinctClient:
+        def __init__(self) -> None:
+            self.mutation_batches = []
+
+        async def claim_flows(self, *_args, **_kwargs):
+            return [
+                ClaimedFlow(
+                    f"f{index}",
+                    b"lease",
+                    index,
+                    partition_key="tenant:order",
+                )
+                for index in range(100)
+            ]
+
+        async def complete_job_mutations(self, items):
+            self.mutation_batches.append(list(items))
+            return [b"OK"] * len(items)
+
+    async def run():
+        client = DistinctClient()
+        workflow = AsyncWorkflow(
+            client,
+            type="order",
+            states=["queued"],
+            batch_size=100,
+        )
+
+        @workflow.on("queued")
+        async def queued(job):
+            return complete(result=job.id)
+
+        result = await workflow.run_once(state="queued")
+
+        assert result.applied == 100
+        assert len(client.mutation_batches) == 1
+        assert [options["result"] for _job, options in client.mutation_batches[0]] == [
+            f"f{index}" for index in range(100)
         ]
 
     asyncio.run(run())
@@ -1239,6 +3141,145 @@ def test_async_workflow_context_flow_helper_defaults_to_current_job():
     asyncio.run(run())
 
 
+def test_async_workflow_flow_commands_match_sync_public_api():
+    def public_methods(cls):
+        return {
+            name
+            for name, value in vars(cls).items()
+            if not name.startswith("_") and callable(value)
+        }
+
+    assert public_methods(async_worker_module.AsyncWorkflowFlowCommands) == public_methods(
+        workflow_module.WorkflowFlowCommands
+    )
+
+
+def test_async_workflow_flow_commands_apply_context_defaults():
+    class RecordingClient:
+        def __init__(self):
+            self.calls = []
+
+        def __getattr__(self, name):
+            async def call(*args, **kwargs):
+                self.calls.append((name, args, kwargs))
+                return name
+
+            return call
+
+    async def run():
+        client = RecordingClient()
+        workflow = AsyncWorkflow(
+            client,
+            type="order",
+            states=["queued"],
+            initial_state="queued",
+        )
+        ctx = AsyncWorkflowContext(
+            workflow,
+            ClaimedFlow(
+                "parent-1",
+                b"lease-1",
+                7,
+                partition_key="tenant-a",
+                type="order",
+                state="running",
+                run_state="queued",
+            ),
+            "queued",
+        )
+
+        assert ctx.flow.client is client
+        with pytest.raises(AttributeError):
+            object.__getattribute__(ctx.flow, "__dict__")
+        await ctx.flow.create("child-1", payload=b"payload")
+        await ctx.flow.step_continue("done", lease_ms=1_000)
+        await ctx.flow.retry(error="later")
+        await ctx.flow.fail(error="broken")
+        await ctx.flow.cancel()
+        await ctx.flow.spawn_children(
+            [ChildSpec(id="child-2", type="child")],
+            wait_state="children_done",
+        )
+        await ctx.flow.value_put(b"value")
+        await ctx.flow.policy_get()
+
+        assert client.calls == [
+            (
+                "create",
+                ("child-1",),
+                {
+                    "type": "order",
+                    "state": "queued",
+                    "payload": b"payload",
+                    "partition_key": "tenant-a",
+                    "return_record": False,
+                },
+            ),
+            (
+                "step_continue",
+                ("parent-1",),
+                {
+                    "lease_token": b"lease-1",
+                    "from_state": "running",
+                    "to_state": "done",
+                    "fencing_token": 7,
+                    "partition_key": "tenant-a",
+                    "lease_ms": 1_000,
+                },
+            ),
+            (
+                "retry",
+                ("parent-1",),
+                {
+                    "lease_token": b"lease-1",
+                    "fencing_token": 7,
+                    "partition_key": "tenant-a",
+                    "return_record": False,
+                    "error": "later",
+                },
+            ),
+            (
+                "fail",
+                ("parent-1",),
+                {
+                    "lease_token": b"lease-1",
+                    "fencing_token": 7,
+                    "partition_key": "tenant-a",
+                    "return_record": False,
+                    "error": "broken",
+                },
+            ),
+            (
+                "cancel",
+                ("parent-1",),
+                {
+                    "fencing_token": 7,
+                    "lease_token": b"lease-1",
+                    "partition_key": "tenant-a",
+                    "return_record": False,
+                },
+            ),
+            (
+                "spawn_children",
+                ("parent-1", [ChildSpec(id="child-2", type="child")]),
+                {
+                    "partition_key": "tenant-a",
+                    "lease_token": b"lease-1",
+                    "fencing_token": 7,
+                    "wait_state": "children_done",
+                },
+            ),
+            (
+                "value_put",
+                (b"value",),
+                {"partition_key": "tenant-a", "owner_flow_id": "parent-1"},
+            ),
+            ("policy_get", ("order",), {}),
+        ]
+
+    asyncio.run(run())
+
+
 def test_async_workflow_on_error_fail_uses_fail_many():
     async def run():
         executor = FakeExecutor()
@@ -1303,7 +3344,7 @@ def test_async_workflow_loop_runs_one_claim_per_iteration_when_handler_stops():
             workflow.stop()
             return complete(result=b"ok")
 
-        workflow.start()
+        workflow.start_workers()
         stats = await workflow.join()
 
         assert stats.claimed == 1

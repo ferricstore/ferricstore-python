@@ -5,9 +5,11 @@ import zlib
 
 import pytest
 
+import ferricstore.async_client as async_client_module
 from ferricstore import (
     AsyncFlowClient,
     BackpressurePolicy,
+    FerricStoreError,
     FlowAlreadyExistsError,
     FlowClient,
     FlowStateMode,
@@ -16,7 +18,10 @@ from ferricstore import (
     OverloadedError,
     StaleLeaseError,
 )
+from ferricstore.backpressure import BackpressureController
 from ferricstore.commands import DataCommandsMixin
+from ferricstore.errors import InvalidCommandError
+from ferricstore.protocol import AsyncProtocolAdapterPool
 from ferricstore.types import (
     ApprovalResult,
     ChildSpec,
@@ -163,6 +168,183 @@ class FakeAsyncExecutor:
         self.closed = True
 
 
+def test_async_transaction_suspends_heartbeat_until_exec():
+    class TransactionExecutor:
+        def __init__(self) -> None:
+            self.paused = 0
+            self.calls: list[tuple[object, ...]] = []
+
+        async def pause_heartbeat(self) -> None:
+            self.paused += 1
+
+        async def resume_heartbeat(self) -> None:
+            self.paused -= 1
+
+        async def execute_command(self, *args):
+            self.calls.append(args)
+            return b"OK"
+
+    async def run() -> None:
+        executor = TransactionExecutor()
+        client = AsyncFlowClient(executor)
+
+        await client.multi()
+        assert executor.paused == 1
+        await client.command("SET", "key", "value")
+        assert executor.paused == 1
+        await client.transaction_exec()
+
+        assert executor.paused == 0
+        assert executor.calls == [
+            ("MULTI",),
+            ("COMMAND_EXEC", "SET", "key", "value"),
+            ("EXEC",),
+        ]
+
+    asyncio.run(run())
+
+
+def test_async_transaction_state_machine_accepts_byte_command_names():
+    async def main():
+        executor = FakeAsyncExecutor()
+        executor.responses.extend([b"OK", b"QUEUED", [b"OK"]])
+        client = AsyncFlowClient(executor)
+
+        await client.command(b"MULTI")
+        await client.command(b"SET", b"key", b"value")
+        await client.command(b"EXEC")
+
+        assert executor.calls == [
+            (b"MULTI",),
+            ("COMMAND_EXEC", b"SET", b"key", b"value"),
+            (b"EXEC",),
+        ]
+
+    run(main())
+
+
+def test_async_pubsub_cleanup_failure_unsubscribes_patterns_and_invalidates_session():
+    class SessionExecutor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+            self.invalidated = False
+            self.closed = False
+
+        async def execute_command(self, *args):
+            self.calls.append(args)
+            if args[0] == "UNSUBSCRIBE":
+                raise FerricStoreError("unsubscribe failed")
+            return b"OK"
+
+        async def invalidate(self) -> None:
+            self.invalidated = True
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class RootExecutor:
+        def __init__(self, session: SessionExecutor) -> None:
+            self.session = session
+
+        async def execute_command(self, *_args):
+            return b"OK"
+
+        async def acquire_session(self) -> SessionExecutor:
+            return self.session
+
+    async def run() -> None:
+        session = SessionExecutor()
+        pubsub = AsyncFlowClient(RootExecutor(session)).pubsub_session()
+        await pubsub.subscribe("jobs")
+
+        with pytest.raises(FerricStoreError, match="unsubscribe failed"):
+            await pubsub.close()
+
+        assert ("UNSUBSCRIBE",) in session.calls
+        assert ("PUNSUBSCRIBE",) in session.calls
+        assert session.invalidated
+        assert session.closed
+
+    asyncio.run(run())
+
+
+def test_async_complete_and_claim_uses_single_batch_round_trip():
+    class BatchExecutor:
+        def __init__(self) -> None:
+            self.batches: list[list[tuple[object, ...]]] = []
+
+        async def execute_command(self, *_args):
+            return b"OK"
+
+        async def execute_batch(self, commands):
+            self.batches.append(commands)
+            return [b"OK", [[b"next", b"p1", b"next-lease", 8]]]
+
+    async def run() -> None:
+        executor = BatchExecutor()
+        client = AsyncFlowClient(executor)
+        jobs = [ClaimedFlow("done", b"lease", 7, partition_key="p1")]
+
+        claimed = await client.complete_flows_and_claim_flows(
+            jobs,
+            result=b"result",
+            type="order",
+            state="queued",
+            worker="worker-1",
+            partition_key="p1",
+        )
+
+        assert len(executor.batches) == 1
+        assert [command[0] for command in executor.batches[0]] == [
+            "FLOW.COMPLETE_MANY",
+            "FLOW.CLAIM_DUE",
+        ]
+        assert claimed == [ClaimedFlow("next", b"next-lease", 8, partition_key="p1")]
+
+    asyncio.run(run())
+
+
+def test_async_subscribe_flow_wake_delegates_to_protocol_executor():
+    class WakeExecutor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        async def execute_command(self, *_args):
+            return b"OK"
+
+        async def subscribe_flow_wake(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return b"subscribed"
+
+    async def run() -> None:
+        executor = WakeExecutor()
+        client = AsyncFlowClient(executor)
+
+        result = await client.subscribe_flow_wake(
+            "order",
+            state="queued",
+            partition_key="p1",
+            limit=10,
+        )
+
+        assert result == b"subscribed"
+        assert executor.calls == [
+            (
+                ("order",),
+                {
+                    "state": "queued",
+                    "states": None,
+                    "partition_key": "p1",
+                    "partition_keys": None,
+                    "priority": 0,
+                    "limit": 10,
+                },
+            )
+        ]
+
+    asyncio.run(run())
+
+
 class OverloadThenAckAsyncExecutor(FakeAsyncExecutor):
     def __init__(self, overloads: int):
         super().__init__()
@@ -234,6 +416,190 @@ def test_async_create_uses_real_async_executor_without_thread_fallback(monkeypat
                 100,
             )
         ]
+
+    run(main())
+
+
+def test_async_transaction_cleans_watch_if_multi_fails():
+    class Session:
+        def __init__(self) -> None:
+            self.calls = []
+            self.invalidated = False
+
+        async def execute_command(self, *args):
+            self.calls.append(args)
+            if args[0] == "MULTI":
+                raise FerricStoreError("MULTI failed")
+            return b"OK"
+
+        async def close(self):
+            pass
+
+        async def invalidate(self):
+            self.invalidated = True
+
+    class Executor:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def execute_command(self, *_args):
+            return b"OK"
+
+        async def acquire_session_for_key(self, _key):
+            return self.session
+
+    async def main():
+        executor = Executor()
+        client = AsyncFlowClient(executor)
+
+        with pytest.raises(FerricStoreError, match="MULTI failed"):
+            async with client.transaction(watch=["tenant:{42}"]):
+                pass
+
+        assert executor.session.calls == [
+            ("WATCH", "tenant:{42}"),
+            ("MULTI",),
+            ("UNWATCH",),
+        ]
+        assert executor.session.invalidated
+
+    run(main())
+
+
+def test_async_claim_retries_legacy_compact_return_mode():
+    class Executor:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def execute_command(self, *args):
+            self.calls.append(args)
+            if len(self.calls) == 1:
+                raise FerricStoreError("FLOW CLAIM return must be records, jobs, or jobs_compact")
+            return [[b"f1", b"p1", b"lease", 7]]
+
+    async def main():
+        executor = Executor()
+        client = AsyncFlowClient(executor)
+
+        jobs = await client.claim_flows("jobs", worker="w1")
+
+        assert [job.id for job in jobs] == ["f1"]
+        assert executor.calls[0][executor.calls[0].index("RETURN") + 1] == ("JOBS_COMPACT_ATTRS")
+        assert executor.calls[1][executor.calls[1].index("RETURN") + 1] == "JOBS_COMPACT"
+
+    run(main())
+
+
+def test_async_manual_transaction_commands_fail_fast_on_rotating_pool():
+    class Adapter:
+        async def execute_command(self, *_args):
+            return b"OK"
+
+        async def close(self):
+            pass
+
+    async def main():
+        client = AsyncFlowClient(AsyncProtocolAdapterPool([Adapter(), Adapter()]))
+
+        with pytest.raises(InvalidCommandError, match=r"transaction\(\)"):
+            await client.multi()
+        with pytest.raises(InvalidCommandError, match=r"transaction\(\)"):
+            await client.watch("key")
+
+    run(main())
+
+
+def test_async_transaction_key_acquires_routed_affine_session():
+    class Session:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def execute_command(self, *args):
+            self.calls.append(args)
+            return b"OK"
+
+        async def close(self):
+            pass
+
+    class Executor:
+        def __init__(self) -> None:
+            self.key = None
+            self.session = Session()
+
+        async def execute_command(self, *_args):
+            raise AssertionError("transaction should use its affine session")
+
+        async def acquire_session_for_key(self, key):
+            self.key = key
+            return self.session
+
+    async def main():
+        executor = Executor()
+        client = AsyncFlowClient(executor)
+
+        async with client.transaction(key="tenant:{42}") as transaction:
+            await transaction.command("SET", "tenant:{42}", b"value")
+
+        assert executor.key == "tenant:{42}"
+        assert executor.session.calls == [
+            ("MULTI",),
+            ("COMMAND_EXEC", "SET", "tenant:{42}", b"value"),
+            ("EXEC",),
+        ]
+
+    run(main())
+
+
+def test_async_transaction_validates_key_and_all_watches_before_acquiring_session():
+    class Executor:
+        def __init__(self) -> None:
+            self.session_keys = None
+            self.calls = []
+
+        async def execute_command(self, *args):
+            self.calls.append(args)
+            return b"OK"
+
+        async def acquire_session_for_keys(self, keys):
+            self.session_keys = keys
+            raise InvalidCommandError("transaction keys must hash to the same slot")
+
+    async def main():
+        executor = Executor()
+        client = AsyncFlowClient(executor)
+
+        with pytest.raises(InvalidCommandError, match="same slot"):
+            async with client.transaction(key="a", watch=["b"]):
+                pass
+
+        assert executor.session_keys == ("a", "b")
+        assert executor.calls == []
+
+    run(main())
+
+
+def test_async_complete_and_claim_rejects_partial_completion_result():
+    class Executor:
+        async def execute_command(self, *_args):
+            return b"OK"
+
+        async def execute_batch(self, _commands):
+            return [[b"OK", FerricStoreError("stale lease")], []]
+
+    async def main():
+        client = AsyncFlowClient(Executor())
+        jobs = [
+            ClaimedFlow("ok", b"lease-1", 1, partition_key="p1"),
+            ClaimedFlow("stale", b"lease-2", 2, partition_key="p1"),
+        ]
+
+        with pytest.raises(FerricStoreError, match="stale lease"):
+            await client.complete_flows_and_claim_flows(
+                jobs,
+                type="jobs",
+                worker="w1",
+                partition_key="p1",
+            )
 
     run(main())
 
@@ -336,6 +702,23 @@ def test_async_command_pipeline_maps_native_execute_batch_errors():
     run(main())
 
 
+def test_async_command_pipeline_rejects_wrong_batch_cardinality():
+    async def main():
+        class BatchExecutor:
+            async def execute_command(self, *args):
+                return b"OK"
+
+            async def execute_batch(self, commands):
+                return []
+
+        client = AsyncFlowClient(BatchExecutor())
+
+        with pytest.raises(FerricStoreError, match="returned 0 items; expected 1"):
+            await client.pipeline().command("GET", "key").execute()
+
+    run(main())
+
+
 def test_async_session_and_blocking_helpers_are_named_commands():
     async def main():
         class ExecutorExecutor:
@@ -399,6 +782,29 @@ def test_async_data_command_helpers_are_codec_aware_and_easy_to_use():
     run(main())
 
 
+def test_async_shared_backpressure_wait_observes_extensions_while_sleeping(monkeypatch):
+    now = [100.0]
+    sleeps: list[float] = []
+    controller = BackpressureController(BackpressurePolicy(jitter=0, shared=False))
+    controller._state.blocked_until = 101.0
+
+    monkeypatch.setattr("ferricstore.backpressure.time.monotonic", lambda: now[0])
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+        if len(sleeps) == 1:
+            controller._state.blocked_until = now[0] + 2.0
+
+    monkeypatch.setattr("ferricstore.backpressure.asyncio.sleep", sleep)
+
+    async def main() -> None:
+        assert await controller.before_request_async(elapsed_s=0.0)
+
+    run(main())
+    assert sleeps == [1.0, 2.0]
+
+
 def test_async_pubsub_session_decodes_native_events_without_raw_command_usage():
     async def main():
         class EventExecutor(FakeAsyncExecutor):
@@ -442,6 +848,195 @@ def test_async_transaction_context_uses_named_helpers_inside_multi():
             ("COMMAND_EXEC", "SET", "k", b"v"),
             ("EXEC",),
         ]
+
+    run(main())
+
+
+def test_async_transaction_context_uses_connection_affine_executor_session():
+    async def main():
+        class SessionExecutor(FakeAsyncExecutor):
+            def __init__(self):
+                super().__init__()
+                self.closed = False
+
+            async def close(self):
+                self.closed = True
+
+        class PoolExecutor(FakeAsyncExecutor):
+            def __init__(self):
+                super().__init__()
+                self.session = SessionExecutor()
+
+            async def acquire_session(self):
+                return self.session
+
+        executor = PoolExecutor()
+        executor.session.responses.extend(["OK", "QUEUED", ["OK"]])
+        client = AsyncFlowClient(executor)
+
+        async with client.transaction() as tx:
+            assert await tx.set("k", "v") == "QUEUED"
+
+        assert executor.calls == []
+        assert executor.session.calls == [
+            ("MULTI",),
+            ("COMMAND_EXEC", "SET", "k", b"v"),
+            ("EXEC",),
+        ]
+        assert executor.session.closed
+
+    run(main())
+
+
+def test_async_transaction_exec_failure_discards_before_releasing_affine_session():
+    async def main():
+        class SessionExecutor(FakeAsyncExecutor):
+            def __init__(self):
+                super().__init__()
+                self.closed = False
+                self.invalidated = False
+
+            async def execute_command(self, *args):
+                self.calls.append(args)
+                if args[0] == "EXEC":
+                    raise FerricStoreError("exec failed")
+                return b"OK"
+
+            async def close(self):
+                self.closed = True
+
+            async def invalidate(self):
+                self.invalidated = True
+
+        class PoolExecutor(FakeAsyncExecutor):
+            def __init__(self):
+                super().__init__()
+                self.session = SessionExecutor()
+
+            async def acquire_session(self):
+                return self.session
+
+        executor = PoolExecutor()
+        client = AsyncFlowClient(executor)
+
+        with pytest.raises(FerricStoreError, match="exec failed"):
+            async with client.transaction():
+                pass
+
+        assert executor.session.calls == [("MULTI",), ("EXEC",), ("DISCARD",)]
+        assert executor.session.invalidated
+        assert executor.session.closed
+
+    run(main())
+
+
+def test_async_transaction_preserves_exec_failure_when_session_close_also_fails():
+    async def main():
+        class SessionExecutor(FakeAsyncExecutor):
+            async def execute_command(self, *args):
+                self.calls.append(args)
+                if args[0] == "EXEC":
+                    raise FerricStoreError("primary async exec failure")
+                return b"OK"
+
+            async def close(self):
+                raise RuntimeError("secondary async close failure")
+
+            async def invalidate(self):
+                pass
+
+        class PoolExecutor(FakeAsyncExecutor):
+            def __init__(self):
+                super().__init__()
+                self.session = SessionExecutor()
+
+            async def acquire_session(self):
+                return self.session
+
+        transaction = AsyncFlowClient(PoolExecutor()).transaction()
+        with pytest.raises(FerricStoreError, match="primary async exec failure") as raised:
+            async with transaction:
+                pass
+
+        assert isinstance(raised.value.__cause__, RuntimeError)
+        assert "secondary async close failure" in str(raised.value.__cause__)
+        assert transaction._active_client is None
+        assert not transaction._owns_client
+
+    run(main())
+
+
+def test_async_transaction_preserves_body_failure_when_discard_also_fails():
+    async def main():
+        class SessionExecutor(FakeAsyncExecutor):
+            async def execute_command(self, *args):
+                self.calls.append(args)
+                if args[0] == "DISCARD":
+                    raise FerricStoreError("secondary async discard failure")
+                return b"OK"
+
+            async def close(self):
+                pass
+
+            async def invalidate(self):
+                pass
+
+        class PoolExecutor(FakeAsyncExecutor):
+            def __init__(self):
+                super().__init__()
+                self.session = SessionExecutor()
+
+            async def acquire_session(self):
+                return self.session
+
+        transaction = AsyncFlowClient(PoolExecutor()).transaction()
+        with pytest.raises(ValueError, match="primary async body failure") as raised:
+            async with transaction:
+                raise ValueError("primary async body failure")
+
+        assert isinstance(raised.value.__cause__, FerricStoreError)
+        assert "secondary async discard failure" in str(raised.value.__cause__)
+        assert transaction._active_client is None
+        assert not transaction._owns_client
+
+    run(main())
+
+
+def test_async_pubsub_uses_connection_affine_executor_session():
+    async def main():
+        class SessionExecutor(FakeAsyncExecutor):
+            def __init__(self):
+                super().__init__()
+                self.closed = False
+                self.events = [{b"kind": b"message", b"channel": b"jobs", b"message": b"one"}]
+
+            async def wait_event(self, timeout=None):
+                return self.events.pop(0) if self.events else None
+
+            async def close(self):
+                self.closed = True
+
+        class PoolExecutor(FakeAsyncExecutor):
+            def __init__(self):
+                super().__init__()
+                self.session = SessionExecutor()
+
+            async def acquire_session(self):
+                return self.session
+
+        executor = PoolExecutor()
+        client = AsyncFlowClient(executor)
+        pubsub = client.pubsub_session()
+
+        await pubsub.subscribe("jobs")
+        message = await pubsub.get_message(timeout=0)
+        await pubsub.close()
+
+        assert message is not None
+        assert message.channel == "jobs"
+        assert executor.calls == []
+        assert executor.session.calls[0] == ("SUBSCRIBE", "jobs")
+        assert executor.session.closed
 
     run(main())
 
@@ -571,6 +1166,98 @@ def test_async_claim_flows_and_complete_jobs_use_hot_compact_paths():
         )
 
     run(main())
+
+
+def test_async_run_steps_many_matches_sync_wire_shape_and_preserves_zero_now():
+    async def main():
+        executor = FakeAsyncExecutor()
+        executor.responses.append(b"OK")
+        client = AsyncFlowClient(executor)
+
+        result = await client.run_steps_many(
+            ["f1", CreateItem("f2", partition_key="tenant:2")],
+            type="order",
+            states=["reserve", "charge"],
+            worker="worker-1",
+            now_ms=0,
+            partition_key="tenant:1",
+        )
+
+        assert result == b"OK"
+        assert executor.calls[0] == (
+            "FLOW.RUN_STEPS_MANY",
+            "TYPE",
+            "order",
+            "STATES",
+            ["reserve", "charge"],
+            "WORKER",
+            "worker-1",
+            "LEASE_MS",
+            30_000,
+            "NOW",
+            0,
+            "ITEMS",
+            [
+                {"id": "f1", "partition_key": "tenant:1"},
+                {"id": "f2", "partition_key": "tenant:2"},
+            ],
+        )
+
+    run(main())
+
+
+def test_async_step_continue_can_return_compact_claimed_job():
+    async def main():
+        executor = FakeAsyncExecutor()
+        executor.responses.append([b"f1", b"tenant:1", b"lease-2", 8])
+        client = AsyncFlowClient(executor)
+
+        job = await client.step_continue(
+            "f1",
+            lease_token=b"lease-1",
+            from_state="queued",
+            to_state="running",
+            fencing_token=7,
+            partition_key="tenant:1",
+            now_ms=100,
+            return_job=True,
+        )
+
+        assert isinstance(job, ClaimedFlow)
+        assert job.lease_token == b"lease-2"
+        assert executor.calls[0][-2:] == ("RETURN", "JOBS_COMPACT")
+
+    run(main())
+
+
+def test_async_complete_many_and_jobs_support_ok_on_success():
+    async def main():
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
+        jobs = [ClaimedFlow("f1", b"lease", 7, partition_key="tenant:1")]
+
+        await client.complete_many(
+            "tenant:1",
+            jobs,
+            now_ms=100,
+            return_ok_on_success=True,
+        )
+        await client.complete_jobs(jobs, now_ms=101, return_ok_on_success=True)
+
+        assert all("OK_ON_SUCCESS" in call for call in executor.calls)
+
+    run(main())
+
+
+def test_async_flow_api_signatures_match_shared_sync_operations():
+    for name in ("run_steps_many", "step_continue", "complete_many", "complete_jobs"):
+        sync_parameters = list(inspect.signature(getattr(FlowClient, name)).parameters.values())[1:]
+        async_parameters = list(
+            inspect.signature(getattr(AsyncFlowClient, name)).parameters.values()
+        )[1:]
+        assert [
+            (parameter.name, parameter.kind, parameter.default) for parameter in async_parameters
+        ] == [(parameter.name, parameter.kind, parameter.default) for parameter in sync_parameters]
 
 
 def test_async_claim_due_accepts_legacy_job_only_alias():
@@ -801,6 +1488,75 @@ def test_async_enqueue_many_keeps_auto_bucket_grouping():
     run(main())
 
 
+def test_async_enqueue_many_groups_explicit_partitions_and_pins_one_now(monkeypatch):
+    class PartitionExecutor:
+        def __init__(self):
+            self.calls = []
+
+        async def execute_command(self, *args):
+            self.calls.append(args)
+            item_offset = args.index("ITEMS") + 1
+            return [str(item_id).encode() for item_id in args[item_offset::2]]
+
+    async def main():
+        executor = PartitionExecutor()
+        client = AsyncFlowClient(executor)
+        items = [
+            CreateItem("flow-a", b"a", partition_key="tenant:b"),
+            CreateItem("flow-b", b"b", partition_key="tenant:a"),
+            CreateItem("flow-c", b"c", partition_key="tenant:b"),
+            CreateItem("flow-d", b"d"),
+            CreateItem("flow-e", b"e", partition_key=""),
+        ]
+
+        assert await client.enqueue_many(items, type="order") == [
+            item.id.encode() for item in items
+        ]
+        assert all(call[0] == "FLOW.CREATE_MANY" for call in executor.calls)
+        assert all(call[1] != "MIXED" for call in executor.calls)
+        assert {call[1] for call in executor.calls} == {
+            "tenant:a",
+            "tenant:b",
+            "",
+            async_client_module._auto_partition_key_for_id("flow-d"),
+        }
+        assert {call[call.index("NOW") + 1] for call in executor.calls} == {123_456}
+
+    monkeypatch.setattr(async_client_module, "_now_ms", lambda: 123_456)
+    run(main())
+
+
+def test_async_enqueue_many_uses_bounded_concurrent_fanout_for_safe_executors():
+    class ConcurrentExecutor:
+        supports_concurrent_fanout = True
+
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+
+        async def execute_command(self, *args):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                await asyncio.sleep(0.01)
+                item_args = args[args.index("ITEMS") + 1 :]
+                return [id.encode() for id in item_args[0::2]]
+            finally:
+                self.active -= 1
+
+    async def main():
+        executor = ConcurrentExecutor()
+        client = AsyncFlowClient(executor)
+        items = [CreateItem(f"fanout-{idx}", b"payload") for idx in range(64)]
+
+        assert await client.enqueue_many(items, type="order", now_ms=100) == [
+            item.id.encode() for item in items
+        ]
+        assert 1 < executor.max_active <= 16
+
+    run(main())
+
+
 def test_async_enqueue_passes_retention_ttl_ms():
     async def main():
         executor = FakeAsyncExecutor()
@@ -874,6 +1630,38 @@ def test_async_enqueue_stops_after_backpressure_retry_budget():
     run(main())
 
 
+def test_async_backpressure_retry_budget_rejects_wait_that_would_overrun(monkeypatch):
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr("ferricstore.backpressure.asyncio.sleep", fake_sleep)
+
+    async def main():
+        controller = BackpressureController(
+            BackpressurePolicy(
+                max_retries=None,
+                max_elapsed_ms=10,
+                base_delay_ms=0,
+                max_delay_ms=0,
+                jitter=0,
+                shared=False,
+            )
+        )
+
+        allowed = await controller.record_overload_async(
+            0,
+            retry_after_ms=20,
+            elapsed_s=0.009,
+        )
+
+        assert allowed is False
+        assert sleeps == []
+
+    run(main())
+
+
 def test_async_enqueue_many_passes_retention_ttl_ms_to_auto_bucket_batches():
     async def main():
         executor = FakeAsyncExecutor()
@@ -937,6 +1725,40 @@ def test_async_create_many_mixed_allows_auto_partition_items():
             0,
             0,
         )
+
+    run(main())
+
+
+def test_async_extended_many_items_preserve_explicit_empty_partition_keys():
+    async def main():
+        executor = FakeAsyncExecutor()
+        executor.responses = [[b"OK", b"OK"]]
+        client = AsyncFlowClient(executor)
+
+        await client.create_many(
+            None,
+            [
+                CreateItem("f1", b"p1", partition_key="", values={"value": b"one"}),
+                CreateItem("f2", b"p2", partition_key="tenant:2"),
+            ],
+            type="order",
+            now_ms=100,
+        )
+        create_call = executor.calls[-1]
+        create_items = create_call.index("ITEMS_EXT") + 2
+        assert create_call[create_items : create_items + 3] == ("f1", "", b"p1")
+
+        await client.spawn_children(
+            "parent-1",
+            [
+                ChildSpec("c1", "email", b"p1", partition_key="", values={"value": b"one"}),
+                ChildSpec("c2", "audit", b"p2", partition_key="tenant:2"),
+            ],
+            now_ms=100,
+        )
+        spawn_call = executor.calls[-1]
+        spawn_items = spawn_call.index("ITEMS_EXT") + 2
+        assert spawn_call[spawn_items : spawn_items + 4] == ("c1", "", "email", b"p1")
 
     run(main())
 
@@ -1281,6 +2103,34 @@ def test_async_value_mget_normalizes_omission_metadata_recursively():
         assert executor.calls[-1] == ("FLOW.VALUE.MGET", "ref-a", "MAX_BYTES", 10)
 
     run(main())
+
+
+def test_async_value_mget_rejects_partial_responses():
+    async def main():
+        executor = FakeAsyncExecutor()
+        executor.responses = [[]]
+        client = AsyncFlowClient(executor)
+
+        with pytest.raises(FerricStoreError, match="expected 1"):
+            await client.value_mget(["ref-a"])
+
+    run(main())
+
+
+def test_async_flow_client_preserves_falsey_custom_codec():
+    class FalseyCodec:
+        def __bool__(self) -> bool:
+            return False
+
+        def encode(self, value):
+            return str(value).encode()
+
+        def decode(self, value):
+            return value
+
+    codec = FalseyCodec()
+
+    assert AsyncFlowClient(FakeAsyncExecutor(), codec=codec).codec is codec
 
 
 def test_async_query_policy_and_cleanup_commands():

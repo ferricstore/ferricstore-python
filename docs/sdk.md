@@ -683,6 +683,11 @@ def created(job):
     return transition("child_created")
 ```
 
+Async workflow contexts expose the same `flow` helper surface; await each
+command (`await job.flow.create(...)`, `await job.flow.step_continue(...)`, and
+so on). Context defaults for the current flow ID, partition, lease, fencing
+token, workflow type, and initial state are identical in sync and async code.
+
 Workflow state decorators default to ack-only mutation responses. Set
 `return_record=True` only when the handler needs the post-mutation record.
 Use `claim_payload=False` when the handler does not need the current payload. Use
@@ -703,7 +708,7 @@ updates.
 server batch commands when possible.
 
 ```python
-auto = client.autobatch(max_batch=100, max_delay_ms=1.0)
+auto = client.autobatch(max_batch=100, max_delay_ms=1.0, max_pending=10_000)
 
 future = auto.create_async("order-1", type="order", payload=b"payload")
 result = future.result()
@@ -712,6 +717,19 @@ result = future.result()
 Autobatch is useful when app code naturally issues many independent single-flow
 calls but you still want server-side batching. The queue and benchmark helpers use
 more specialized batching for hot paths.
+
+`max_pending` bounds the number of queued operations (the default is `10_000`).
+When the queue reaches that capacity, producer calls wait until the batching thread
+removes work. This applies backpressure instead of allowing memory use and queue
+drain cost to grow without limit.
+
+Independent batch replies are checked item by item. A stale lease, fencing
+failure, overload, or other per-item error completes only that autobatch future
+with an exception; response-cardinality mismatches fail the entire group.
+
+Queue and workflow handlers may return a different completion result for every
+job. Protocol-backed clients pipeline those distinct completions in one
+transport batch instead of issuing one round trip per job.
 
 ## Performance guidelines
 
