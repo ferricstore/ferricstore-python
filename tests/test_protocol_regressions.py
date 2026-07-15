@@ -200,7 +200,12 @@ def test_tls_topology_keeps_distinct_physical_destinations() -> None:
     }
 
 
-def test_shared_protocol_adapter_requires_transaction_session() -> None:
+def test_shared_protocol_adapter_requires_transaction_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This test characterizes session ownership only; it must not depend on a
+    # FerricStore process happening to listen on the default local port.
+    monkeypatch.setattr(ProtocolAdapter, "_ensure_connected", lambda _self: None)
     adapter = ProtocolAdapter(timeout=None, heartbeat_interval=None)
     client = FlowClient(adapter)
     try:
