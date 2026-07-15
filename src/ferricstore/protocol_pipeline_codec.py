@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import struct
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, cast
 
+from ferricstore.command_grammar import (
+    flow_create_many_item_count,
+    parse_stream_read,
+    split_flow_value_mget,
+)
 from ferricstore.protocol_common import (
     _coerce_bool,
     _command_name,
     _command_token,
+    _pending_request_capacity_error,
     _text,
 )
 from ferricstore.protocol_constants import (
@@ -37,9 +43,11 @@ from ferricstore.protocol_constants import (
     _COMPACT_SADD_PIPELINE_MODE,
     _COMPACT_SISMEMBER_PIPELINE_MODE,
     _COMPACT_SMEMBERS_PIPELINE_MODE,
+    _COMPACT_SREM_PIPELINE_MODE,
     _COMPACT_U32,
     _COMPACT_ZADD_PIPELINE_MODE,
     _COMPACT_ZRANGE_PIPELINE_MODE,
+    _COMPACT_ZREM_PIPELINE_MODE,
     _COMPACT_ZSCORE_PIPELINE_MODE,
     _CONTROL_OPCODES,
     _NULL_U32,
@@ -60,9 +68,24 @@ from ferricstore.protocol_constants import (
 from ferricstore.protocol_flow_codec import (
     _compact_binary,
     _compact_bool_marker,
+    _compact_i64,
     _compact_optional_binary,
     _maybe_bytes,
     _optional_bytes,
+)
+from ferricstore.protocol_pipeline_mutations import (
+    _compact_pipeline_hmget_payload_from_raw,
+    _compact_pipeline_hset_payload_from_raw,
+    _compact_pipeline_range_payload_from_raw,
+    _compact_pipeline_zadd_payload_from_raw,
+)
+from ferricstore.protocol_pipeline_raw import (
+    _compact_kv_keys_payload,
+    _compact_kv_set_keys_value_payload,
+    _compact_kv_set_pairs_payload,
+    _compact_pipeline_keys_payload_from_raw,
+    _compact_pipeline_set_payload_from_raw,
+    _compact_pipeline_two_binary_payload_from_raw,
 )
 
 
@@ -97,10 +120,8 @@ def _blocks_forever(args: Sequence[Any]) -> bool:
     elif name == "BLMPOP" and values:
         candidate = values[0]
     elif name in {"XREAD", "XREADGROUP"}:
-        for index, value in enumerate(values[:-1]):
-            if _command_name(value) == "BLOCK":
-                candidate = values[index + 1]
-                break
+        parsed = parse_stream_read(values, read_group=name == "XREADGROUP")
+        candidate = parsed.block if parsed.valid else None
     try:
         return candidate is not None and float(candidate) == 0.0
     except (TypeError, ValueError):
@@ -110,13 +131,6 @@ def _blocks_forever(args: Sequence[Any]) -> bool:
 def _expected_command_collection_items(args: Sequence[Any]) -> int | None:
     """Return an exact list cardinality only when command grammar makes it certain."""
 
-    def token_is(value: Any, token: str) -> bool:
-        if isinstance(value, str):
-            return value.upper() == token
-        if isinstance(value, bytes):
-            return value.upper() == token.encode()
-        return False
-
     if not args:
         return None
     name = _command_name(args[0])
@@ -125,31 +139,11 @@ def _expected_command_collection_items(args: Sequence[Any]) -> int | None:
     if name in {"SET", "MSET"}:
         return 1
     if name == "FLOW.VALUE.MGET":
-        values = args[1:]
-        for index, value in enumerate(values):
-            if token_is(value, "MAX_BYTES") or token_is(value, "MAXBYTES"):
-                return index
-        return len(values)
+        refs, _max_bytes = split_flow_value_mget(args[1:])
+        return len(refs)
     if name != "FLOW.CREATE_MANY":
         return None
-
-    for marker in ("ITEMS_EXT", "ITEMS"):
-        try:
-            marker_index = next(
-                index for index, value in enumerate(args) if token_is(value, marker)
-            )
-        except StopIteration:
-            continue
-        if marker == "ITEMS_EXT":
-            if marker_index + 1 < len(args):
-                count = args[marker_index + 1]
-                if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
-                    return count
-            return None
-        width = 3 if len(args) > 1 and token_is(args[1], "MIXED") else 2
-        item_values = len(args) - marker_index - 1
-        return item_values // width if item_values % width == 0 else None
-    return None
+    return flow_create_many_item_count(args[1:])
 
 
 def _expected_payload_collection_items(
@@ -163,6 +157,7 @@ def _expected_payload_collection_items(
         if opcode in {
             _OP_FLOW_CREATE_MANY,
             _OP_FLOW_COMPLETE_MANY,
+            _OP_FLOW_TRANSITION_MANY,
             _OP_FLOW_RETRY_MANY,
             _OP_FLOW_FAIL_MANY,
             _OP_FLOW_CANCEL_MANY,
@@ -238,181 +233,204 @@ def _expected_payload_collection_items(
     return None
 
 
+_PipelineItemEncoder = Callable[[dict[str, Any], bytes], tuple[bytes, ...] | None]
+
+
+def _compact_key_only_pipeline_item(
+    payload: dict[str, Any], key: bytes
+) -> tuple[bytes, ...] | None:
+    if set(payload) != {"key"}:
+        return None
+    return (_compact_binary(key),)
+
+
+def _compact_set_pipeline_item(payload: dict[str, Any], key: bytes) -> tuple[bytes, ...] | None:
+    if set(payload) != {"key", "value"}:
+        return None
+    value = _maybe_bytes(payload.get("value"))
+    if value is None:
+        return None
+    return _compact_binary(key), _compact_binary(value)
+
+
+def _compact_hget_pipeline_item(payload: dict[str, Any], key: bytes) -> tuple[bytes, ...] | None:
+    if set(payload) != {"key", "field"}:
+        return None
+    field = _maybe_bytes(payload.get("field"))
+    if field is None:
+        return None
+    return _compact_binary(key), _compact_binary(field)
+
+
+def _compact_hmget_pipeline_item(payload: dict[str, Any], key: bytes) -> tuple[bytes, ...] | None:
+    if set(payload) != {"key", "fields"}:
+        return None
+    fields = payload.get("fields")
+    if not isinstance(fields, list) or not fields:
+        return None
+    encoded_fields = [_maybe_bytes(field) for field in fields]
+    if any(field is None for field in encoded_fields):
+        return None
+    return (
+        _compact_binary(key),
+        _COMPACT_U32.pack(len(encoded_fields)),
+        *(_compact_binary(field) for field in encoded_fields if field is not None),
+    )
+
+
+def _compact_member_pipeline_item(payload: dict[str, Any], key: bytes) -> tuple[bytes, ...] | None:
+    if set(payload) != {"key", "member"}:
+        return None
+    member = _maybe_bytes(payload.get("member"))
+    if member is None:
+        return None
+    return _compact_binary(key), _compact_binary(member)
+
+
+def _compact_lrange_pipeline_item(payload: dict[str, Any], key: bytes) -> tuple[bytes, ...] | None:
+    if set(payload) != {"key", "start", "stop"}:
+        return None
+    start = payload.get("start")
+    stop = payload.get("stop")
+    start = _compact_i64(start)
+    stop = _compact_i64(stop)
+    if start is None or stop is None:
+        return None
+    return _compact_binary(key), _COMPACT_I64.pack(start), _COMPACT_I64.pack(stop)
+
+
+def _compact_zrange_pipeline_item(payload: dict[str, Any], key: bytes) -> tuple[bytes, ...] | None:
+    if not set(payload).issubset({"key", "start", "stop", "withscores"}):
+        return None
+    start = payload.get("start")
+    stop = payload.get("stop")
+    start = _compact_i64(start)
+    stop = _compact_i64(stop)
+    if start is None or stop is None:
+        return None
+    return (
+        _compact_binary(key),
+        _COMPACT_I64.pack(start),
+        _COMPACT_I64.pack(stop),
+        b"\x01" if bool(payload.get("withscores", False)) else b"\x00",
+    )
+
+
+def _compact_hset_pipeline_item(payload: dict[str, Any], key: bytes) -> tuple[bytes, ...] | None:
+    if set(payload) != {"key", "fields"}:
+        return None
+    fields = payload.get("fields")
+    if not isinstance(fields, dict) or len(fields) != 1:
+        return None
+    field_arg, value_arg = next(iter(fields.items()))
+    field = _maybe_bytes(field_arg)
+    value = _maybe_bytes(value_arg)
+    if field is None or value is None:
+        return None
+    return _compact_binary(key), _compact_binary(field), _compact_binary(value)
+
+
+def _single_binary_list_pipeline_encoder(field_name: str) -> _PipelineItemEncoder:
+    def encode(payload: dict[str, Any], key: bytes) -> tuple[bytes, ...] | None:
+        if set(payload) != {"key", field_name}:
+            return None
+        values = payload.get(field_name)
+        if not isinstance(values, list) or len(values) != 1:
+            return None
+        value = _maybe_bytes(values[0])
+        if value is None:
+            return None
+        return _compact_binary(key), _compact_binary(value)
+
+    return encode
+
+
+def _compact_zadd_pipeline_item(payload: dict[str, Any], key: bytes) -> tuple[bytes, ...] | None:
+    if set(payload) != {"key", "items"}:
+        return None
+    items = payload.get("items")
+    if not isinstance(items, list) or len(items) != 1:
+        return None
+    item = items[0]
+    if not isinstance(item, list) or len(item) != 2:
+        return None
+    score_arg, member_arg = item
+    member = _maybe_bytes(member_arg)
+    if member is None:
+        return None
+    try:
+        score = float(score_arg)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return _compact_binary(key), _COMPACT_F64.pack(score), _compact_binary(member)
+
+
+_COMPACT_PIPELINE_MODES = {
+    _OPCODES["SET"]: 1,
+    _OPCODES["GET"]: 2,
+    _OPCODES["HGET"]: _COMPACT_HGET_PIPELINE_MODE,
+    _OPCODES["HMGET"]: _COMPACT_HMGET_PIPELINE_MODE,
+    _OPCODES["HGETALL"]: _COMPACT_HGETALL_PIPELINE_MODE,
+    _OPCODES["SMEMBERS"]: _COMPACT_SMEMBERS_PIPELINE_MODE,
+    _OPCODES["SISMEMBER"]: _COMPACT_SISMEMBER_PIPELINE_MODE,
+    _OPCODES["LRANGE"]: _COMPACT_LRANGE_PIPELINE_MODE,
+    _OPCODES["ZRANGE"]: _COMPACT_ZRANGE_PIPELINE_MODE,
+    _OPCODES["ZSCORE"]: _COMPACT_ZSCORE_PIPELINE_MODE,
+    _OPCODES["HSET"]: _COMPACT_HSET_PIPELINE_MODE,
+    _OPCODES["LPUSH"]: _COMPACT_LPUSH_PIPELINE_MODE,
+    _OPCODES["RPUSH"]: _COMPACT_RPUSH_PIPELINE_MODE,
+    _OPCODES["SADD"]: _COMPACT_SADD_PIPELINE_MODE,
+    _OPCODES["SREM"]: _COMPACT_SREM_PIPELINE_MODE,
+    _OPCODES["ZADD"]: _COMPACT_ZADD_PIPELINE_MODE,
+    _OPCODES["ZREM"]: _COMPACT_ZREM_PIPELINE_MODE,
+}
+
+_COMPACT_PIPELINE_ITEM_ENCODERS: dict[int, _PipelineItemEncoder] = {
+    _OPCODES["SET"]: _compact_set_pipeline_item,
+    _OPCODES["GET"]: _compact_key_only_pipeline_item,
+    _OPCODES["HGET"]: _compact_hget_pipeline_item,
+    _OPCODES["HMGET"]: _compact_hmget_pipeline_item,
+    _OPCODES["HGETALL"]: _compact_key_only_pipeline_item,
+    _OPCODES["SMEMBERS"]: _compact_key_only_pipeline_item,
+    _OPCODES["SISMEMBER"]: _compact_member_pipeline_item,
+    _OPCODES["LRANGE"]: _compact_lrange_pipeline_item,
+    _OPCODES["ZRANGE"]: _compact_zrange_pipeline_item,
+    _OPCODES["ZSCORE"]: _compact_member_pipeline_item,
+    _OPCODES["HSET"]: _compact_hset_pipeline_item,
+    _OPCODES["LPUSH"]: _single_binary_list_pipeline_encoder("values"),
+    _OPCODES["RPUSH"]: _single_binary_list_pipeline_encoder("values"),
+    _OPCODES["SADD"]: _single_binary_list_pipeline_encoder("members"),
+    _OPCODES["SREM"]: _single_binary_list_pipeline_encoder("members"),
+    _OPCODES["ZADD"]: _compact_zadd_pipeline_item,
+    _OPCODES["ZREM"]: _single_binary_list_pipeline_encoder("members"),
+}
+
+
 def _compact_pipeline_payload(
     commands: list[ProtocolCommand], *, values_only: bool = False
 ) -> bytes | None:
     if not commands:
         return None
-
     opcode = commands[0].opcode
     if opcode == _OPCODES["FLOW.GET"]:
         return _compact_flow_get_pipeline_payload(commands, values_only=values_only)
 
-    if opcode == _OPCODES["SET"]:
-        mode = 1
-    elif opcode == _OPCODES["GET"]:
-        mode = 2
-    elif opcode == _OPCODES["HGET"]:
-        mode = _COMPACT_HGET_PIPELINE_MODE
-    elif opcode == _OPCODES["HMGET"]:
-        mode = _COMPACT_HMGET_PIPELINE_MODE
-    elif opcode == _OPCODES["HGETALL"]:
-        mode = _COMPACT_HGETALL_PIPELINE_MODE
-    elif opcode == _OPCODES["SMEMBERS"]:
-        mode = _COMPACT_SMEMBERS_PIPELINE_MODE
-    elif opcode == _OPCODES["SISMEMBER"]:
-        mode = _COMPACT_SISMEMBER_PIPELINE_MODE
-    elif opcode == _OPCODES["LRANGE"]:
-        mode = _COMPACT_LRANGE_PIPELINE_MODE
-    elif opcode == _OPCODES["ZRANGE"]:
-        mode = _COMPACT_ZRANGE_PIPELINE_MODE
-    elif opcode == _OPCODES["ZSCORE"]:
-        mode = _COMPACT_ZSCORE_PIPELINE_MODE
-    elif opcode == _OPCODES["HSET"]:
-        mode = _COMPACT_HSET_PIPELINE_MODE
-    elif opcode == _OPCODES["LPUSH"]:
-        mode = _COMPACT_LPUSH_PIPELINE_MODE
-    elif opcode == _OPCODES["RPUSH"]:
-        mode = _COMPACT_RPUSH_PIPELINE_MODE
-    elif opcode == _OPCODES["SADD"]:
-        mode = _COMPACT_SADD_PIPELINE_MODE
-    elif opcode == _OPCODES["ZADD"]:
-        mode = _COMPACT_ZADD_PIPELINE_MODE
-    else:
+    mode = _COMPACT_PIPELINE_MODES.get(opcode)
+    encoder = _COMPACT_PIPELINE_ITEM_ENCODERS.get(opcode)
+    if mode is None or encoder is None:
         return None
     if values_only:
         mode |= 0x80
 
-    parts: list[bytes] = [struct.pack(">BBI", _COMPACT_PIPELINE_REQUEST, mode, len(commands))]
-
+    parts = [struct.pack(">BBI", _COMPACT_PIPELINE_REQUEST, mode, len(commands))]
     for command in commands:
         if command.opcode != opcode or command.flags != 0 or not isinstance(command.payload, dict):
             return None
         key = _maybe_bytes(command.payload.get("key"))
-        if key is None:
+        encoded_item = encoder(command.payload, key) if key is not None else None
+        if encoded_item is None:
             return None
-        if opcode == _OPCODES["SET"]:
-            if set(command.payload) != {"key", "value"}:
-                return None
-            value = _maybe_bytes(command.payload.get("value"))
-            if value is None:
-                return None
-            parts.append(_compact_binary(key))
-            parts.append(_compact_binary(value))
-        elif opcode == _OPCODES["GET"] or opcode == _OPCODES["SMEMBERS"]:
-            if set(command.payload) != {"key"}:
-                return None
-            parts.append(_compact_binary(key))
-        elif opcode == _OPCODES["HGET"]:
-            if set(command.payload) != {"key", "field"}:
-                return None
-            field = _maybe_bytes(command.payload.get("field"))
-            if field is None:
-                return None
-            parts.append(_compact_binary(key))
-            parts.append(_compact_binary(field))
-        elif opcode == _OPCODES["HMGET"]:
-            if set(command.payload) != {"key", "fields"}:
-                return None
-            fields = command.payload.get("fields")
-            if not isinstance(fields, list) or not fields:
-                return None
-            encoded_fields = [_maybe_bytes(field) for field in fields]
-            if any(field is None for field in encoded_fields):
-                return None
-            parts.append(_compact_binary(key))
-            parts.append(_COMPACT_U32.pack(len(encoded_fields)))
-            parts.extend(_compact_binary(field) for field in encoded_fields if field is not None)
-        elif opcode == _OPCODES["HGETALL"]:
-            if set(command.payload) != {"key"}:
-                return None
-            parts.append(_compact_binary(key))
-        elif opcode == _OPCODES["SISMEMBER"] or opcode == _OPCODES["ZSCORE"]:
-            if set(command.payload) != {"key", "member"}:
-                return None
-            member = _maybe_bytes(command.payload.get("member"))
-            if member is None:
-                return None
-            parts.append(_compact_binary(key))
-            parts.append(_compact_binary(member))
-        elif opcode == _OPCODES["LRANGE"]:
-            if set(command.payload) != {"key", "start", "stop"}:
-                return None
-            start = command.payload.get("start")
-            stop = command.payload.get("stop")
-            if not isinstance(start, int) or not isinstance(stop, int):
-                return None
-            parts.append(_compact_binary(key))
-            parts.append(_COMPACT_I64.pack(start))
-            parts.append(_COMPACT_I64.pack(stop))
-        elif opcode == _OPCODES["ZRANGE"]:
-            payload_keys = set(command.payload)
-            if not payload_keys.issubset({"key", "start", "stop", "withscores"}):
-                return None
-            start = command.payload.get("start")
-            stop = command.payload.get("stop")
-            with_scores = bool(command.payload.get("withscores", False))
-            if not isinstance(start, int) or not isinstance(stop, int):
-                return None
-            parts.append(_compact_binary(key))
-            parts.append(_COMPACT_I64.pack(start))
-            parts.append(_COMPACT_I64.pack(stop))
-            parts.append(b"\x01" if with_scores else b"\x00")
-        elif opcode == _OPCODES["HSET"]:
-            if set(command.payload) != {"key", "fields"}:
-                return None
-            fields = command.payload.get("fields")
-            if not isinstance(fields, dict) or len(fields) != 1:
-                return None
-            field_arg, value_arg = next(iter(fields.items()))
-            field = _maybe_bytes(field_arg)
-            value = _maybe_bytes(value_arg)
-            if field is None or value is None:
-                return None
-            parts.append(_compact_binary(key))
-            parts.append(_compact_binary(field))
-            parts.append(_compact_binary(value))
-        elif opcode in {_OPCODES["LPUSH"], _OPCODES["RPUSH"]}:
-            if set(command.payload) != {"key", "values"}:
-                return None
-            values = command.payload.get("values")
-            if not isinstance(values, list) or len(values) != 1:
-                return None
-            value = _maybe_bytes(values[0])
-            if value is None:
-                return None
-            parts.append(_compact_binary(key))
-            parts.append(_compact_binary(value))
-        elif opcode == _OPCODES["SADD"]:
-            if set(command.payload) != {"key", "members"}:
-                return None
-            members = command.payload.get("members")
-            if not isinstance(members, list) or len(members) != 1:
-                return None
-            member = _maybe_bytes(members[0])
-            if member is None:
-                return None
-            parts.append(_compact_binary(key))
-            parts.append(_compact_binary(member))
-        elif opcode == _OPCODES["ZADD"]:
-            if set(command.payload) != {"key", "items"}:
-                return None
-            items = command.payload.get("items")
-            if not isinstance(items, list) or len(items) != 1:
-                return None
-            item = items[0]
-            if not isinstance(item, list) or len(item) != 2:
-                return None
-            score_arg, member_arg = item
-            member = _maybe_bytes(member_arg)
-            if member is None:
-                return None
-            parts.append(_compact_binary(key))
-            parts.append(_COMPACT_F64.pack(float(score_arg)))
-            parts.append(_compact_binary(member))
-        else:
-            return None
-
+        parts.extend(encoded_item)
     return b"".join(parts)
 
 
@@ -471,12 +489,102 @@ def _compact_flow_get_pipeline_payload(
     return b"".join(parts)
 
 
+def _binary_wire_size(value: Any) -> int | None:
+    """Return compact length-prefix plus UTF-8 bytes without allocating the encoding."""
+    if isinstance(value, bytes):
+        return 4 + len(value)
+    if not isinstance(value, str):
+        return None
+    if value.isascii():
+        return 4 + len(value)
+    size = 4
+    for character in value:
+        codepoint = ord(character)
+        if codepoint <= 0x7F:
+            size += 1
+        elif codepoint <= 0x7FF:
+            size += 2
+        elif 0xD800 <= codepoint <= 0xDFFF:
+            return None
+        elif codepoint <= 0xFFFF:
+            size += 3
+        else:
+            size += 4
+    return size
+
+
+class _CompactPayloadBudget:
+    """Track exact compact wire bytes before each corresponding allocation."""
+
+    __slots__ = ("_max_payload_bytes", "_pending_limit", "size")
+
+    def __init__(
+        self,
+        max_payload_bytes: int | None,
+        pending_limit: int | None,
+        *,
+        initial_size: int = 0,
+    ) -> None:
+        self._max_payload_bytes = max_payload_bytes
+        self._pending_limit = pending_limit
+        self.size = 0
+        self.reserve(initial_size)
+
+    def reserve(self, size: int) -> None:
+        if self._max_payload_bytes is not None and size > self._max_payload_bytes - self.size:
+            raise _pending_request_capacity_error(self._pending_limit)
+        self.size += size
+
+
+def _bounded_maybe_bytes(
+    value: Any,
+    max_payload_bytes: int | None,
+    pending_limit: int | None,
+    *,
+    budget: _CompactPayloadBudget | None = None,
+) -> bytes | None:
+    wire_size = _binary_wire_size(value)
+    if wire_size is not None:
+        if budget is not None:
+            budget.reserve(wire_size)
+        elif max_payload_bytes is not None and wire_size > max_payload_bytes:
+            raise _pending_request_capacity_error(pending_limit)
+    return _maybe_bytes(value)
+
+
+def _bounded_optional_bytes(
+    value: Any,
+    max_payload_bytes: int | None,
+    pending_limit: int | None,
+    *,
+    budget: _CompactPayloadBudget | None = None,
+) -> bytes | None | bool:
+    if value is None:
+        return None
+    encoded = _bounded_maybe_bytes(
+        value,
+        max_payload_bytes,
+        pending_limit,
+        budget=budget,
+    )
+    return encoded if encoded is not None else False
+
+
 def _compact_flow_get_pipeline_payload_from_raw(
-    commands: list[tuple[Any, ...]], *, values_only: bool = False
+    commands: list[tuple[Any, ...]],
+    *,
+    values_only: bool = False,
+    max_payload_bytes: int | None = None,
+    pending_limit: int | None = None,
 ) -> bytes | None:
     items: list[tuple[bytes, bytes | None]] = []
     has_partition = False
     return_mode: str | None = None
+    budget = _CompactPayloadBudget(
+        max_payload_bytes,
+        pending_limit,
+        initial_size=_COMPACT_PIPELINE_HEADER.size,
+    )
 
     for command in commands:
         if len(command) < 2:
@@ -489,11 +597,16 @@ def _compact_flow_get_pipeline_payload_from_raw(
         if command_name != "FLOW.GET":
             return None
 
-        flow_id = _maybe_bytes(command[1])
+        flow_id = _bounded_maybe_bytes(
+            command[1],
+            max_payload_bytes,
+            pending_limit,
+            budget=budget,
+        )
         if flow_id is None:
             return None
 
-        partition_key = None
+        partition_arg: Any = None
         option_index = 2
         while option_index < len(command):
             if option_index + 1 >= len(command):
@@ -503,11 +616,7 @@ def _compact_flow_get_pipeline_payload_from_raw(
             value = command[option_index + 1]
 
             if option in {"PARTITION", "PARTITION_KEY"}:
-                partition_value = _optional_bytes(value)
-                if partition_value is False:
-                    return None
-                partition_key = cast(bytes | None, partition_value)
-                has_partition = has_partition or partition_key is not None
+                partition_arg = value
             elif option == "RETURN":
                 normalized_return = _text(value).lower()
                 if normalized_return != "meta":
@@ -521,11 +630,24 @@ def _compact_flow_get_pipeline_payload_from_raw(
 
             option_index += 2
 
+        partition_value = _bounded_optional_bytes(
+            partition_arg,
+            max_payload_bytes,
+            pending_limit,
+            budget=budget,
+        )
+        if partition_value is False:
+            return None
+        partition_key = cast(bytes | None, partition_value)
+        has_partition = has_partition or partition_key is not None
         items.append((flow_id, partition_key))
 
     mode = 17 if return_mode == "meta" else 16 if has_partition else 9
     if values_only:
         mode |= 0x80
+
+    if has_partition or return_mode == "meta":
+        budget.reserve(4 * sum(partition_key is None for _flow_id, partition_key in items))
 
     parts: list[bytes] = [struct.pack(">BBI", _COMPACT_PIPELINE_REQUEST, mode, len(items))]
     for flow_id, partition_key in items:
@@ -537,12 +659,21 @@ def _compact_flow_get_pipeline_payload_from_raw(
 
 
 def _compact_flow_history_pipeline_payload_from_raw(
-    commands: list[tuple[Any, ...]], *, values_only: bool
+    commands: list[tuple[Any, ...]],
+    *,
+    values_only: bool,
+    max_payload_bytes: int | None = None,
+    pending_limit: int | None = None,
 ) -> bytes | None:
     history_count: int | None = None
     include_cold: bool | None = None
     consistent_projection: bool | None = None
     items: list[tuple[bytes, bytes | None]] = []
+    budget = _CompactPayloadBudget(
+        max_payload_bytes,
+        pending_limit,
+        initial_size=_COMPACT_PIPELINE_HEADER.size + 10,
+    )
 
     for command in commands:
         if len(command) < 2:
@@ -555,11 +686,16 @@ def _compact_flow_history_pipeline_payload_from_raw(
         if command_name != "FLOW.HISTORY":
             return None
 
-        flow_id = _maybe_bytes(command[1])
+        flow_id = _bounded_maybe_bytes(
+            command[1],
+            max_payload_bytes,
+            pending_limit,
+            budget=budget,
+        )
         if flow_id is None:
             return None
 
-        partition_key = None
+        partition_arg: Any = None
         item_count = 100
         item_include_cold = False
         item_consistent_projection = True
@@ -573,13 +709,15 @@ def _compact_flow_history_pipeline_payload_from_raw(
 
             if option == "COUNT":
                 try:
-                    item_count = int(value)
-                except (TypeError, ValueError):
+                    parsed_count = int(value)
+                except (OverflowError, TypeError, ValueError):
                     return None
+                compact_count = _compact_i64(parsed_count)
+                if compact_count is None:
+                    return None
+                item_count = compact_count
             elif option in {"PARTITION", "PARTITION_KEY"}:
-                partition_key = _optional_bytes(value)
-                if partition_key is False:
-                    return None
+                partition_arg = value
             elif option == "INCLUDE_COLD":
                 item_include_cold = _coerce_bool(value)
             elif option == "CONSISTENT_PROJECTION":
@@ -588,6 +726,18 @@ def _compact_flow_history_pipeline_payload_from_raw(
                 return None
 
             option_index += 2
+
+        partition_value = _bounded_optional_bytes(
+            partition_arg,
+            max_payload_bytes,
+            pending_limit,
+            budget=budget,
+        )
+        if partition_value is False:
+            return None
+        partition_key = cast(bytes | None, partition_value)
+        if partition_key is None:
+            budget.reserve(4)
 
         if history_count is None:
             history_count = item_count
@@ -600,7 +750,7 @@ def _compact_flow_history_pipeline_payload_from_raw(
         ):
             return None
 
-        items.append((flow_id, cast(bytes | None, partition_key)))
+        items.append((flow_id, partition_key))
 
     if history_count is None or include_cold is None or consistent_projection is None:
         return None
@@ -662,307 +812,9 @@ def _compact_mixed_pipeline_payload_from_raw(commands: list[tuple[Any, ...]]) ->
     return b"".join(parts)
 
 
-def _compact_kv_set_pairs_payload(args: tuple[Any, ...], mode: int = 1) -> bytes | None:
-    if len(args) == 0 or len(args) % 2 != 0:
-        return None
-    parts = [_COMPACT_PIPELINE_HEADER.pack(_COMPACT_PIPELINE_REQUEST, mode, len(args) // 2)]
-    pack_u32 = _COMPACT_U32.pack
-    append = parts.append
-    for idx in range(0, len(args), 2):
-        key_arg = args[idx]
-        value_arg = args[idx + 1]
-        if isinstance(key_arg, bytes):
-            key = key_arg
-        elif isinstance(key_arg, str):
-            key = key_arg.encode()
-        else:
-            return None
-        if isinstance(value_arg, bytes):
-            value = value_arg
-        elif isinstance(value_arg, str):
-            value = value_arg.encode()
-        else:
-            return None
-        append(pack_u32(len(key)))
-        append(key)
-        append(pack_u32(len(value)))
-        append(value)
-    return b"".join(parts)
-
-
-def _compact_kv_keys_payload(args: Sequence[Any], mode: int) -> bytes | None:
-    if not args:
-        return None
-    parts = [_COMPACT_PIPELINE_HEADER.pack(_COMPACT_PIPELINE_REQUEST, mode, len(args))]
-    pack_u32 = _COMPACT_U32.pack
-    append = parts.append
-    for arg in args:
-        if isinstance(arg, bytes):
-            key = arg
-        elif isinstance(arg, str):
-            key = arg.encode()
-        else:
-            return None
-        append(pack_u32(len(key)))
-        append(key)
-    return b"".join(parts)
-
-
-def _compact_kv_set_keys_value_payload(
-    keys: Sequence[Any], value_arg: Any, mode: int = 1
-) -> bytes | None:
-    if not keys:
-        return None
-    if isinstance(value_arg, bytes):
-        value = value_arg
-    elif isinstance(value_arg, str):
-        value = value_arg.encode()
-    else:
-        return None
-
-    payload = bytearray(_COMPACT_PIPELINE_HEADER.pack(_COMPACT_PIPELINE_REQUEST, mode, len(keys)))
-    pack_u32 = _COMPACT_U32.pack
-    extend = payload.extend
-    value_len = pack_u32(len(value))
-    for key_arg in keys:
-        if isinstance(key_arg, bytes):
-            key = key_arg
-        elif isinstance(key_arg, str):
-            key = key_arg.encode()
-        else:
-            return None
-        extend(pack_u32(len(key)))
-        extend(key)
-        extend(value_len)
-        extend(value)
-    return bytes(payload)
-
-
-def _compact_pipeline_set_payload_from_raw(
-    commands: list[tuple[Any, ...]], mode: int
-) -> bytes | None:
-    payload = bytearray(
-        _COMPACT_PIPELINE_HEADER.pack(_COMPACT_PIPELINE_REQUEST, mode, len(commands))
-    )
-    pack_u32 = _COMPACT_U32.pack
-    extend = payload.extend
-    for command in commands:
-        if len(command) != 3:
-            return None
-        raw_name = command[0]
-        if raw_name != "SET" and _command_name(raw_name) != "SET":
-            return None
-        key_arg = command[1]
-        if isinstance(key_arg, bytes):
-            key = key_arg
-        elif isinstance(key_arg, str):
-            key = key_arg.encode()
-        else:
-            return None
-        value_arg = command[2]
-        if isinstance(value_arg, bytes):
-            value = value_arg
-        elif isinstance(value_arg, str):
-            value = value_arg.encode()
-        else:
-            return None
-        extend(pack_u32(len(key)))
-        extend(key)
-        extend(pack_u32(len(value)))
-        extend(value)
-    return bytes(payload)
-
-
-def _compact_pipeline_keys_payload_from_raw(
-    commands: list[tuple[Any, ...]], name: str, mode: int
-) -> bytes | None:
-    payload = bytearray(
-        _COMPACT_PIPELINE_HEADER.pack(_COMPACT_PIPELINE_REQUEST, mode, len(commands))
-    )
-    pack_u32 = _COMPACT_U32.pack
-    extend = payload.extend
-    for command in commands:
-        if len(command) != 2:
-            return None
-        raw_name = command[0]
-        if raw_name != name and _command_name(raw_name) != name:
-            return None
-        key_arg = command[1]
-        if isinstance(key_arg, bytes):
-            key = key_arg
-        elif isinstance(key_arg, str):
-            key = key_arg.encode()
-        else:
-            return None
-        extend(pack_u32(len(key)))
-        extend(key)
-    return bytes(payload)
-
-
-def _compact_pipeline_two_binary_payload_from_raw(
-    commands: list[tuple[Any, ...]], name: str, mode: int
-) -> bytes | None:
-    payload = bytearray(
-        _COMPACT_PIPELINE_HEADER.pack(_COMPACT_PIPELINE_REQUEST, mode, len(commands))
-    )
-    pack_u32 = _COMPACT_U32.pack
-    extend = payload.extend
-    for command in commands:
-        if len(command) != 3:
-            return None
-        raw_name = command[0]
-        if raw_name != name and _command_name(raw_name) != name:
-            return None
-        key = _maybe_bytes(command[1])
-        item = _maybe_bytes(command[2])
-        if key is None or item is None:
-            return None
-        extend(pack_u32(len(key)))
-        extend(key)
-        extend(pack_u32(len(item)))
-        extend(item)
-    return bytes(payload)
-
-
-def _compact_pipeline_range_payload_from_raw(
-    commands: list[tuple[Any, ...]], name: str, mode: int
-) -> bytes | None:
-    payload = bytearray(
-        _COMPACT_PIPELINE_HEADER.pack(_COMPACT_PIPELINE_REQUEST, mode, len(commands))
-    )
-    pack_u32 = _COMPACT_U32.pack
-    pack_i64 = _COMPACT_I64.pack
-    extend = payload.extend
-    for command in commands:
-        if not command:
-            return None
-        try:
-            command_name = _command_name(command[0])
-        except Exception:
-            return None
-        if command_name != name:
-            return None
-        if name == "LRANGE":
-            if len(command) != 4:
-                return None
-            with_scores = False
-        else:
-            if len(command) not in {4, 5}:
-                return None
-            with_scores = False
-            if len(command) == 5:
-                option = _command_name(command[4])
-                if option != "WITHSCORES":
-                    return None
-                with_scores = True
-        key = _maybe_bytes(command[1])
-        if key is None:
-            return None
-        try:
-            start = int(command[2])
-            stop = int(command[3])
-        except (TypeError, ValueError):
-            return None
-        extend(pack_u32(len(key)))
-        extend(key)
-        extend(pack_i64(start))
-        extend(pack_i64(stop))
-        if name == "ZRANGE":
-            extend(b"\x01" if with_scores else b"\x00")
-    return bytes(payload)
-
-
-def _compact_pipeline_hset_payload_from_raw(
-    commands: list[tuple[Any, ...]], mode: int
-) -> bytes | None:
-    payload = bytearray(
-        _COMPACT_PIPELINE_HEADER.pack(_COMPACT_PIPELINE_REQUEST, mode, len(commands))
-    )
-    pack_u32 = _COMPACT_U32.pack
-    extend = payload.extend
-    for command in commands:
-        if len(command) != 4:
-            return None
-        raw_name = command[0]
-        if raw_name != "HSET" and _command_name(raw_name) != "HSET":
-            return None
-        key = _maybe_bytes(command[1])
-        field = _maybe_bytes(command[2])
-        value = _maybe_bytes(command[3])
-        if key is None or field is None or value is None:
-            return None
-        extend(pack_u32(len(key)))
-        extend(key)
-        extend(pack_u32(len(field)))
-        extend(field)
-        extend(pack_u32(len(value)))
-        extend(value)
-    return bytes(payload)
-
-
-def _compact_pipeline_hmget_payload_from_raw(
-    commands: list[tuple[Any, ...]], mode: int
-) -> bytes | None:
-    payload = bytearray(
-        _COMPACT_PIPELINE_HEADER.pack(_COMPACT_PIPELINE_REQUEST, mode, len(commands))
-    )
-    pack_u32 = _COMPACT_U32.pack
-    extend = payload.extend
-    for command in commands:
-        if len(command) < 3:
-            return None
-        raw_name = command[0]
-        if raw_name != "HMGET" and _command_name(raw_name) != "HMGET":
-            return None
-        key = _maybe_bytes(command[1])
-        if key is None:
-            return None
-        fields = [_maybe_bytes(field) for field in command[2:]]
-        if any(field is None for field in fields):
-            return None
-        extend(pack_u32(len(key)))
-        extend(key)
-        extend(pack_u32(len(fields)))
-        for field in fields:
-            if field is None:
-                return None
-            extend(pack_u32(len(field)))
-            extend(field)
-    return bytes(payload)
-
-
-def _compact_pipeline_zadd_payload_from_raw(
-    commands: list[tuple[Any, ...]], mode: int
-) -> bytes | None:
-    payload = bytearray(
-        _COMPACT_PIPELINE_HEADER.pack(_COMPACT_PIPELINE_REQUEST, mode, len(commands))
-    )
-    pack_u32 = _COMPACT_U32.pack
-    pack_f64 = _COMPACT_F64.pack
-    extend = payload.extend
-    for command in commands:
-        if len(command) != 4:
-            return None
-        raw_name = command[0]
-        if raw_name != "ZADD" and _command_name(raw_name) != "ZADD":
-            return None
-        key = _maybe_bytes(command[1])
-        member = _maybe_bytes(command[3])
-        if key is None or member is None:
-            return None
-        try:
-            score = float(command[2])
-        except (TypeError, ValueError):
-            return None
-        extend(pack_u32(len(key)))
-        extend(key)
-        extend(pack_f64(score))
-        extend(pack_u32(len(member)))
-        extend(member)
-    return bytes(payload)
-
-
 __all__ = [
+    "_CompactPayloadBudget",
+    "_binary_wire_size",
     "_blocks_forever",
     "_compact_flow_get_pipeline_payload",
     "_compact_flow_get_pipeline_payload_from_raw",

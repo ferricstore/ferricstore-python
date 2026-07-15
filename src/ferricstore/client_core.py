@@ -16,11 +16,14 @@ from ferricstore.batch_core import (
 )
 from ferricstore.client_autobatch import AutobatchFlowClient
 from ferricstore.client_claims import _ClientClaimsMixin
+from ferricstore.client_effects import _ClientEffectsMixin
 from ferricstore.client_governance import _ClientGovernanceMixin
 from ferricstore.client_management import _ClientManagementMixin
+from ferricstore.client_markers import SyncFlowClientMarker
 from ferricstore.client_mutations import _ClientMutationsMixin
 from ferricstore.client_producer import _ClientProducerMixin
 from ferricstore.client_queries import _ClientQueriesMixin
+from ferricstore.client_schedules import _ClientSchedulesMixin
 from ferricstore.client_sessions import (
     CommandPipeline,
     PubSubSession,
@@ -33,6 +36,7 @@ from ferricstore.client_values import _ClientValuesMixin
 from ferricstore.codecs import Codec, RawCodec
 from ferricstore.command_core import normalize_command_name
 from ferricstore.commands import DataCommandsMixin
+from ferricstore.config_validation import validate_string_sequence
 from ferricstore.errors import InvalidCommandError
 from ferricstore.lifecycle_core import (
     close_resources_sync,
@@ -88,9 +92,8 @@ class _ClientCoreMixin(_ClientMixinBase):
         backpressure: BackpressurePolicy | None = None,
         **kwargs: Any,
     ) -> FlowClient:
-        if not urls:
-            raise ValueError("FerricStore SDK requires at least one URL")
-        for url in urls:
+        resolved_urls = validate_string_sequence(urls, name="urls", allow_empty=False)
+        for url in resolved_urls:
             if urlparse(url).scheme.lower() not in {"ferric", "ferrics"}:
                 raise ValueError("FerricStore SDK URLs must use ferric:// or ferrics://")
 
@@ -99,7 +102,7 @@ class _ClientCoreMixin(_ClientMixinBase):
         return cast(
             FlowClient,
             cls(
-                ProtocolAdapterPool.from_urls(list(urls), **kwargs),
+                ProtocolAdapterPool.from_urls(list(resolved_urls), **kwargs),
                 codec=codec,
                 backpressure=backpressure,
             ),
@@ -204,14 +207,27 @@ class _ClientCoreMixin(_ClientMixinBase):
             session_client = FlowClient(session_executor, codec=self.codec)
             session_client.backpressure = self.backpressure
             return session_client, True
-        acquire_session = None
-        if session_keys:
-            acquire_session = getattr(raw_executor, "acquire_session_for_key", None)
-        if not callable(acquire_session):
+        acquire_session_for_key = (
+            getattr(raw_executor, "acquire_session_for_key", None) if session_keys else None
+        )
+        if callable(acquire_session_for_key):
+            session_executor = acquire_session_for_key(session_keys[0])
+        else:
             acquire_session = getattr(raw_executor, "acquire_session", None)
+            if not callable(acquire_session):
+                return cast(FlowClient, self), False
+            session_executor = acquire_session()
+        session_client = FlowClient(session_executor, codec=self.codec)
+        session_client.backpressure = self.backpressure
+        return session_client, True
+
+    def _acquire_subscription_client(self) -> tuple[FlowClient, bool]:
+        """Acquire a connection owned for the lifetime of one event subscription."""
+        raw_executor = getattr(self.executor, "_executor", self.executor)
+        acquire_session = getattr(raw_executor, "acquire_dedicated_session", None)
         if not callable(acquire_session):
-            return cast(FlowClient, self), False
-        session_executor = acquire_session(session_keys[0]) if session_keys else acquire_session()
+            return self._acquire_session_client()
+        session_executor = acquire_session()
         session_client = FlowClient(session_executor, codec=self.codec)
         session_client.backpressure = self.backpressure
         return session_client, True
@@ -271,8 +287,11 @@ class FlowClient(
     _ClientClaimsMixin,
     _ClientMutationsMixin,
     _ClientQueriesMixin,
+    _ClientSchedulesMixin,
+    _ClientEffectsMixin,
     _ClientGovernanceMixin,
     _ClientSupportMixin,
     DataCommandsMixin,
+    SyncFlowClientMarker,
 ):
     """FerricFlow client over the FerricStore native protocol."""

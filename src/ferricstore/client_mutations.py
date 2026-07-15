@@ -9,6 +9,7 @@ from ferricstore.client_helpers import (
     _append_attributes,
     _append_bool,
     _append_named_values,
+    _append_priority,
     _append_state_meta,
     _complete_command_args,
     _fail_command_args,
@@ -151,7 +152,7 @@ class _ClientMutationsMixin(_ClientMixinBase):
         args: builtins.list[Any] = ["FLOW.TRANSITION_MANY", wire_partition, from_state, to_state]
         _append(args, "PAYLOAD", self.codec.encode(payload) if payload is not None else None)
         _append(args, "RUN_AT", run_at_ms)
-        _append(args, "PRIORITY", priority)
+        _append_priority(args, priority)
         _append(args, "NOW", now_ms if now_ms is not None else _now_ms())
         _append_bool(args, "INDEPENDENT", independent)
         _append_attributes(

@@ -22,6 +22,7 @@ pip install -e ".[dev]"
 ruff check .
 ruff format --check .
 mypy src/ferricstore
+python tools/generate_async_commands.py --check
 pytest --cov=ferricstore --cov-report=term-missing
 bandit -q -r src/ferricstore
 pip-audit
@@ -51,8 +52,20 @@ Before opening a PR:
 - Add or update tests for SDK behavior changes.
 - Update docs for public API changes.
 - Keep examples runnable with local FerricStore.
-- Do not include generated files such as `__pycache__`, `.pytest_cache`, `dist`, or build artifacts.
+- Do not include transient files such as `__pycache__`, `.pytest_cache`, `dist`, or build artifacts.
 - Keep high-level docs focused on `QueueClient` / `WorkflowClient`; use `FlowClient` only for low-level command control.
+
+## Data command generation
+
+`src/ferricstore/commands.py` is the authoritative sync command surface. After
+changing it, regenerate the checked-in async surface used for runtime typing:
+
+```bash
+python tools/generate_async_commands.py
+```
+
+Do not edit `src/ferricstore/async_commands.py` directly. Its freshness and
+sync/async signature parity are enforced by the architecture tests.
 
 ## Compatibility policy
 

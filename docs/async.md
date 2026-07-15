@@ -49,6 +49,10 @@ the completed batch and the next claim in one protocol round trip. Both options
 are explicit so deployments can enable them after validating their server
 version and workload.
 
+Each enabled wake coordinator owns a dedicated protocol subscription connection.
+Closing the coordinator closes that connection, so its server-side filter cannot
+overwrite or outlive another worker's subscription.
+
 Fusion is active only inside `run()`/`run_forever()`. A standalone `run_once()`
 always completes its claimed jobs without prefetching another leased batch, so
 the caller never inherits hidden outstanding leases. Wake subscriptions are
@@ -78,6 +82,9 @@ that has begun closing cannot be restarted.
 in-flight close operation across callers. Cancelling one caller does not detach
 later callers from cleanup, and a failed owned resource remains available for a
 subsequent close retry while resources already closed are not closed twice.
+The optional producer-loop thread follows the same rule: a failed producer
+client close keeps its event loop alive for the next `close()` attempt, and the
+thread is retired only after client cleanup succeeds.
 
 Native async socket and topology-pool close calls follow the same ownership
 rule. Cancelling one close waiter does not cancel transport cleanup, and a later

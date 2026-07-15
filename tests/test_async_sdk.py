@@ -1,8 +1,13 @@
 import asyncio
+import threading
+from typing import Any
 
 import pytest
 
+import ferricstore.async_queue_api as async_queue_api_module
+import ferricstore.async_queue_runtime as async_queue_runtime_module
 import ferricstore.async_worker as async_worker_module
+import ferricstore.async_workflow_runtime as async_workflow_runtime_module
 import ferricstore.workflow as workflow_module
 from ferricstore import (
     AsyncFlowClient,
@@ -25,6 +30,7 @@ from ferricstore import (
     retry,
     transition,
 )
+from ferricstore.async_wake import AsyncFlowWakeCoordinator
 from ferricstore.types import ClaimedFlow
 
 
@@ -111,6 +117,435 @@ class ValueClaimExecutor(FakeExecutor):
         if args[0] == "FLOW.COMPLETE_MANY":
             return [b"OK"]
         return b"OK"
+
+
+@pytest.mark.parametrize(
+    ("module", "constructor"),
+    [
+        (async_queue_api_module, "queue_flow"),
+        (async_queue_api_module, "queue_client"),
+        (async_queue_api_module, "queue_client_from_url"),
+        (async_queue_runtime_module, "queue_worker"),
+        (async_workflow_runtime_module, "workflow"),
+        (async_workflow_runtime_module, "workflow_client"),
+        (async_workflow_runtime_module, "workflow_client_from_url"),
+    ],
+)
+def test_async_owned_construction_rolls_back_first_client(
+    monkeypatch: pytest.MonkeyPatch,
+    module: Any,
+    constructor: str,
+) -> None:
+    class OwnedClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    opened: list[OwnedClient] = []
+
+    def from_url(_url: str, **_kwargs: Any) -> OwnedClient:
+        if opened:
+            raise OSError("claim connection failed")
+        client = OwnedClient()
+        opened.append(client)
+        return client
+
+    monkeypatch.setattr(module.AsyncFlowClient, "from_url", staticmethod(from_url))
+
+    with pytest.raises(OSError, match="claim connection failed"):
+        if constructor == "queue_flow":
+            AsyncQueueFlow("ferric://seed.local:6388", type="order")
+        elif constructor == "queue_client":
+            AsyncQueueClient("ferric://seed.local:6388")
+        elif constructor == "queue_client_from_url":
+            AsyncQueueClient.from_url("ferric://seed.local:6388")
+        elif constructor == "queue_worker":
+            AsyncQueueFlowWorker("ferric://seed.local:6388", type="order")
+        elif constructor == "workflow":
+            AsyncWorkflow("ferric://seed.local:6388", type="order")
+        elif constructor == "workflow_client":
+            AsyncWorkflowClient("ferric://seed.local:6388")
+        else:
+            AsyncWorkflowClient.from_url("ferric://seed.local:6388")
+
+    assert len(opened) == 1
+    assert opened[0].closed is True
+
+
+@pytest.mark.parametrize(
+    ("module", "constructor"),
+    [
+        (async_queue_api_module, "queue_flow"),
+        (async_queue_runtime_module, "queue_worker"),
+    ],
+)
+def test_async_owned_construction_rolls_back_after_late_initialization_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    module: Any,
+    constructor: str,
+) -> None:
+    class OwnedClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    opened: list[OwnedClient] = []
+
+    def from_url(_url: str, **_kwargs: Any) -> OwnedClient:
+        client = OwnedClient()
+        opened.append(client)
+        return client
+
+    def fail_wake_coordinator(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("wake initialization failed")
+
+    monkeypatch.setattr(module.AsyncFlowClient, "from_url", staticmethod(from_url))
+    monkeypatch.setattr(module, "AsyncFlowWakeCoordinator", fail_wake_coordinator)
+
+    with pytest.raises(OSError, match="wake initialization failed"):
+        if constructor == "queue_flow":
+            AsyncQueueFlow(
+                "ferric://seed.local:6388",
+                type="order",
+                protocol_wake_hints=True,
+            )
+        else:
+            AsyncQueueFlowWorker(
+                "ferric://seed.local:6388",
+                type="order",
+                protocol_wake_hints=True,
+            )
+
+    assert len(opened) == 2
+    assert all(client.closed for client in opened)
+
+
+@pytest.mark.parametrize(
+    ("module", "constructor"),
+    [
+        (async_queue_api_module, "queue_client"),
+        (async_workflow_runtime_module, "workflow"),
+        (async_workflow_runtime_module, "workflow_client"),
+    ],
+)
+def test_async_owned_construction_validates_values_before_opening_clients(
+    monkeypatch: pytest.MonkeyPatch,
+    module: Any,
+    constructor: str,
+) -> None:
+    opened: list[object] = []
+
+    def from_url(_url: str, **_kwargs: Any) -> object:
+        client = object()
+        opened.append(client)
+        return client
+
+    def fail_value_config() -> None:
+        raise ValueError("value configuration failed")
+
+    monkeypatch.setattr(module.AsyncFlowClient, "from_url", staticmethod(from_url))
+    monkeypatch.setattr(module, "ValueConfig", fail_value_config)
+
+    with pytest.raises(ValueError, match="value configuration failed"):
+        if constructor == "queue_client":
+            AsyncQueueClient("ferric://seed.local:6388")
+        elif constructor == "workflow":
+            AsyncWorkflow("ferric://seed.local:6388", type="order")
+        else:
+            AsyncWorkflowClient("ferric://seed.local:6388")
+
+    assert opened == []
+
+
+def test_async_owned_rollback_finishes_inside_active_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class OwnedClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    opened: list[OwnedClient] = []
+
+    def from_url(_url: str, **_kwargs: Any) -> OwnedClient:
+        if opened:
+            raise OSError("claim connection failed")
+        client = OwnedClient()
+        opened.append(client)
+        return client
+
+    monkeypatch.setattr(
+        async_queue_api_module.AsyncFlowClient,
+        "from_url",
+        staticmethod(from_url),
+    )
+
+    async def run() -> None:
+        with pytest.raises(OSError, match="claim connection failed"):
+            AsyncQueueClient("ferric://seed.local:6388")
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+    assert len(opened) == 1
+    assert opened[0].closed is True
+
+
+@pytest.mark.parametrize("workers", [1, 16, 57, 128, 256])
+def test_auto_partition_ownership_is_complete_and_non_empty(workers):
+    assignments = [
+        async_worker_module._owned_auto_partition_keys(
+            worker_index=worker_index,
+            workers=workers,
+            server_shards=16,
+        )
+        for worker_index in range(workers)
+    ]
+
+    assert all(assignments)
+    flattened = [key for assignment in assignments for key in assignment]
+    assert len(flattened) == async_worker_module.AUTO_PARTITION_BUCKETS
+    assert len(set(flattened)) == async_worker_module.AUTO_PARTITION_BUCKETS
+
+
+def test_auto_partition_ownership_keeps_each_worker_shard_local():
+    workers = 128
+    assignments = [
+        async_worker_module._owned_auto_partition_keys(
+            worker_index=worker_index,
+            workers=workers,
+            server_shards=16,
+        )
+        for worker_index in range(workers)
+    ]
+
+    for assignment in assignments:
+        shards = {
+            async_worker_module._auto_partition_server_shard(
+                int(key.removeprefix(async_worker_module.AUTO_PARTITION_PREFIX)),
+                16,
+            )
+            for key in assignment
+        }
+        assert len(shards) == 1
+
+
+def test_auto_partition_assignment_plan_is_cached():
+    async_worker_module._auto_partition_assignments.cache_clear()
+
+    first = async_worker_module._auto_partition_assignments(57, 16)
+    second = async_worker_module._auto_partition_assignments(57, 16)
+
+    assert first is second
+    assert async_worker_module._auto_partition_assignments.cache_info().hits == 1
+
+
+@pytest.mark.parametrize("invalid", [True, 1.0])
+def test_auto_partition_cache_does_not_alias_invalid_shard_counts(invalid: Any) -> None:
+    async_worker_module._auto_partition_assignments.cache_clear()
+    async_worker_module._auto_partition_assignments(1, 1)
+
+    with pytest.raises(ValueError, match="server_shards"):
+        async_worker_module._auto_partition_assignments(1, invalid)
+
+
+def test_auto_partition_workers_cannot_exceed_bucket_count():
+    with pytest.raises(ValueError, match="cannot exceed"):
+        async_worker_module._owned_auto_partition_keys(
+            worker_index=0,
+            workers=async_worker_module.AUTO_PARTITION_BUCKETS + 1,
+            server_shards=16,
+        )
+
+
+def test_async_queue_worker_rejects_empty_auto_partition_ownership(monkeypatch):
+    monkeypatch.setattr(
+        "ferricstore.async_queue_runtime._owned_auto_partition_keys",
+        lambda **_: [],
+    )
+
+    with pytest.raises(ValueError, match="no auto partitions"):
+        AsyncQueueFlowWorker(
+            FakeExecutor(),
+            type="order",
+            auto_partitions=True,
+        )
+
+
+@pytest.mark.parametrize("runtime", [AsyncQueueFlow, AsyncWorkflow])
+def test_async_multiworker_runtimes_reject_more_workers_than_auto_partitions(runtime):
+    with pytest.raises(ValueError, match="cannot exceed"):
+        runtime(
+            FakeExecutor(),
+            type="order",
+            workers=async_worker_module.AUTO_PARTITION_BUCKETS + 1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"concurrency": 0}, "concurrency must be positive"),
+        ({"batch_size": 0}, "batch_size must be positive"),
+        ({"claim_partition_batch_size": 0}, "claim_partition_batch_size must be positive"),
+        ({"idle_sleep_s": -0.001}, "idle_sleep_s must be non-negative"),
+        ({"max_idle_sleep_s": -0.001}, "max_idle_sleep_s must be non-negative"),
+    ],
+)
+def test_async_queue_rejects_invalid_runtime_configuration_before_creating_clients(
+    monkeypatch,
+    kwargs,
+    message,
+):
+    created = []
+
+    def from_url(*args, **options):
+        created.append((args, options))
+        return FakeExecutor()
+
+    monkeypatch.setattr(
+        "ferricstore.async_queue_runtime.AsyncFlowClient.from_url",
+        staticmethod(from_url),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        AsyncQueueFlow("ferric://127.0.0.1:6388", type="order", **kwargs)
+
+    assert created == []
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid", "message"),
+    [
+        ("concurrency", 1.5, "concurrency must be a positive integer"),
+        ("concurrency", True, "concurrency must be a positive integer"),
+        ("batch_size", float("nan"), "batch_size must be a positive integer"),
+        ("workers", "2", "workers must be a positive integer"),
+        (
+            "claim_partition_batch_size",
+            1.5,
+            "claim_partition_batch_size must be a positive integer",
+        ),
+        ("block_ms", True, "block_ms must be a non-negative integer"),
+    ],
+)
+def test_async_queue_rejects_non_integer_runtime_configuration(
+    field: str,
+    invalid: Any,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        AsyncQueueFlow(FakeExecutor(), type="order", **{field: invalid})
+
+
+@pytest.mark.parametrize(
+    ("runtime", "field", "value"),
+    [
+        ("queue", "claim_values", "payload"),
+        ("queue_worker", "states", "queued"),
+        ("queue_worker", "partition_keys", "tenant"),
+        ("workflow", "states", "queued"),
+        ("workflow", "partition_by", "tenant"),
+        ("workflow", "claim_values", "payload"),
+    ],
+)
+def test_async_runtimes_reject_scalar_strings_for_sequence_configuration(
+    runtime: str,
+    field: str,
+    value: str,
+) -> None:
+    kwargs: dict[str, Any] = {field: value}
+
+    with pytest.raises(ValueError, match=field):
+        if runtime == "queue":
+            AsyncQueueFlow(FakeExecutor(), type="order", **kwargs)
+        elif runtime == "queue_worker":
+            AsyncQueueFlowWorker(FakeExecutor(), type="order", **kwargs)
+        else:
+            AsyncWorkflow(FakeExecutor(), type="order", **kwargs)
+
+
+@pytest.mark.parametrize("invalid", [0, -1, True, 1.5, 1025])
+@pytest.mark.parametrize("runtime", ["queue", "queue_worker", "workflow"])
+def test_async_runtimes_reject_invalid_server_shard_topology(
+    runtime: str,
+    invalid: Any,
+) -> None:
+    with pytest.raises(ValueError, match="server_shards"):
+        if runtime == "queue":
+            AsyncQueueFlow(FakeExecutor(), type="order", server_shards=invalid)
+        elif runtime == "queue_worker":
+            AsyncQueueFlowWorker(FakeExecutor(), type="order", server_shards=invalid)
+        else:
+            AsyncWorkflow(FakeExecutor(), type="order", server_shards=invalid)
+
+
+def test_async_queue_builds_wake_partition_keys_only_when_hints_are_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: list[int] = []
+
+    def partition_key(index: int) -> str:
+        built.append(index)
+        return f"partition:{index}"
+
+    monkeypatch.setattr(async_queue_api_module, "_auto_partition_key", partition_key)
+
+    AsyncQueueFlow(FakeExecutor(), type="order")
+    assert built == []
+
+    enabled = AsyncQueueFlow(FakeExecutor(), type="order", protocol_wake_hints=True)
+    assert built == list(range(async_queue_runtime_module.AUTO_PARTITION_BUCKETS))
+    assert enabled._wake_coordinator is not None
+
+
+@pytest.mark.parametrize(
+    ("runtime", "kwargs"),
+    [
+        ("queue", {"claim_values": [""]}),
+        ("queue_worker", {"states": [1]}),
+        ("workflow", {"partition_by": [b"tenant"]}),
+    ],
+)
+def test_async_runtimes_reject_invalid_sequence_items(
+    runtime: str,
+    kwargs: dict[str, Any],
+) -> None:
+    with pytest.raises(ValueError, match="non-empty strings"):
+        if runtime == "queue":
+            AsyncQueueFlow(FakeExecutor(), type="order", **kwargs)
+        elif runtime == "queue_worker":
+            AsyncQueueFlowWorker(FakeExecutor(), type="order", **kwargs)
+        else:
+            AsyncWorkflow(FakeExecutor(), type="order", **kwargs)
+
+
+def test_async_workflow_rejects_negative_idle_sleep_before_creating_clients(monkeypatch):
+    created = []
+
+    def from_url(*args, **options):
+        created.append((args, options))
+        return FakeExecutor()
+
+    monkeypatch.setattr(
+        "ferricstore.async_workflow_runtime.AsyncFlowClient.from_url",
+        staticmethod(from_url),
+    )
+
+    with pytest.raises(ValueError, match="idle_sleep_s must be non-negative"):
+        AsyncWorkflow(
+            "ferric://127.0.0.1:6388",
+            type="order",
+            idle_sleep_s=-0.001,
+        )
+
+    assert created == []
 
 
 def test_async_queue_worker_standalone_run_once_does_not_prefetch_leased_jobs():
@@ -304,6 +739,342 @@ def test_async_queue_worker_retries_failed_wake_subscription():
 
         assert client.attempts == 2
         assert worker._protocol_wake_hints_enabled
+
+    asyncio.run(run())
+
+
+def test_async_queue_workers_share_one_union_wake_subscription():
+    class WakeClient:
+        def __init__(self) -> None:
+            self.subscriptions = []
+
+        async def subscribe_flow_wake(self, *args, **kwargs):
+            self.subscriptions.append((args, kwargs))
+            return b"OK"
+
+        async def wait_event(self, timeout=None):
+            await asyncio.Future()
+
+    async def run() -> None:
+        client = WakeClient()
+        queue = AsyncQueueFlow(
+            client,
+            type="order",
+            workers=3,
+            protocol_wake_hints=True,
+        )
+        workers = [queue._build_worker(index) for index in range(queue.workers)]
+        queue._workers = workers
+        try:
+            await asyncio.gather(*(worker._subscribe_protocol_wake_hints() for worker in workers))
+
+            assert len(client.subscriptions) == 1
+            args, kwargs = client.subscriptions[0]
+            assert args == ("order",)
+            assert kwargs["partition_key"] is None
+            assert set(kwargs["partition_keys"]) == {
+                async_worker_module._auto_partition_key(index)
+                for index in range(async_worker_module.AUTO_PARTITION_BUCKETS)
+            }
+        finally:
+            await queue.close()
+
+    asyncio.run(run())
+
+
+def test_async_queue_wake_event_is_broadcast_to_all_waiting_workers():
+    class WakeClient:
+        def __init__(self) -> None:
+            self.events = asyncio.Queue()
+            self.active_waits = 0
+            self.max_active_waits = 0
+
+        async def subscribe_flow_wake(self, *_args, **_kwargs):
+            return b"OK"
+
+        async def wait_event(self, timeout=None):
+            self.active_waits += 1
+            self.max_active_waits = max(self.max_active_waits, self.active_waits)
+            try:
+                if timeout is None:
+                    return await self.events.get()
+                try:
+                    return await asyncio.wait_for(self.events.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    return None
+            finally:
+                self.active_waits -= 1
+
+    async def run() -> None:
+        client = WakeClient()
+        queue = AsyncQueueFlow(
+            client,
+            type="order",
+            workers=2,
+            protocol_wake_hints=True,
+        )
+        workers = [queue._build_worker(index) for index in range(queue.workers)]
+        queue._workers = workers
+        try:
+            await asyncio.gather(*(worker._subscribe_protocol_wake_hints() for worker in workers))
+            waits = [
+                asyncio.create_task(worker._wait_for_protocol_wake_hint(0.2)) for worker in workers
+            ]
+            await asyncio.sleep(0)
+            await client.events.put({"event": "FLOW_WAKE"})
+
+            assert await asyncio.gather(*waits) == [True, True]
+            assert client.max_active_waits == 1
+        finally:
+            await queue.close()
+
+    asyncio.run(run())
+
+
+def test_async_wake_coordinator_recovers_after_transient_event_failure():
+    class WakeClient:
+        def __init__(self) -> None:
+            self.subscriptions = 0
+            self.waits = 0
+            self.events: asyncio.Queue[object] = asyncio.Queue()
+            self.resubscribed = asyncio.Event()
+
+        async def subscribe_flow_wake(self, *_args, **_kwargs):
+            self.subscriptions += 1
+            if self.subscriptions >= 2:
+                self.resubscribed.set()
+            return b"OK"
+
+        async def wait_event(self, timeout=None):
+            del timeout
+            self.waits += 1
+            if self.waits == 1:
+                raise ConnectionError("transient disconnect")
+            return await self.events.get()
+
+    async def run() -> None:
+        client = WakeClient()
+        coordinator = AsyncFlowWakeCoordinator(
+            client,
+            type="order",
+            state=None,
+            states=None,
+            partition_key=None,
+            partition_keys=None,
+            priority=0,
+            limit=10,
+            enabled=True,
+        )
+        try:
+            assert await coordinator.subscribe()
+            await asyncio.wait_for(client.resubscribed.wait(), timeout=1)
+
+            assert client.subscriptions >= 2
+            assert coordinator.enabled
+            await client.events.put({"event": "FLOW_WAKE"})
+            woke, generation = await coordinator.wait(0, 0.5)
+            assert woke
+            assert generation == 1
+        finally:
+            await coordinator.close()
+
+    asyncio.run(run())
+
+
+def test_async_wake_coordinator_owns_an_isolated_subscription_session():
+    class DedicatedWakeClient:
+        def __init__(self) -> None:
+            self.subscriptions: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+            self.events: asyncio.Queue[object] = asyncio.Queue()
+            self.closed = False
+
+        async def subscribe_flow_wake(self, *args: Any, **kwargs: Any) -> bytes:
+            self.subscriptions.append((args, kwargs))
+            return b"OK"
+
+        async def wait_event(self, timeout: float | None = None) -> object:
+            del timeout
+            return await self.events.get()
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class SharedClaimClient:
+        def __init__(self) -> None:
+            self.subscriptions = 0
+            self.dedicated = DedicatedWakeClient()
+
+        async def subscribe_flow_wake(self, *_args: Any, **_kwargs: Any) -> bytes:
+            self.subscriptions += 1
+            return b"OK"
+
+        async def wait_event(self, timeout: float | None = None) -> None:
+            del timeout
+            return None
+
+        async def _acquire_subscription_client(self):
+            return self.dedicated, True
+
+    async def run() -> None:
+        shared = SharedClaimClient()
+        coordinator = AsyncFlowWakeCoordinator(
+            shared,
+            type="order",
+            state=None,
+            states=None,
+            partition_key=None,
+            partition_keys=None,
+            priority=0,
+            limit=10,
+            enabled=True,
+        )
+        assert await coordinator.subscribe()
+        assert shared.subscriptions == 0
+        assert shared.dedicated.subscriptions
+
+        await coordinator.close()
+
+        assert shared.dedicated.closed
+
+    asyncio.run(run())
+
+
+def test_async_wake_coordinator_retries_owned_subscription_close():
+    class DedicatedWakeClient:
+        def __init__(self) -> None:
+            self.close_attempts = 0
+
+        async def subscribe_flow_wake(self, *_args: Any, **_kwargs: Any) -> bytes:
+            return b"OK"
+
+        async def wait_event(self, timeout: float | None = None) -> None:
+            del timeout
+            await asyncio.Future()
+
+        async def close(self) -> None:
+            self.close_attempts += 1
+            if self.close_attempts == 1:
+                raise RuntimeError("temporary close failure")
+
+    class SharedClaimClient:
+        def __init__(self) -> None:
+            self.dedicated = DedicatedWakeClient()
+
+        async def _acquire_subscription_client(self):
+            return self.dedicated, True
+
+    async def run() -> None:
+        shared = SharedClaimClient()
+        coordinator = AsyncFlowWakeCoordinator(
+            shared,
+            type="order",
+            state=None,
+            states=None,
+            partition_key=None,
+            partition_keys=None,
+            priority=0,
+            limit=10,
+            enabled=True,
+        )
+        assert await coordinator.subscribe()
+
+        with pytest.raises(RuntimeError, match="temporary close failure"):
+            await coordinator.close()
+        await coordinator.close()
+
+        assert shared.dedicated.close_attempts == 2
+
+    asyncio.run(run())
+
+
+def test_async_wake_close_cancels_a_hung_resubscription():
+    class WakeClient:
+        def __init__(self) -> None:
+            self.subscriptions = 0
+            self.reconnect_entered = asyncio.Event()
+
+        async def subscribe_flow_wake(self, *_args, **_kwargs):
+            self.subscriptions += 1
+            if self.subscriptions > 1:
+                self.reconnect_entered.set()
+                await asyncio.Event().wait()
+            return b"OK"
+
+        async def wait_event(self, timeout=None):
+            del timeout
+            raise ConnectionError("stream disconnected")
+
+    async def run() -> None:
+        client = WakeClient()
+        coordinator = AsyncFlowWakeCoordinator(
+            client,
+            type="order",
+            state=None,
+            states=None,
+            partition_key=None,
+            partition_keys=None,
+            priority=0,
+            limit=10,
+            enabled=True,
+        )
+        assert await coordinator.subscribe()
+        await asyncio.wait_for(client.reconnect_entered.wait(), timeout=1)
+
+        await asyncio.wait_for(coordinator.close(), timeout=0.1)
+
+        assert not coordinator.enabled
+
+    asyncio.run(run())
+
+
+def test_async_wake_recovery_backoff_survives_successful_resubscriptions():
+    class WakeClient:
+        def __init__(self) -> None:
+            self.subscription_times: list[float] = []
+            self.enough_attempts = asyncio.Event()
+
+        async def subscribe_flow_wake(self, *_args, **_kwargs):
+            self.subscription_times.append(asyncio.get_running_loop().time())
+            if len(self.subscription_times) >= 4:
+                self.enough_attempts.set()
+            return b"OK"
+
+        async def wait_event(self, timeout=None):
+            del timeout
+            raise ConnectionError("stream disconnected")
+
+    async def run() -> None:
+        client = WakeClient()
+        coordinator = AsyncFlowWakeCoordinator(
+            client,
+            type="order",
+            state=None,
+            states=None,
+            partition_key=None,
+            partition_keys=None,
+            priority=0,
+            limit=10,
+            enabled=True,
+        )
+        coordinator._MIN_RECOVERY_DELAY_S = 0.01
+        coordinator._MAX_RECOVERY_DELAY_S = 0.04
+        try:
+            assert await coordinator.subscribe()
+            await asyncio.wait_for(client.enough_attempts.wait(), timeout=1)
+        finally:
+            await coordinator.close()
+
+        intervals = [
+            later - earlier
+            for earlier, later in zip(
+                client.subscription_times[:-1],
+                client.subscription_times[1:],
+                strict=True,
+            )
+        ]
+        assert intervals[0] >= 0.008
+        assert intervals[1] >= 0.018
+        assert intervals[2] >= 0.035
 
     asyncio.run(run())
 
@@ -2227,6 +2998,102 @@ def test_async_queue_flow_simple_api_enqueues_and_claims_owned_buckets():
     asyncio.run(run())
 
 
+class _ThreadAwareUrlClient:
+    def __init__(self) -> None:
+        self.enqueue_ids: list[str] = []
+        self.enqueue_threads: list[int] = []
+        self.closed = 0
+
+    async def enqueue(self, id: str, **_kwargs: Any) -> bytes:
+        self.enqueue_ids.append(id)
+        self.enqueue_threads.append(threading.get_ident())
+        return b"OK"
+
+    async def enqueue_many(self, items: Any, **_kwargs: Any) -> list[bytes]:
+        return [await self.enqueue(item.id, **_kwargs) for item in items]
+
+    async def claim_flows(self, *_args: Any, **_kwargs: Any) -> list[Any]:
+        return []
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+def test_direct_producer_loop_thread_reuses_one_background_client(monkeypatch: Any) -> None:
+    created: list[tuple[int, dict[str, Any], _ThreadAwareUrlClient]] = []
+
+    def from_url(_url: str, **kwargs: Any) -> _ThreadAwareUrlClient:
+        client = _ThreadAwareUrlClient()
+        created.append((threading.get_ident(), kwargs, client))
+        return client
+
+    monkeypatch.setattr(AsyncFlowClient, "from_url", staticmethod(from_url))
+
+    async def run() -> None:
+        main_thread = threading.get_ident()
+        queue = AsyncQueueFlow(
+            "ferric://localhost:6388",
+            type="email",
+            producer_loop_thread=True,
+        )
+        await queue.enqueue("one")
+        await queue.enqueue("two")
+        await queue.close()
+
+        background = [entry for entry in created if entry[0] != main_thread]
+        assert len(background) == 1
+        assert background[0][2].enqueue_ids == ["one", "two"]
+        assert background[0][2].closed == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("runtime", ["queue", "workflow"])
+def test_high_level_producer_loop_preserves_url_kwargs_and_reuses_client(
+    monkeypatch: Any,
+    runtime: str,
+) -> None:
+    created: list[tuple[int, dict[str, Any], _ThreadAwareUrlClient]] = []
+
+    def from_url(_url: str, **kwargs: Any) -> _ThreadAwareUrlClient:
+        client = _ThreadAwareUrlClient()
+        created.append((threading.get_ident(), kwargs, client))
+        return client
+
+    monkeypatch.setattr(AsyncFlowClient, "from_url", staticmethod(from_url))
+
+    async def run() -> None:
+        main_thread = threading.get_ident()
+        config = WorkerConfig(producer_loop_thread=True)
+        if runtime == "queue":
+            sdk: AsyncQueueClient | AsyncWorkflowClient = AsyncQueueClient.from_url(
+                "ferric://localhost:6388",
+                worker_config=config,
+                timeout=7.0,
+            )
+            owner: AsyncQueueFlow | AsyncWorkflow = sdk.queue(type="email").worker()
+        else:
+            sdk = AsyncWorkflowClient.from_url(
+                "ferric://localhost:6388",
+                worker_config=config,
+                timeout=7.0,
+            )
+            owner = sdk.workflow(type="orders", states=["queued"])
+
+        await owner.enqueue("one")
+        await owner.enqueue("two")
+        await owner.close()
+        await sdk.close()
+
+        background = [entry for entry in created if entry[0] != main_thread]
+        assert len(background) == 1
+        assert background[0][1] == {"timeout": 7.0}
+        assert background[0][2].enqueue_ids == ["one", "two"]
+        assert background[0][2].closed == 1
+
+    asyncio.run(run())
+
+
 def test_async_queue_flow_defaults_to_nonblocking_claims():
     queue = AsyncQueueFlow(
         AsyncFlowClient(FakeExecutor()),
@@ -2958,7 +3825,7 @@ def test_async_workflow_claims_all_priorities_by_default():
 
         @workflow.on("queued")
         async def queued(_job: ClaimedFlow):
-            return transition("queued", priority=5)
+            return transition("queued", priority=2)
 
         await workflow.run_once(state="queued")
 

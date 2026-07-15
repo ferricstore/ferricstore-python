@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import struct
 import time
+from collections.abc import Callable
 from typing import Any, cast
 
 from ferricstore.batch_core import (
@@ -15,6 +16,7 @@ from ferricstore.errors import (
 from ferricstore.protocol_codec import (
     DecodeBudget,
     DecodedCollectionLimitError,
+    DuplicateProtocolMapKeyError,
 )
 from ferricstore.protocol_codec import (
     decode_value_at as _decode_value_at,
@@ -72,21 +74,27 @@ from ferricstore.protocol_constants import (
 from ferricstore.protocol_framing import (
     decompress_response as _decompress_response,
 )
-
-
-def _require_compact_collection_count(
-    count: int,
-    *,
-    max_collection_items: int | None,
-    expected_collection_items: int | None = None,
-) -> None:
-    if max_collection_items is not None and count > max_collection_items:
-        raise FerricStoreError("protocol response collection exceeds max_decoded_collection_items")
-    if expected_collection_items is not None and count != expected_collection_items:
-        raise FerricStoreError(
-            f"protocol response collection returned {count} items; "
-            f"expected {expected_collection_items}"
-        )
+from ferricstore.protocol_response_collections import (
+    _read_custom_binary_list,
+    _read_custom_binary_map,
+    _try_decode_custom_binary_list_list,
+    _try_decode_custom_binary_map_list,
+    _try_decode_custom_kv_get,
+    _try_decode_custom_kv_mget,
+    _try_decode_custom_kv_mget_fixed,
+)
+from ferricstore.protocol_response_contracts import (
+    require_compact_collection_count as _require_compact_collection_count,
+)
+from ferricstore.protocol_response_contracts import validate_response_cardinality
+from ferricstore.protocol_response_primitives import (
+    _read_compact_binary,
+    _read_compact_optional_binary,
+    _read_tagged_binary,
+    _read_tagged_i64,
+    _read_u32,
+    _require_available,
+)
 
 
 def _preflight_compact_collection(
@@ -145,82 +153,71 @@ def _try_fast_response_value_at(
         expected_collection_items=expected_collection_items,
     ):
         return None
-    budget = DecodeBudget(max_collection_items)
-    if opcode == _OP_PIPELINE:
-        if len(data) <= offset:
-            return None
-        if data[offset] == _COMPACT_PIPELINE_RESPONSE:
-            return _try_decode_custom_pipeline_response(data, offset, budget=budget)
-        if data[offset] == _COMPACT_KV_MGET:
-            return _try_decode_custom_kv_mget(data, offset, budget=budget)
-        if data[offset] == _COMPACT_KV_MGET_FIXED:
-            return _try_decode_custom_kv_mget_fixed(data, offset, budget=budget)
-        if data[offset] == _COMPACT_FLOW_RECORD_LIST:
-            return _try_decode_custom_flow_record_list(data, offset, budget=budget)
-        if data[offset] == _COMPACT_FLOW_CLAIM_JOBS:
-            return _try_decode_custom_claim_jobs(data, offset, budget=budget)
-        if data[offset] == _COMPACT_BINARY_LIST_LIST:
-            return _try_decode_custom_binary_list_list(
-                data,
-                offset,
-                budget=budget,
-            )
-        if data[offset] == _COMPACT_BINARY_MAP_LIST:
-            return _try_decode_custom_binary_map_list(
-                data,
-                offset,
-                budget=budget,
-            )
-        if data[offset] == _COMPACT_INTEGER_LIST:
-            return _try_decode_custom_integer_list(data, offset, budget=budget)
-        if data[offset] == _COMPACT_OK_LIST:
-            return _try_decode_custom_ok_list(data, offset, budget=budget)
+    decoder = _FAST_RESPONSE_DECODERS.get(opcode)
+    if decoder is None:
         return None
-    if opcode == _OP_GET:
-        if len(data) > offset and data[offset] == _COMPACT_KV_GET:
-            return _try_decode_custom_kv_get(data, offset)
+    return decoder(data, offset, DecodeBudget(max_collection_items))
+
+
+_FastResponseDecoder = Callable[[bytes, int, DecodeBudget], Any | None]
+_FAST_RESPONSE_DECODERS: dict[int, _FastResponseDecoder] = {}
+_PIPELINE_MARKER_DECODERS: dict[int, Callable[..., Any | None]] = {}
+_MGET_MARKER_DECODERS: dict[int, Callable[..., Any | None]] = {}
+
+
+def _try_fast_pipeline(data: bytes, offset: int, budget: DecodeBudget) -> Any | None:
+    if offset >= len(data):
         return None
-    if opcode in {_OP_SET, _OP_MSET}:
-        if len(data) > offset and data[offset] == _COMPACT_OK_LIST:
-            ok_values = _try_decode_custom_ok_list(data, offset, budget=budget)
-            if ok_values is not None and len(ok_values) == 1:
-                return b"OK"
-        return None
-    if opcode == _OP_MGET:
-        if len(data) > offset and data[offset] == _COMPACT_KV_MGET:
-            return _try_decode_custom_kv_mget(data, offset, budget=budget)
-        if len(data) > offset and data[offset] == _COMPACT_KV_MGET_FIXED:
-            return _try_decode_custom_kv_mget_fixed(data, offset, budget=budget)
-        return None
-    if opcode == _OP_FLOW_VALUE_MGET:
-        if len(data) > offset and data[offset] == _COMPACT_KV_MGET:
-            return _try_decode_custom_kv_mget(data, offset, budget=budget)
-        if len(data) > offset and data[offset] == _COMPACT_KV_MGET_FIXED:
-            return _try_decode_custom_kv_mget_fixed(data, offset, budget=budget)
-        return None
-    if opcode == _OP_FLOW_GET:
-        if len(data) > offset and data[offset] == _COMPACT_FLOW_RECORD:
-            return _try_decode_custom_flow_record(data, offset, budget=budget)
-        return None
-    if opcode in _FLOW_RECORD_LIST_OPCODES:
-        if len(data) > offset and data[offset] == _COMPACT_FLOW_RECORD_LIST:
-            return _try_decode_custom_flow_record_list(data, offset, budget=budget)
-        return None
-    if opcode == _OP_FLOW_CLAIM_DUE:
-        if len(data) > offset and data[offset] == _COMPACT_FLOW_CLAIM_JOBS:
-            return _try_decode_custom_claim_jobs(data, offset, budget=budget)
-        return _try_decode_claim_jobs_compact(data, offset, budget=budget)
-    if opcode in {
-        _OP_FLOW_CREATE_MANY,
-        _OP_FLOW_COMPLETE_MANY,
-        _OP_FLOW_RETRY_MANY,
-        _OP_FLOW_FAIL_MANY,
-        _OP_FLOW_CANCEL_MANY,
-    }:
-        if len(data) > offset and data[offset] == _COMPACT_OK_LIST:
-            return _try_decode_custom_ok_list(data, offset, budget=budget)
-        return _try_decode_binary_list(data, offset, budget=budget)
+    decoder = _PIPELINE_MARKER_DECODERS.get(data[offset])
+    return None if decoder is None else decoder(data, offset, budget=budget)
+
+
+def _try_fast_get(data: bytes, offset: int, _budget: DecodeBudget) -> Any | None:
+    if offset < len(data) and data[offset] == _COMPACT_KV_GET:
+        return _try_decode_custom_kv_get(data, offset)
     return None
+
+
+def _try_fast_ok(data: bytes, offset: int, budget: DecodeBudget) -> Any | None:
+    if offset >= len(data) or data[offset] != _COMPACT_OK_LIST:
+        return None
+    values = _try_decode_custom_ok_list(data, offset, budget=budget)
+    return b"OK" if values is not None and len(values) == 1 else None
+
+
+def _try_fast_mget(data: bytes, offset: int, budget: DecodeBudget) -> Any | None:
+    if offset >= len(data):
+        return None
+    decoder = _MGET_MARKER_DECODERS.get(data[offset])
+    return None if decoder is None else decoder(data, offset, budget=budget)
+
+
+def _try_fast_flow_record(data: bytes, offset: int, budget: DecodeBudget) -> Any | None:
+    if offset < len(data) and data[offset] == _COMPACT_FLOW_RECORD:
+        return _try_decode_custom_flow_record(data, offset, budget=budget)
+    return None
+
+
+def _try_fast_flow_record_list(
+    data: bytes,
+    offset: int,
+    budget: DecodeBudget,
+) -> Any | None:
+    if offset < len(data) and data[offset] == _COMPACT_FLOW_RECORD_LIST:
+        return _try_decode_custom_flow_record_list(data, offset, budget=budget)
+    return None
+
+
+def _try_fast_claim(data: bytes, offset: int, budget: DecodeBudget) -> Any | None:
+    if offset < len(data) and data[offset] == _COMPACT_FLOW_CLAIM_JOBS:
+        return _try_decode_custom_claim_jobs(data, offset, budget=budget)
+    return _try_decode_claim_jobs_compact(data, offset, budget=budget)
+
+
+def _try_fast_many(data: bytes, offset: int, budget: DecodeBudget) -> Any | None:
+    if offset < len(data) and data[offset] == _COMPACT_OK_LIST:
+        return _try_decode_custom_ok_list(data, offset, budget=budget)
+    return _try_decode_binary_list(data, offset, budget=budget)
 
 
 def _try_decode_custom_pipeline_response(
@@ -301,251 +298,6 @@ def _is_custom_compact_nil(opcode: int, data: bytes, offset: int) -> bool:
     )
 
 
-def _try_decode_custom_kv_get(data: bytes, offset: int = 0) -> bytes | None:
-    try:
-        offset += 1
-        present = data[offset]
-        offset += 1
-        if present == 0:
-            return None
-        if present != 1:
-            return None
-        value, offset = _read_compact_binary(data, offset)
-        if offset != len(data):
-            return None
-        return value
-    except (IndexError, struct.error, FerricStoreError):
-        return None
-
-
-def _try_decode_custom_kv_mget(
-    data: bytes,
-    offset: int = 0,
-    *,
-    budget: DecodeBudget,
-) -> list[bytes | None] | None:
-    offset += 1
-    data_len = len(data)
-    if offset + 4 > data_len:
-        return None
-
-    unpack_u32 = _COMPACT_U32.unpack_from
-    count = unpack_u32(data, offset)[0]
-    offset += 4
-    budget.consume(count)
-    values: list[bytes | None] = []
-    append_value = values.append
-
-    for _ in range(count):
-        if offset >= data_len:
-            return None
-
-        present = data[offset]
-        offset += 1
-
-        if present == 1:
-            if offset + 4 > data_len:
-                return None
-
-            size = unpack_u32(data, offset)[0]
-            offset += 4
-            end = offset + size
-            if size == _NULL_U32 or end > data_len:
-                return None
-
-            append_value(data[offset:end])
-            offset = end
-        elif present == 0:
-            append_value(None)
-        else:
-            return None
-
-    if offset != data_len:
-        return None
-    return values
-
-
-def _try_decode_custom_kv_mget_fixed(
-    data: bytes,
-    offset: int = 0,
-    *,
-    budget: DecodeBudget,
-) -> list[bytes | None] | None:
-    offset += 1
-    data_len = len(data)
-    if offset + 8 > data_len:
-        return None
-
-    unpack_u32 = _COMPACT_U32.unpack_from
-    count = unpack_u32(data, offset)[0]
-    offset += 4
-    budget.consume(count)
-    size = unpack_u32(data, offset)[0]
-    offset += 4
-
-    payload_len = data_len - offset
-    if size == _NULL_U32 or payload_len != count * size:
-        return None
-
-    if count == 0:
-        return [] if offset == data_len else None
-    if size == 0:
-        return [b""] * count
-
-    end = offset + payload_len
-    return [data[item_offset : item_offset + size] for item_offset in range(offset, end, size)]
-
-
-def _try_decode_custom_binary_list_list(
-    data: bytes,
-    offset: int = 0,
-    *,
-    budget: DecodeBudget,
-) -> list[list[bytes]] | None:
-    try:
-        offset += 1
-        data_len = len(data)
-        if offset + 4 > data_len:
-            return None
-        unpack_u32 = _COMPACT_U32.unpack_from
-        count = unpack_u32(data, offset)[0]
-        offset += 4
-        budget.consume(count)
-        values: list[list[bytes] | None] = [None] * count
-
-        for outer_index in range(count):
-            if offset + 4 > data_len:
-                return None
-            inner_count = unpack_u32(data, offset)[0]
-            offset += 4
-            budget.consume(inner_count)
-
-            if inner_count == 0:
-                values[outer_index] = []
-                continue
-
-            if inner_count == 1:
-                if offset + 4 > data_len:
-                    return None
-                size = unpack_u32(data, offset)[0]
-                offset += 4
-                if size == _NULL_U32 or offset + size > data_len:
-                    return None
-                values[outer_index] = [data[offset : offset + size]]
-                offset += size
-                continue
-
-            if inner_count > (data_len - offset) // 4:
-                return None
-            inner_values = [b""] * inner_count
-            for inner_index in range(inner_count):
-                if offset + 4 > data_len:
-                    return None
-                size = unpack_u32(data, offset)[0]
-                offset += 4
-                if size == _NULL_U32 or offset + size > data_len:
-                    return None
-                inner_values[inner_index] = data[offset : offset + size]
-                offset += size
-            values[outer_index] = inner_values
-
-        if offset != data_len:
-            return None
-        return cast(list[list[bytes]], values)
-    except (IndexError, struct.error):
-        return None
-
-
-def _try_decode_custom_binary_map_list(
-    data: bytes,
-    offset: int = 0,
-    *,
-    budget: DecodeBudget,
-) -> list[dict[bytes, bytes]] | None:
-    try:
-        offset += 1
-        data_len = len(data)
-        if offset + 4 > data_len:
-            return None
-        unpack_u32 = _COMPACT_U32.unpack_from
-        count = unpack_u32(data, offset)[0]
-        offset += 4
-        budget.consume(count)
-        values: list[dict[bytes, bytes] | None] = [None] * count
-
-        for outer_index in range(count):
-            if offset + 4 > data_len:
-                return None
-            item_count = unpack_u32(data, offset)[0]
-            offset += 4
-            budget.consume(item_count)
-
-            if item_count == 0:
-                values[outer_index] = {}
-                continue
-
-            items: dict[bytes, bytes] = {}
-            for _ in range(item_count):
-                if offset + 4 > data_len:
-                    return None
-                key_size = unpack_u32(data, offset)[0]
-                offset += 4
-                if key_size == _NULL_U32 or offset + key_size > data_len:
-                    return None
-                key = data[offset : offset + key_size]
-                offset += key_size
-
-                if offset + 4 > data_len:
-                    return None
-                value_size = unpack_u32(data, offset)[0]
-                offset += 4
-                if value_size == _NULL_U32 or offset + value_size > data_len:
-                    return None
-                items[key] = data[offset : offset + value_size]
-                offset += value_size
-
-            values[outer_index] = items
-
-        if offset != data_len:
-            return None
-        return cast(list[dict[bytes, bytes]], values)
-    except (IndexError, struct.error):
-        return None
-
-
-def _read_custom_binary_list(
-    data: bytes,
-    offset: int,
-    *,
-    budget: DecodeBudget,
-) -> tuple[list[bytes], int]:
-    count = _read_u32(data, offset)
-    offset += 4
-    budget.consume(count)
-    values: list[bytes] = []
-    for _ in range(count):
-        value, offset = _read_compact_binary(data, offset)
-        values.append(value)
-    return values, offset
-
-
-def _read_custom_binary_map(
-    data: bytes,
-    offset: int,
-    *,
-    budget: DecodeBudget,
-) -> tuple[dict[bytes, bytes], int]:
-    count = _read_u32(data, offset)
-    offset += 4
-    budget.consume(count)
-    values: dict[bytes, bytes] = {}
-    for _ in range(count):
-        key, offset = _read_compact_binary(data, offset)
-        value, offset = _read_compact_binary(data, offset)
-        values[key] = value
-    return values, offset
-
-
 def _try_decode_custom_claim_jobs(
     data: bytes,
     offset: int = 0,
@@ -579,6 +331,8 @@ def _try_decode_custom_claim_jobs(
             raise limit_error
         return None
     except DecodedCollectionLimitError:
+        raise
+    except DuplicateProtocolMapKeyError:
         raise
     except (IndexError, struct.error, FerricStoreError):
         return None
@@ -619,6 +373,8 @@ def _try_decode_custom_claim_jobs_width(
             return None
         return cast(list[list[Any]], items)
     except DecodedCollectionLimitError:
+        raise
+    except DuplicateProtocolMapKeyError:
         raise
     except (IndexError, struct.error, FerricStoreError):
         return None
@@ -672,6 +428,8 @@ def _try_decode_custom_ok_list(
         return [b"OK"] * count
     except DecodedCollectionLimitError:
         raise
+    except DuplicateProtocolMapKeyError:
+        raise
     except (IndexError, struct.error, FerricStoreError):
         return None
 
@@ -703,6 +461,8 @@ def _try_decode_custom_integer_list(
         return values
     except DecodedCollectionLimitError:
         raise
+    except DuplicateProtocolMapKeyError:
+        raise
     except (IndexError, struct.error, FerricStoreError):
         return None
 
@@ -718,6 +478,8 @@ def _try_decode_custom_flow_record(
         return value if offset == len(data) else None
     except DecodedCollectionLimitError:
         raise
+    except DuplicateProtocolMapKeyError:
+        raise
     except (IndexError, struct.error, FerricStoreError):
         return None
 
@@ -732,6 +494,8 @@ def _try_decode_custom_flow_record_list(
         value, offset = _read_custom_flow_record_list(data, offset, budget=budget)
         return value if offset == len(data) else None
     except DecodedCollectionLimitError:
+        raise
+    except DuplicateProtocolMapKeyError:
         raise
     except (IndexError, struct.error, FerricStoreError):
         return None
@@ -775,6 +539,8 @@ def _read_custom_flow_record(
             key = field_keys[key_id]
         else:
             raise FerricStoreError("protocol compact Flow record key is unknown")
+        if key in record:
+            raise DuplicateProtocolMapKeyError("duplicate protocol map key while decoding")
         value, offset = decode_record_value(data, offset, data_len, budget=budget)
         record[key] = value
     return record, offset
@@ -930,51 +696,43 @@ def _try_decode_binary_list(
         return None
 
 
-def _read_u32(data: bytes, offset: int) -> int:
-    _require_available(data, offset, 4)
-    value: int = _COMPACT_U32.unpack_from(data, offset)[0]
-    return value
-
-
-def _read_tagged_binary(data: bytes, offset: int) -> tuple[bytes, int]:
-    if data[offset] != 4:
-        raise FerricStoreError("protocol fast path expected binary")
-    offset += 1
-    size = _read_u32(data, offset)
-    offset += 4
-    _require_available(data, offset, size)
-    return data[offset : offset + size], offset + size
-
-
-def _read_tagged_i64(data: bytes, offset: int) -> tuple[int, int]:
-    if data[offset] != 3:
-        raise FerricStoreError("protocol fast path expected integer")
-    offset += 1
-    _require_available(data, offset, 8)
-    return struct.unpack_from(">q", data, offset)[0], offset + 8
-
-
-def _read_compact_binary(data: bytes, offset: int) -> tuple[bytes, int]:
-    size = _read_u32(data, offset)
-    offset += 4
-    if size == _NULL_U32:
-        raise FerricStoreError("protocol compact value expected binary")
-    _require_available(data, offset, size)
-    return data[offset : offset + size], offset + size
-
-
-def _read_compact_optional_binary(data: bytes, offset: int) -> tuple[bytes | None, int]:
-    size = _read_u32(data, offset)
-    offset += 4
-    if size == _NULL_U32:
-        return None, offset
-    _require_available(data, offset, size)
-    return data[offset : offset + size], offset + size
-
-
-def _require_available(data: bytes, offset: int, size: int) -> None:
-    if len(data) - offset < size:
-        raise FerricStoreError("protocol value is truncated")
+_PIPELINE_MARKER_DECODERS.update(
+    {
+        _COMPACT_PIPELINE_RESPONSE: _try_decode_custom_pipeline_response,
+        _COMPACT_KV_MGET: _try_decode_custom_kv_mget,
+        _COMPACT_KV_MGET_FIXED: _try_decode_custom_kv_mget_fixed,
+        _COMPACT_FLOW_RECORD_LIST: _try_decode_custom_flow_record_list,
+        _COMPACT_FLOW_CLAIM_JOBS: _try_decode_custom_claim_jobs,
+        _COMPACT_BINARY_LIST_LIST: _try_decode_custom_binary_list_list,
+        _COMPACT_BINARY_MAP_LIST: _try_decode_custom_binary_map_list,
+        _COMPACT_INTEGER_LIST: _try_decode_custom_integer_list,
+        _COMPACT_OK_LIST: _try_decode_custom_ok_list,
+    }
+)
+_MGET_MARKER_DECODERS.update(
+    {
+        _COMPACT_KV_MGET: _try_decode_custom_kv_mget,
+        _COMPACT_KV_MGET_FIXED: _try_decode_custom_kv_mget_fixed,
+    }
+)
+_FAST_RESPONSE_DECODERS.update(
+    {
+        _OP_PIPELINE: _try_fast_pipeline,
+        _OP_GET: _try_fast_get,
+        _OP_SET: _try_fast_ok,
+        _OP_MSET: _try_fast_ok,
+        _OP_MGET: _try_fast_mget,
+        _OP_FLOW_VALUE_MGET: _try_fast_mget,
+        _OP_FLOW_GET: _try_fast_flow_record,
+        _OP_FLOW_CLAIM_DUE: _try_fast_claim,
+        _OP_FLOW_CREATE_MANY: _try_fast_many,
+        _OP_FLOW_COMPLETE_MANY: _try_fast_many,
+        _OP_FLOW_RETRY_MANY: _try_fast_many,
+        _OP_FLOW_FAIL_MANY: _try_fast_many,
+        _OP_FLOW_CANCEL_MANY: _try_fast_many,
+    }
+)
+_FAST_RESPONSE_DECODERS.update(dict.fromkeys(_FLOW_RECORD_LIST_OPCODES, _try_fast_flow_record_list))
 
 
 def _extract_traced_value(value: Any) -> tuple[Any, dict[str, Any]]:
@@ -1055,6 +813,8 @@ def _decode_protocol_response(
             },
             "server": server_trace,
         }
+    if status == _STATUS_OK:
+        validate_response_cardinality(opcode, value, expected_collection_items)
 
     return ProtocolResponse(
         lane_id=lane_id,
@@ -1142,7 +902,13 @@ def _status_text(value: Any) -> str | None:
     if isinstance(value, str):
         return value
     if isinstance(value, bytes):
-        return value.decode()
+        try:
+            return value.decode()
+        except UnicodeDecodeError as exc:
+            raise FerricStoreError(
+                "protocol PIPELINE status is not valid UTF-8",
+                raw=value,
+            ) from exc
     return None
 
 

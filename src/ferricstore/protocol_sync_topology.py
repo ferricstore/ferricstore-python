@@ -12,6 +12,10 @@ from urllib.parse import urlparse
 from ferricstore.batch_core import (
     SyncFanoutExecutor,
 )
+from ferricstore.config_validation import (
+    validate_optional_positive_int,
+    validate_optional_thread_wait_seconds,
+)
 from ferricstore.errors import (
     FerricStoreError,
     InvalidCommandError,
@@ -23,61 +27,60 @@ from ferricstore.lifecycle_core import (
     try_set_future_exception,
     try_set_future_result,
 )
-from ferricstore.protocol_commands import (
-    build_protocol_command,
-)
+from ferricstore.protocol_commands import build_protocol_command
 from ferricstore.protocol_common import (
     RoutingTopology,
     _close_adapter_sync,
-    _close_adapters_sync,
-    _command_name,
-    _connection_endpoint_key,
     _endpoint_adapter_is_idle,
-    _endpoint_from_url,
     _is_retryable_route_error,
     _is_safe_control_retry,
-    _map_get,
-    _normalized_host_set,
     _protocol_connection_count,
-    _set_seed_auth_defaults,
     _set_wire_future_sources,
-    _text_or_none,
     _unique_adapters,
-    _url_from_endpoint,
 )
 from ferricstore.protocol_constants import (
-    _CONTROL_OPCODES,
     _FLAG_TRACE,
     _TLS_SCHEMES,
-    ProtocolCommand,
 )
+from ferricstore.protocol_lifecycle import DEFAULT_MAX_BATCH_ITEMS
+from ferricstore.protocol_planning import PreparedCommand, prepare_protocol_command
 from ferricstore.protocol_sync import (
     ProtocolPipeline,
 )
-from ferricstore.protocol_sync_pool import (
-    ProtocolAdapterPool,
+from ferricstore.protocol_sync_endpoints import SyncTopologyEndpointMixin
+from ferricstore.protocol_sync_routing import (
+    SyncTopologyRoutingMixin,
+    _TopologyGenerationChanged,
 )
 from ferricstore.topology_core import (
     ControlEndpointSelector,
     FlowWakeSubscriptionRegistry,
     RouteBatchPlan,
-    RoutedBatchTarget,
-    route_for_command,
-    route_for_keys,
     validate_single_slot,
 )
 from ferricstore.topology_lifecycle import (
+    EndpointAdapterLease,
     EndpointAdapterLifecycle,
     SyncSingleFlight,
 )
+from ferricstore.topology_security import (
+    TopologyEndpointTrust,
+    TopologyRuntimeConfig,
+    seed_urls_by_endpoint,
+    validate_seed_credential_consistency,
+    validate_topology_configuration,
+)
 
 
-class TopologyProtocolAdapterPool:
+class TopologyProtocolAdapterPool(SyncTopologyEndpointMixin, SyncTopologyRoutingMixin):
     """Topology-aware native pool backed by the server SHARDS slot table."""
 
     client: TopologyProtocolAdapterPool
     requires_explicit_session = True
     supports_concurrent_fanout = True
+
+    def _prepare_routed_command(self, args: tuple[Any, ...]) -> PreparedCommand:
+        return prepare_protocol_command(args, builder=build_protocol_command)
 
     def __init__(
         self,
@@ -91,25 +94,38 @@ class TopologyProtocolAdapterPool:
     ) -> None:
         if not urls:
             raise ValueError("TopologyProtocolAdapterPool requires at least one seed URL")
+        validate_topology_configuration(urls, endpoint_policy)
+        runtime_config = TopologyRuntimeConfig.build(
+            warm_connections=warm_connections,
+            trusted_hosts=trusted_hosts,
+            endpoint_validator=endpoint_validator,
+            tls=kwargs.get("tls", False),
+        )
         self.seed_urls = list(urls)
         self.client = self
         self.endpoint_policy = endpoint_policy
-        self.endpoint_validator = endpoint_validator
-        self.warm_connections = warm_connections
+        self.endpoint_validator = runtime_config.endpoint_validator
+        self.warm_connections = runtime_config.warm_connections
         self._max_connections = _protocol_connection_count(kwargs.pop("max_connections", 1))
-        self._tls = bool(kwargs.get("tls")) or any(
+        self._tls = runtime_config.tls or any(
             urlparse(url).scheme.lower() in _TLS_SCHEMES for url in self.seed_urls
         )
+        self.max_batch_items = validate_optional_positive_int(
+            kwargs.get("max_batch_items", DEFAULT_MAX_BATCH_ITEMS),
+            name="max_batch_items",
+        )
         self._adapter_kwargs = dict(kwargs)
-        _set_seed_auth_defaults(self.seed_urls, self._adapter_kwargs)
-        self._seed_endpoint_keys = {
-            _connection_endpoint_key(
-                _endpoint_from_url(url),
-                tls=urlparse(url).scheme.lower() in _TLS_SCHEMES,
-            )
-            for url in self.seed_urls
-        }
-        self._trusted_hosts = _normalized_host_set(list(trusted_hosts or []))
+        validate_seed_credential_consistency(self.seed_urls, self._adapter_kwargs)
+        self._seed_urls_by_endpoint = seed_urls_by_endpoint(self.seed_urls)
+        self._seed_endpoint_keys = set(self._seed_urls_by_endpoint)
+        self._endpoint_trust = TopologyEndpointTrust(
+            policy=endpoint_policy,
+            seed_endpoint_keys=self._seed_endpoint_keys,
+            trusted_hosts=runtime_config.trusted_hosts,
+            tls=self._tls,
+            validator=runtime_config.endpoint_validator,
+        )
+        self._trusted_hosts = set(self._endpoint_trust.trusted_hosts)
         self._endpoint_lifecycle = EndpointAdapterLifecycle[tuple[str, int]](
             is_idle=_endpoint_adapter_is_idle
         )
@@ -156,6 +172,10 @@ class TopologyProtocolAdapterPool:
         return ("topology-protocol", tuple(sorted(self.seed_urls)))
 
     def wait_event(self, timeout: float | None = None) -> Any | None:
+        timeout = validate_optional_thread_wait_seconds(
+            timeout,
+            name="wait_event timeout",
+        )
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             if self._closed:
@@ -183,16 +203,29 @@ class TopologyProtocolAdapterPool:
                 return None
 
     def _take_event(self) -> Any | None:
+        leases: list[EndpointAdapterLease[tuple[str, int]]] = []
         with self._lock:
-            adapters = list(self._adapters.values())
-        for adapter in adapters:
-            wait_event = getattr(adapter, "wait_event", None)
-            if not callable(wait_event):
-                continue
-            event = wait_event(timeout=0.0)
-            if event is not None:
-                return event
-        return None
+            lifecycle = getattr(self, "_endpoint_lifecycle", None)
+            if lifecycle is None:
+                adapters = list(self._adapters.values())
+            else:
+                for key, adapter in self._adapters.items():
+                    lease = lifecycle.acquire(key, adapter)
+                    if lease is not None:
+                        leases.append(lease)
+                adapters = [lease.adapter for lease in leases]
+        try:
+            for adapter in adapters:
+                wait_event = getattr(adapter, "wait_event", None)
+                if not callable(wait_event):
+                    continue
+                event = wait_event(timeout=0.0)
+                if event is not None:
+                    return event
+            return None
+        finally:
+            for lease in reversed(leases):
+                self._release_adapter_lease(lease)
 
     def close(self) -> None:
         coordinator = getattr(self, "_close_coordinator", None)
@@ -279,9 +312,21 @@ class TopologyProtocolAdapterPool:
         key = validate_single_slot(keys, slot_for_key=RoutingTopology.slot_for_key)
         if key is None:
             return self.acquire_session()
-        route = self.route(key)
+        lease: EndpointAdapterLease[tuple[str, int]] | None = None
         try:
-            adapter = self._adapter_for_endpoint(route["endpoint"])
+            while True:
+                with self._lock:
+                    route = dict(self.route(key))
+                    generation = self._topology_generation
+                try:
+                    lease = self._leased_adapter_for_endpoint(
+                        route["endpoint"],
+                        generation=generation,
+                    )
+                except _TopologyGenerationChanged:
+                    continue
+                break
+            adapter = lease.adapter
             acquire_session = getattr(adapter, "acquire_session_on_lane", None)
             if callable(acquire_session):
                 return acquire_session(int(route["lane_id"]))
@@ -294,6 +339,9 @@ class TopologyProtocolAdapterPool:
                 with contextlib.suppress(Exception):
                     self.refresh_topology()
             raise
+        finally:
+            if lease is not None:
+                self._release_adapter_lease(lease)
 
     def refresh_topology(self) -> RoutingTopology:
         singleflight = getattr(self, "_refresh_singleflight", None)
@@ -336,31 +384,63 @@ class TopologyProtocolAdapterPool:
         return route
 
     def execute_command(self, *args: Any) -> Any:
-        route_data = self._route_data(args)
-        if route_data is None:
-            return self._execute_control_method("execute_command", args)
-
-        command, route = route_data
+        lease: EndpointAdapterLease[tuple[str, int]] | None = None
         try:
-            adapter = self._adapter_for_endpoint(route["endpoint"])
-            return self._execute_protocol_command(adapter, command, route["lane_id"], args)
+            while True:
+                route_data = self._route_data(args)
+                if route_data is None:
+                    return self._execute_control_method("execute_command", args)
+                prepared, route = route_data
+                try:
+                    lease = self._leased_adapter_for_endpoint(
+                        route["endpoint"],
+                        generation=int(route["_sdk_generation"]),
+                    )
+                except _TopologyGenerationChanged:
+                    continue
+                break
+            adapter = lease.adapter
+            return self._execute_protocol_command(adapter, prepared, route["lane_id"])
         except Exception as exc:
             if _is_retryable_route_error(exc):
                 with contextlib.suppress(Exception):
                     self.refresh_topology()
             raise
+        finally:
+            if lease is not None:
+                self._release_adapter_lease(lease)
 
     def execute_command_with_trace(self, *args: Any) -> dict[str, Any]:
-        route_data = self._route_data(args)
-        if route_data is None:
-            return cast(
-                dict[str, Any],
-                self._execute_control_method("execute_command_with_trace", args),
-            )
-
-        command, route = route_data
+        lease: EndpointAdapterLease[tuple[str, int]] | None = None
         try:
-            adapter = self._adapter_for_endpoint(route["endpoint"])
+            while True:
+                route_data = self._route_data(args)
+                if route_data is None:
+                    return cast(
+                        dict[str, Any],
+                        self._execute_control_method("execute_command_with_trace", args),
+                    )
+                prepared, route = route_data
+                try:
+                    lease = self._leased_adapter_for_endpoint(
+                        route["endpoint"],
+                        generation=int(route["_sdk_generation"]),
+                    )
+                except _TopologyGenerationChanged:
+                    continue
+                break
+            command = prepared.command
+            adapter = lease.adapter
+            execute_prepared = getattr(
+                adapter,
+                "execute_prepared_command_with_trace_on_lane",
+                None,
+            )
+            if callable(execute_prepared):
+                return cast(
+                    dict[str, Any],
+                    execute_prepared(prepared, int(route["lane_id"])),
+                )
             execute_on_lane = getattr(adapter, "execute_command_with_trace_on_lane", None)
             if callable(execute_on_lane):
                 return cast(
@@ -385,6 +465,9 @@ class TopologyProtocolAdapterPool:
                 with contextlib.suppress(Exception):
                     self.refresh_topology()
             raise
+        finally:
+            if lease is not None:
+                self._release_adapter_lease(lease)
 
     def _execute_control_method(self, method: str, args: tuple[Any, ...]) -> Any:
         adapter = self._control_adapter()
@@ -402,13 +485,29 @@ class TopologyProtocolAdapterPool:
             raise
 
     def submit_command(self, *args: Any) -> Future[Any]:
-        route_data = self._route_data(args)
-        if route_data is None:
-            return cast(Future[Any], self._control_adapter().submit_command(*args))
-
-        command, route = route_data
+        lease: EndpointAdapterLease[tuple[str, int]] | None = None
         try:
-            adapter = self._adapter_for_endpoint(route["endpoint"])
+            while True:
+                route_data = self._route_data(args)
+                if route_data is None:
+                    return cast(Future[Any], self._control_adapter().submit_command(*args))
+                prepared, route = route_data
+                try:
+                    lease = self._leased_adapter_for_endpoint(
+                        route["endpoint"],
+                        generation=int(route["_sdk_generation"]),
+                    )
+                except _TopologyGenerationChanged:
+                    continue
+                break
+            command = prepared.command
+            adapter = lease.adapter
+            submit_prepared = getattr(adapter, "submit_prepared_command_on_lane", None)
+            if callable(submit_prepared):
+                return cast(
+                    Future[Any],
+                    submit_prepared(prepared, int(route["lane_id"])),
+                )
             submit_on_lane = getattr(adapter, "submit_command_on_lane", None)
             if callable(submit_on_lane):
                 return cast(Future[Any], submit_on_lane(args, int(route["lane_id"])))
@@ -423,6 +522,8 @@ class TopologyProtocolAdapterPool:
                     int(route["lane_id"]),
                     command.payload,
                     command.flags,
+                    expected_collection_items=prepared.expected_collection_items,
+                    _expire_at_adapter_timeout=not prepared.blocks_forever,
                 )
                 return cast(Future[Any], adapter._value_future(response_future))
             return cast(Future[Any], adapter.submit_command(*args))
@@ -431,32 +532,47 @@ class TopologyProtocolAdapterPool:
                 with contextlib.suppress(Exception):
                     self.refresh_topology()
             raise
+        finally:
+            if lease is not None:
+                self._release_adapter_lease(lease)
 
     def submit_commands(self, commands: list[tuple[Any, ...]]) -> list[Future[Any]]:
         if not commands:
             return []
+        leases: list[EndpointAdapterLease[tuple[str, int]]] = []
         try:
+            routed_commands, leases = self._prepare_routed_batch(commands)
             plan = RouteBatchPlan.build(
-                ((self._batch_target_for_command(args), args) for args in commands),
+                routed_commands,
                 group_key=lambda target: (id(target.adapter), target.lane_id),
             )
             group_futures: list[list[Future[Any]]] = []
             for group in plan.groups:
                 target = group.target
+                submit_prepared = (
+                    getattr(target.adapter, "submit_prepared_commands_on_lane", None)
+                    if target.lane_id is not None
+                    else None
+                )
+                if callable(submit_prepared):
+                    futures = list(submit_prepared(group.commands, target.lane_id))
+                    group_futures.append(futures)
+                    continue
+                raw_commands = [prepared.args for prepared in group.commands]
                 submit_commands = (
                     getattr(target.adapter, "submit_commands_on_lane", None)
                     if target.lane_id is not None
                     else None
                 )
                 if callable(submit_commands):
-                    futures = list(submit_commands(group.commands, target.lane_id))
+                    futures = list(submit_commands(raw_commands, target.lane_id))
                     group_futures.append(futures)
                     continue
                 submit_commands = getattr(target.adapter, "submit_commands", None)
                 if callable(submit_commands):
-                    futures = list(submit_commands(group.commands))
+                    futures = list(submit_commands(raw_commands))
                 else:
-                    futures = [target.adapter.submit_command(*args) for args in group.commands]
+                    futures = [target.adapter.submit_command(*args) for args in raw_commands]
                 group_futures.append(futures)
             return cast(list[Future[Any]], plan.merge(group_futures))
         except Exception as exc:
@@ -464,35 +580,54 @@ class TopologyProtocolAdapterPool:
                 with contextlib.suppress(Exception):
                     self.refresh_topology()
             raise
+        finally:
+            for lease in reversed(leases):
+                self._release_adapter_lease(lease)
 
     def submit_batch(self, commands: list[tuple[Any, ...]]) -> Future[list[Any]]:
         future: Future[list[Any]] = Future()
         if not commands:
             future.set_result([])
             return future
+        future.set_running_or_notify_cancel()
+        leases: list[EndpointAdapterLease[tuple[str, int]]] = []
         try:
+            routed_commands, leases = self._prepare_routed_batch(commands)
             plan = RouteBatchPlan.build(
-                ((self._batch_target_for_command(args), args) for args in commands),
+                routed_commands,
                 group_key=lambda target: (id(target.adapter), target.lane_id),
             )
             group_futures: list[Future[list[Any]]] = []
             for group in plan.groups:
                 target = group.target
+                submit_prepared = (
+                    getattr(target.adapter, "submit_prepared_batch_on_lane", None)
+                    if target.lane_id is not None
+                    else None
+                )
+                if callable(submit_prepared):
+                    group_future = submit_prepared(group.commands, target.lane_id)
+                    group_futures.append(cast(Future[list[Any]], group_future))
+                    continue
+                raw_commands = [prepared.args for prepared in group.commands]
                 submit_batch = (
                     getattr(target.adapter, "submit_batch_on_lane", None)
                     if target.lane_id is not None
                     else None
                 )
                 if callable(submit_batch):
-                    group_future = submit_batch(group.commands, target.lane_id)
+                    group_future = submit_batch(raw_commands, target.lane_id)
                 else:
-                    group_future = target.adapter.submit_batch(group.commands)
+                    group_future = target.adapter.submit_batch(raw_commands)
                 group_futures.append(cast(Future[list[Any]], group_future))
         except Exception as exc:
             if _is_retryable_route_error(exc):
                 with contextlib.suppress(Exception):
                     self.refresh_topology()
             raise
+        finally:
+            for lease in reversed(leases):
+                self._release_adapter_lease(lease)
         _set_wire_future_sources(
             future,
             [
@@ -531,64 +666,84 @@ class TopologyProtocolAdapterPool:
         return future
 
     def submit_mget(self, keys: Sequence[Any]) -> Future[Any]:
-        target = self._batch_target_for_keys(keys)
-        submit_on_lane = getattr(target.adapter, "submit_command_on_lane", None)
-        if target.lane_id is not None and callable(submit_on_lane):
-            return cast(
-                Future[Any],
-                submit_on_lane(("MGET", *keys), target.lane_id),
-            )
-        return cast(Future[Any], target.adapter.submit_mget(keys))
+        target, lease = self._leased_batch_target_for_keys(keys)
+        try:
+            submit_on_lane = getattr(target.adapter, "submit_command_on_lane", None)
+            if target.lane_id is not None and callable(submit_on_lane):
+                return cast(
+                    Future[Any],
+                    submit_on_lane(("MGET", *keys), target.lane_id),
+                )
+            return cast(Future[Any], target.adapter.submit_mget(keys))
+        finally:
+            if lease is not None:
+                self._release_adapter_lease(lease)
 
     def submit_mset_same_value(self, keys: Sequence[Any], value: Any) -> Future[Any]:
-        target = self._batch_target_for_keys(keys)
-        submit_on_lane = getattr(target.adapter, "submit_command_on_lane", None)
-        if target.lane_id is not None and callable(submit_on_lane):
-            args: list[Any] = ["MSET"]
-            for key in keys:
-                args.extend([key, value])
-            return cast(Future[Any], submit_on_lane(tuple(args), target.lane_id))
-        return cast(Future[Any], target.adapter.submit_mset_same_value(keys, value))
+        target, lease = self._leased_batch_target_for_keys(keys)
+        try:
+            submit_on_lane = getattr(target.adapter, "submit_command_on_lane", None)
+            if target.lane_id is not None and callable(submit_on_lane):
+                args: list[Any] = ["MSET"]
+                for key in keys:
+                    args.extend([key, value])
+                return cast(Future[Any], submit_on_lane(tuple(args), target.lane_id))
+            return cast(Future[Any], target.adapter.submit_mset_same_value(keys, value))
+        finally:
+            if lease is not None:
+                self._release_adapter_lease(lease)
 
     def submit_mset_payload(self, payload: bytes) -> Future[Any]:
-        target = self._opaque_payload_target()
-        submit_on_lane = getattr(target.adapter, "submit_mset_payload_on_lane", None)
-        if callable(submit_on_lane):
-            return cast(Future[Any], submit_on_lane(payload, target.lane_id))
-        return cast(Future[Any], target.adapter.submit_mset_payload(payload))
+        target, lease = self._leased_opaque_payload_target()
+        try:
+            submit_on_lane = getattr(target.adapter, "submit_mset_payload_on_lane", None)
+            if callable(submit_on_lane):
+                return cast(Future[Any], submit_on_lane(payload, target.lane_id))
+            return cast(Future[Any], target.adapter.submit_mset_payload(payload))
+        finally:
+            self._release_adapter_lease(lease)
 
     def submit_pipeline_payload(self, payload: bytes, count: int) -> Future[list[Any]]:
-        target = self._opaque_payload_target()
-        submit_on_lane = getattr(target.adapter, "submit_pipeline_payload_on_lane", None)
-        if callable(submit_on_lane):
-            return cast(Future[list[Any]], submit_on_lane(payload, count, target.lane_id))
-        return cast(Future[list[Any]], target.adapter.submit_pipeline_payload(payload, count))
+        target, lease = self._leased_opaque_payload_target()
+        try:
+            submit_on_lane = getattr(target.adapter, "submit_pipeline_payload_on_lane", None)
+            if callable(submit_on_lane):
+                return cast(Future[list[Any]], submit_on_lane(payload, count, target.lane_id))
+            return cast(Future[list[Any]], target.adapter.submit_pipeline_payload(payload, count))
+        finally:
+            self._release_adapter_lease(lease)
 
     def submit_flow_many_payload(
         self, command: str, payload: bytes, count: int
     ) -> Future[list[Any]]:
-        target = self._opaque_payload_target()
-        submit_on_lane = getattr(target.adapter, "submit_flow_many_payload_on_lane", None)
-        if callable(submit_on_lane):
+        target, lease = self._leased_opaque_payload_target()
+        try:
+            submit_on_lane = getattr(target.adapter, "submit_flow_many_payload_on_lane", None)
+            if callable(submit_on_lane):
+                return cast(
+                    Future[list[Any]],
+                    submit_on_lane(command, payload, count, target.lane_id),
+                )
             return cast(
                 Future[list[Any]],
-                submit_on_lane(command, payload, count, target.lane_id),
+                target.adapter.submit_flow_many_payload(command, payload, count),
             )
-        return cast(
-            Future[list[Any]],
-            target.adapter.submit_flow_many_payload(command, payload, count),
-        )
+        finally:
+            self._release_adapter_lease(lease)
 
     def submit_flow_value_mget_payload(self, payload: bytes) -> Future[Any]:
-        target = self._opaque_payload_target()
-        submit_on_lane = getattr(
-            target.adapter,
-            "submit_flow_value_mget_payload_on_lane",
-            None,
-        )
-        if callable(submit_on_lane):
-            return cast(Future[Any], submit_on_lane(payload, target.lane_id))
-        return cast(Future[Any], target.adapter.submit_flow_value_mget_payload(payload))
+        target, lease = self._leased_opaque_payload_target()
+        try:
+            submit_on_lane = getattr(
+                target.adapter,
+                "submit_flow_value_mget_payload_on_lane",
+                None,
+            )
+            if callable(submit_on_lane):
+                return cast(Future[Any], submit_on_lane(payload, target.lane_id))
+            return cast(Future[Any], target.adapter.submit_flow_value_mget_payload(payload))
+        finally:
+            self._release_adapter_lease(lease)
 
     def subscribe_flow_wake(self, *args: Any, **kwargs: Any) -> Any:
         update_lock = getattr(self, "_subscription_update_lock", None)
@@ -615,23 +770,33 @@ class TopologyProtocolAdapterPool:
 
         def execute_group(group: Any) -> list[Any]:
             target = group.target
+            execute_prepared = (
+                getattr(target.adapter, "execute_prepared_batch_on_lane", None)
+                if target.lane_id is not None
+                else None
+            )
+            if callable(execute_prepared):
+                return list(execute_prepared(group.commands, target.lane_id))
+            raw_commands = [prepared.args for prepared in group.commands]
             execute_batch = (
                 getattr(target.adapter, "execute_batch_on_lane", None)
                 if target.lane_id is not None
                 else None
             )
             if callable(execute_batch):
-                return list(execute_batch(group.commands, target.lane_id))
+                return list(execute_batch(raw_commands, target.lane_id))
             execute_batch = getattr(target.adapter, "execute_batch", None)
             return (
-                list(execute_batch(group.commands))
+                list(execute_batch(raw_commands))
                 if callable(execute_batch)
-                else [target.adapter.execute_command(*args) for args in group.commands]
+                else [target.adapter.execute_command(*args) for args in raw_commands]
             )
 
+        leases: list[EndpointAdapterLease[tuple[str, int]]] = []
         try:
+            routed_commands, leases = self._prepare_routed_batch(commands)
             plan = RouteBatchPlan.build(
-                ((self._batch_target_for_command(args), args) for args in commands),
+                routed_commands,
                 group_key=lambda target: (id(target.adapter), target.lane_id),
             )
             group_values = self._batch_fanout.run(
@@ -645,10 +810,21 @@ class TopologyProtocolAdapterPool:
                 with contextlib.suppress(Exception):
                     self.refresh_topology()
             raise
+        finally:
+            for lease in reversed(leases):
+                self._release_adapter_lease(lease)
 
     def _execute_protocol_command(
-        self, adapter: Any, command: ProtocolCommand, lane_id: int, args: tuple[Any, ...]
+        self,
+        adapter: Any,
+        prepared: PreparedCommand,
+        lane_id: int,
     ) -> Any:
+        execute_prepared = getattr(adapter, "execute_prepared_command_on_lane", None)
+        if callable(execute_prepared):
+            return execute_prepared(prepared, int(lane_id))
+        args = prepared.args
+        command = prepared.command
         execute_on_lane = getattr(adapter, "execute_command_on_lane", None)
         if callable(execute_on_lane):
             return execute_on_lane(args, int(lane_id))
@@ -662,253 +838,6 @@ class TopologyProtocolAdapterPool:
             command.flags,
         )
         return adapter._response_value(response)
-
-    def _route_data(self, args: tuple[Any, ...]) -> tuple[ProtocolCommand, dict[str, Any]] | None:
-        if not args:
-            return None
-        try:
-            command = build_protocol_command(*args)
-        except Exception:
-            return None
-        decision = route_for_command(
-            args,
-            opcode=command.opcode,
-            payload=command.payload,
-            control_opcodes=_CONTROL_OPCODES,
-            command_name=_command_name,
-            slot_for_key=RoutingTopology.slot_for_key,
-        )
-        key = decision.require_routable_key()
-        if key is None:
-            return None
-        return command, self.route(key)
-
-    def _single_shard_key(self, keys: Sequence[Any]) -> str | bytes | None:
-        decision = route_for_keys(keys, slot_for_key=RoutingTopology.slot_for_key)
-        return decision.require_routable_key()
-
-    def _adapter_for_command(self, args: tuple[Any, ...]) -> Any:
-        route_data = self._route_data(args)
-        if route_data is None:
-            return self._control_adapter()
-        return self._adapter_for_endpoint(route_data[1]["endpoint"])
-
-    def _batch_target_for_command(self, args: tuple[Any, ...]) -> RoutedBatchTarget[Any]:
-        route_data = self._route_data(args)
-        if route_data is None:
-            return RoutedBatchTarget(self._control_adapter(), None)
-        route = route_data[1]
-        return RoutedBatchTarget(
-            self._adapter_for_endpoint(route["endpoint"]),
-            int(route["lane_id"]),
-        )
-
-    def _batch_target_for_keys(self, keys: Sequence[Any]) -> RoutedBatchTarget[Any]:
-        key = self._single_shard_key(keys)
-        if key is None:
-            return RoutedBatchTarget(self._control_adapter(), None)
-        route = self.route(key)
-        return RoutedBatchTarget(
-            self._adapter_for_endpoint(route["endpoint"]),
-            int(route["lane_id"]),
-        )
-
-    def _adapter_for_keys(self, keys: Sequence[Any]) -> Any | None:
-        key = self._single_shard_key(keys)
-        if key is None:
-            return None
-        route = self.route(key)
-        return self._adapter_for_endpoint(route["endpoint"])
-
-    def _control_adapter(self) -> Any:
-        if self._closed:
-            raise FerricStoreError("protocol topology pool is closed")
-        for url in self._refresh_candidate_urls():
-            with contextlib.suppress(Exception):
-                return self._adapter_for_url(url)
-        return self._adapter_for_url(self.seed_urls[0])
-
-    def _opaque_payload_target(self) -> RoutedBatchTarget[Any]:
-        """Route opaque payloads only when topology has one exact destination."""
-        with self._lock:
-            if self._closed:
-                raise FerricStoreError("protocol topology pool is closed")
-            destinations = self.topology.route_destinations
-        if len(destinations) != 1:
-            raise InvalidCommandError(
-                "opaque payload submission requires exactly one topology route; "
-                "submit decoded commands when routing across multiple leaders"
-            )
-        route = destinations[0]
-        return RoutedBatchTarget(
-            self._adapter_for_endpoint(route["endpoint"]),
-            int(route["lane_id"]),
-        )
-
-    def _adapter_for_url(self, url: str) -> Any:
-        endpoint = _endpoint_from_url(url)
-        key = _connection_endpoint_key(
-            endpoint,
-            tls=urlparse(url).scheme.lower() in _TLS_SCHEMES,
-        )
-        if key not in self._seed_endpoint_keys:
-            self._validate_endpoint(endpoint)
-        return self._adapter_for_key(key, lambda: self._new_endpoint_adapter(url))
-
-    def _adapter_for_endpoint(self, endpoint: Mapping[str, Any]) -> Any:
-        self._validate_endpoint(endpoint)
-        key = _connection_endpoint_key(endpoint, tls=self._tls)
-        return self._adapter_for_key(
-            key,
-            lambda: self._new_endpoint_adapter(_url_from_endpoint(endpoint, tls=self._tls)),
-        )
-
-    def _adapter_for_key(
-        self,
-        key: tuple[str, int],
-        create: Callable[[], Any],
-    ) -> Any:
-        with self._lock:
-            if self._closed:
-                raise FerricStoreError("protocol topology pool is closed")
-            adapter = self._endpoint_lifecycle.get(key)
-            if adapter is not None:
-                return adapter
-            creation = self._adapter_creations.get(key)
-            if creation is None:
-                creation = Future()
-                self._adapter_creations[key] = creation
-                creator = True
-            else:
-                creator = False
-        if not creator:
-            return creation.result()
-
-        candidate: Any | None = None
-        try:
-            candidate = create()
-            self._register_adapter_events(candidate)
-            while True:
-                with self._lock:
-                    if self._closed:
-                        raise FerricStoreError("protocol topology pool is closed")
-                    subscription_generation = self._subscription_generation
-                self._subscription_registry.activate_sync(candidate)
-                with self._lock:
-                    if self._closed:
-                        raise FerricStoreError("protocol topology pool is closed")
-                    if subscription_generation != self._subscription_generation:
-                        continue
-                    self._endpoint_lifecycle.put(key, candidate)
-                    creation.set_result(candidate)
-                    self._adapter_creations.pop(key, None)
-                    self._adapter_creation_cv.notify_all()
-                    self._event_ready.set()
-                    return candidate
-        except BaseException as error:
-            if candidate is not None:
-                self._cleanup_adapters.add(candidate)
-                self._cleanup_retired_adapters([candidate])
-            with self._lock:
-                creation.set_exception(error)
-                self._adapter_creations.pop(key, None)
-                self._adapter_creation_cv.notify_all()
-            raise
-
-    def _install_topology(self, topology: RoutingTopology) -> list[Any]:
-        live_keys = set(self._seed_endpoint_keys)
-        live_keys.update(
-            _connection_endpoint_key(endpoint, tls=self._tls)
-            for endpoint in topology.endpoints.values()
-        )
-        ready = self._endpoint_lifecycle.install(
-            live_keys,
-            self._retired_adapter_became_idle,
-        )
-        self._topology_generation = self._endpoint_lifecycle.generation
-        self.topology = topology
-        cleanup_adapters = self._cleanup_adapters
-        for adapter in ready:
-            cleanup_adapters.add(adapter)
-        return ready
-
-    def _retired_adapter_became_idle(
-        self,
-        key: tuple[str, int],
-        adapter: Any,
-    ) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            ready = self._endpoint_lifecycle.claim_idle(key, adapter)
-            if ready is None:
-                return
-            self._cleanup_adapters.add(ready)
-        self._cleanup_retired_adapters([ready])
-
-    def _cleanup_retired_adapters(self, adapters: Sequence[Any]) -> None:
-        cleanup_lock = self._adapter_cleanup_lock
-        retained = self._cleanup_adapters.snapshot()
-        for adapter in _unique_adapters([*adapters, *retained]):
-            with cleanup_lock:
-                if not self._cleanup_adapters.contains(adapter):
-                    continue
-                try:
-                    _close_adapters_sync([adapter], self._event_listener)
-                except BaseException:
-                    continue
-                self._cleanup_adapters.complete(adapter)
-            with self._lock:
-                snapshot = self._close_adapters_snapshot
-                if snapshot is not None:
-                    snapshot[:] = [candidate for candidate in snapshot if candidate is not adapter]
-
-    def _new_endpoint_adapter(self, url: str) -> Any:
-        return ProtocolAdapterPool.from_url(
-            url,
-            max_connections=self._max_connections,
-            **self._adapter_kwargs,
-        )
-
-    def _register_adapter_events(self, adapter: Any) -> None:
-        add_listener = getattr(adapter, "add_event_listener", None)
-        if callable(add_listener):
-            add_listener(self._event_listener)
-        else:
-            self._event_poll_fallback = True
-
-    def _validate_endpoint(self, endpoint: Mapping[str, Any]) -> None:
-        host = _text_or_none(_map_get(endpoint, "host", "native_host"))
-        if host is None:
-            raise FerricStoreError("invalid learned endpoint", raw=endpoint)
-        allowed = False
-        policy = self.endpoint_policy
-        if policy in {"any", "none"}:
-            allowed = True
-        elif policy == "seed_hosts":
-            allowed = (
-                _connection_endpoint_key(endpoint, tls=self._tls) in self._seed_endpoint_keys
-                or host.lower() in self._trusted_hosts
-            )
-        elif isinstance(policy, tuple) and len(policy) == 2 and policy[0] == "allow_hosts":
-            allowed = host.lower() in _normalized_host_set(policy[1])
-        else:
-            raise FerricStoreError(f"invalid endpoint_policy {policy!r}")
-        if not allowed:
-            raise FerricStoreError("unsafe learned endpoint", raw=endpoint)
-        if self.endpoint_validator is not None and not self.endpoint_validator(endpoint):
-            raise FerricStoreError("unsafe learned endpoint", raw=endpoint)
-
-    def _refresh_candidate_urls(self) -> list[str]:
-        discovered_urls = [
-            _url_from_endpoint(endpoint, tls=self._tls)
-            for endpoint in self.topology.endpoints.values()
-        ]
-        live_urls = set(self.seed_urls)
-        live_urls.update(discovered_urls)
-        return [
-            url for url in self._control_endpoints.candidates(discovered_urls) if url in live_urls
-        ]
 
 
 __all__ = [

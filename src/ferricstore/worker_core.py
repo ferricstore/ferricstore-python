@@ -1,14 +1,18 @@
 from __future__ import annotations
 
-import asyncio
 import inspect
 import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
+if TYPE_CHECKING:
+    import asyncio
+
+from ferricstore.config_validation import validate_thread_wait_seconds
 from ferricstore.errors import FerricStoreError, classify_server_error, map_exception
 
 _MANY_OK_STATUSES = {"ok", "success"}
@@ -91,6 +95,20 @@ def validate_many_result(response: Any, expected_count: int, *, operation: str) 
         if error is not None:
             raise error
     return items
+
+
+def validate_worker_idle_timing(
+    idle_sleep_s: float,
+    max_idle_sleep_s: float | None,
+) -> tuple[float, float]:
+    """Validate and normalize the idle backoff interval shared by all workers."""
+    minimum_s = validate_thread_wait_seconds(idle_sleep_s, name="idle_sleep_s")
+    maximum_s = (
+        minimum_s
+        if max_idle_sleep_s is None
+        else validate_thread_wait_seconds(max_idle_sleep_s, name="max_idle_sleep_s")
+    )
+    return minimum_s, max(minimum_s, maximum_s)
 
 
 @dataclass(slots=True)
@@ -186,6 +204,8 @@ class AsyncWorkerInvocationTracker:
     """Track public async worker calls across terminal, retryable shutdown."""
 
     def __init__(self) -> None:
+        import asyncio
+
         self._active = 0
         self._closing = False
         self._idle = asyncio.Event()
@@ -225,6 +245,8 @@ class AsyncWorkerInvocationTracker:
         self._closing = True
 
     async def wait_for_idle(self, deadline: CloseDeadline, message: str) -> None:
+        import asyncio
+
         while self._active:
             timeout = deadline.remaining(message)
             try:
@@ -264,9 +286,10 @@ class CloseDeadline:
 
     @classmethod
     def start(cls, timeout: float | None) -> CloseDeadline:
-        if timeout is not None and timeout < 0:
-            raise ValueError("close timeout must be non-negative")
-        return cls(None if timeout is None else time.monotonic() + timeout)
+        if timeout is None:
+            return cls(None)
+        timeout_s = validate_thread_wait_seconds(timeout, name="close timeout")
+        return cls(time.monotonic() + timeout_s)
 
     def remaining(self, message: str) -> float | None:
         if self.expires_at is None:
@@ -291,7 +314,7 @@ class CloseDeadline:
             return future.result()
         try:
             return future.result(timeout=self.remaining(message))
-        except TimeoutError:
+        except FutureTimeoutError:
             if future.done():
                 return future.result()
             raise CloseTimeoutError(message) from None
@@ -301,6 +324,8 @@ class CloseDeadline:
         tasks: list[asyncio.Task[Any]],
         message: str,
     ) -> None:
+        import asyncio
+
         pending = [task for task in tasks if not task.done()]
         if not pending:
             return
@@ -312,6 +337,8 @@ class CloseDeadline:
             raise CloseTimeoutError(message)
 
     async def wait_awaitable(self, awaitable: Any, message: str) -> Any:
+        import asyncio
+
         try:
             timeout = self.remaining(message)
         except BaseException:
@@ -332,6 +359,8 @@ class CloseDeadline:
 
     async def wait_task(self, task: asyncio.Future[Any], message: str) -> Any:
         """Wait within the deadline without taking ownership of the task."""
+        import asyncio
+
         if task.done():
             return task.result()
         _done, pending = await asyncio.wait([task], timeout=self.remaining(message))
@@ -385,6 +414,8 @@ def _observe_task_completion(task: asyncio.Future[Any]) -> None:
 
 
 def _discard_unstarted_awaitable(awaitable: Any) -> None:
+    import asyncio
+
     if isinstance(awaitable, asyncio.Future):
         _observe_task_completion(awaitable)
     elif inspect.iscoroutine(awaitable):

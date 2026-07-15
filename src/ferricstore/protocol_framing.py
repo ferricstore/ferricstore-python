@@ -1,15 +1,26 @@
 from __future__ import annotations
 
 import io
+import os
+import socket
+import struct
+import sys
 import time
 import zlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
+from ferricstore.config_validation import (
+    validate_optional_nonnegative_int as validated_optional_nonnegative_int,
+)
+from ferricstore.config_validation import (
+    validate_optional_positive_int as validated_optional_positive_int,
+)
 from ferricstore.errors import FerricStoreError
 
 _FRAME_BODY_SPLIT_BYTES = 64 * 1024
+_SOCKET_TIMEOUT_OPTION_SIZE = struct.calcsize("@I" if os.name == "nt" else "@ll")
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,30 +46,6 @@ def validate_response_identity(
             message,
             raw={"expected": expected, "actual": actual},
         )
-
-
-def validated_optional_nonnegative_int(value: Any, *, name: str) -> int | None:
-    """Validate a byte/item/count limit without coercing lossy input types."""
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} must be a non-negative integer or None")
-    return value
-
-
-def validated_nonnegative_int(value: Any, *, name: str) -> int:
-    validated = validated_optional_nonnegative_int(value, name=name)
-    if validated is None:
-        raise ValueError(f"{name} must be a non-negative integer")
-    return validated
-
-
-def validated_optional_positive_int(value: Any, *, name: str) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError(f"{name} must be a positive integer or None")
-    return value
 
 
 def validated_response_chunk_limit(value: Any) -> int | None:
@@ -135,24 +122,30 @@ def decompress_response(body: bytes, limit: int | None) -> bytes:
         name="max_decompressed_response_bytes",
     )
     try:
-        if limit is None:
-            return zlib.decompress(body)
-
         decompressor = zlib.decompressobj()
+        if limit is None:
+            decoded = decompressor.decompress(body)
+            if not decompressor.eof or decompressor.unused_data or decompressor.unconsumed_tail:
+                raise FerricStoreError("protocol response has invalid compressed data")
+            return decoded + decompressor.flush()
+
         output = bytearray()
         compressed = body
         while True:
             remaining = limit - len(output)
-            output.extend(decompressor.decompress(compressed, remaining + 1))
+            output.extend(decompressor.decompress(compressed, min(remaining + 1, sys.maxsize)))
             if len(output) > limit:
                 raise FerricStoreError("protocol response exceeds max_decompressed_response_bytes")
             if not decompressor.unconsumed_tail:
                 break
             compressed = decompressor.unconsumed_tail
 
-        if not decompressor.eof:
+        if not decompressor.eof or decompressor.unused_data or decompressor.unconsumed_tail:
             raise FerricStoreError("protocol response has invalid compressed data")
-        output.extend(decompressor.flush(limit - len(output) + 1))
+        flush_limit = limit - len(output) + 1
+        output.extend(
+            decompressor.flush(flush_limit) if flush_limit <= sys.maxsize else decompressor.flush()
+        )
         if len(output) > limit:
             raise FerricStoreError("protocol response exceeds max_decompressed_response_bytes")
         return bytes(output)
@@ -170,35 +163,73 @@ def send_frames(
     timeout: float | None,
     manage_timeout: bool = True,
 ) -> None:
-    """Write a frame sequence against one deadline instead of one timeout per frame."""
-    gettimeout = cast(Callable[[], float | None] | None, getattr(sock, "gettimeout", None))
-    settimeout = cast(
-        Callable[[float | None], None] | None,
-        getattr(sock, "settimeout", None),
-    )
-    previous_timeout: float | None = None
+    """Write frames against one deadline without changing the socket's read timeout."""
+    getsockopt = cast(Callable[..., Any] | None, getattr(sock, "getsockopt", None))
+    setsockopt = cast(Callable[..., Any] | None, getattr(sock, "setsockopt", None))
     apply_write_timeout = (
-        manage_timeout and timeout is not None and gettimeout is not None and settimeout is not None
+        manage_timeout
+        and timeout is not None
+        and getsockopt is not None
+        and setsockopt is not None
+        and hasattr(socket, "SO_SNDTIMEO")
     )
     deadline = time.monotonic() + timeout if apply_write_timeout and timeout is not None else None
-    if apply_write_timeout and gettimeout is not None and settimeout is not None:
-        previous_timeout = gettimeout()
-    try:
-        for index, frame in enumerate(frames):
-            if deadline is not None and settimeout is not None:
-                remaining = timeout if index == 0 else deadline - time.monotonic()
-                assert remaining is not None
-                if remaining <= 0:
-                    raise TimeoutError("protocol batch write timed out")
-                settimeout(remaining)
+    previous_timeout: bytes | None = None
+    if apply_write_timeout and getsockopt is not None:
+        previous_timeout = cast(
+            bytes,
+            getsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, _SOCKET_TIMEOUT_OPTION_SIZE),
+        )
+
+    def set_write_timeout(remaining: float) -> None:
+        if setsockopt is None:
+            return
+        if remaining <= 0:
+            raise TimeoutError("protocol batch write timed out")
+        if os.name == "nt":
+            timeout_value = struct.pack("@I", max(1, int(remaining * 1_000)))
+        else:
+            seconds = int(remaining)
+            microseconds = max(1, int((remaining - seconds) * 1_000_000))
+            timeout_value = struct.pack("@ll", seconds, microseconds)
+        setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, timeout_value)
+
+    def send_frame(frame: bytes) -> None:
+        send = cast(Callable[[Any], int] | None, getattr(sock, "send", None))
+        if send is None:
+            if deadline is not None:
+                set_write_timeout(deadline - time.monotonic())
             sock.sendall(frame)
+            return
+        view = memoryview(frame)
+        offset = 0
+        while offset < len(view):
+            if deadline is not None:
+                set_write_timeout(deadline - time.monotonic())
+            sent = send(view[offset:])
+            if sent <= 0:
+                raise ConnectionError("protocol socket write made no progress")
+            offset += sent
+
+    try:
+        for frame in frames:
+            send_frame(frame)
     except BaseException as write_error:
-        if apply_write_timeout and settimeout is not None:
+        if previous_timeout is not None and setsockopt is not None:
             try:
-                settimeout(previous_timeout)
+                setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, previous_timeout)
             except BaseException as restore_error:
                 raise write_error.with_traceback(write_error.__traceback__) from restore_error
         raise
     else:
-        if apply_write_timeout and settimeout is not None:
-            settimeout(previous_timeout)
+        if previous_timeout is not None and setsockopt is not None:
+            try:
+                setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, previous_timeout)
+            except OSError:
+                # The reader owns connection shutdown and may retire the socket
+                # immediately after receiving the response.  A completed write
+                # must not become an ambiguous failure solely because restoring
+                # timeout state raced that close.
+                fileno = getattr(sock, "fileno", None)
+                if not callable(fileno) or fileno() >= 0:
+                    raise

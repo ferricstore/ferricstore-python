@@ -6,11 +6,13 @@ import inspect
 import time
 from collections.abc import Callable, Sequence
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
+from ferricstore.async_ownership import rollback_async_resources
 from ferricstore.batch_core import (
     run_async_fanout,
 )
+from ferricstore.config_validation import validate_optional_thread_wait_seconds
 from ferricstore.errors import (
     FerricStoreError,
     InvalidCommandError,
@@ -21,6 +23,7 @@ from ferricstore.lifecycle_core import (
     await_cancellation_safe,
     close_resources_async,
     consume_async_future_exception,
+    register_event_listener_transactionally,
 )
 from ferricstore.protocol_async import (
     AsyncProtocolAdapter,
@@ -30,11 +33,13 @@ from ferricstore.protocol_common import (
     _async_adapter_outer_fanout_limit,
     _close_adapter_async,
     _notify_event_listeners,
+    _pool_topology_options,
     _protocol_connection_count,
 )
 from ferricstore.protocol_constants import (
     _ASYNC_ADAPTER_FANOUT_LIMIT,
 )
+from ferricstore.protocol_planning import PreparedCommand
 
 if TYPE_CHECKING:
     from ferricstore.protocol_async_topology import AsyncTopologyProtocolAdapterPool
@@ -65,19 +70,16 @@ class AsyncProtocolAdapterPool:
         self._event_poll_fallback = False
         self._close_coordinator = AsyncCloseCoordinator()
         self._close_adapters = RetryableResourceSet(adapters)
-        for adapter in adapters:
-            add_listener = getattr(adapter, "add_event_listener", None)
-            if callable(add_listener):
-                add_listener(self._event_listener)
-            else:
-                self._event_poll_fallback = True
+        self._event_poll_fallback = register_event_listener_transactionally(
+            adapters,
+            self._event_listener,
+        )
 
     @classmethod
     def from_url(
         cls, url: str, **kwargs: Any
     ) -> AsyncProtocolAdapterPool | AsyncProtocolAdapter | AsyncTopologyProtocolAdapterPool:
-        seeds = kwargs.pop("seeds", None)
-        ha_routing = bool(kwargs.pop("ha_routing", False))
+        seeds, ha_routing = _pool_topology_options(kwargs)
         if seeds is not None or ha_routing:
             urls = [url]
             if seeds is not None:
@@ -87,7 +89,15 @@ class AsyncProtocolAdapterPool:
         max_connections = _protocol_connection_count(kwargs.pop("max_connections", 1))
         if max_connections <= 1:
             return AsyncProtocolAdapter.from_url(url, **kwargs)
-        return cls([AsyncProtocolAdapter.from_url(url, **kwargs) for _ in range(max_connections)])
+        adapters: list[AsyncProtocolAdapter] = []
+        try:
+            adapters.extend(
+                AsyncProtocolAdapter.from_url(url, **kwargs) for _ in range(max_connections)
+            )
+            return cls(adapters)
+        except BaseException:
+            rollback_async_resources(adapters)
+            raise
 
     @classmethod
     def from_urls(cls, urls: Sequence[str], **kwargs: Any) -> AsyncTopologyProtocolAdapterPool:
@@ -137,6 +147,10 @@ class AsyncProtocolAdapterPool:
         return list(self._idle_listeners)
 
     async def wait_event(self, timeout: float | None = None) -> Any | None:
+        timeout = validate_optional_thread_wait_seconds(
+            timeout,
+            name="wait_event timeout",
+        )
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             if self._closed:
@@ -246,6 +260,20 @@ class AsyncProtocolAdapterPool:
         finally:
             await self._release_adapter(index)
 
+    async def execute_prepared_command_on_lane(
+        self,
+        prepared: PreparedCommand,
+        lane_id: int,
+    ) -> Any:
+        index, adapter = await self._acquire_adapter()
+        try:
+            execute_prepared = getattr(adapter, "execute_prepared_command_on_lane", None)
+            if callable(execute_prepared):
+                return await execute_prepared(prepared, lane_id)
+            return await adapter.execute_command_on_lane(prepared.args, lane_id)
+        finally:
+            await self._release_adapter(index)
+
     async def execute_command_with_trace(self, *args: Any) -> dict[str, Any]:
         index, adapter = await self._acquire_adapter()
         try:
@@ -261,6 +289,24 @@ class AsyncProtocolAdapterPool:
         index, adapter = await self._acquire_adapter()
         try:
             return await adapter.execute_command_with_trace_on_lane(args, lane_id)
+        finally:
+            await self._release_adapter(index)
+
+    async def execute_prepared_command_with_trace_on_lane(
+        self,
+        prepared: PreparedCommand,
+        lane_id: int,
+    ) -> dict[str, Any]:
+        index, adapter = await self._acquire_adapter()
+        try:
+            execute_prepared = getattr(
+                adapter,
+                "execute_prepared_command_with_trace_on_lane",
+                None,
+            )
+            if callable(execute_prepared):
+                return cast(dict[str, Any], await execute_prepared(prepared, lane_id))
+            return await adapter.execute_command_with_trace_on_lane(prepared.args, lane_id)
         finally:
             await self._release_adapter(index)
 
@@ -333,6 +379,32 @@ class AsyncProtocolAdapterPool:
         finally:
             await self._release_adapter(index)
 
+    async def execute_prepared_batch_on_lane(
+        self,
+        prepared_commands: list[PreparedCommand],
+        lane_id: int,
+        *,
+        ordered: bool = False,
+    ) -> list[Any]:
+        index, adapter = await self._acquire_adapter()
+        try:
+            execute_prepared = getattr(adapter, "execute_prepared_batch_on_lane", None)
+            if callable(execute_prepared):
+                return cast(
+                    list[Any],
+                    await execute_prepared(
+                        prepared_commands,
+                        lane_id,
+                        ordered=ordered,
+                    ),
+                )
+            raw_commands = [prepared.args for prepared in prepared_commands]
+            if ordered:
+                return await adapter.execute_batch_ordered_on_lane(raw_commands, lane_id)
+            return await adapter.execute_batch_on_lane(raw_commands, lane_id)
+        finally:
+            await self._release_adapter(index)
+
     async def acquire_session(self) -> _AsyncProtocolAdapterSession:
         async with self._condition:
             if self._closed:
@@ -357,6 +429,14 @@ class AsyncProtocolAdapterPool:
                 if self._session_waiters == 0:
                     self._event_ready.set()
                 self._condition.notify_all()
+
+    async def acquire_dedicated_session(self) -> AsyncProtocolAdapter:
+        """Create an independent connection without retaining a pooled adapter lease."""
+        index, adapter = await self._acquire_adapter()
+        try:
+            return await adapter.acquire_session()
+        finally:
+            await self._release_adapter(index)
 
     async def acquire_session_on_lane(self, lane_id: int) -> AsyncProtocolAdapter:
         index, adapter = await self._acquire_adapter()
@@ -407,6 +487,8 @@ class AsyncProtocolAdapterPool:
 
 
 class _AsyncProtocolAdapterSession:
+    requires_explicit_session = False
+
     def __init__(
         self,
         pool: AsyncProtocolAdapterPool,

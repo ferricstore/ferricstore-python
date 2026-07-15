@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import io
 import logging
 import socket
@@ -17,8 +19,14 @@ import pytest
 
 import ferricstore.protocol as protocol_module
 import ferricstore.protocol_async as protocol_async_module
+import ferricstore.protocol_async_topology as protocol_async_topology_module
+import ferricstore.protocol_commands as protocol_commands_module
 import ferricstore.protocol_responses as protocol_response_module
+import ferricstore.protocol_sync as protocol_sync_module
+import ferricstore.protocol_sync_batch as protocol_sync_batch_module
+import ferricstore.protocol_sync_topology as protocol_sync_topology_module
 from ferricstore import AsyncFlowClient, AsyncProtocolAdapter, FlowClient, ProtocolAdapter
+from ferricstore.command_core import command_route_keys
 from ferricstore.errors import (
     FerricStoreError,
     FlowAlreadyExistsError,
@@ -48,12 +56,33 @@ from ferricstore.protocol import (
     encode_value,
 )
 from ferricstore.protocol_codec import MAX_VALUE_NESTING
+from ferricstore.protocol_pipeline_codec import (
+    _blocks_forever,
+    _expected_command_collection_items,
+    _expected_payload_collection_items,
+)
 from ferricstore.types import ChildSpec, ClaimedFlow, CreateItem
 
 
-def _single_shard_topology(host: str = "leader.local", port: int = 6391) -> dict[str, Any]:
+def _flow_partition_route_key(value: str | bytes) -> str:
+    encoded = value if isinstance(value, bytes) else value.encode()
+    digest = base64.urlsafe_b64encode(hashlib.sha256(encoded).digest()).rstrip(b"=").decode()
+    return f"f:{{f:{digest}}}:route"
+
+
+def _flow_id_route_key(value: str | bytes) -> str:
+    encoded = value if isinstance(value, bytes) else value.encode()
+    return f"f:{{fa:{zlib.crc32(encoded) % 256}}}:route"
+
+
+def _single_shard_topology(
+    host: str = "leader.local",
+    port: int = 6391,
+    *,
+    route_epoch: int = 1,
+) -> dict[str, Any]:
     return {
-        "route_epoch": 1,
+        "route_epoch": route_epoch,
         "shard_count": 1,
         "ranges": [
             {
@@ -1260,32 +1289,16 @@ def test_topology_routes_flow_commands_by_effective_partition(monkeypatch):
         ["ferric://seed.local:6388"],
         endpoint_policy="any",
     )
-    flow_id = next(
-        f"flow-{index}"
-        for index in range(10_000)
-        if (RoutingTopology.slot_for_key(f"flow-{index}") < 512)
-        != (
-            RoutingTopology.slot_for_key(
-                f"__flow_auto__:{zlib.crc32(f'flow-{index}'.encode()) % 256}"
-            )
-            < 512
-        )
-    )
-    auto_partition = f"__flow_auto__:{zlib.crc32(flow_id.encode()) % 256}"
+    flow_id = "flow-1"
     expected_auto_url = (
         "ferric://leader-a.local:6391"
-        if RoutingTopology.slot_for_key(auto_partition) < 512
+        if RoutingTopology.slot_for_key(_flow_id_route_key(flow_id)) < 512
         else "ferric://leader-b.local:6392"
     )
-    explicit_partition = next(
-        f"tenant-{index}"
-        for index in range(10_000)
-        if (RoutingTopology.slot_for_key(f"tenant-{index}") < 512)
-        != (RoutingTopology.slot_for_key(auto_partition) < 512)
-    )
+    explicit_partition = "tenant-a"
     expected_explicit_url = (
         "ferric://leader-a.local:6391"
-        if RoutingTopology.slot_for_key(explicit_partition) < 512
+        if RoutingTopology.slot_for_key(_flow_partition_route_key(explicit_partition)) < 512
         else "ferric://leader-b.local:6392"
     )
 
@@ -1332,7 +1345,18 @@ def test_topology_routes_flow_commands_by_effective_partition(monkeypatch):
         )
         == expected_explicit_url
     )
-    assert created["ferric://seed.local:6388"].calls == [("SHARDS",)]
+    approval_id = "approval-1"
+    expected_approval_url = (
+        "ferric://leader-a.local:6391"
+        if RoutingTopology.slot_for_key(_flow_partition_route_key(approval_id)) < 512
+        else "ferric://leader-b.local:6392"
+    )
+    assert pool.execute_command("FLOW.APPROVAL.GET", approval_id) == expected_approval_url
+    assert pool.execute_command("FLOW.SCHEDULE.GET", "daily-report") == ("ferric://seed.local:6388")
+    assert created["ferric://seed.local:6388"].calls == [
+        ("SHARDS",),
+        ("FLOW.SCHEDULE.GET", "daily-report"),
+    ]
 
 
 def test_topology_rejects_cross_slot_generic_multi_key_command(monkeypatch):
@@ -2565,34 +2589,41 @@ def test_protocol_request_timeout_includes_send_time(monkeypatch):
     adapter.close()
 
 
-def test_protocol_send_applies_and_restores_write_timeout(monkeypatch):
+def test_protocol_send_applies_and_restores_send_timeout(monkeypatch):
     monkeypatch.setattr(ProtocolAdapter, "_connect", lambda self: None)
 
     class FakeSocket:
         def __init__(self):
-            self.timeout = None
-            self.timeouts = []
+            self.previous_timeout = b"previous"
+            self.timeout_options = []
 
-        def gettimeout(self):
-            return self.timeout
+        def getsockopt(self, level, option, size):
+            assert (level, option) == (socket.SOL_SOCKET, socket.SO_SNDTIMEO)
+            assert size > 0
+            return self.previous_timeout
 
-        def settimeout(self, value):
-            self.timeout = value
-            self.timeouts.append(value)
+        def setsockopt(self, level, option, value):
+            assert (level, option) == (socket.SOL_SOCKET, socket.SO_SNDTIMEO)
+            self.timeout_options.append(value)
+
+        def settimeout(self, _value):
+            pytest.fail("a write deadline must not change the shared read timeout")
 
         def sendall(self, _data):
             return None
 
     adapter = ProtocolAdapter(timeout=0.25, heartbeat_interval=None)
-    socket = FakeSocket()
-    adapter._sock = socket
+    sock = FakeSocket()
+    adapter._sock = sock
     response: Future[ProtocolResponse] = Future()
-    adapter._register_pending_request(1, response, binding=(0, socket))
+    adapter._register_pending_request(1, response, binding=(0, sock))
 
     adapter._send(0x0101, 1, 1, {"key": "a"})
     adapter._discard_pending_request(1, expected_future=response)
 
-    assert socket.timeouts == [0.25, None]
+    assert len(sock.timeout_options) == 2
+    assert sock.timeout_options[0] != sock.previous_timeout
+    assert sock.timeout_options[1] == sock.previous_timeout
 
 
 def test_protocol_send_does_not_copy_large_frame_body(monkeypatch):
@@ -3034,6 +3065,34 @@ def test_protocol_pools_reject_non_positive_max_connections(monkeypatch, max_con
         )
 
 
+@pytest.mark.parametrize("max_connections", [True, 1.5, "3"])
+def test_protocol_pools_reject_non_integer_max_connections(
+    monkeypatch,
+    max_connections: Any,
+):
+    monkeypatch.setattr(
+        ProtocolAdapter,
+        "from_url",
+        lambda *_args, **_kwargs: pytest.fail("invalid size must fail before adapter creation"),
+    )
+    monkeypatch.setattr(
+        AsyncProtocolAdapter,
+        "from_url",
+        lambda *_args, **_kwargs: pytest.fail("invalid size must fail before adapter creation"),
+    )
+
+    with pytest.raises(ValueError, match="max_connections must be a positive integer"):
+        ProtocolAdapterPool.from_url(
+            "ferric://localhost:6388",
+            max_connections=max_connections,
+        )
+    with pytest.raises(ValueError, match="max_connections must be a positive integer"):
+        AsyncProtocolAdapterPool.from_url(
+            "ferric://localhost:6388",
+            max_connections=max_connections,
+        )
+
+
 @pytest.mark.parametrize("lanes", [0, -1])
 def test_protocol_adapters_reject_non_positive_lane_counts(monkeypatch, lanes: int):
     monkeypatch.setattr(
@@ -3046,6 +3105,74 @@ def test_protocol_adapters_reject_non_positive_lane_counts(monkeypatch, lanes: i
         ProtocolAdapter(lanes=lanes)
     with pytest.raises(ValueError, match="lanes must be positive"):
         AsyncProtocolAdapter(lanes=lanes)
+
+
+@pytest.mark.parametrize("lanes", [True, 1.5, "3"])
+def test_protocol_adapters_reject_non_integer_lane_counts(monkeypatch, lanes: Any):
+    monkeypatch.setattr(
+        ProtocolAdapter,
+        "_connect",
+        lambda _self: pytest.fail("invalid lanes must fail before connecting"),
+    )
+
+    with pytest.raises(ValueError, match="lanes must be a positive integer"):
+        ProtocolAdapter(lanes=lanes)
+    with pytest.raises(ValueError, match="lanes must be a positive integer"):
+        AsyncProtocolAdapter(lanes=lanes)
+
+
+@pytest.mark.parametrize("port", [0, 65_536, True, 1.5, "6388"])
+def test_direct_protocol_adapters_reject_invalid_ports(monkeypatch, port: Any):
+    monkeypatch.setattr(
+        ProtocolAdapter,
+        "_ensure_connected",
+        lambda _self: pytest.fail("invalid port must fail before connecting"),
+    )
+
+    for adapter_type in (ProtocolAdapter, AsyncProtocolAdapter):
+        with pytest.raises(ValueError, match="port must be between 1 and 65535"):
+            adapter_type(port=port)
+
+
+@pytest.mark.parametrize("host", [None, "", "   ", True, 123])
+def test_direct_protocol_adapters_reject_invalid_hosts(monkeypatch, host: Any):
+    monkeypatch.setattr(
+        ProtocolAdapter,
+        "_ensure_connected",
+        lambda _self: pytest.fail("invalid host must fail before connecting"),
+    )
+
+    for adapter_type in (ProtocolAdapter, AsyncProtocolAdapter):
+        with pytest.raises(ValueError, match="host must be a non-empty string"):
+            adapter_type(host=host)
+
+
+def test_all_sync_protocol_wait_event_boundaries_reject_nan() -> None:
+    for adapter_type in (
+        ProtocolAdapter,
+        ProtocolAdapterPool,
+        protocol_module.TopologyProtocolAdapterPool,
+    ):
+        adapter = object.__new__(adapter_type)
+        with pytest.raises(ValueError, match="wait_event timeout must be non-negative and finite"):
+            adapter.wait_event(timeout=float("nan"))
+
+
+def test_all_async_protocol_wait_event_boundaries_reject_nan() -> None:
+    async def run() -> None:
+        for adapter_type in (
+            AsyncProtocolAdapter,
+            AsyncProtocolAdapterPool,
+            protocol_module.AsyncTopologyProtocolAdapterPool,
+        ):
+            adapter = object.__new__(adapter_type)
+            with pytest.raises(
+                ValueError,
+                match="wait_event timeout must be non-negative and finite",
+            ):
+                await adapter.wait_event(timeout=float("nan"))
+
+    asyncio.run(run())
 
 
 def test_protocol_adapter_pool_session_is_affine_and_excluded_from_rotation():
@@ -3656,7 +3783,11 @@ def test_protocol_submit_batch_kv_pipeline_does_not_try_flow_many(monkeypatch):
     def fail_flow_many(_commands):
         raise AssertionError("KV submit_batch should not scan Flow-many compaction")
 
-    monkeypatch.setattr(protocol_module, "_compact_flow_many_payloads_from_raw", fail_flow_many)
+    monkeypatch.setattr(
+        protocol_sync_batch_module,
+        "_compact_flow_many_payloads_from_raw",
+        fail_flow_many,
+    )
 
     adapter = ProtocolAdapter("127.0.0.1", 6388, lanes=16)
     adapter._sock = FakeSocket()
@@ -4093,6 +4224,13 @@ def test_protocol_flow_payload_flag_uses_shared_option_boundaries() -> None:
         "PARTITION",
         "tenant-b",
     )
+    binary_options = build_protocol_command(
+        b"FLOW.GET",
+        b"flow-3",
+        b"PAYLOAD",
+        b"PARTITION",
+        b"tenant-c",
+    )
 
     assert command.payload == {
         "id": "flow-1",
@@ -4104,6 +4242,427 @@ def test_protocol_flow_payload_flag_uses_shared_option_boundaries() -> None:
         "payload": b"PARTITION",
         "partition_key": "tenant-b",
     }
+    assert binary_options.payload == {
+        "id": b"flow-3",
+        "payload": True,
+        "partition_key": b"tenant-c",
+    }
+
+
+@pytest.mark.parametrize("reserved_payload", [b"ITEMS", b"ITEMS_EXT"])
+def test_protocol_flow_many_item_marker_ignores_opaque_payload_values(
+    reserved_payload: bytes,
+) -> None:
+    command = build_protocol_command(
+        "FLOW.COMPLETE_MANY",
+        "tenant",
+        "PAYLOAD",
+        reserved_payload,
+        "NOW",
+        123,
+        "ITEMS",
+        "job-1",
+        b"lease",
+        7,
+    )
+
+    assert command.payload == {
+        "payload": reserved_payload,
+        "now_ms": 123,
+        "partition_key": "tenant",
+        "items": [["job-1", b"lease", 7]],
+    }
+
+
+@pytest.mark.parametrize("state", ["ITEMS", "ITEMS_EXT"])
+def test_protocol_flow_many_item_marker_ignores_option_values(state: str) -> None:
+    command = build_protocol_command(
+        "FLOW.CREATE_MANY",
+        "AUTO",
+        "TYPE",
+        "order",
+        "STATE",
+        state,
+        "NOW",
+        123,
+        "ITEMS",
+        "job-1",
+        b"payload",
+    )
+
+    assert command.payload == {
+        "type": "order",
+        "state": state,
+        "now_ms": 123,
+        "items": [["job-1", b"payload"]],
+    }
+
+
+def test_protocol_flow_value_mget_only_treats_typed_trailing_limit_as_option() -> None:
+    keyword_ref = ("FLOW.VALUE.MGET", "MAX_BYTES")
+    keyword_and_ref = ("FLOW.VALUE.MGET", "MAX_BYTES", "ref-2")
+    limited = ("FLOW.VALUE.MGET", "MAX_BYTES", "ref-2", "MAX_BYTES", 10)
+
+    for args, expected_refs in (
+        (keyword_ref, 1),
+        (keyword_and_ref, 2),
+        (limited, 2),
+    ):
+        command = build_protocol_command(*args)
+        assert _expected_command_collection_items(args) == expected_refs
+        assert _expected_payload_collection_items(command.opcode, command.payload) == expected_refs
+
+    assert command_route_keys(keyword_ref[0], keyword_ref[1:]) == ("MAX_BYTES",)
+    assert command_route_keys(keyword_and_ref[0], keyword_and_ref[1:]) == (
+        "MAX_BYTES",
+        "ref-2",
+    )
+    assert command_route_keys(limited[0], limited[1:]) == ("MAX_BYTES", "ref-2")
+
+
+def test_protocol_create_many_cardinality_uses_grammar_item_marker() -> None:
+    args = (
+        "FLOW.CREATE_MANY",
+        "MIXED",
+        "TYPE",
+        "order",
+        "STATE",
+        "ITEMS",
+        "NOW",
+        123,
+        "ITEMS",
+        "job-1",
+        "tenant",
+        b"payload",
+    )
+
+    command = build_protocol_command(*args)
+
+    assert _expected_command_collection_items(args) == 1
+    assert _expected_payload_collection_items(command.opcode, command.payload) == 1
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (("XREADGROUP", "GROUP", "BLOCK", 0, "STREAMS", "orders", ">"), False),
+        (
+            (
+                "XREADGROUP",
+                "GROUP",
+                "BLOCK",
+                "worker",
+                "BLOCK",
+                0,
+                "STREAMS",
+                "orders",
+                ">",
+            ),
+            True,
+        ),
+        (("XREAD", "STREAMS", "BLOCK", 0), False),
+        (("XREAD", "BLOCK", 0, "STREAMS", "orders", "$"), True),
+    ],
+)
+def test_protocol_blocking_timeout_uses_stream_command_grammar(
+    args: tuple[Any, ...], expected: bool
+) -> None:
+    assert _blocks_forever(args) is expected
+
+
+def test_protocol_trace_and_submit_preserve_infinite_blocking_timeout() -> None:
+    trace_adapter = object.__new__(ProtocolAdapter)
+    trace_call: dict[str, Any] = {}
+
+    def request(*_args: Any, **kwargs: Any) -> ProtocolResponse:
+        trace_call.update(kwargs)
+        return ProtocolResponse(1, 0, 1, 0, 0, b"value", trace={})
+
+    trace_adapter._request = request
+    trace_adapter._response_value = lambda response: response.value
+
+    assert trace_adapter.execute_command_with_trace("BLPOP", "jobs", 0)["value"] == b"value"
+    assert trace_call["timeout"] is None
+    trace_call.clear()
+    trace_adapter._request_on_lane = request
+    assert (
+        trace_adapter.execute_command_with_trace_on_lane(("BLPOP", "jobs", 0), 7)["value"]
+        == b"value"
+    )
+    assert trace_call["timeout"] is None
+
+    submit_adapter = object.__new__(ProtocolAdapter)
+    submit_call: dict[str, Any] = {}
+    response_future: Future[ProtocolResponse] = Future()
+
+    def submit(*_args: Any, **kwargs: Any) -> tuple[int, Future[ProtocolResponse]]:
+        submit_call.update(kwargs)
+        return 1, response_future
+
+    submit_adapter._submit_request = submit
+    submit_adapter._value_future = lambda future: future
+
+    assert submit_adapter.submit_command("BLPOP", "jobs", 0) is response_future
+    assert submit_call["_expire_at_adapter_timeout"] is False
+    submit_call.clear()
+    submit_adapter._submit_request_on_lane = submit
+    assert submit_adapter.submit_command_on_lane(("BLPOP", "jobs", 0), 7) is response_future
+    assert submit_call["_expire_at_adapter_timeout"] is False
+
+
+def test_async_protocol_trace_preserves_infinite_blocking_timeout() -> None:
+    async def run() -> None:
+        adapter = object.__new__(AsyncProtocolAdapter)
+        call: dict[str, Any] = {}
+
+        async def request(*_args: Any, **kwargs: Any) -> ProtocolResponse:
+            call.update(kwargs)
+            return ProtocolResponse(1, 0, 1, 0, 0, b"value", trace={})
+
+        adapter._request = request
+        adapter._response_value = lambda response: response.value
+
+        result = await adapter.execute_command_with_trace("BLPOP", "jobs", 0)
+
+        assert result["value"] == b"value"
+        assert call["timeout"] is None
+        call.clear()
+        adapter._request_on_lane = request
+        result = await adapter.execute_command_with_trace_on_lane(("BLPOP", "jobs", 0), 7)
+        assert result["value"] == b"value"
+        assert call["timeout"] is None
+
+    asyncio.run(run())
+
+
+def test_protocol_flow_option_parser_handles_deep_opaque_keyword_payloads() -> None:
+    args: list[Any] = [
+        "FLOW.CREATE",
+        "flow-1",
+        "TYPE",
+        "order",
+        "STATE",
+        "queued",
+        "PAYLOAD",
+        b"NOW",
+    ]
+    for index in range(1_100):
+        args.extend(("ATTRIBUTE", f"key-{index}", f"value-{index}"))
+
+    command = build_protocol_command(*args)
+
+    assert command.payload["payload"] == b"NOW"
+    assert len(command.payload["attributes"]) == 1_100
+
+
+def test_protocol_command_only_tokens_are_semantic_options_not_opaque_values() -> None:
+    get = build_protocol_command("FLOW.GET", "STATE_META")
+    create = build_protocol_command(
+        "FLOW.CREATE",
+        "flow-1",
+        "TYPE",
+        "order",
+        "STATE",
+        "queued",
+        "PAYLOAD",
+        b"STATE_META",
+    )
+    command_only = build_protocol_command(
+        "FLOW.CREATE",
+        "flow-1",
+        "TYPE",
+        "order",
+        "STATE",
+        "queued",
+        "STATE_META",
+        "version",
+        1,
+    )
+
+    assert get.opcode != _OP_COMMAND_EXEC
+    assert get.payload == {"id": "STATE_META"}
+    assert create.opcode != _OP_COMMAND_EXEC
+    assert create.payload["payload"] == b"STATE_META"
+    assert command_only.opcode == _OP_COMMAND_EXEC
+
+
+def test_topology_routed_command_builds_protocol_payload_once(monkeypatch: Any) -> None:
+    class InMemoryAdapter(ProtocolAdapter):
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self.closed = False
+
+        def _request(
+            self,
+            opcode: int,
+            lane_id: int,
+            _payload: Any,
+            flags: int = 0,
+            **_kwargs: Any,
+        ) -> ProtocolResponse:
+            if opcode == 0x0007:
+                value: Any = _single_shard_topology()
+            elif opcode == 0x020F:
+                value = [b"OK", b"OK"]
+            else:
+                value = b"OK"
+            return ProtocolResponse(lane_id, opcode, 1, flags, 0, value)
+
+        def _request_on_lane(self, *args: Any, **kwargs: Any) -> ProtocolResponse:
+            return self._request(*args, **kwargs)
+
+        def _response_value(self, response: ProtocolResponse) -> Any:
+            return response.value
+
+        def add_event_listener(self, _listener: Any) -> None:
+            pass
+
+        def remove_event_listener(self, _listener: Any) -> None:
+            pass
+
+        def register_flow_wake_subscription(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        ProtocolAdapter,
+        "from_url",
+        lambda url, **_kwargs: InMemoryAdapter(url),
+    )
+    pool = protocol_module.TopologyProtocolAdapterPool(
+        ["ferric://seed.local:6388"], endpoint_policy="any"
+    )
+    calls = 0
+    original = build_protocol_command
+
+    def counted(*args: Any) -> ProtocolCommand:
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(protocol_sync_topology_module, "build_protocol_command", counted)
+    monkeypatch.setattr(protocol_sync_module, "build_protocol_command", counted)
+    monkeypatch.setattr(protocol_commands_module, "build_protocol_command", counted)
+    try:
+        assert pool.execute_command("FLOW.GET", "flow-1") == b"OK"
+        assert calls == 1
+        calls = 0
+        assert pool.execute_batch(
+            [
+                (
+                    "FLOW.CREATE",
+                    f"flow-{index}",
+                    "TYPE",
+                    "order",
+                    "STATE",
+                    "queued",
+                    "NOW",
+                    123,
+                    "RUN_AT",
+                    123,
+                    "PAYLOAD",
+                    b"payload",
+                )
+                for index in range(2)
+            ]
+        ) == [b"OK", b"OK"]
+    finally:
+        pool.close()
+
+    assert calls == 2
+
+
+def test_async_topology_routed_command_builds_protocol_payload_once(monkeypatch: Any) -> None:
+    class InMemoryAdapter(AsyncProtocolAdapter):
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        async def _request(
+            self,
+            opcode: int,
+            lane_id: int,
+            _payload: Any,
+            flags: int = 0,
+            **_kwargs: Any,
+        ) -> ProtocolResponse:
+            if opcode == 0x0007:
+                value: Any = _single_shard_topology()
+            elif opcode == 0x020F:
+                value = [b"OK", b"OK"]
+            else:
+                value = b"OK"
+            return ProtocolResponse(lane_id, opcode, 1, flags, 0, value)
+
+        async def _request_on_lane(self, *args: Any, **kwargs: Any) -> ProtocolResponse:
+            return await self._request(*args, **kwargs)
+
+        def _response_value(self, response: ProtocolResponse) -> Any:
+            return response.value
+
+        def add_event_listener(self, _listener: Any) -> None:
+            pass
+
+        def remove_event_listener(self, _listener: Any) -> None:
+            pass
+
+        def register_flow_wake_subscription(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        AsyncProtocolAdapter,
+        "from_url",
+        lambda url, **_kwargs: InMemoryAdapter(url),
+    )
+
+    async def run() -> None:
+        pool = protocol_module.AsyncTopologyProtocolAdapterPool(
+            ["ferric://seed.local:6388"], endpoint_policy="any"
+        )
+        await pool.refresh_topology()
+        calls = 0
+        original = build_protocol_command
+
+        def counted(*args: Any) -> ProtocolCommand:
+            nonlocal calls
+            calls += 1
+            return original(*args)
+
+        monkeypatch.setattr(protocol_async_topology_module, "build_protocol_command", counted)
+        monkeypatch.setattr(protocol_commands_module, "build_protocol_command", counted)
+        try:
+            assert await pool.execute_command("FLOW.GET", "flow-1") == b"OK"
+            assert calls == 1
+            calls = 0
+            assert await pool.execute_batch(
+                [
+                    (
+                        "FLOW.CREATE",
+                        f"flow-{index}",
+                        "TYPE",
+                        "order",
+                        "STATE",
+                        "queued",
+                        "NOW",
+                        123,
+                        "RUN_AT",
+                        123,
+                        "PAYLOAD",
+                        b"payload",
+                    )
+                    for index in range(2)
+                ]
+            ) == [b"OK", b"OK"]
+        finally:
+            await pool.close()
+
+        assert calls == 2
+
+    asyncio.run(run())
 
 
 def test_protocol_execute_batch_compacts_partitioned_flow_get(monkeypatch):
@@ -4481,6 +5040,29 @@ def test_protocol_decodes_compact_flow_record_response():
     }
 
 
+def test_protocol_rejects_duplicate_generic_map_keys_while_decoding():
+    payload = (
+        b"\x06"
+        + struct.pack(">I", 2)
+        + struct.pack(">I", 4)
+        + b"same"
+        + encode_value(b"first")
+        + struct.pack(">I", 4)
+        + b"same"
+        + encode_value(b"second")
+    )
+
+    with pytest.raises(FerricStoreError, match="duplicate protocol map key"):
+        decode_value(payload)
+
+
+def test_protocol_rejects_duplicate_compact_flow_record_keys():
+    record = compact_flow_record([(1, b"flow-1"), (1, b"flow-2")])
+
+    with pytest.raises(FerricStoreError, match="duplicate protocol map key"):
+        _try_fast_response_value_at(0x0202, record, 0)
+
+
 def test_protocol_decodes_compact_flow_records_inside_pipeline_response():
     record = compact_flow_record([(1, b"flow-1"), (2, b"email"), (3, b"queued")])
     record_list = (
@@ -4579,6 +5161,45 @@ def test_protocol_decodes_compact_binary_map_list_as_pipeline_values():
     )
 
     assert _try_fast_response_value_at(0x000E, payload, 0) == [{b"f": b"v"}, {}]
+
+
+def test_protocol_rejects_duplicate_compact_binary_map_list_keys():
+    payload = (
+        b"\x87"
+        + struct.pack(">I", 1)
+        + struct.pack(">I", 2)
+        + struct.pack(">I", 1)
+        + b"f"
+        + struct.pack(">I", 3)
+        + b"one"
+        + struct.pack(">I", 1)
+        + b"f"
+        + struct.pack(">I", 3)
+        + b"two"
+    )
+
+    with pytest.raises(FerricStoreError, match="duplicate protocol map key"):
+        _try_fast_response_value_at(0x000E, payload, 0)
+
+
+def test_protocol_rejects_duplicate_compact_pipeline_map_keys():
+    payload = (
+        bytes([_COMPACT_PIPELINE_RESPONSE])
+        + struct.pack(">I", 1)
+        + b"\x00\x07"
+        + struct.pack(">I", 2)
+        + struct.pack(">I", 1)
+        + b"f"
+        + struct.pack(">I", 3)
+        + b"one"
+        + struct.pack(">I", 1)
+        + b"f"
+        + struct.pack(">I", 3)
+        + b"two"
+    )
+
+    with pytest.raises(FerricStoreError, match="duplicate protocol map key"):
+        _try_fast_response_value_at(0x000E, payload, 0)
 
 
 def test_protocol_rejects_truncated_compact_binary_map_list():
@@ -5089,6 +5710,97 @@ def test_protocol_adapter_sync_reconnect_is_single_flight():
 
     assert all(not thread.is_alive() for thread in threads)
     assert calls == 1
+
+
+def test_protocol_adapter_concurrent_caller_waits_for_socket_publication():
+    adapter = object.__new__(ProtocolAdapter)
+    adapter._sock = None
+    adapter._closed = False
+    adapter._connecting = False
+    adapter._connect_lock = threading.Lock()
+    connect_entered = threading.Event()
+    release_connect = threading.Event()
+    errors: list[BaseException] = []
+
+    def fake_connect() -> None:
+        adapter._connecting = True
+        connect_entered.set()
+        assert release_connect.wait(timeout=1.0)
+        adapter._sock = cast(Any, object())
+        adapter._connecting = False
+
+    adapter._connect = fake_connect
+
+    def ensure_connected() -> None:
+        try:
+            adapter._ensure_connected()
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=ensure_connected)
+    second = threading.Thread(target=ensure_connected)
+    first.start()
+    assert connect_entered.wait(timeout=1.0)
+    second.start()
+    time.sleep(0.02)
+
+    assert second.is_alive()
+    release_connect.set()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+
+
+def test_protocol_adapter_concurrent_caller_waits_for_handshake_readiness():
+    adapter = object.__new__(ProtocolAdapter)
+    adapter._sock = None
+    adapter._closed = False
+    adapter._connecting = False
+    adapter._connect_lock = threading.Lock()
+    socket_published = threading.Event()
+    release_handshake = threading.Event()
+    second_returned = threading.Event()
+    errors: list[BaseException] = []
+
+    def fake_connect() -> None:
+        adapter._connecting = True
+        adapter._sock = cast(Any, object())
+        socket_published.set()
+        assert release_handshake.wait(timeout=1.0)
+        adapter._connecting = False
+
+    adapter._connect = fake_connect
+
+    def first_caller() -> None:
+        try:
+            adapter._ensure_connected()
+        except BaseException as exc:
+            errors.append(exc)
+
+    def second_caller() -> None:
+        try:
+            adapter._ensure_connected()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            second_returned.set()
+
+    first = threading.Thread(target=first_caller)
+    second = threading.Thread(target=second_caller)
+    first.start()
+    assert socket_published.wait(timeout=1.0)
+    second.start()
+
+    assert not second_returned.wait(timeout=0.05)
+    release_handshake.set()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+
+    assert second_returned.is_set()
+    assert errors == []
 
 
 def test_protocol_adapter_stale_reader_does_not_close_newer_socket():
@@ -5666,6 +6378,148 @@ def test_compact_response_rejects_count_that_exceeds_request_cardinality():
         )
 
 
+@pytest.mark.parametrize(
+    "opcode",
+    [
+        protocol_module._OP_MGET,
+        protocol_module._OP_PIPELINE,
+        protocol_module._OP_FLOW_VALUE_MGET,
+    ],
+)
+def test_generic_collection_response_enforces_request_cardinality(opcode: int) -> None:
+    class Adapter:
+        max_decoded_collection_items = 100
+
+        def __init__(self) -> None:
+            self._pending_response_item_counts = {7: 2}
+
+    body = protocol_module._STATUS.pack(protocol_module._STATUS_OK) + encode_value([b"only"])
+
+    with pytest.raises(FerricStoreError, match="returned 1 items; expected 2"):
+        protocol_response_module._decode_protocol_response(
+            Adapter(),
+            lane_id=1,
+            opcode=opcode,
+            request_id=7,
+            flags=0,
+            body=body,
+            read_started_ns=0,
+            read_done_ns=0,
+        )
+
+
+def test_generic_collection_response_validates_after_trace_unwrap() -> None:
+    class Adapter:
+        max_decoded_collection_items = 100
+
+        def __init__(self) -> None:
+            self._pending_response_item_counts = {7: 2}
+
+    body = protocol_module._STATUS.pack(protocol_module._STATUS_OK) + encode_value(
+        {b"value": [b"only"], b"trace": {b"worker_us": 1}}
+    )
+
+    with pytest.raises(FerricStoreError, match="returned 1 items; expected 2"):
+        protocol_response_module._decode_protocol_response(
+            Adapter(),
+            lane_id=1,
+            opcode=protocol_module._OP_MGET,
+            request_id=7,
+            flags=protocol_module._FLAG_TRACE,
+            body=body,
+            read_started_ns=0,
+            read_done_ns=0,
+        )
+
+
+def test_generic_collection_response_rejects_scalar_for_exact_contract() -> None:
+    class Adapter:
+        max_decoded_collection_items = 100
+
+        def __init__(self) -> None:
+            self._pending_response_item_counts = {7: 2}
+
+    body = protocol_module._STATUS.pack(protocol_module._STATUS_OK) + encode_value(b"OK")
+
+    with pytest.raises(FerricStoreError, match="scalar; expected 2 items"):
+        protocol_response_module._decode_protocol_response(
+            Adapter(),
+            lane_id=1,
+            opcode=protocol_module._OP_MGET,
+            request_id=7,
+            flags=0,
+            body=body,
+            read_started_ns=0,
+            read_done_ns=0,
+        )
+
+
+def test_generic_collection_response_accepts_exact_request_cardinality() -> None:
+    class Adapter:
+        max_decoded_collection_items = 100
+
+        def __init__(self) -> None:
+            self._pending_response_item_counts = {7: 2}
+
+    body = protocol_module._STATUS.pack(protocol_module._STATUS_OK) + encode_value(
+        [b"first", b"second"]
+    )
+    response = protocol_response_module._decode_protocol_response(
+        Adapter(),
+        lane_id=1,
+        opcode=protocol_module._OP_MGET,
+        request_id=7,
+        flags=0,
+        body=body,
+        read_started_ns=0,
+        read_done_ns=0,
+    )
+
+    assert response.value == [b"first", b"second"]
+
+
+@pytest.mark.parametrize(
+    ("opcode", "expected", "ok_value"),
+    [
+        (protocol_module._OP_SET, 1, "OK"),
+        (protocol_module._OP_FLOW_CREATE_MANY, 2, b"OK"),
+    ],
+)
+def test_generic_collection_contract_preserves_legacy_ok_scalar(
+    opcode: int,
+    expected: int,
+    ok_value: str | bytes,
+) -> None:
+    class Adapter:
+        max_decoded_collection_items = 100
+
+        def __init__(self) -> None:
+            self._pending_response_item_counts = {7: expected}
+
+    body = protocol_module._STATUS.pack(protocol_module._STATUS_OK) + encode_value(ok_value)
+
+    response = protocol_response_module._decode_protocol_response(
+        Adapter(),
+        lane_id=1,
+        opcode=opcode,
+        request_id=7,
+        flags=0,
+        body=body,
+        read_started_ns=0,
+        read_done_ns=0,
+    )
+
+    assert protocol_response_module._ok_scalar(response.value)
+
+
+@pytest.mark.parametrize("invalid", [True, 1.5, "2"])
+def test_protocol_decode_collection_limit_rejects_non_integer_values(invalid: Any) -> None:
+    encoded = encode_value(b"value")
+
+    with pytest.raises(ValueError, match="max_collection_items"):
+        decode_value(encoded, max_collection_items=invalid)
+
+
 def test_protocol_value_decoder_enforces_one_cumulative_nested_collection_budget():
     payload = encode_value([[b"one"], [b"two"]])
 
@@ -6155,6 +7009,112 @@ def test_async_protocol_adapter_allows_multiple_inflight_requests():
     asyncio.run(run())
 
     assert received == [(0x0101, 1), (0x0101, 2)]
+
+
+def test_async_protocol_adapter_waits_for_authenticated_handshake_before_commands():
+    header = struct.Struct(">4sBBIHQI")
+    status = struct.Struct(">H")
+    observed_opcodes: list[int] = []
+
+    async def recv_frame(
+        reader: asyncio.StreamReader,
+    ) -> tuple[int, int, int, Any]:
+        raw_header = await reader.readexactly(header.size)
+        magic, version, _flags, lane_id, opcode, request_id, body_len = header.unpack(raw_header)
+        assert magic == b"FSNP"
+        assert version == 0x01
+        value, rest = decode_value(await reader.readexactly(body_len))
+        assert rest == b""
+        return opcode, lane_id, request_id, value
+
+    def response(opcode: int, lane_id: int, request_id: int, value: Any) -> bytes:
+        body = status.pack(0) + encode_value(value)
+        return header.pack(b"FSNP", 0x81, 0, lane_id, opcode, request_id, len(body)) + body
+
+    async def run() -> None:
+        startup_received = asyncio.Event()
+        handler_finished = asyncio.Event()
+        handler_errors: list[BaseException] = []
+
+        async def handle(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            get_count = 0
+            try:
+                startup_opcode, startup_lane, startup_id, _startup_payload = await recv_frame(
+                    reader
+                )
+                observed_opcodes.append(startup_opcode)
+                startup_received.set()
+
+                try:
+                    early = await asyncio.wait_for(recv_frame(reader), timeout=0.1)
+                except asyncio.TimeoutError:
+                    early = None
+                if early is not None:
+                    opcode, lane, request_id, _payload = early
+                    observed_opcodes.append(opcode)
+                    if opcode == 0x0101:
+                        get_count += 1
+                    writer.write(response(opcode, lane, request_id, b"value"))
+                    await writer.drain()
+
+                writer.write(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
+                await writer.drain()
+
+                auth_opcode, auth_lane, auth_id, _auth_payload = await recv_frame(reader)
+                observed_opcodes.append(auth_opcode)
+                writer.write(response(auth_opcode, auth_lane, auth_id, {"ok": True}))
+                await writer.drain()
+
+                while get_count < 2:
+                    opcode, lane, request_id, _payload = await recv_frame(reader)
+                    observed_opcodes.append(opcode)
+                    if opcode == 0x0101:
+                        get_count += 1
+                    writer.write(response(opcode, lane, request_id, b"value"))
+                    await writer.drain()
+            except BaseException as exc:
+                handler_errors.append(exc)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+                handler_finished.set()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        adapter = AsyncProtocolAdapter(
+            "127.0.0.1",
+            port,
+            client_name="pytest",
+            password="secret",
+            timeout=1.0,
+            heartbeat_interval=None,
+        )
+        first: asyncio.Task[Any] | None = None
+        second: asyncio.Task[Any] | None = None
+        try:
+            first = asyncio.create_task(adapter.execute_command("GET", "first"))
+            await asyncio.wait_for(startup_received.wait(), timeout=1.0)
+            second = asyncio.create_task(adapter.execute_command("GET", "second"))
+            assert await asyncio.wait_for(asyncio.gather(first, second), timeout=1.0) == [
+                b"value",
+                b"value",
+            ]
+            await asyncio.wait_for(handler_finished.wait(), timeout=1.0)
+            assert handler_errors == []
+        finally:
+            for task in (first, second):
+                if task is not None and not task.done():
+                    task.cancel()
+            await adapter.close()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+
+    assert observed_opcodes == [0x000C, 0x0002, 0x0101, 0x0101]
 
 
 def test_async_protocol_adapter_trace_command_returns_client_and_server_timings():
@@ -7855,7 +8815,11 @@ def test_protocol_compacts_batched_step_continue_without_generic_builder(monkeyp
     def fail_build_protocol_command(*_args, **_kwargs):
         raise AssertionError("generic builder should not be used for compact STEP_CONTINUE")
 
-    monkeypatch.setattr(protocol_module, "build_protocol_command", fail_build_protocol_command)
+    monkeypatch.setattr(
+        protocol_commands_module,
+        "build_protocol_command",
+        fail_build_protocol_command,
+    )
 
     payloads = _compact_flow_many_payloads_from_raw(
         [
@@ -7993,7 +8957,11 @@ def test_protocol_compacts_batched_value_put_without_generic_builder(monkeypatch
     def fail_build_protocol_command(*_args, **_kwargs):
         raise AssertionError("generic builder should not be used for compact VALUE.PUT")
 
-    monkeypatch.setattr(protocol_module, "build_protocol_command", fail_build_protocol_command)
+    monkeypatch.setattr(
+        protocol_commands_module,
+        "build_protocol_command",
+        fail_build_protocol_command,
+    )
 
     payloads = _compact_flow_many_payloads_from_raw(
         [
@@ -8646,7 +9614,7 @@ def test_async_topology_refresh_never_connects_to_untrusted_learned_endpoint(mon
 
 
 def test_topology_refresh_closes_idle_stale_endpoint_adapters(monkeypatch):
-    current = {"host": "leader-1.local", "port": 6391}
+    current = {"host": "leader-1.local", "port": 6391, "epoch": 1}
     created: dict[str, list[Any]] = {}
 
     class FakeAdapter:
@@ -8656,7 +9624,9 @@ def test_topology_refresh_closes_idle_stale_endpoint_adapters(monkeypatch):
 
         def execute_command(self, *args: Any) -> Any:
             if args[0] == "SHARDS":
-                return _single_shard_topology(current["host"], current["port"])
+                return _single_shard_topology(
+                    current["host"], current["port"], route_epoch=current["epoch"]
+                )
             return b"OK"
 
         def close(self) -> None:
@@ -8673,12 +9643,12 @@ def test_topology_refresh_closes_idle_stale_endpoint_adapters(monkeypatch):
     )
     leader_1 = pool._adapter_for_endpoint(next(iter(pool.topology.endpoints.values())))
 
-    current.update(host="leader-2.local", port=6392)
+    current.update(host="leader-2.local", port=6392, epoch=2)
     pool.refresh_topology()
     leader_2 = pool._adapter_for_endpoint(next(iter(pool.topology.endpoints.values())))
     assert leader_1.closed is True
 
-    current.update(host="leader-3.local", port=6393)
+    current.update(host="leader-3.local", port=6393, epoch=3)
     pool.refresh_topology()
     leader_3 = pool._adapter_for_endpoint(next(iter(pool.topology.endpoints.values())))
 
@@ -8691,7 +9661,7 @@ def test_topology_refresh_closes_idle_stale_endpoint_adapters(monkeypatch):
 
 
 def test_topology_refresh_recreates_idle_endpoint_that_reappears(monkeypatch):
-    current = {"host": "leader-1.local", "port": 6391}
+    current = {"host": "leader-1.local", "port": 6391, "epoch": 1}
     created: dict[str, list[Any]] = {}
 
     class FakeAdapter:
@@ -8701,7 +9671,9 @@ def test_topology_refresh_recreates_idle_endpoint_that_reappears(monkeypatch):
 
         def execute_command(self, *args: Any) -> Any:
             if args[0] == "SHARDS":
-                return _single_shard_topology(current["host"], current["port"])
+                return _single_shard_topology(
+                    current["host"], current["port"], route_epoch=current["epoch"]
+                )
             return b"OK"
 
         def close(self) -> None:
@@ -8718,9 +9690,9 @@ def test_topology_refresh_recreates_idle_endpoint_that_reappears(monkeypatch):
     )
     original = pool._adapter_for_endpoint(next(iter(pool.topology.endpoints.values())))
 
-    current.update(host="leader-2.local", port=6392)
+    current.update(host="leader-2.local", port=6392, epoch=2)
     pool.refresh_topology()
-    current.update(host="leader-1.local", port=6391)
+    current.update(host="leader-1.local", port=6391, epoch=3)
     pool.refresh_topology()
     reused = pool._adapter_for_endpoint(next(iter(pool.topology.endpoints.values())))
 
@@ -8731,7 +9703,7 @@ def test_topology_refresh_recreates_idle_endpoint_that_reappears(monkeypatch):
 
 
 def test_topology_refresh_keeps_busy_retired_adapter_until_it_is_idle(monkeypatch):
-    current = {"host": "leader-1.local", "port": 6391}
+    current = {"host": "leader-1.local", "port": 6391, "epoch": 1}
 
     class FakeAdapter:
         def __init__(self, url: str) -> None:
@@ -8743,7 +9715,9 @@ def test_topology_refresh_keeps_busy_retired_adapter_until_it_is_idle(monkeypatc
 
         def execute_command(self, *args: Any) -> Any:
             if args[0] == "SHARDS":
-                return _single_shard_topology(current["host"], current["port"])
+                return _single_shard_topology(
+                    current["host"], current["port"], route_epoch=current["epoch"]
+                )
             return b"OK"
 
         def close(self) -> None:
@@ -8760,21 +9734,21 @@ def test_topology_refresh_keeps_busy_retired_adapter_until_it_is_idle(monkeypatc
     leader_1 = pool._adapter_for_endpoint(next(iter(pool.topology.endpoints.values())))
     leader_1._active[0] = 1
 
-    current.update(host="leader-2.local", port=6392)
+    current.update(host="leader-2.local", port=6392, epoch=2)
     pool.refresh_topology()
-    current.update(host="leader-3.local", port=6393)
+    current.update(host="leader-3.local", port=6393, epoch=3)
     pool.refresh_topology()
     assert leader_1.closed is False
 
     leader_1._active[0] = 0
-    current.update(host="leader-4.local", port=6394)
+    current.update(host="leader-4.local", port=6394, epoch=4)
     pool.refresh_topology()
     assert leader_1.closed is True
     pool.close()
 
 
 def test_async_topology_refresh_closes_idle_stale_endpoint_adapters(monkeypatch):
-    current = {"host": "leader-1.local", "port": 6391}
+    current = {"host": "leader-1.local", "port": 6391, "epoch": 1}
     created: dict[str, list[Any]] = {}
 
     class FakeAdapter:
@@ -8784,7 +9758,9 @@ def test_async_topology_refresh_closes_idle_stale_endpoint_adapters(monkeypatch)
 
         async def execute_command(self, *args: Any) -> Any:
             if args[0] == "SHARDS":
-                return _single_shard_topology(current["host"], current["port"])
+                return _single_shard_topology(
+                    current["host"], current["port"], route_epoch=current["epoch"]
+                )
             return b"OK"
 
         async def close(self) -> None:
@@ -8804,14 +9780,14 @@ def test_async_topology_refresh_closes_idle_stale_endpoint_adapters(monkeypatch)
         await pool.refresh_topology()
         leader_1 = pool._adapter_for_endpoint(next(iter(pool.topology.endpoints.values())))
 
-        current.update(host="leader-2.local", port=6392)
+        current.update(host="leader-2.local", port=6392, epoch=2)
         await pool.refresh_topology()
         leader_2 = pool._adapter_for_endpoint(next(iter(pool.topology.endpoints.values())))
         if pool._cleanup_tasks:
             await asyncio.gather(*pool._cleanup_tasks)
         assert leader_1.closed is True
 
-        current.update(host="leader-3.local", port=6393)
+        current.update(host="leader-3.local", port=6393, epoch=3)
         await pool.refresh_topology()
         leader_3 = pool._adapter_for_endpoint(next(iter(pool.topology.endpoints.values())))
         if pool._cleanup_tasks:
@@ -9811,7 +10787,7 @@ def test_async_topology_adapter_creation_failure_refreshes_routes(monkeypatch):
     asyncio.run(run())
 
 
-def test_cancelled_batch_future_completion_is_quiet():
+def test_submitted_batch_future_is_running_before_completion():
     stream = io.StringIO()
     handler = logging.StreamHandler(stream)
     logger = logging.getLogger("concurrent.futures")
@@ -9822,31 +10798,44 @@ def test_cancelled_batch_future_completion_is_quiet():
         adapter = object.__new__(ProtocolAdapter)
         source: Future[ProtocolResponse] = Future()
         result: Future[list[Any]] = Future()
+        result.set_running_or_notify_cancel()
         adapter._complete_batch_future(source, 1, result)
-        assert result.cancel()
+        assert result.cancel() is False
 
         source.set_result(ProtocolResponse(1, 1, 1, 0, 0, [b"OK"]))
 
-        assert result.cancelled()
+        assert result.result(timeout=1) == [b"OK"]
         assert "InvalidStateError" not in stream.getvalue()
     finally:
         logger.removeHandler(handler)
         logger.setLevel(old_level)
 
 
+def test_public_submit_pipeline_payload_future_is_running_on_return():
+    adapter = object.__new__(ProtocolAdapter)
+    source: Future[ProtocolResponse] = Future()
+    adapter._submit_pipeline_payload = lambda *_args, **_kwargs: source
+
+    result = adapter.submit_pipeline_payload(b"payload", 1)
+
+    assert result.cancel() is False
+
+
 def test_submit_commands_applies_write_timeout_without_joining_entire_batch():
     class FakeSocket:
         def __init__(self) -> None:
-            self.timeout: float | None = None
-            self.timeouts: list[float | None] = []
+            self.previous_timeout = b"previous"
+            self.timeout_options: list[bytes] = []
             self.writes: list[bytes] = []
 
-        def gettimeout(self) -> float | None:
-            return self.timeout
+        def getsockopt(self, _level: int, _option: int, _size: int) -> bytes:
+            return self.previous_timeout
 
-        def settimeout(self, value: float | None) -> None:
-            self.timeout = value
-            self.timeouts.append(value)
+        def setsockopt(self, _level: int, _option: int, value: bytes) -> None:
+            self.timeout_options.append(value)
+
+        def settimeout(self, _value: float | None) -> None:
+            pytest.fail("a write deadline must not change the shared read timeout")
 
         def sendall(self, value: bytes) -> None:
             self.writes.append(value)
@@ -9869,9 +10858,8 @@ def test_submit_commands_applies_write_timeout_without_joining_entire_batch():
 
     adapter.submit_commands([("PING",), ("MULTI",)])
 
-    assert sock.timeouts[0] <= 0.25
-    assert sock.timeouts[1] <= sock.timeouts[0]
-    assert sock.timeouts[-1] is None
+    assert len(sock.timeout_options) == 3
+    assert sock.timeout_options[-1] == sock.previous_timeout
     assert len(sock.writes) == 2
 
 
@@ -9880,15 +10868,14 @@ def test_send_frames_uses_one_deadline_for_the_entire_batch(monkeypatch):
 
     class FakeSocket:
         def __init__(self) -> None:
-            self.timeout: float | None = None
-            self.timeouts: list[float | None] = []
+            self.previous_timeout = b"previous"
+            self.timeout_options: list[bytes] = []
 
-        def gettimeout(self) -> float | None:
-            return self.timeout
+        def getsockopt(self, _level: int, _option: int, _size: int) -> bytes:
+            return self.previous_timeout
 
-        def settimeout(self, value: float | None) -> None:
-            self.timeout = value
-            self.timeouts.append(value)
+        def setsockopt(self, _level: int, _option: int, value: bytes) -> None:
+            self.timeout_options.append(value)
 
         def sendall(self, _value: bytes) -> None:
             nonlocal now
@@ -9899,8 +10886,15 @@ def test_send_frames_uses_one_deadline_for_the_entire_batch(monkeypatch):
 
     protocol_module._send_frames(sock, [b"a", b"b", b"c"], timeout=0.1)
 
-    assert sock.timeouts[:-1] == pytest.approx([0.1, 0.06, 0.02])
-    assert sock.timeouts[-1] is None
+    def seconds(value: bytes) -> float:
+        if len(value) == struct.calcsize("@I"):
+            return struct.unpack("@I", value)[0] / 1_000
+        whole, micros = struct.unpack("@ll", value)
+        return whole + micros / 1_000_000
+
+    applied = [seconds(value) for value in sock.timeout_options[:-1]]
+    assert applied == pytest.approx([0.1, 0.06, 0.02], abs=0.000_01)
+    assert sock.timeout_options[-1] == sock.previous_timeout
 
 
 def test_protocol_pool_closes_partial_connections_when_construction_fails(monkeypatch):
@@ -9958,6 +10952,7 @@ def test_topology_constructor_closes_seed_adapter_when_discovery_fails(monkeypat
 
 def test_topology_control_uses_last_good_seed_and_rotates_safe_commands(monkeypatch):
     availability = {"seed-a": False, "seed-b": True}
+    topology_epoch = 0
     created: dict[str, Any] = {}
 
     class FakeAdapter:
@@ -9967,11 +10962,17 @@ def test_topology_control_uses_last_good_seed_and_rotates_safe_commands(monkeypa
             self.calls: list[tuple[Any, ...]] = []
 
         def execute_command(self, *args):
+            nonlocal topology_epoch
             self.calls.append(args)
             if not availability[self.host]:
                 raise OSError(f"{self.host} unavailable")
             if args[0] == "SHARDS":
-                return _single_shard_topology(self.host, 6388)
+                topology_epoch += 1
+                return _single_shard_topology(
+                    self.host,
+                    6388,
+                    route_epoch=topology_epoch,
+                )
             return f"PONG:{self.host}".encode()
 
         def close(self) -> None:
@@ -10001,8 +11002,34 @@ def test_topology_control_uses_last_good_seed_and_rotates_safe_commands(monkeypa
         pool.close()
 
 
+def test_topology_control_fast_path_reuses_last_good_adapter_without_rebuilding_candidates(
+    monkeypatch,
+):
+    class FakeAdapter:
+        def execute_command(self, *args):
+            if args[0] == "SHARDS":
+                return _single_shard_topology("seed.local", 6388)
+            return b"PONG"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(ProtocolAdapter, "from_url", lambda *_args, **_kwargs: FakeAdapter())
+    pool = protocol_module.TopologyProtocolAdapterPool(["ferric://seed.local:6388"])
+    try:
+        monkeypatch.setattr(
+            pool,
+            "_refresh_candidate_urls",
+            lambda: pytest.fail("steady-state control lookup rebuilt topology candidates"),
+        )
+        assert pool.execute_command("PING") == b"PONG"
+    finally:
+        pool.close()
+
+
 def test_async_topology_control_uses_last_good_seed_and_rotates_safe_commands(monkeypatch):
     availability = {"seed-a": False, "seed-b": True}
+    topology_epoch = 0
     created: dict[str, Any] = {}
 
     class FakeAdapter:
@@ -10012,11 +11039,17 @@ def test_async_topology_control_uses_last_good_seed_and_rotates_safe_commands(mo
             self.calls: list[tuple[Any, ...]] = []
 
         async def execute_command(self, *args):
+            nonlocal topology_epoch
             self.calls.append(args)
             if not availability[self.host]:
                 raise OSError(f"{self.host} unavailable")
             if args[0] == "SHARDS":
-                return _single_shard_topology(self.host, 6388)
+                topology_epoch += 1
+                return _single_shard_topology(
+                    self.host,
+                    6388,
+                    route_epoch=topology_epoch,
+                )
             return f"PONG:{self.host}".encode()
 
         async def close(self) -> None:
@@ -10045,6 +11078,36 @@ def test_async_topology_control_uses_last_good_seed_and_rotates_safe_commands(mo
                 await pool.execute_command("CLIENT.SETNAME", "review-client")
             assert ("CLIENT.SETNAME", "review-client") not in created["ferric://seed-b:6388"].calls
             assert await pool.execute_command("PING") == b"PONG:seed-b"
+        finally:
+            await pool.close()
+
+    asyncio.run(run())
+
+
+def test_async_topology_control_fast_path_reuses_last_good_adapter_without_rebuilding_candidates(
+    monkeypatch,
+):
+    class FakeAdapter:
+        async def execute_command(self, *args):
+            if args[0] == "SHARDS":
+                return _single_shard_topology("seed.local", 6388)
+            return b"PONG"
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(AsyncProtocolAdapter, "from_url", lambda *_args, **_kwargs: FakeAdapter())
+
+    async def run() -> None:
+        pool = protocol_module.AsyncTopologyProtocolAdapterPool(["ferric://seed.local:6388"])
+        await pool.refresh_topology()
+        try:
+            monkeypatch.setattr(
+                pool,
+                "_refresh_candidate_urls",
+                lambda: pytest.fail("steady-state control lookup rebuilt topology candidates"),
+            )
+            assert await pool.execute_command("PING") == b"PONG"
         finally:
             await pool.close()
 

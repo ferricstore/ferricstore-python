@@ -336,6 +336,57 @@ def test_autobatch_rejects_non_positive_pending_capacity() -> None:
         autobatch.close()
 
 
+@pytest.mark.parametrize("field", ["max_batch", "max_pending"])
+@pytest.mark.parametrize(
+    "invalid",
+    [True, 1.5, float("nan"), float("inf"), "2"],
+)
+def test_autobatch_rejects_non_integer_capacity(field: str, invalid: Any) -> None:
+    with pytest.raises(ValueError, match=rf"{field} must be a positive integer"):
+        FlowClient(FakeExecutor()).autobatch(**{field: invalid})
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf"), -1.0, True])
+def test_autobatch_rejects_non_finite_or_negative_delay(invalid: float) -> None:
+    autobatch = None
+    try:
+        with pytest.raises(ValueError, match="max_delay_ms must be non-negative and finite"):
+            autobatch = FlowClient(FakeExecutor()).autobatch(max_delay_ms=invalid)
+    finally:
+        if autobatch is not None:
+            autobatch.close()
+
+
+def test_autobatch_rejects_delay_above_platform_wait_limit() -> None:
+    with pytest.raises(ValueError, match="max_delay_ms exceeds platform wait limit"):
+        FlowClient(FakeExecutor()).autobatch(max_delay_ms=(threading.TIMEOUT_MAX + 1.0) * 1000.0)
+
+
+def test_autobatch_terminal_dispatch_failure_completes_pending_future(monkeypatch) -> None:
+    failure = RuntimeError("dispatcher failed")
+
+    def fail_after_enqueue(client: client_module.AutobatchFlowClient):
+        with client._condition:
+            while not client._pending and not client._closed:
+                client._condition.wait()
+        raise failure
+
+    monkeypatch.setattr(client_module.AutobatchFlowClient, "_take_batch", fail_after_enqueue)
+    client = FlowClient(FakeExecutor()).autobatch(max_delay_ms=0)
+    future = client.create_async(
+        "f1",
+        type="order",
+        payload=b"payload",
+        partition_key="p1",
+        return_record=False,
+    )
+
+    with pytest.raises(RuntimeError, match="dispatcher failed"):
+        future.result(timeout=1)
+
+    client.close(timeout=1)
+
+
 def test_autobatch_pending_queue_is_bounded_and_constant_time_at_the_front() -> None:
     client = object.__new__(client_module.AutobatchFlowClient)
     client._condition = threading.Condition()
@@ -1282,7 +1333,7 @@ def test_signal_builds_flow_signal_command_with_guards_and_values():
         override_values=["payment_event"],
         run_at_ms=1250,
         now_ms=1100,
-        priority=5,
+        priority=2,
     )
 
     assert result == b"OK"
@@ -1306,7 +1357,7 @@ def test_signal_builds_flow_signal_command_with_guards_and_values():
         "NOW",
         1100,
         "PRIORITY",
-        5,
+        2,
         "VALUE",
         "payment_event",
         b"payment-bytes",
@@ -1679,7 +1730,9 @@ def test_submit_create_many_uses_executor_submit_command():
     ]
 
 
-def test_submit_create_many_cancellation_race_is_quiet(caplog: pytest.LogCaptureFixture) -> None:
+def test_submit_create_many_is_running_after_wire_submission(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     class SubmitExecutor:
         def __init__(self) -> None:
             self.source: Future[Any] = Future()
@@ -1709,12 +1762,12 @@ def test_submit_create_many_cancellation_race_is_quiet(caplog: pytest.LogCapture
     source_thread = threading.Thread(target=lambda: executor.source.set_result([b"OK"]))
     source_thread.start()
     assert decode_entered.wait(1)
-    assert target.cancel()
+    assert target.cancel() is False
     release_decode.set()
     source_thread.join(1)
 
     assert source_thread.is_alive() is False
-    assert target.cancelled()
+    assert target.result(timeout=1) == [b"OK"]
     assert caplog.records == []
 
 
@@ -2279,6 +2332,9 @@ def test_run_steps_many_can_use_step_count_and_rejects_ambiguous_state_shape():
     with pytest.raises(ValueError, match="exactly one"):
         client.run_steps_many(["f1"], type="order", states=["reserve"], steps=1, worker="worker-1")
 
+    with pytest.raises(ValueError, match="run_steps_many states"):
+        client.run_steps_many(["f1"], type="order", states="reserve", worker="worker-1")
+
 
 def test_claim_due_can_return_claimed_flow_items():
     executor = FakeExecutor()
@@ -2759,7 +2815,7 @@ def test_reclaim_exposes_claim_due_response_options_and_partitions():
         "order",
         worker="worker-1",
         partition_keys=["p1", "p2"],
-        priority=5,
+        priority=2,
         limit=10,
         now_ms=100,
         include_record=False,
@@ -2785,7 +2841,7 @@ def test_reclaim_exposes_claim_due_response_options_and_partitions():
         "p1",
         "p2",
         "PRIORITY",
-        5,
+        2,
         "RETURN",
         "JOBS_COMPACT_ATTRS",
         "NOPAYLOAD",
@@ -2863,6 +2919,14 @@ def test_flow_worker_supports_multi_state_claims():
         "STATE",
         "retry",
     )
+
+
+@pytest.mark.parametrize("field", ["states", "partition_keys", "claim_values"])
+def test_flow_worker_rejects_scalar_strings_for_sequence_configuration(field: str) -> None:
+    client = FlowClient(FakeExecutor())
+
+    with pytest.raises(ValueError, match=field):
+        QueueFlowWorker(client, type="order", **{field: "queued"})
 
 
 def test_flow_worker_can_claim_named_values_without_compact_return():
@@ -3618,6 +3682,16 @@ def test_autobatch_close_timeout_does_not_hang():
     client.close(timeout=1)
 
 
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf"), -1.0, True])
+def test_autobatch_close_rejects_non_finite_or_negative_timeout(invalid: float) -> None:
+    client = FlowClient(FakeExecutor()).autobatch(max_delay_ms=0)
+    try:
+        with pytest.raises(ValueError, match="close timeout must be non-negative and finite"):
+            client.close(timeout=invalid)
+    finally:
+        client.close(timeout=1)
+
+
 def test_autobatch_never_takes_more_than_max_batch():
     client = object.__new__(client_module.AutobatchFlowClient)
     client.max_batch = 2
@@ -3647,7 +3721,7 @@ def test_expand_many_response_rejects_wrong_length_lists():
         client_module._expand_many_response([b"OK"], 2)
 
 
-def test_autobatch_cancelled_future_does_not_kill_worker():
+def test_autobatch_cancellation_after_dispatch_reports_operation_is_running():
     executor = BlockingExecutor()
     client = FlowClient(executor).autobatch(max_batch=10, max_delay_ms=0)
 
@@ -3659,8 +3733,10 @@ def test_autobatch_cancelled_future_does_not_kill_worker():
         return_record=False,
     )
     assert executor.entered.wait(1)
-    assert cancelled.cancel()
+    assert cancelled.cancel() is False
     executor.release.set()
+
+    assert cancelled.result(timeout=1) == b"OK"
 
     survivor = client.create_async(
         "f2",
@@ -3672,6 +3748,27 @@ def test_autobatch_cancelled_future_does_not_kill_worker():
 
     assert survivor.result(timeout=1) == b"OK"
     assert client._worker.is_alive()
+    client.close(timeout=1)
+
+
+def test_autobatch_cancellation_before_dispatch_prevents_wire_mutation():
+    executor = PerItemAckExecutor()
+    client = FlowClient(executor).autobatch(max_batch=2, max_delay_ms=10_000)
+
+    cancelled = client.create_async(
+        "f1",
+        type="order",
+        payload=b"payload",
+        partition_key="p1",
+        return_record=False,
+    )
+    assert cancelled.cancel() is True
+
+    # The flush marker fills the batch and deterministically releases the worker.
+    client.flush()
+
+    assert cancelled.cancelled()
+    assert executor.calls == []
     client.close(timeout=1)
 
 
@@ -4681,7 +4778,9 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
 
     schedule = client.schedule_create(
         "daily-report",
-        target={"id": "flow-1", "type": "report", "state": "queued"},
+        target={"id_prefix": "flow", "type": "report", "state": "queued"},
+        kind="cron",
+        cron="0 9 * * *",
         timezone="Asia/Jerusalem",
         overwrite=True,
         now_ms=100,
@@ -4692,10 +4791,14 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     assert executor.calls[-1] == (
         "FLOW.SCHEDULE.CREATE",
         "daily-report",
+        "KIND",
+        "cron",
+        "CRON",
+        "0 9 * * *",
         "TIMEZONE",
         "Asia/Jerusalem",
         "TARGET",
-        {"id": "flow-1", "type": "report", "state": "queued"},
+        {"id_prefix": "flow", "type": "report", "state": "queued"},
         "OVERWRITE",
         "true",
         "NOW",
@@ -4756,6 +4859,8 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     effect = client.effect_confirm(
         "flow-1",
         "send-email",
+        lease_token=b"lease",
+        fencing_token=7,
         external_id="mail-1",
         latency_ms=42,
     )
@@ -4766,6 +4871,10 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
         "flow-1",
         "EFFECT_KEY",
         "send-email",
+        "LEASE_TOKEN",
+        b"lease",
+        "FENCING",
+        7,
         "EXTERNAL_ID",
         "mail-1",
         "LATENCY_MS",
@@ -4775,6 +4884,8 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     effect = client.effect_fail(
         "flow-1",
         "send-email",
+        lease_token=b"lease",
+        fencing_token=7,
         error="smtp down",
         reason="provider_unavailable",
         latency_ms=84,
@@ -4786,6 +4897,10 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
         "flow-1",
         "EFFECT_KEY",
         "send-email",
+        "LEASE_TOKEN",
+        b"lease",
+        "FENCING",
+        7,
         "ERROR",
         "smtp down",
         "REASON",

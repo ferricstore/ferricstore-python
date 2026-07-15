@@ -8,18 +8,19 @@ from typing import TYPE_CHECKING, Any, cast
 from ferricstore.batch_core import (
     require_batch_items,
 )
-from ferricstore.client_helpers import (
-    _append,
-    _append_payload_read,
-    _append_value_return,
+from ferricstore.client_claim_options import (
     _claim_due_command_args,
     _claim_return_compat_args,
     _claim_return_mode_unsupported,
+    _reclaim_command_args,
+    _resolve_include_record,
+)
+from ferricstore.client_helpers import (
+    _append,
     _complete_jobs_command_args,
     _complete_many_args,
     _flow_return,
     _now_ms,
-    _resolve_include_record,
     _step_continue_args,
     _transition_command_args,
 )
@@ -363,30 +364,22 @@ class _ClientClaimsMixin(_ClientMixinBase):
         if state not in (None, "running"):
             raise ValueError("FLOW.RECLAIM only supports running state")
 
-        args: builtins.list[Any] = [
-            "FLOW.RECLAIM",
+        args = _reclaim_command_args(
             type,
-            "WORKER",
-            worker,
-            "LEASE_MS",
-            lease_ms,
-            "LIMIT",
-            limit,
-            "NOW",
-            now_ms if now_ms is not None else _now_ms(),
-        ]
-        if partition_key is not None and partition_keys is not None:
-            raise ValueError("partition_key and partition_keys are mutually exclusive")
-        _append(args, "PARTITION", partition_key)
-        if partition_keys is not None:
-            if not partition_keys:
-                raise ValueError("partition_keys must be non-empty")
-            args.extend(["PARTITIONS", len(partition_keys), *partition_keys])
-        _append(args, "PRIORITY", priority)
-        if not include_record:
-            _append(args, "RETURN", "JOBS_COMPACT_ATTRS" if include_attributes else "JOBS_COMPACT")
-        _append_payload_read(args, payload, payload_max_bytes)
-        _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
+            worker=worker,
+            partition_key=partition_key,
+            partition_keys=partition_keys,
+            lease_ms=lease_ms,
+            limit=limit,
+            priority=priority,
+            now_ms=now_ms,
+            include_record=include_record,
+            payload=payload,
+            payload_max_bytes=payload_max_bytes,
+            values=values,
+            value_max_bytes=value_max_bytes,
+            include_attributes=include_attributes,
+        )
         response = self._execute_claim_command(args)
         return self._decode_claim_due_response(response, include_record)
 
@@ -751,6 +744,8 @@ class _ClientClaimsMixin(_ClientMixinBase):
         source_complete, source_claim = submit_commands([tuple(complete_args), tuple(claim_args)])
         complete_future: Future[int] = Future()
         claim_future: Future[builtins.list[ClaimedFlow]] = Future()
+        complete_future.set_running_or_notify_cancel()
+        claim_future.set_running_or_notify_cancel()
 
         def complete_done(source: Future[Any]) -> None:
             if complete_future.cancelled():

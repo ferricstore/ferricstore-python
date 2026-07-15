@@ -5,12 +5,16 @@ import struct
 from collections.abc import Callable
 from typing import Any, Final
 
+from ferricstore.config_validation import validate_optional_nonnegative_int
 from ferricstore.errors import FerricStoreError
 
 MAX_VALUE_NESTING: Final = 128
 _U32 = struct.Struct(">I")
 _I64 = struct.Struct(">q")
 _F64 = struct.Struct(">d")
+_U32_MAX: Final = 2**32 - 1
+_I64_MIN: Final = -(2**63)
+_I64_MAX: Final = 2**63 - 1
 
 
 class DecodedCollectionLimitError(FerricStoreError):
@@ -19,6 +23,10 @@ class DecodedCollectionLimitError(FerricStoreError):
 
 class EncodedValueLimitError(FerricStoreError):
     """Raised before an encoded value can exceed its caller-provided byte budget."""
+
+
+class DuplicateProtocolMapKeyError(FerricStoreError):
+    """Raised when one wire map contains the same canonical key more than once."""
 
 
 class _ValueWriter:
@@ -35,11 +43,20 @@ class _ValueWriter:
         self._size = 0
 
     def write(self, value: bytes | bytearray) -> None:
-        size = len(value)
-        if self._max_bytes is not None and size > self._max_bytes - self._size:
-            raise EncodedValueLimitError("encoded protocol value exceeds max_bytes")
+        size = memoryview(value).nbytes
+        self.ensure_capacity(size)
         self._write(value)
         self._size += size
+
+    def ensure_capacity(self, size: int) -> None:
+        if self._max_bytes is not None and size > self._max_bytes - self._size:
+            raise EncodedValueLimitError("encoded protocol value exceeds max_bytes")
+
+    @property
+    def remaining_capacity(self) -> int | None:
+        if self._max_bytes is None:
+            return None
+        return self._max_bytes - self._size
 
 
 class DecodeBudget:
@@ -48,9 +65,10 @@ class DecodeBudget:
     __slots__ = ("remaining",)
 
     def __init__(self, max_collection_items: int | None) -> None:
-        if max_collection_items is not None and max_collection_items < 0:
-            raise ValueError("max_collection_items must be non-negative or None")
-        self.remaining = max_collection_items
+        self.remaining = validate_optional_nonnegative_int(
+            max_collection_items,
+            name="max_collection_items",
+        )
 
     def consume(self, count: int) -> None:
         if self.remaining is None:
@@ -70,10 +88,7 @@ class DecodeBudget:
 
 def encode_value(value: Any, *, max_bytes: int | None = None) -> bytes:
     """Encode one value into a single growing buffer with an explicit depth bound."""
-    if max_bytes is not None and (
-        isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0
-    ):
-        raise ValueError("max_bytes must be a non-negative integer or None")
+    max_bytes = validate_optional_nonnegative_int(max_bytes, name="max_bytes")
     stream = io.BytesIO()
     _write_value(_ValueWriter(stream.write, max_bytes=max_bytes), value, depth=0)
     return stream.getvalue()
@@ -86,10 +101,7 @@ def encode_value_into(
     max_bytes: int | None = None,
 ) -> None:
     """Stream one encoded value to a sink, optionally stopping at a byte bound."""
-    if max_bytes is not None and (
-        isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0
-    ):
-        raise ValueError("max_bytes must be a non-negative integer or None")
+    max_bytes = validate_optional_nonnegative_int(max_bytes, name="max_bytes")
     _write_value(_ValueWriter(write, max_bytes=max_bytes), value, depth=0)
 
 
@@ -136,27 +148,43 @@ def _write_value(stream: _ValueWriter, value: Any, *, depth: int) -> None:
         stream.write(b"\x02")
         return
     if isinstance(value, int):
+        if value < _I64_MIN or value > _I64_MAX:
+            raise FerricStoreError("protocol integer must fit in a signed 64-bit value")
         stream.write(b"\x03")
         stream.write(_I64.pack(value))
         return
     if isinstance(value, str):
-        _write_binary(stream, value.encode())
+        remaining = stream.remaining_capacity
+        if remaining is not None:
+            stream.ensure_capacity(5)
+            _require_utf8_within(value, remaining - 5)
+        _write_binary(stream, str.encode(value))
         return
     if isinstance(value, (bytes, bytearray)):
         _write_binary(stream, value)
         return
-    if isinstance(value, (list, tuple)):
-        stream.write(b"\x05")
-        stream.write(_U32.pack(len(value)))
-        for item in value:
+    if isinstance(value, list):
+        count = list.__len__(value)
+        _write_collection_header(stream, b"\x05", count)
+        for item in list.__iter__(value):
+            _write_value(stream, item, depth=depth + 1)
+        return
+    if isinstance(value, tuple):
+        count = tuple.__len__(value)
+        _write_collection_header(stream, b"\x05", count)
+        for item in tuple.__iter__(value):
             _write_value(stream, item, depth=depth + 1)
         return
     if isinstance(value, dict):
-        stream.write(b"\x06")
-        stream.write(_U32.pack(len(value)))
-        for key, item in value.items():
+        count = dict.__len__(value)
+        _write_collection_header(stream, b"\x06", count)
+        encoded_keys: set[bytes] = set()
+        for key, item in dict.items(value):
             encoded_key = _key_bytes(key)
-            stream.write(_U32.pack(len(encoded_key)))
+            if encoded_key in encoded_keys:
+                raise DuplicateProtocolMapKeyError("duplicate protocol map key after wire encoding")
+            encoded_keys.add(encoded_key)
+            _write_binary_length(stream, len(encoded_key))
             stream.write(encoded_key)
             _write_value(stream, item, depth=depth + 1)
         return
@@ -164,7 +192,53 @@ def _write_value(stream: _ValueWriter, value: Any, *, depth: int) -> None:
         stream.write(b"\x07")
         stream.write(_F64.pack(value))
         return
-    _write_binary(stream, str(value).encode())
+    raise FerricStoreError(f"unsupported protocol value type: {type(value).__name__}")
+
+
+def _write_collection_header(stream: _ValueWriter, tag: bytes, count: int) -> None:
+    if count > _U32_MAX:
+        raise FerricStoreError("protocol collection must fit in an unsigned 32-bit count")
+    stream.write(tag)
+    stream.write(_U32.pack(count))
+
+
+def _require_utf8_within(value: str, limit: int) -> None:
+    """Reject an oversized UTF-8 string without allocating its encoded copy."""
+    length = str.__len__(value)
+    # Every Unicode code point needs at least one UTF-8 byte.  This cheap bound
+    # avoids both ``isascii`` and the exact byte-count scan when character count
+    # alone proves that the value cannot fit.
+    if length > limit:
+        raise EncodedValueLimitError("encoded protocol value exceeds max_bytes")
+    if str.isascii(value):
+        return
+
+    size = 0
+    for index in range(length):
+        codepoint = ord(str.__getitem__(value, index))
+        if codepoint <= 0x7F:
+            size += 1
+        elif codepoint <= 0x7FF:
+            size += 2
+        elif codepoint <= 0xFFFF:
+            size += 3
+        else:
+            size += 4
+        if size > limit:
+            raise EncodedValueLimitError("encoded protocol value exceeds max_bytes")
+
+
+def _write_binary_length(stream: _ValueWriter, size: int) -> None:
+    if size > _U32_MAX:
+        raise FerricStoreError("protocol binary must fit in an unsigned 32-bit length")
+    stream.write(_U32.pack(size))
+
+
+def _write_binary(stream: _ValueWriter, value: bytes | bytearray) -> None:
+    size = memoryview(value).nbytes
+    stream.write(b"\x04")
+    _write_binary_length(stream, size)
+    stream.write(value)
 
 
 def _decode_value_at(
@@ -211,6 +285,8 @@ def _decode_value_at(
         map_values: dict[bytes, Any] = {}
         for _ in range(count):
             key, offset = _read_binary(data, offset)
+            if key in map_values:
+                raise DuplicateProtocolMapKeyError("duplicate protocol map key while decoding")
             value, offset = _decode_value_at(
                 data,
                 offset,
@@ -223,12 +299,6 @@ def _decode_value_at(
         _require_available(data, offset, _F64.size)
         return _F64.unpack_from(data, offset)[0], offset + _F64.size
     raise FerricStoreError("protocol value has unknown tag")
-
-
-def _write_binary(stream: _ValueWriter, value: bytes | bytearray) -> None:
-    stream.write(b"\x04")
-    stream.write(_U32.pack(len(value)))
-    stream.write(value)
 
 
 def _read_binary(data: bytes, offset: int) -> tuple[bytes, int]:
@@ -253,4 +323,4 @@ def _key_bytes(value: Any) -> bytes:
         return value
     if isinstance(value, str):
         return value.encode()
-    return str(value).encode()
+    raise FerricStoreError("protocol map keys must be str or bytes")

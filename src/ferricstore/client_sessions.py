@@ -9,6 +9,7 @@ from ferricstore.adapters import CommandExecutor
 from ferricstore.batch_core import (
     require_batch_items,
 )
+from ferricstore.config_validation import validate_string_sequence
 from ferricstore.errors import map_exception
 from ferricstore.lifecycle_core import (
     raise_primary_with_cleanup,
@@ -171,12 +172,18 @@ class TransactionSession:
     ) -> None:
         self.client = client
         self.key = key
-        self.watch_keys = list(watch or ())
+        self.watch_keys = (
+            list(validate_string_sequence(watch, name="watch")) if watch is not None else []
+        )
         self._active_client: FlowClient | None = None
         self._owns_client = False
         self.closed = False
 
     def __enter__(self) -> FlowClient:
+        if self.closed:
+            raise RuntimeError("transaction session cannot be reused")
+        if self._active_client is not None:
+            raise RuntimeError("transaction session is already active")
         session_keys = ((self.key,) if self.key is not None else ()) + tuple(self.watch_keys)
         session_client, owns_client = self.client._acquire_session_client(session_keys)
         self._active_client = session_client

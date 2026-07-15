@@ -1554,10 +1554,17 @@ def test_real_ferricstore_native_protocol_flow_admin_surface() -> None:
             limit=10,
             now_ms=now + 25,
         )
-        assert client.limit_spend(limit_scope, shard_id=0, amount=2, now_ms=now + 26)
-        assert client.limit_release(limit_scope, shard_id=0, amount=1)
-        assert client.limit_get(limit_scope, now_ms=now + 27) is not None
-        assert isinstance(client.limit_list(scope=limit_scope, limit=10, now_ms=now + 28), list)
+        spent = client.limit_spend(limit_scope, shard_id=0, amount=2, now_ms=now + 26)
+        spent_lease = _field(spent, "lease")
+        assert _field(spent_lease, "in_use") == 2
+        assert client.limit_release(
+            limit_scope,
+            shard_id=0,
+            amount=2,
+            now_ms=now + 27,
+        )
+        assert client.limit_get(limit_scope, now_ms=now + 28) is not None
+        assert isinstance(client.limit_list(scope=limit_scope, limit=10, now_ms=now + 29), list)
         assert isinstance(client.governance_overview(limit=10), object)
     finally:
         client.close()
@@ -2319,13 +2326,11 @@ def test_real_ferricstore_named_data_helpers_cover_native_protocol_surface() -> 
         assert call("command_info", "GET") is not None
         assert call("slowlog", "GET", 10) is not None
         assert call("config", "GET", "*") is not None
-        assert _ok(call("watch", key("watched")))
-        assert _ok(call("unwatch"))
-        assert _ok(call("multi"))
-        assert _ok(call("discard"))
-        assert _ok(call("multi"))
-        assert call("set", key("tx-set"), "value", encode=False) in (b"QUEUED", "QUEUED")
-        assert call("transaction_exec") is not None
+        with client.transaction(watch=[key("watched")]) as transaction:
+            assert transaction.set(key("tx-set"), "value", encode=False) in (
+                b"QUEUED",
+                "QUEUED",
+            )
         assert call("publish", key("channel"), {"event": "helper"}) >= 0
         assert call("pubsub", "CHANNELS") is not None
 
@@ -2339,12 +2344,13 @@ def test_real_ferricstore_named_data_helpers_cover_native_protocol_surface() -> 
             "psubscribe",
             "punsubscribe",
         }
+        session_only_helpers = {"discard", "multi", "transaction_exec", "unwatch", "watch"}
         public_helpers = {
             name
             for name, value in DataCommandsMixin.__dict__.items()
             if callable(value) and not name.startswith("_")
         }
-        assert public_helpers - covered - non_docker_safe_helpers == set()
+        assert public_helpers - covered - non_docker_safe_helpers - session_only_helpers == set()
     finally:
         with suppress(Exception):
             if keys:

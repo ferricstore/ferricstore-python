@@ -1,72 +1,27 @@
 from __future__ import annotations
 
-import zlib
 from collections.abc import Sequence
 from typing import Any
 
-from ferricstore.flow_options import flow_option_width
-
-FLOW_AUTO_PARTITION_PREFIX = "__flow_auto__:"
-FLOW_AUTO_PARTITION_BUCKETS = 256
-
-_FLOW_POSITIONAL_PARTITION_COMMANDS = {
-    "FLOW.CANCEL_MANY",
-    "FLOW.COMPLETE_MANY",
-    "FLOW.CREATE_MANY",
-    "FLOW.FAIL_MANY",
-    "FLOW.RETRY_MANY",
-    "FLOW.TRANSITION_MANY",
-}
-
-_FLOW_AUTO_ID_COMMANDS = {
-    "FLOW.CANCEL",
-    "FLOW.COMPLETE",
-    "FLOW.CREATE",
-    "FLOW.EFFECT.COMPENSATE",
-    "FLOW.EFFECT.CONFIRM",
-    "FLOW.EFFECT.FAIL",
-    "FLOW.EFFECT.GET",
-    "FLOW.EFFECT.RESERVE",
-    "FLOW.EXTEND_LEASE",
-    "FLOW.FAIL",
-    "FLOW.GET",
-    "FLOW.GOVERNANCE.LEDGER",
-    "FLOW.HISTORY",
-    "FLOW.RETRY",
-    "FLOW.REWIND",
-    "FLOW.SIGNAL",
-    "FLOW.SPAWN_CHILDREN",
-    "FLOW.START_AND_CLAIM",
-    "FLOW.STEP_CONTINUE",
-    "FLOW.TRANSITION",
-}
-
-_FLOW_OPTION_STARTS = {
-    "FLOW.ATTRIBUTE_VALUES": 2,
-    "FLOW.CANCEL": 1,
-    "FLOW.CLAIM_DUE": 1,
-    "FLOW.COMPLETE": 2,
-    "FLOW.CREATE": 1,
-    "FLOW.EFFECT.COMPENSATE": 1,
-    "FLOW.EFFECT.CONFIRM": 1,
-    "FLOW.EFFECT.FAIL": 1,
-    "FLOW.EFFECT.GET": 1,
-    "FLOW.EFFECT.RESERVE": 1,
-    "FLOW.EXTEND_LEASE": 2,
-    "FLOW.FAIL": 2,
-    "FLOW.GET": 1,
-    "FLOW.GOVERNANCE.LEDGER": 1,
-    "FLOW.HISTORY": 1,
-    "FLOW.LIST": 1,
-    "FLOW.RETRY": 2,
-    "FLOW.REWIND": 1,
-    "FLOW.SEARCH": 1,
-    "FLOW.SIGNAL": 1,
-    "FLOW.SPAWN_CHILDREN": 1,
-    "FLOW.START_AND_CLAIM": 1,
-    "FLOW.STEP_CONTINUE": 4,
-    "FLOW.TRANSITION": 3,
-}
+from ferricstore.command_grammar import parse_stream_read
+from ferricstore.flow_routing import (
+    FLOW_AUTO_PARTITION_BUCKETS as FLOW_AUTO_PARTITION_BUCKETS,
+)
+from ferricstore.flow_routing import (
+    FLOW_AUTO_PARTITION_PREFIX as FLOW_AUTO_PARTITION_PREFIX,
+)
+from ferricstore.flow_routing import (
+    flow_auto_partition_index as flow_auto_partition_index,
+)
+from ferricstore.flow_routing import (
+    flow_auto_partition_key as flow_auto_partition_key,
+)
+from ferricstore.flow_routing import (
+    flow_auto_partition_key_for_index as flow_auto_partition_key_for_index,
+)
+from ferricstore.flow_routing import (
+    flow_command_route_keys,
+)
 
 _CONTROL_COMMANDS = {
     "AUTH",
@@ -301,9 +256,7 @@ def command_route_keys(name: str, args: Sequence[Any]) -> tuple[Any, ...]:
     normalized = normalize_command_name(name)
     values = tuple(args)
     if normalized.startswith("FLOW."):
-        flow_keys = _flow_command_route_keys(normalized, values)
-        if flow_keys is not None:
-            return flow_keys
+        return flow_command_route_keys(normalized, values)
     if normalized in _CONTROL_COMMANDS:
         return ()
     if normalized in _PAIR_KEYS_COMMANDS:
@@ -322,7 +275,7 @@ def command_route_keys(name: str, args: Sequence[Any]) -> tuple[Any, ...]:
         count = _non_negative_int(values[count_index] if len(values) > count_index else None)
         return values[offset : offset + count] if count is not None else ()
     if normalized in {"XREAD", "XREADGROUP"}:
-        return _stream_keys(values)
+        return _stream_keys(values, read_group=normalized == "XREADGROUP")
     if normalized in {"CMS.MERGE", "TDIGEST.MERGE"}:
         count = _non_negative_int(values[1] if len(values) > 1 else None)
         return values[:1] + values[2 : 2 + count] if count is not None else ()
@@ -335,72 +288,9 @@ def command_route_keys(name: str, args: Sequence[Any]) -> tuple[Any, ...]:
     return ()
 
 
-def flow_auto_partition_key(id: str | bytes) -> str:
-    return flow_auto_partition_key_for_index(flow_auto_partition_index(id))
-
-
-def flow_auto_partition_index(id: str | bytes) -> int:
-    encoded = id if isinstance(id, bytes) else id.encode()
-    return zlib.crc32(encoded) % FLOW_AUTO_PARTITION_BUCKETS
-
-
-def flow_auto_partition_key_for_index(index: int) -> str:
-    return f"{FLOW_AUTO_PARTITION_PREFIX}{index % FLOW_AUTO_PARTITION_BUCKETS}"
-
-
-def _flow_command_route_keys(name: str, args: tuple[Any, ...]) -> tuple[Any, ...] | None:
-    if name in _FLOW_POSITIONAL_PARTITION_COMMANDS and args:
-        marker = normalize_command_name(args[0])
-        if marker in {"AUTO", "MIXED", "NONE"}:
-            return ()
-        return args[:1]
-
-    option_start = _FLOW_OPTION_STARTS.get(name)
-    if option_start is not None:
-        partition = _flow_partition_option(args, option_start)
-        if partition is not None:
-            return partition
-
-    if name in _FLOW_AUTO_ID_COMMANDS and args and isinstance(args[0], (str, bytes)):
-        return (flow_auto_partition_key(args[0]),)
-    return None
-
-
-def _flow_partition_option(
-    args: tuple[Any, ...],
-    start: int,
-) -> tuple[Any, ...] | None:
-    """Read PARTITION only at option boundaries, never from positional data."""
-    index = start
-    while index < len(args):
-        token = normalize_command_name(args[index])
-        if token == "PARTITION":
-            return args[index + 1 : index + 2]
-        if token in {"ITEMS", "ITEMS_EXT"}:
-            return None
-        width = flow_option_width(args, index)
-        if width is None:
-            return None
-        index += width
-    return None
-
-
-def _stream_keys(args: tuple[Any, ...]) -> tuple[Any, ...]:
-    streams_index = next(
-        (
-            index
-            for index, value in enumerate(args)
-            if (
-                value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
-            ).upper()
-            == "STREAMS"
-        ),
-        None,
-    )
-    if streams_index is None:
-        return ()
-    remaining = args[streams_index + 1 :]
-    return remaining[: len(remaining) // 2]
+def _stream_keys(args: tuple[Any, ...], *, read_group: bool) -> tuple[Any, ...]:
+    parsed = parse_stream_read(args, read_group=read_group)
+    return parsed.keys if parsed.valid else ()
 
 
 def _non_negative_int(value: Any) -> int | None:

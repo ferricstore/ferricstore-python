@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-import asyncio
 import threading
-from collections.abc import Awaitable, Callable, Hashable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Hashable, Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Executor, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
+from importlib import import_module
 from typing import Any, TypeVar, cast
 
 from ferricstore.command_core import flow_auto_partition_key
+from ferricstore.config_validation import validate_positive_int
 from ferricstore.errors import FerricStoreError
 from ferricstore.types import CreateItem
 
@@ -28,9 +29,10 @@ class SyncFanoutExecutor:
         max_concurrency: int = _DEFAULT_FANOUT_LIMIT,
         thread_name_prefix: str = "ferricstore-fanout",
     ) -> None:
-        if max_concurrency <= 0:
-            raise ValueError("max_concurrency must be positive")
-        self.max_concurrency = max_concurrency
+        self.max_concurrency = validate_positive_int(
+            max_concurrency,
+            name="max_concurrency",
+        )
         self.thread_name_prefix = thread_name_prefix
         self._condition = threading.Condition()
         self._executor: ThreadPoolExecutor | None = None
@@ -262,8 +264,7 @@ def run_sync_fanout(
     stop_on_error: bool = False,
 ) -> list[_Result]:
     """Map independent operations in order, with explicit bounded concurrency."""
-    if max_concurrency <= 0:
-        raise ValueError("max_concurrency must be positive")
+    max_concurrency = validate_positive_int(max_concurrency, name="max_concurrency")
     if not concurrent or len(items) < 2:
         return [operation(item) for item in items]
     worker_count = min(max_concurrency, len(items))
@@ -286,8 +287,7 @@ def run_sync_fanout_on_executor(
     stop_on_error: bool = False,
 ) -> list[_Result]:
     """Map through an existing executor without submitting the whole input at once."""
-    if max_concurrency <= 0:
-        raise ValueError("max_concurrency must be positive")
+    max_concurrency = validate_positive_int(max_concurrency, name="max_concurrency")
     if not items:
         return []
 
@@ -333,8 +333,9 @@ async def run_async_fanout(
     stop_on_error: bool = False,
 ) -> list[_Result]:
     """Async counterpart to :func:`run_sync_fanout`, preserving input order."""
-    if max_concurrency <= 0:
-        raise ValueError("max_concurrency must be positive")
+    import asyncio
+
+    max_concurrency = validate_positive_int(max_concurrency, name="max_concurrency")
     if not concurrent or len(items) < 2:
         return [await operation(item) for item in items]
 
@@ -370,6 +371,14 @@ async def run_async_fanout(
     if errors:
         raise errors[min(errors)]
     return cast(list[_Result], results)
+
+
+def __getattr__(name: str) -> Any:
+    if name == "asyncio":
+        value = import_module("asyncio")
+        globals()[name] = value
+        return value
+    raise AttributeError(name)
 
 
 def _batch_fingerprint(value: Any, active: set[int]) -> Hashable:
@@ -432,7 +441,7 @@ def _batch_fingerprint(value: Any, active: set[int]) -> Hashable:
                 "mapping",
                 value_type.__module__,
                 value_type.__qualname__,
-                frozenset(
+                _fingerprint_multiset(
                     (
                         _batch_fingerprint(key, active),
                         _batch_fingerprint(item, active),
@@ -448,7 +457,7 @@ def _batch_fingerprint(value: Any, active: set[int]) -> Hashable:
         try:
             return (
                 value_type.__name__,
-                frozenset(_batch_fingerprint(item, active) for item in value),
+                _fingerprint_multiset(_batch_fingerprint(item, active) for item in value),
             )
         finally:
             active.remove(identity)
@@ -519,11 +528,19 @@ def _queued_batch_fingerprint(value: Any, active: set[int]) -> Hashable:
         try:
             return (
                 "frozenset",
-                frozenset(_queued_batch_fingerprint(item, active) for item in value),
+                _fingerprint_multiset(_queued_batch_fingerprint(item, active) for item in value),
             )
         finally:
             active.remove(identity)
     return ("identity", identity)
+
+
+def _fingerprint_multiset(values: Iterable[Hashable]) -> frozenset[tuple[Hashable, int]]:
+    """Keep collision multiplicity while remaining independent of iteration order."""
+    counts: dict[Hashable, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return frozenset(counts.items())
 
 
 def _pipeline_status(item: Any) -> str | None:

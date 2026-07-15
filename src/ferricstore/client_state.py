@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
-
+from ferricstore.adapters import CommandExecutor
 from ferricstore.backpressure import (
     BackpressureController,
 )
@@ -12,7 +11,7 @@ from ferricstore.codecs import Codec
 
 
 class _ClientMixinBase:
-    executor: Any
+    executor: CommandExecutor
     codec: Codec
     backpressure: BackpressureController
     _transaction_mode: bool

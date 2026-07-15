@@ -23,6 +23,17 @@ from ferricstore.protocol_constants import (
     _NULL_U32,
 )
 
+_I64_MAX = (1 << 63) - 1
+
+
+def _compact_i64(value: Any) -> int | None:
+    """Return an exactly typed wire integer or decline compact encoding."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < _I64_MIN or value > _I64_MAX:
+        return None
+    return value
+
 
 def _compact_flow_create_many_payload(payload: dict[str, Any]) -> bytes | None:
     allowed = {
@@ -42,14 +53,9 @@ def _compact_flow_create_many_payload(payload: dict[str, Any]) -> bytes | None:
         return None
     type_value = _maybe_bytes(payload.get("type"))
     state = _maybe_bytes(payload.get("state"))
-    now_ms = payload.get("now_ms")
-    run_at_ms = payload.get("run_at_ms")
-    if (
-        type_value is None
-        or state is None
-        or not isinstance(now_ms, int)
-        or not isinstance(run_at_ms, int)
-    ):
+    now_ms = _compact_i64(payload.get("now_ms"))
+    run_at_ms = _compact_i64(payload.get("run_at_ms"))
+    if type_value is None or state is None or now_ms is None or run_at_ms is None:
         return None
     return_mode = _compact_create_many_return_mode(payload.get("return"))
     if return_mode is None:
@@ -128,20 +134,20 @@ def _compact_flow_claim_due_payload(payload: dict[str, Any]) -> bytes | None:
     type_value = _maybe_bytes(payload.get("type"))
     state = _optional_bytes(payload.get("state"))
     worker = _maybe_bytes(payload.get("worker"))
-    lease_ms = payload.get("lease_ms")
-    limit = payload.get("limit")
-    block_ms = payload.get("block_ms", -1)
-    reclaim_ratio = payload.get("reclaim_ratio", 0)
-    priority = payload.get("priority", _I64_MIN)
+    lease_ms = _compact_i64(payload.get("lease_ms"))
+    limit = _compact_i64(payload.get("limit"))
+    block_ms = _compact_i64(payload.get("block_ms", -1))
+    reclaim_ratio = _compact_i64(payload.get("reclaim_ratio", 0))
+    priority = _compact_i64(payload.get("priority", _I64_MIN))
     if (
         type_value is None
         or state is False
         or worker is None
-        or not isinstance(lease_ms, int)
-        or not isinstance(limit, int)
-        or not isinstance(block_ms, int)
-        or not isinstance(reclaim_ratio, int)
-        or not isinstance(priority, int)
+        or lease_ms is None
+        or limit is None
+        or block_ms is None
+        or reclaim_ratio is None
+        or priority is None
     ):
         return None
     return_mode = _compact_return_mode(payload.get("return"))
@@ -193,9 +199,9 @@ def _compact_flow_claimed_many_payload(
     allowed = {"partition_key", "now_ms", "independent", "items", "return"} | extra_allowed
     if not set(payload).issubset(allowed):
         return None
-    now_ms = payload.get("now_ms")
+    now_ms = _compact_i64(payload.get("now_ms"))
     items = payload.get("items")
-    if not isinstance(now_ms, int) or not isinstance(items, list):
+    if now_ms is None or not isinstance(items, list):
         return None
     return_mode = payload.get("return")
     if return_mode is None:
@@ -224,8 +230,8 @@ def _compact_flow_claimed_many_payload(
         body.extend(partition_key)
 
     if "run_at_ms" in extra_allowed:
-        run_at_ms = payload.get("run_at_ms")
-        if not isinstance(run_at_ms, int):
+        run_at_ms = _compact_i64(payload.get("run_at_ms"))
+        if run_at_ms is None:
             return None
         body.extend(
             struct.pack(
@@ -260,7 +266,8 @@ def _compact_flow_claimed_many_payload(
         else:
             lease_token = _maybe_bytes(item[1])
             fencing_token = item[2]
-        if item_id is None or lease_token is None or not isinstance(fencing_token, int):
+        fencing_token = _compact_i64(fencing_token)
+        if item_id is None or lease_token is None or fencing_token is None:
             return None
         body.extend(pack_u32(len(item_id)))
         body.extend(item_id)
@@ -279,9 +286,9 @@ def _compact_flow_cancel_many_payload(payload: dict[str, Any]) -> bytes | None:
     allowed = {"partition_key", "now_ms", "independent", "items", "return"}
     if not set(payload).issubset(allowed):
         return None
-    now_ms = payload.get("now_ms")
+    now_ms = _compact_i64(payload.get("now_ms"))
     items = payload.get("items")
-    if not isinstance(now_ms, int) or not isinstance(items, list):
+    if now_ms is None or not isinstance(items, list):
         return None
     return_mode = payload.get("return")
     if return_mode is None:
@@ -310,7 +317,8 @@ def _compact_flow_cancel_many_payload(payload: dict[str, Any]) -> bytes | None:
         item_id = _maybe_bytes(item.get("id"))
         item_partition = _optional_bytes(item.get("partition_key"))
         fencing_token = item.get("fencing_token")
-        if item_id is None or item_partition is False or not isinstance(fencing_token, int):
+        fencing_token = _compact_i64(fencing_token)
+        if item_id is None or item_partition is False or fencing_token is None:
             return None
         parts.append(_compact_binary(item_id))
         parts.append(_compact_optional_binary(cast(bytes | None, item_partition)))
@@ -333,14 +341,14 @@ def _compact_flow_transition_many_payload(payload: dict[str, Any]) -> bytes | No
         return None
     from_state = _maybe_bytes(payload.get("from_state"))
     to_state = _maybe_bytes(payload.get("to_state"))
-    now_ms = payload.get("now_ms")
-    run_at_ms = payload.get("run_at_ms")
+    now_ms = _compact_i64(payload.get("now_ms"))
+    run_at_ms = _compact_i64(payload.get("run_at_ms"))
     items = payload.get("items")
     if (
         from_state is None
         or to_state is None
-        or not isinstance(now_ms, int)
-        or not isinstance(run_at_ms, int)
+        or now_ms is None
+        or run_at_ms is None
         or not isinstance(items, list)
     ):
         return None
@@ -380,11 +388,12 @@ def _compact_flow_transition_many_payload(payload: dict[str, Any]) -> bytes | No
         item_partition = _optional_bytes(item.get("partition_key"))
         lease_token = _optional_bytes(item.get("lease_token"))
         fencing_token = item.get("fencing_token")
+        fencing_token = _compact_i64(fencing_token)
         if (
             item_id is None
             or item_partition is False
             or lease_token is False
-            or not isinstance(fencing_token, int)
+            or fencing_token is None
         ):
             return None
         parts.append(_compact_binary(item_id))
@@ -400,8 +409,8 @@ def _compact_flow_value_mget_payload(payload: dict[str, Any]) -> bytes | None:
     refs = payload.get("refs")
     if not isinstance(refs, list):
         return None
-    max_bytes_value = payload.get("max_bytes", _I64_MIN)
-    if not isinstance(max_bytes_value, int):
+    max_bytes_value = _compact_i64(payload.get("max_bytes", _I64_MIN))
+    if max_bytes_value is None:
         return None
 
     parts = [
@@ -422,7 +431,7 @@ def _compact_flow_list_payload(payload: dict[str, Any]) -> bytes | None:
 
     flow_type = _maybe_bytes(payload.get("type"))
     state = _optional_bytes(payload.get("state"))
-    count = _raw_int(payload.get("count"))
+    count = _compact_i64(_raw_int(payload.get("count")))
     if flow_type is None or state is False or count is None:
         return None
 
@@ -465,17 +474,23 @@ def _compact_flow_value_put_payload(mode: int, items: list[dict[str, Any]]) -> b
     parts = [struct.pack(">BBI", _COMPACT_PIPELINE_REQUEST, 0x80 | mode, len(items))]
     if mode in {7, 15}:
         for item in items:
+            now_ms = _compact_i64(item.get("now_ms"))
+            if now_ms is None:
+                return None
             parts.append(_compact_binary(cast(bytes, item["value"])))
-            parts.append(struct.pack(">q", cast(int, item["now_ms"])))
+            parts.append(struct.pack(">q", now_ms))
         return b"".join(parts)
 
     if mode in {8, 14}:
         for item in items:
+            now_ms = _compact_i64(item.get("now_ms"))
+            if now_ms is None:
+                return None
             parts.append(_compact_binary(cast(bytes, item["value"])))
             parts.append(_compact_binary(cast(bytes, item["owner_flow_id"])))
             parts.append(_compact_binary(cast(bytes, item["name"])))
             parts.append(_compact_optional_binary(cast(bytes | None, item["partition_key"])))
-            parts.append(struct.pack(">q", cast(int, item["now_ms"])))
+            parts.append(struct.pack(">q", now_ms))
         return b"".join(parts)
 
     return None
@@ -590,6 +605,7 @@ __all__ = [
     "_compact_flow_transition_many_payload",
     "_compact_flow_value_mget_payload",
     "_compact_flow_value_put_payload",
+    "_compact_i64",
     "_compact_optional_binary",
     "_compact_partition_request",
     "_compact_return_mode",

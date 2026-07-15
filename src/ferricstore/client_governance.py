@@ -7,20 +7,35 @@ from typing import TYPE_CHECKING, Any, cast
 from ferricstore.client_helpers import (
     _append,
     _append_bool,
-    _append_extra_options,
     _normalize_admin_response,
-    _ok_response,
 )
 from ferricstore.client_state import _ClientMixinBase
+from ferricstore.config_validation import validate_string_sequence
+from ferricstore.governance_validation import (
+    validate_approval_decision,
+    validate_approval_list,
+    validate_approval_request,
+    validate_budget_list,
+    validate_budget_reserve,
+    validate_budget_settlement,
+    validate_circuit_open,
+    validate_circuit_operation,
+    validate_ledger_options,
+    validate_limit_get,
+    validate_limit_lease,
+    validate_limit_list,
+    validate_limit_release,
+    validate_limit_spend,
+    validate_nonempty_string,
+    validate_retention_cleanup,
+)
+from ferricstore.retry_policy import RetryPolicy
 from ferricstore.types import (
     ApprovalResult,
     BudgetResult,
     CircuitBreakerStatus,
-    EffectResult,
     FlowStatePolicyLike,
     GovernanceOverview,
-    RetryPolicy,
-    ScheduleResult,
 )
 
 
@@ -28,129 +43,6 @@ class _ClientGovernanceMixin(_ClientMixinBase):
     if TYPE_CHECKING:
         _append_retry_policy: Callable[[builtins.list[Any], RetryPolicy], None]
         _append_state_policy: Callable[[builtins.list[Any], FlowStatePolicyLike], None]
-
-    def schedule_create(
-        self,
-        id: str,
-        *,
-        target: dict[str, Any],
-        kind: str | None = None,
-        at_ms: int | None = None,
-        delay_ms: int | None = None,
-        start_at_ms: int | None = None,
-        every_ms: int | None = None,
-        cron: str | None = None,
-        timezone: str | None = None,
-        overlap_policy: str | None = None,
-        overlap_retry_ms: int | None = None,
-        max_fires: int | None = None,
-        end_at_ms: int | None = None,
-        overwrite: bool | None = None,
-        now_ms: int | None = None,
-        extra_options: dict[str, Any] | None = None,
-    ) -> ScheduleResult:
-        """Create or replace a durable Flow schedule."""
-
-        args: builtins.list[Any] = ["FLOW.SCHEDULE.CREATE", id]
-        _append(args, "KIND", kind)
-        _append(args, "AT_MS", at_ms)
-        _append(args, "DELAY_MS", delay_ms)
-        _append(args, "START_AT_MS", start_at_ms)
-        _append(args, "EVERY_MS", every_ms)
-        _append(args, "CRON", cron)
-        _append(args, "TIMEZONE", timezone)
-        _append(args, "TARGET", target)
-        _append(args, "OVERLAP_POLICY", overlap_policy)
-        _append(args, "OVERLAP_RETRY_MS", overlap_retry_ms)
-        _append(args, "MAX_FIRES", max_fires)
-        _append(args, "END_AT_MS", end_at_ms)
-        _append_bool(args, "OVERWRITE", overwrite)
-        _append(args, "NOW", now_ms)
-        _append_extra_options(args, extra_options)
-        return ScheduleResult.from_resp(
-            cast(dict[str, Any], _normalize_admin_response(self.executor.execute_command(*args)))
-        )
-
-    def schedule_get(self, id: str, *, now_ms: int | None = None) -> ScheduleResult | None:
-        args: builtins.list[Any] = ["FLOW.SCHEDULE.GET", id]
-        _append(args, "NOW", now_ms)
-        response = cast(
-            dict[str, Any] | None, _normalize_admin_response(self.executor.execute_command(*args))
-        )
-        return ScheduleResult.from_resp(response) if response is not None else None
-
-    def schedule_fire(self, id: str, *, now_ms: int | None = None) -> ScheduleResult:
-        args: builtins.list[Any] = ["FLOW.SCHEDULE.FIRE", id]
-        _append(args, "NOW", now_ms)
-        return ScheduleResult.from_resp(
-            cast(dict[str, Any], _normalize_admin_response(self.executor.execute_command(*args)))
-        )
-
-    def schedule_pause(self, id: str, *, now_ms: int | None = None) -> ScheduleResult:
-        args: builtins.list[Any] = ["FLOW.SCHEDULE.PAUSE", id]
-        _append(args, "NOW", now_ms)
-        return ScheduleResult.from_resp(
-            cast(dict[str, Any], _normalize_admin_response(self.executor.execute_command(*args)))
-        )
-
-    def schedule_resume(self, id: str, *, now_ms: int | None = None) -> ScheduleResult:
-        args: builtins.list[Any] = ["FLOW.SCHEDULE.RESUME", id]
-        _append(args, "NOW", now_ms)
-        return ScheduleResult.from_resp(
-            cast(dict[str, Any], _normalize_admin_response(self.executor.execute_command(*args)))
-        )
-
-    def schedule_delete(self, id: str, *, now_ms: int | None = None) -> ScheduleResult:
-        args: builtins.list[Any] = ["FLOW.SCHEDULE.DELETE", id]
-        _append(args, "NOW", now_ms)
-        response = _normalize_admin_response(self.executor.execute_command(*args))
-        if _ok_response(response):
-            return ScheduleResult(id=id, status="deleted", raw={"id": id, "status": "deleted"})
-        return ScheduleResult.from_resp(cast(dict[str, Any], response))
-
-    def schedule_fire_due(
-        self,
-        *,
-        now_ms: int | None = None,
-        worker: str | None = None,
-        block_ms: int | None = None,
-        limit: int | None = None,
-    ) -> ScheduleResult:
-        args: builtins.list[Any] = ["FLOW.SCHEDULE.FIRE_DUE"]
-        _append(args, "NOW", now_ms)
-        _append(args, "WORKER", worker)
-        _append(args, "BLOCK", block_ms)
-        _append(args, "LIMIT", limit)
-        return ScheduleResult.from_resp(
-            cast(dict[str, Any], _normalize_admin_response(self.executor.execute_command(*args)))
-        )
-
-    def schedule_list(
-        self,
-        *,
-        kind: str | None = None,
-        state: str | None = None,
-        timezone: str | None = None,
-        target_type: str | None = None,
-        from_ms: int | None = None,
-        to_ms: int | None = None,
-        count: int | None = None,
-        rev: bool | None = None,
-    ) -> builtins.list[ScheduleResult]:
-        args: builtins.list[Any] = ["FLOW.SCHEDULE.LIST"]
-        _append(args, "KIND", kind)
-        _append(args, "STATE", state)
-        _append(args, "TIMEZONE", timezone)
-        _append(args, "TARGET_TYPE", target_type)
-        _append(args, "FROM_MS", from_ms)
-        _append(args, "TO_MS", to_ms)
-        _append(args, "COUNT", count)
-        _append_bool(args, "REV", rev)
-        response = cast(
-            builtins.list[dict[str, Any]],
-            _normalize_admin_response(self.executor.execute_command(*args)),
-        )
-        return [ScheduleResult.from_resp(item) for item in response]
 
     def install_policy(
         self,
@@ -160,165 +52,24 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         states: dict[str, FlowStatePolicyLike] | None = None,
         indexed_state_meta: str | None = None,
     ) -> Any:
+        validate_nonempty_string(type, name="type")
+        if indexed_state_meta is not None:
+            validate_nonempty_string(indexed_state_meta, name="indexed_state_meta")
         args: builtins.list[Any] = ["FLOW.POLICY.SET", type]
         _append(args, "INDEXED_STATE_META", indexed_state_meta)
         if retry is not None:
             self._append_retry_policy(args, retry)
         for state, policy in (states or {}).items():
+            validate_nonempty_string(state, name="state")
             args.extend(["STATE", state])
             self._append_state_policy(args, policy)
         return self.executor.execute_command(*args)
 
     def policy_get(self, type: str, *, state: str | None = None) -> dict[Any, Any]:
+        validate_nonempty_string(type, name="type")
         args: builtins.list[Any] = ["FLOW.POLICY.GET", type]
         _append(args, "STATE", state)
         return dict(self.executor.execute_command(*args) or {})
-
-    def effect_reserve(
-        self,
-        id: str,
-        effect_key: str,
-        effect_type: str,
-        *,
-        partition_key: str | None = None,
-        lease_token: bytes | None = None,
-        fencing_token: int | None = None,
-        operation_digest: str,
-        idempotency_key: str | None = None,
-        governance_scope: str | None = None,
-        now_ms: int | None = None,
-    ) -> EffectResult:
-        args: builtins.list[Any] = ["FLOW.EFFECT.RESERVE", id]
-        _append(args, "EFFECT_KEY", effect_key)
-        _append(args, "EFFECT_TYPE", effect_type)
-        _append(args, "PARTITION", partition_key)
-        _append(args, "LEASE_TOKEN", lease_token)
-        _append(args, "FENCING", fencing_token)
-        _append(args, "OPERATION_DIGEST", operation_digest)
-        _append(args, "IDEMPOTENCY_KEY", idempotency_key)
-        _append(args, "GOVERNANCE_SCOPE", governance_scope)
-        _append(args, "NOW", now_ms)
-        return EffectResult.from_resp(
-            cast(dict[str, Any], _normalize_admin_response(self.executor.execute_command(*args)))
-        )
-
-    def effect_confirm(
-        self,
-        id: str,
-        effect_key: str,
-        *,
-        partition_key: str | None = None,
-        lease_token: bytes | None = None,
-        fencing_token: int | None = None,
-        external_id: str | None = None,
-        latency_ms: int | None = None,
-        now_ms: int | None = None,
-    ) -> EffectResult:
-        return self._effect_status(
-            "FLOW.EFFECT.CONFIRM",
-            id,
-            effect_key,
-            partition_key=partition_key,
-            lease_token=lease_token,
-            fencing_token=fencing_token,
-            external_id=external_id,
-            latency_ms=latency_ms,
-            now_ms=now_ms,
-        )
-
-    def effect_fail(
-        self,
-        id: str,
-        effect_key: str,
-        *,
-        partition_key: str | None = None,
-        lease_token: bytes | None = None,
-        fencing_token: int | None = None,
-        error: str | None = None,
-        reason: str | None = None,
-        latency_ms: int | None = None,
-        now_ms: int | None = None,
-    ) -> EffectResult:
-        return self._effect_status(
-            "FLOW.EFFECT.FAIL",
-            id,
-            effect_key,
-            partition_key=partition_key,
-            lease_token=lease_token,
-            fencing_token=fencing_token,
-            error=error,
-            reason=reason,
-            latency_ms=latency_ms,
-            now_ms=now_ms,
-        )
-
-    def effect_compensate(
-        self,
-        id: str,
-        effect_key: str,
-        *,
-        partition_key: str | None = None,
-        lease_token: bytes | None = None,
-        fencing_token: int | None = None,
-        external_id: str | None = None,
-        reason: str | None = None,
-        now_ms: int | None = None,
-    ) -> EffectResult:
-        return self._effect_status(
-            "FLOW.EFFECT.COMPENSATE",
-            id,
-            effect_key,
-            partition_key=partition_key,
-            lease_token=lease_token,
-            fencing_token=fencing_token,
-            external_id=external_id,
-            reason=reason,
-            now_ms=now_ms,
-        )
-
-    def effect_get(
-        self,
-        id: str,
-        effect_key: str,
-        *,
-        partition_key: str | None = None,
-    ) -> EffectResult | None:
-        args: builtins.list[Any] = ["FLOW.EFFECT.GET", id]
-        _append(args, "EFFECT_KEY", effect_key)
-        _append(args, "PARTITION", partition_key)
-        response = cast(
-            dict[str, Any] | None, _normalize_admin_response(self.executor.execute_command(*args))
-        )
-        return EffectResult.from_resp(response) if response is not None else None
-
-    def _effect_status(
-        self,
-        command: str,
-        id: str,
-        effect_key: str,
-        *,
-        partition_key: str | None = None,
-        lease_token: bytes | None = None,
-        fencing_token: int | None = None,
-        external_id: str | None = None,
-        error: str | None = None,
-        reason: str | None = None,
-        latency_ms: int | None = None,
-        now_ms: int | None = None,
-    ) -> EffectResult:
-        args: builtins.list[Any] = [command, id]
-        _append(args, "EFFECT_KEY", effect_key)
-        _append(args, "PARTITION", partition_key)
-        _append(args, "LEASE_TOKEN", lease_token)
-        _append(args, "FENCING", fencing_token)
-        _append(args, "EXTERNAL_ID", external_id)
-        _append(args, "ERROR", error)
-        _append(args, "REASON", reason)
-        _append(args, "LATENCY_MS", latency_ms)
-        _append(args, "NOW", now_ms)
-        return EffectResult.from_resp(
-            cast(dict[str, Any], _normalize_admin_response(self.executor.execute_command(*args)))
-        )
 
     def governance_ledger(
         self,
@@ -330,6 +81,7 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         to_ms: int | None = None,
         rev: bool | None = None,
     ) -> builtins.list[dict[str, Any]]:
+        validate_ledger_options(id, limit=limit, from_ms=from_ms, to_ms=to_ms, rev=rev)
         args: builtins.list[Any] = ["FLOW.GOVERNANCE.LEDGER", id]
         _append(args, "PARTITION", partition_key)
         _append(args, "LIMIT", limit)
@@ -356,12 +108,28 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         expires_at_ms: int | None = None,
         now_ms: int | None = None,
     ) -> ApprovalResult:
+        validate_approval_request(
+            id=id,
+            flow_id=flow_id,
+            scope=scope,
+            policy_hash=policy_hash,
+            policy_version=policy_version,
+            timeout_ms=timeout_ms,
+            expires_at_ms=expires_at_ms,
+            now_ms=now_ms,
+        )
         args: builtins.list[Any] = ["FLOW.APPROVAL.REQUEST", id]
         _append(args, "FLOW_ID", flow_id)
         _append(args, "SCOPE", scope)
         _append(args, "REASON", reason)
         _append(args, "REQUESTED_BY", requested_by)
-        _append(args, "ASSIGNEES", list(assignees) if assignees is not None else None)
+        _append(
+            args,
+            "ASSIGNEES",
+            list(validate_string_sequence(assignees, name="assignees"))
+            if assignees is not None
+            else None,
+        )
         _append(args, "POLICY_HASH", policy_hash)
         _append(args, "POLICY_VERSION", policy_version)
         _append(args, "TIMEOUT_MS", timeout_ms)
@@ -399,6 +167,7 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         reason: str | None,
         now_ms: int | None,
     ) -> ApprovalResult:
+        validate_approval_decision(id=id, approver=approver, now_ms=now_ms)
         args: builtins.list[Any] = [command, id]
         _append(args, "APPROVER", approver)
         _append(args, "REASON", reason)
@@ -408,6 +177,7 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         )
 
     def approval_get(self, id: str) -> ApprovalResult | None:
+        validate_nonempty_string(id, name="id")
         response = cast(
             dict[str, Any] | None,
             _normalize_admin_response(self.executor.execute_command("FLOW.APPROVAL.GET", id)),
@@ -423,6 +193,13 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         flow_id: str | None = None,
         limit: int | None = None,
     ) -> builtins.list[ApprovalResult]:
+        validate_approval_list(
+            status=status,
+            scope=scope,
+            partition_key=partition_key,
+            flow_id=flow_id,
+            limit=limit,
+        )
         args: builtins.list[Any] = ["FLOW.APPROVAL.LIST"]
         _append(args, "STATUS", status)
         _append(args, "SCOPE", scope)
@@ -444,6 +221,13 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         flow_id: str | None = None,
         limit: int | None = None,
     ) -> GovernanceOverview:
+        validate_approval_list(
+            status=status,
+            scope=scope,
+            partition_key=partition_key,
+            flow_id=flow_id,
+            limit=limit,
+        )
         args: builtins.list[Any] = ["FLOW.GOVERNANCE.OVERVIEW"]
         _append(args, "SCOPE", scope)
         _append(args, "PARTITION", partition_key)
@@ -460,17 +244,49 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         *,
         open_ms: int | None = None,
         failure_threshold: int | None = None,
+        window_ms: int | None = None,
+        min_calls: int | None = None,
+        failure_rate_pct: int | None = None,
+        latency_threshold_ms: int | None = None,
+        error_classes: Sequence[str] | None = None,
+        half_open_max_probes: int | None = None,
+        half_open_success_threshold: int | None = None,
         now_ms: int | None = None,
     ) -> CircuitBreakerStatus:
+        validated_error_classes = validate_circuit_open(
+            scope,
+            open_ms=open_ms,
+            failure_threshold=failure_threshold,
+            window_ms=window_ms,
+            min_calls=min_calls,
+            failure_rate_pct=failure_rate_pct,
+            latency_threshold_ms=latency_threshold_ms,
+            error_classes=error_classes,
+            half_open_max_probes=half_open_max_probes,
+            half_open_success_threshold=half_open_success_threshold,
+            now_ms=now_ms,
+        )
         args: builtins.list[Any] = ["FLOW.CIRCUIT.OPEN", scope]
         _append(args, "OPEN_MS", open_ms)
         _append(args, "FAILURE_THRESHOLD", failure_threshold)
+        _append(args, "WINDOW_MS", window_ms)
+        _append(args, "MIN_CALLS", min_calls)
+        _append(args, "FAILURE_RATE_PCT", failure_rate_pct)
+        _append(args, "LATENCY_THRESHOLD_MS", latency_threshold_ms)
+        _append(
+            args,
+            "ERROR_CLASSES",
+            list(validated_error_classes) if validated_error_classes is not None else None,
+        )
+        _append(args, "HALF_OPEN_MAX_PROBES", half_open_max_probes)
+        _append(args, "HALF_OPEN_SUCCESS_THRESHOLD", half_open_success_threshold)
         _append(args, "NOW", now_ms)
         return CircuitBreakerStatus.from_resp(
             cast(dict[str, Any], _normalize_admin_response(self.executor.execute_command(*args)))
         )
 
     def circuit_close(self, scope: str, *, now_ms: int | None = None) -> CircuitBreakerStatus:
+        validate_circuit_operation(scope, now_ms=now_ms)
         args: builtins.list[Any] = ["FLOW.CIRCUIT.CLOSE", scope]
         _append(args, "NOW", now_ms)
         return CircuitBreakerStatus.from_resp(
@@ -478,6 +294,7 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         )
 
     def circuit_get(self, scope: str) -> CircuitBreakerStatus | None:
+        validate_circuit_operation(scope)
         response = cast(
             dict[str, Any] | None,
             _normalize_admin_response(self.executor.execute_command("FLOW.CIRCUIT.GET", scope)),
@@ -494,6 +311,14 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         reservation_id: str | None = None,
         now_ms: int | None = None,
     ) -> BudgetResult:
+        validate_budget_reserve(
+            scope,
+            amount,
+            limit=limit,
+            window_ms=window_ms,
+            reservation_id=reservation_id,
+            now_ms=now_ms,
+        )
         args: builtins.list[Any] = ["FLOW.BUDGET.RESERVE", scope]
         _append(args, "AMOUNT", amount)
         _append(args, "LIMIT", limit)
@@ -513,6 +338,12 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         usage: Mapping[str, Any] | None = None,
         now_ms: int | None = None,
     ) -> BudgetResult:
+        validate_budget_settlement(
+            scope,
+            reservation_id,
+            actual_amount=actual_amount,
+            now_ms=now_ms,
+        )
         args: builtins.list[Any] = ["FLOW.BUDGET.COMMIT", scope]
         _append(args, "RESERVATION_ID", reservation_id)
         _append(args, "ACTUAL_AMOUNT", actual_amount)
@@ -529,6 +360,7 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         *,
         now_ms: int | None = None,
     ) -> BudgetResult:
+        validate_budget_settlement(scope, reservation_id, now_ms=now_ms)
         args: builtins.list[Any] = ["FLOW.BUDGET.RELEASE", scope]
         _append(args, "RESERVATION_ID", reservation_id)
         _append(args, "NOW", now_ms)
@@ -537,6 +369,7 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         )
 
     def budget_get(self, scope: str) -> BudgetResult | None:
+        validate_nonempty_string(scope, name="scope")
         response = cast(
             dict[str, Any] | None,
             _normalize_admin_response(self.executor.execute_command("FLOW.BUDGET.GET", scope)),
@@ -550,6 +383,7 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         partition_key: str | None = None,
         limit: int | None = None,
     ) -> builtins.list[BudgetResult]:
+        validate_budget_list(scope=scope, partition_key=partition_key, limit=limit)
         args: builtins.list[Any] = ["FLOW.BUDGET.LIST"]
         _append(args, "SCOPE", scope)
         _append(args, "PARTITION", partition_key)
@@ -570,6 +404,14 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         limit: int | None = None,
         now_ms: int | None = None,
     ) -> dict[str, Any]:
+        validate_limit_lease(
+            scope,
+            shard_id=shard_id,
+            amount=amount,
+            ttl_ms=ttl_ms,
+            limit=limit,
+            now_ms=now_ms,
+        )
         args: builtins.list[Any] = ["FLOW.LIMIT.LEASE", scope]
         _append(args, "SHARD_ID", shard_id)
         _append(args, "AMOUNT", amount)
@@ -586,19 +428,44 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         amount: int,
         now_ms: int | None = None,
     ) -> dict[str, Any]:
+        validate_limit_spend(scope, shard_id=shard_id, amount=amount, now_ms=now_ms)
         args: builtins.list[Any] = ["FLOW.LIMIT.SPEND", scope]
         _append(args, "SHARD_ID", shard_id)
         _append(args, "AMOUNT", amount)
         _append(args, "NOW", now_ms)
         return cast(dict[str, Any], _normalize_admin_response(self.executor.execute_command(*args)))
 
-    def limit_release(self, scope: str, *, shard_id: int, amount: int) -> dict[str, Any]:
+    def limit_release(
+        self,
+        scope: str,
+        *,
+        shard_id: int,
+        reservation_ids: Sequence[str] | None = None,
+        amount: int | None = None,
+        now_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Release credits by amount or by exact server-provided reservation IDs."""
+
+        validated_reservation_ids = validate_limit_release(
+            scope,
+            shard_id=shard_id,
+            reservation_ids=reservation_ids,
+            amount=amount,
+            now_ms=now_ms,
+        )
         args: builtins.list[Any] = ["FLOW.LIMIT.RELEASE", scope]
         _append(args, "SHARD_ID", shard_id)
         _append(args, "AMOUNT", amount)
+        _append(
+            args,
+            "RESERVATION_IDS",
+            list(validated_reservation_ids) if validated_reservation_ids is not None else None,
+        )
+        _append(args, "NOW", now_ms)
         return cast(dict[str, Any], _normalize_admin_response(self.executor.execute_command(*args)))
 
     def limit_get(self, scope: str, *, now_ms: int | None = None) -> dict[str, Any] | None:
+        validate_limit_get(scope, now_ms=now_ms)
         args: builtins.list[Any] = ["FLOW.LIMIT.GET", scope]
         _append(args, "NOW", now_ms)
         return cast(
@@ -614,6 +481,12 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         limit: int | None = None,
         now_ms: int | None = None,
     ) -> builtins.list[dict[str, Any]]:
+        validate_limit_list(
+            scope=scope,
+            partition_key=partition_key,
+            limit=limit,
+            now_ms=now_ms,
+        )
         args: builtins.list[Any] = ["FLOW.LIMIT.LIST"]
         _append(args, "SCOPE", scope)
         _append(args, "PARTITION", partition_key)
@@ -630,6 +503,7 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         limit: int | None = None,
         now_ms: int | None = None,
     ) -> dict[Any, Any]:
+        validate_retention_cleanup(limit=limit, now_ms=now_ms)
         args: builtins.list[Any] = ["FLOW.RETENTION_CLEANUP"]
         _append(args, "LIMIT", limit)
         _append(args, "NOW", now_ms)

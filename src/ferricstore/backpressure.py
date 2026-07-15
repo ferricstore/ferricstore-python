@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import math
 import random
 import threading
@@ -8,7 +7,15 @@ import time
 import weakref
 from collections.abc import Hashable
 from dataclasses import dataclass
+from importlib import import_module
 from typing import Any, cast
+
+from ferricstore.config_validation import (
+    validate_bool,
+    validate_finite_nonnegative,
+    validate_optional_nonnegative_int,
+    validate_thread_wait_milliseconds,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +34,16 @@ class BackpressurePolicy:
     max_delay_ms: float = 500.0
     jitter: float = 0.25
     shared: bool = True
+
+    def __post_init__(self) -> None:
+        validate_bool(self.enabled, name="enabled")
+        validate_bool(self.shared, name="shared")
+        validate_optional_nonnegative_int(self.max_retries, name="max_retries")
+        if self.max_elapsed_ms is not None:
+            validate_finite_nonnegative(self.max_elapsed_ms, name="max_elapsed_ms")
+        validate_thread_wait_milliseconds(self.base_delay_ms, name="base_delay_ms")
+        validate_thread_wait_milliseconds(self.max_delay_ms, name="max_delay_ms")
+        validate_finite_nonnegative(self.jitter, name="jitter")
 
 
 class _BackpressureState:
@@ -74,6 +91,8 @@ class BackpressureController:
             time.sleep(delay)
 
     async def before_request_async(self, *, elapsed_s: float | None = None) -> bool:
+        import asyncio
+
         started = time.monotonic()
         while True:
             delay = self._wait_delay()
@@ -119,6 +138,8 @@ class BackpressureController:
         *,
         elapsed_s: float | None = None,
     ) -> bool:
+        import asyncio
+
         delay = self._reserve_overload_delay(attempt, retry_after_ms, elapsed_s=elapsed_s)
         if delay is None:
             return False
@@ -199,7 +220,7 @@ class BackpressureController:
     def _retry_after_delay(self, retry_after_ms: int | None) -> float:
         if retry_after_ms is None:
             return 0.0
-        return max(retry_after_ms, 0) / 1000.0
+        return min(max(retry_after_ms, 0) / 1000.0, threading.TIMEOUT_MAX)
 
     def _delay_for_attempt(self, attempt: int) -> float:
         base = max(self.policy.base_delay_ms, 0.0) / 1000.0
@@ -234,3 +255,11 @@ def backpressure_scope_for(executor: Any) -> Hashable:
             return ("executor", id(executor))
         return cast(Hashable, explicit)
     return ("executor", id(executor))
+
+
+def __getattr__(name: str) -> Any:
+    if name == "asyncio":
+        value = import_module("asyncio")
+        globals()[name] = value
+        return value
+    raise AttributeError(name)

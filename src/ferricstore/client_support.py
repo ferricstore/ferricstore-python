@@ -12,12 +12,12 @@ from ferricstore.client_helpers import (
 )
 from ferricstore.client_state import _ClientMixinBase
 from ferricstore.errors import OverloadedError
+from ferricstore.retry_policy import RetryPolicy
 from ferricstore.types import (
     ClaimedFlow,
     FencedItem,
     FlowRecord,
     FlowStatePolicyLike,
-    RetryPolicy,
 )
 
 

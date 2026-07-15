@@ -13,9 +13,17 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, cast
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 
 from ferricstore.command_core import normalize_command_name
+from ferricstore.config_validation import (
+    validate_bool,
+    validate_optional_flow_priority,
+    validate_string_sequence,
+)
+from ferricstore.config_validation import (
+    validate_optional_nonnegative_int as validated_optional_nonnegative_int,
+)
 from ferricstore.errors import (
     FerricStoreError,
     InvalidCommandError,
@@ -42,7 +50,6 @@ from ferricstore.protocol_framing import (
     ResponseIdentity,
     frame_parts,
     validate_response_identity,
-    validated_optional_nonnegative_int,
 )
 from ferricstore.protocol_framing import (
     send_frames as _send_frames,
@@ -78,6 +85,23 @@ def _request_body_byte_limit(
     return body_limit
 
 
+def _compact_payload_budget(
+    max_pending_request_bytes: int | None,
+    compression: str,
+) -> tuple[bool, int | None]:
+    """Return whether eager compact encoding is safe and its raw body budget."""
+    if max_pending_request_bytes is None:
+        return True, None
+    if compression == "zlib":
+        # Generic encoding can stream directly into the compressor. Eager compact
+        # encoding would first materialize the entire uncompressed body.
+        return False, None
+    body_limit = max_pending_request_bytes - _HEADER.size
+    if body_limit < 0:
+        raise _pending_request_capacity_error(max_pending_request_bytes)
+    return True, body_limit
+
+
 class _RequestBodyBuffer:
     __slots__ = ("_max_bytes", "_pending_limit", "_size", "_stream")
 
@@ -88,7 +112,7 @@ class _RequestBodyBuffer:
         self._stream = io.BytesIO()
 
     def write(self, chunk: bytes | bytearray) -> None:
-        size = len(chunk)
+        size = memoryview(chunk).nbytes
         if self._max_bytes is not None and size > self._max_bytes - self._size:
             raise _pending_request_capacity_error(self._pending_limit)
         self._stream.write(chunk)
@@ -105,6 +129,11 @@ def _encode_request_body(
     max_body_bytes: int | None,
     pending_limit: int | None,
 ) -> tuple[bytes, bool]:
+    if isinstance(payload, bytes) and type(payload) is not bytes:
+        # Framing and admission accounting must not dispatch to a subclass's
+        # overridden __len__ or __bytes__.  Ordinary bytes retain the zero-copy
+        # fast path; uncommon subclasses are normalized through their buffer.
+        payload = memoryview(payload).tobytes()
     if isinstance(payload, bytes) and (not payload or compression != "zlib"):
         if max_body_bytes is not None and len(payload) > max_body_bytes:
             raise _pending_request_capacity_error(pending_limit)
@@ -112,8 +141,10 @@ def _encode_request_body(
 
     output = _RequestBodyBuffer(max_body_bytes, pending_limit)
     if compression != "zlib":
-        assert not isinstance(payload, bytes)
-        encode_value_into(payload, output.write)
+        if isinstance(payload, bytes):
+            output.write(payload)
+        else:
+            encode_value_into(payload, output.write)
         return output.finish(), False
 
     compressor = zlib.compressobj()
@@ -148,17 +179,15 @@ def _timeout_with_deadline(timeout: float | None, deadline: float | None) -> flo
 def _protocol_connection_count(value: Any) -> int:
     if value is None:
         return 1
-    count = int(value)
-    if count <= 0:
-        raise ValueError("max_connections must be positive")
-    return count
+    from ferricstore.config_validation import validate_positive_int
+
+    return validate_positive_int(value, name="max_connections")
 
 
 def _protocol_lane_count(value: Any) -> int:
-    count = int(value)
-    if count <= 0:
-        raise ValueError("lanes must be positive")
-    return count
+    from ferricstore.config_validation import validate_positive_int
+
+    return validate_positive_int(value, name="lanes")
 
 
 def _protocol_collection_limit(value: Any) -> int | None:
@@ -359,17 +388,22 @@ def _flow_wake_payload(
 
     flow_wake: dict[str, Any] = {"type": type}
     if states is not None:
-        if not states:
-            raise ValueError("states must be non-empty")
-        flow_wake["states"] = list(states)
+        flow_wake["states"] = list(
+            validate_string_sequence(states, name="states", allow_empty=False)
+        )
     elif state is not None:
         flow_wake["state"] = state
     if partition_keys is not None:
-        if not partition_keys:
-            raise ValueError("partition_keys must be non-empty")
-        flow_wake["partition_keys"] = list(partition_keys)
+        flow_wake["partition_keys"] = list(
+            validate_string_sequence(
+                partition_keys,
+                name="partition_keys",
+                allow_empty=False,
+            )
+        )
     elif partition_key is not None:
         flow_wake["partition_key"] = partition_key
+    priority = validate_optional_flow_priority(priority)
     if priority is not None:
         flow_wake["priority"] = priority
     if limit is not None:
@@ -389,7 +423,7 @@ class RoutingTopology:
     route_epoch: int
     shard_count: int
     slots: tuple[dict[str, Any] | None, ...]
-    endpoints: dict[tuple[str, int], dict[str, Any]]
+    endpoints: dict[tuple[str, int, int], dict[str, Any]]
     route_destinations: tuple[dict[str, Any], ...]
 
     @classmethod
@@ -397,7 +431,7 @@ class RoutingTopology:
         return cls(
             route_epoch=0,
             shard_count=0,
-            slots=tuple([None] * _ROUTE_SLOT_COUNT),
+            slots=(None,) * _ROUTE_SLOT_COUNT,
             endpoints={},
             route_destinations=(),
         )
@@ -418,7 +452,7 @@ class RoutingTopology:
             raise FerricStoreError("invalid SHARDS topology payload", raw=payload)
 
         slots: list[dict[str, Any] | None] = [None] * _ROUTE_SLOT_COUNT
-        endpoints: dict[tuple[str, int], dict[str, Any]] = {}
+        endpoints: dict[tuple[str, int, int], dict[str, Any]] = {}
         routed_shards: set[int] = set()
 
         for item in ranges:
@@ -449,10 +483,12 @@ class RoutingTopology:
                 raise FerricStoreError("invalid SHARDS range", raw=item)
 
             endpoint_key = cls.endpoint_key(endpoint)
+            endpoint_identity = cls.endpoint_identity(endpoint)
             route = {
                 "shard": shard,
                 "lane_id": lane_id,
                 "endpoint_key": endpoint_key,
+                "endpoint_identity": endpoint_identity,
                 "endpoint": endpoint,
                 "leader_node": endpoint["node"],
             }
@@ -463,7 +499,7 @@ class RoutingTopology:
                         raw=item,
                     )
                 slots[slot] = route
-            endpoints[endpoint_key] = endpoint
+            endpoints[endpoint_identity] = endpoint
             routed_shards.add(shard)
 
         if any(route is None for route in slots):
@@ -471,18 +507,18 @@ class RoutingTopology:
         if len(routed_shards) != shard_count:
             raise FerricStoreError("SHARDS shard_count does not match slot table", raw=payload)
 
-        destinations: dict[tuple[tuple[str, int], int], dict[str, Any]] = {}
-        for slot_route in slots:
-            assert slot_route is not None
+        complete_slots = cast(list[dict[str, Any]], slots)
+        destinations: dict[tuple[tuple[str, int, int], int], dict[str, Any]] = {}
+        for slot_route in complete_slots:
             destinations.setdefault(
-                (slot_route["endpoint_key"], slot_route["lane_id"]),
+                (slot_route["endpoint_identity"], slot_route["lane_id"]),
                 slot_route,
             )
 
         return cls(
             route_epoch=route_epoch,
             shard_count=shard_count,
-            slots=tuple(slots),
+            slots=tuple(complete_slots),
             endpoints=endpoints,
             route_destinations=tuple(destinations.values()),
         )
@@ -493,8 +529,16 @@ class RoutingTopology:
         port = _int_or_none(_map_get(endpoint, "native_port"))
         if not host or not _valid_port(port):
             raise FerricStoreError("invalid FerricStore endpoint", raw=endpoint)
-        assert port is not None
-        return (host.lower(), port)
+        return (host.lower(), cast(int, port))
+
+    @staticmethod
+    def endpoint_identity(endpoint: Mapping[str, Any]) -> tuple[str, int, int]:
+        """Identify both plaintext and TLS destinations without transport context."""
+        host, native_port = RoutingTopology.endpoint_key(endpoint)
+        tls_port = _int_or_none(_map_get(endpoint, "native_tls_port"))
+        if tls_port is not None and not _valid_port(tls_port):
+            raise FerricStoreError("invalid FerricStore endpoint", raw=endpoint)
+        return (host, native_port, native_port if tls_port is None else tls_port)
 
     @staticmethod
     def slot_for_key(key: str | bytes) -> int:
@@ -538,11 +582,10 @@ class RoutingTopology:
             or (tls_port is not None and not _valid_port(tls_port))
         ):
             raise FerricStoreError("invalid SHARDS endpoint", raw=item)
-        assert port is not None
         result = {
             "node": _text_or_none(_map_get(raw, "node", "leader_node", "owner_node")) or host,
             "host": host,
-            "native_port": port,
+            "native_port": cast(int, port),
         }
         if tls_port is not None:
             result["native_tls_port"] = tls_port
@@ -593,6 +636,15 @@ def _valid_port(value: int | None) -> bool:
     return value is not None and 1 <= value <= 65535
 
 
+def _protocol_url_port(parsed: Any, *, tls: bool) -> int:
+    port = parsed.port
+    if port is None:
+        return 6389 if tls else 6388
+    if not _valid_port(port):
+        raise ValueError("port must be between 1 and 65535")
+    return cast(int, port)
+
+
 def _hash_tag_or_key(key: str | bytes) -> str | bytes:
     if isinstance(key, bytes):
         start = key.find(b"{")
@@ -626,7 +678,7 @@ def _endpoint_from_url(url: str) -> dict[str, Any]:
     if scheme not in _SUPPORTED_SCHEMES:
         raise ValueError(f"unsupported FerricStore URL scheme: {parsed.scheme}")
     host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or (6389 if tls else 6388)
+    port = _protocol_url_port(parsed, tls=tls)
     endpoint: dict[str, Any] = {
         "node": host,
         "host": host,
@@ -663,6 +715,29 @@ def _connection_endpoint_key(
     return (host.lower(), tls_port if tls and tls_port is not None else native_port)
 
 
+def _topology_update_required(
+    current: RoutingTopology,
+    candidate: RoutingTopology,
+) -> bool:
+    """Validate monotonic topology replacement and report whether state must change."""
+    if current.shard_count == 0:
+        return True
+    if candidate.route_epoch < current.route_epoch:
+        raise FerricStoreError(
+            "stale SHARDS route_epoch "
+            f"{candidate.route_epoch}; current route_epoch is {current.route_epoch}",
+            raw=candidate,
+        )
+    if candidate.route_epoch == current.route_epoch:
+        if candidate != current:
+            raise FerricStoreError(
+                f"conflicting SHARDS topology for route_epoch {candidate.route_epoch}",
+                raw=candidate,
+            )
+        return False
+    return True
+
+
 def _url_host(host: str) -> str:
     if ":" in host and not host.startswith("["):
         return f"[{host}]"
@@ -671,17 +746,6 @@ def _url_host(host: str) -> str:
 
 def _normalized_host_set(hosts: Sequence[str | None]) -> set[str]:
     return {host.lower() for host in hosts if host}
-
-
-def _set_seed_auth_defaults(urls: Sequence[str], kwargs: dict[str, Any]) -> None:
-    for url in urls:
-        parsed = urlparse(url)
-        if parsed.username and "username" not in kwargs:
-            kwargs["username"] = unquote(parsed.username)
-        if parsed.password and "password" not in kwargs:
-            kwargs["password"] = unquote(parsed.password)
-        if "username" in kwargs and "password" in kwargs:
-            return
 
 
 def _is_retryable_route_error(exc: BaseException) -> bool:
@@ -711,10 +775,22 @@ def _coerce_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, bytes):
-        value = value.decode()
+        try:
+            value = value.decode()
+        except UnicodeDecodeError as exc:
+            raise InvalidCommandError("protocol boolean must be valid UTF-8") from exc
     if isinstance(value, str):
-        return value.lower() in {"1", "true", "yes"}
-    return bool(value)
+        normalized = value.lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    elif type(value) is int:
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+    raise InvalidCommandError("protocol boolean must be true/false, yes/no, on/off, or 1/0")
 
 
 def _map_get(mapping: Any, *keys: str) -> Any:
@@ -764,6 +840,15 @@ def _normalize_protocol_url_kwargs(kwargs: dict[str, Any]) -> None:
         kwargs.pop(compatibility_only, None)
 
 
+def _pool_topology_options(kwargs: dict[str, Any]) -> tuple[list[str] | None, bool]:
+    seeds = kwargs.pop("seeds", None)
+    resolved_seeds = (
+        list(validate_string_sequence(seeds, name="seeds")) if seeds is not None else None
+    )
+    ha_routing = validate_bool(kwargs.pop("ha_routing", False), name="ha_routing")
+    return resolved_seeds, ha_routing
+
+
 __all__ = [
     "RoutingTopology",
     "_RequestBodyBuffer",
@@ -775,6 +860,7 @@ __all__ = [
     "_coerce_bool",
     "_command_name",
     "_command_token",
+    "_compact_payload_budget",
     "_connection_endpoint_key",
     "_encode_request_body",
     "_endpoint_adapter_is_idle",
@@ -803,7 +889,6 @@ __all__ = [
     "_response_identity_map",
     "_response_item_count_map",
     "_send_frame",
-    "_set_seed_auth_defaults",
     "_set_wire_future_sources",
     "_sync_adapter_deadline",
     "_text",

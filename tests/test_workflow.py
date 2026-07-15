@@ -517,12 +517,12 @@ def test_workflow_outcomes_propagate_priority_and_terminal_ttl_options():
         fencing_token=1,
     )
 
-    workflow.apply(job, transition("next", priority=7), state_name="created")
+    workflow.apply(job, transition("next", priority=2), state_name="created")
     workflow.apply(job, complete(result=b"done", ttl_ms=123), state_name="done")
     workflow.apply(job, fail(error=b"bad", ttl_ms=456), state_name="done")
 
     assert executor.calls[0][0] == "FLOW.TRANSITION"
-    assert executor.calls[0][executor.calls[0].index("PRIORITY") + 1] == 7
+    assert executor.calls[0][executor.calls[0].index("PRIORITY") + 1] == 2
     assert executor.calls[1][0] == "FLOW.COMPLETE"
     assert executor.calls[1][executor.calls[1].index("TTL") + 1] == 123
     assert executor.calls[2][0] == "FLOW.FAIL"
@@ -1277,6 +1277,11 @@ def test_flow_workflow_constructor_registers_state_handlers_and_partition_by():
 
     assert workflow._states["created"].on_error == "fail"
     assert executor.calls[0][executor.calls[0].index("PARTITION") + 1] == "tenant-a:order-1"
+
+
+def test_flow_workflow_rejects_scalar_partition_by_before_owning_clients() -> None:
+    with pytest.raises(ValueError, match="partition_by"):
+        FlowWorkflow(FlowClient(FakeExecutor()), type="order", partition_by="tenant_id")
 
 
 def test_flow_workflow_on_alias_registers_state_handler():

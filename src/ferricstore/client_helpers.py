@@ -12,16 +12,22 @@ from ferricstore.batch_core import (
 )
 from ferricstore.codecs import Codec
 from ferricstore.command_core import flow_auto_partition_key
-from ferricstore.errors import FerricStoreError
+from ferricstore.config_validation import (
+    validate_optional_bool,
+    validate_optional_flow_priority,
+    validate_optional_nonnegative_int,
+    validate_positive_int,
+    validate_string_sequence,
+)
+from ferricstore.model_core import _normalize_ref_meta
 from ferricstore.mutation_core import JobMutation, MutationKind
+from ferricstore.retry_policy import RetryPolicy
 from ferricstore.types import (
     ClaimedFlow,
     CreateItem,
     FlowRecord,
     FlowStatePolicy,
     FlowStatePolicyLike,
-    RetryPolicy,
-    _normalize_ref_meta,
     normalize_flow_state_mode,
 )
 from ferricstore.worker_core import expand_many_result
@@ -86,7 +92,14 @@ def _append(args: builtins.list[Any], name: str, value: Any) -> None:
         args.extend([name, value])
 
 
+def _append_priority(args: builtins.list[Any], priority: int | None) -> None:
+    priority = validate_optional_flow_priority(priority)
+    if priority is not None:
+        args.extend(["PRIORITY", priority])
+
+
 def _append_bool(args: builtins.list[Any], name: str, value: bool | None) -> None:
+    value = validate_optional_bool(value, name=name)
     if value is not None:
         args.extend([name, "true" if value else "false"])
 
@@ -94,6 +107,8 @@ def _append_bool(args: builtins.list[Any], name: str, value: bool | None) -> Non
 def _append_payload_read(
     args: builtins.list[Any], payload: bool | None, max_bytes: int | None
 ) -> None:
+    payload = validate_optional_bool(payload, name="payload")
+    max_bytes = validate_optional_nonnegative_int(max_bytes, name="payload_max_bytes")
     if payload is False:
         args.append("NOPAYLOAD")
         return
@@ -286,14 +301,24 @@ def _run_steps_many_args(
 ) -> builtins.list[Any]:
     if (states is None) == (steps is None):
         raise ValueError("run_steps_many requires exactly one of states or steps")
-    if states is not None and not states:
-        raise ValueError("run_steps_many states must be non-empty")
-    if steps is not None and steps <= 0:
-        raise ValueError("run_steps_many steps must be positive")
+    lease_ms = validate_positive_int(lease_ms, name="lease_ms")
+    now_ms = validate_optional_nonnegative_int(now_ms, name="now_ms")
+    if retention_ttl_ms is not None:
+        retention_ttl_ms = validate_positive_int(
+            retention_ttl_ms,
+            name="retention_ttl_ms",
+        )
+    resolved_states = (
+        validate_string_sequence(states, name="run_steps_many states", allow_empty=False)
+        if states is not None
+        else None
+    )
+    if steps is not None:
+        steps = validate_positive_int(steps, name="run_steps_many steps")
 
     args: builtins.list[Any] = ["FLOW.RUN_STEPS_MANY", "TYPE", type]
-    if states is not None:
-        args.extend(["STATES", list(states)])
+    if resolved_states is not None:
+        args.extend(["STATES", list(resolved_states)])
     else:
         args.extend(["STEPS", steps])
     args.extend(
@@ -570,7 +595,7 @@ def _transition_command_args(
     _append(args, "PARTITION", partition_key)
     _append_encoded(args, "PAYLOAD", codec, payload)
     _append(args, "RUN_AT", run_at_ms if run_at_ms is not None else now_ms)
-    _append(args, "PRIORITY", priority)
+    _append_priority(args, priority)
     _append_attributes(
         args,
         attributes_merge=attributes_merge,
@@ -711,102 +736,6 @@ def _job_mutation_command_args(
     raise ValueError(f"unsupported job mutation kind {mutation.kind!r}")
 
 
-def _claim_due_command_args(
-    type: str,
-    *,
-    state: str | None = None,
-    states: builtins.list[str] | None = None,
-    worker: str,
-    partition_key: str | None = None,
-    partition_keys: builtins.list[str] | None = None,
-    lease_ms: int = 30_000,
-    limit: int = 1,
-    priority: int | None = None,
-    now_ms: int | None = None,
-    block_ms: int | None = None,
-    reclaim_expired: bool | None = None,
-    reclaim_ratio: int | None = None,
-    include_record: bool = True,
-    payload: bool | None = None,
-    payload_max_bytes: int | None = None,
-    values: builtins.list[str] | None = None,
-    value_max_bytes: int | None = None,
-    include_state: bool = False,
-    include_attributes: bool = True,
-) -> builtins.list[Any]:
-    args: builtins.list[Any] = ["FLOW.CLAIM_DUE", type]
-    if state is not None and states is not None:
-        raise ValueError("state and states are mutually exclusive")
-    if states is not None:
-        if not states:
-            raise ValueError("states must be non-empty")
-        for item in states:
-            if not isinstance(item, str) or item == "":
-                raise ValueError("states must contain non-empty strings")
-            _append(args, "STATE", item)
-    else:
-        _append(args, "STATE", state)
-    args.extend(["WORKER", worker, "LEASE_MS", lease_ms, "LIMIT", limit])
-    _append(args, "NOW", now_ms)
-    if partition_key is not None and partition_keys is not None:
-        raise ValueError("partition_key and partition_keys are mutually exclusive")
-    _append(args, "PARTITION", partition_key)
-    if partition_keys is not None:
-        if not partition_keys:
-            raise ValueError("partition_keys must be non-empty")
-        args.extend(["PARTITIONS", len(partition_keys), *partition_keys])
-    _append(args, "PRIORITY", priority)
-    if not include_record:
-        if include_state and include_attributes:
-            return_mode = "JOBS_COMPACT_STATE_ATTRS"
-        elif include_state:
-            return_mode = "JOBS_COMPACT_STATE"
-        elif include_attributes:
-            return_mode = "JOBS_COMPACT_ATTRS"
-        else:
-            return_mode = "JOBS_COMPACT"
-        _append(args, "RETURN", return_mode)
-    _append(args, "BLOCK", block_ms)
-    _append_payload_read(args, payload, payload_max_bytes)
-    _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
-    _append_bool(args, "RECLAIM_EXPIRED", reclaim_expired)
-    _append(args, "RECLAIM_RATIO", reclaim_ratio)
-    return args
-
-
-def _resolve_include_record(include_record: bool | None, job_only: bool | None) -> bool:
-    if job_only is None:
-        return True if include_record is None else include_record
-    legacy_include_record = not job_only
-    if include_record is not None and include_record != legacy_include_record:
-        raise ValueError("include_record and job_only cannot disagree")
-    return legacy_include_record
-
-
-def _claim_return_mode_unsupported(exc: FerricStoreError) -> bool:
-    message = f"{exc.message} {exc.raw or ''}".lower()
-    return "flow claim return must be records, jobs, or jobs_compact" in message
-
-
-def _claim_return_compat_args(args: builtins.list[Any]) -> builtins.list[Any] | None:
-    try:
-        return_index = args.index("RETURN")
-    except ValueError:
-        return None
-
-    rich_return_modes = {
-        "JOBS_COMPACT_ATTRS",
-        "JOBS_COMPACT_STATE",
-        "JOBS_COMPACT_STATE_ATTRS",
-    }
-    if return_index + 1 >= len(args) or args[return_index + 1] not in rich_return_modes:
-        return None
-
-    compat_args = list(args)
-    compat_args[return_index + 1] = "JOBS_COMPACT"
-    return compat_args
-
-
 def _append_named_counts(
     args: builtins.list[Any],
     codec: Codec,
@@ -827,7 +756,12 @@ def _append_value_return(
     values: builtins.list[str] | None = None,
     value_max_bytes: int | None = None,
 ) -> None:
-    for name in values or []:
+    resolved_values = validate_string_sequence(values, name="values") if values is not None else ()
+    value_max_bytes = validate_optional_nonnegative_int(
+        value_max_bytes,
+        name="value_max_bytes",
+    )
+    for name in resolved_values:
         args.extend(["VALUE", name])
     _append(args, "VALUE_MAX_BYTES", value_max_bytes)
 

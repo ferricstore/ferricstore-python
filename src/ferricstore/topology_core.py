@@ -20,6 +20,10 @@ class ControlEndpointSelector:
     def mark_success(self, url: str) -> None:
         self._last_good_url = url
 
+    @property
+    def preferred_url(self) -> str | None:
+        return self._last_good_url
+
     def candidates(self, discovered_urls: Iterable[str] = ()) -> list[str]:
         urls: list[str] = []
         if self._last_good_url is not None:
@@ -56,13 +60,31 @@ def route_for_keys(
     *,
     slot_for_key: Callable[[str | bytes], int],
 ) -> RouteDecision:
-    usable = tuple(key for key in keys if isinstance(key, (str, bytes)))
-    if not usable:
+    first_key: str | bytes | None = None
+    first_slot = 0
+    same_slot_count = 0
+    cross_slots: list[int] | None = None
+    for key in keys:
+        if not isinstance(key, (str, bytes)):
+            continue
+        slot = slot_for_key(key)
+        if first_key is None:
+            first_key = key
+            first_slot = slot
+            same_slot_count = 1
+        elif cross_slots is not None:
+            cross_slots.append(slot)
+        elif slot == first_slot:
+            same_slot_count += 1
+        else:
+            cross_slots = [first_slot] * same_slot_count
+            cross_slots.append(slot)
+
+    if first_key is None:
         return RouteDecision(RouteKind.CONTROL)
-    slots = tuple(slot_for_key(key) for key in usable)
-    if any(slot != slots[0] for slot in slots[1:]):
-        return RouteDecision(RouteKind.CROSS_SHARD, slots=slots)
-    return RouteDecision(RouteKind.SINGLE_SHARD, key=usable[0], slots=(slots[0],))
+    if cross_slots is not None:
+        return RouteDecision(RouteKind.CROSS_SHARD, slots=tuple(cross_slots))
+    return RouteDecision(RouteKind.SINGLE_SHARD, key=first_key, slots=(first_slot,))
 
 
 def route_for_command(
@@ -86,7 +108,12 @@ def route_for_command(
         command_args = command_args[1:]
     route_keys = command_route_keys(name, command_args)
     if route_keys:
-        return route_for_keys(route_keys, slot_for_key=slot_for_key)
+        decision = route_for_keys(route_keys, slot_for_key=slot_for_key)
+        if name.startswith("FLOW.") and decision.kind is RouteKind.CROSS_SHARD:
+            return RouteDecision(RouteKind.CONTROL)
+        return decision
+    if name.startswith("FLOW."):
+        return RouteDecision(RouteKind.CONTROL)
     if not isinstance(payload, Mapping):
         return RouteDecision(RouteKind.CONTROL)
     for field in (
@@ -94,6 +121,8 @@ def route_for_command(
         "partition_key",
         "id",
         "owner_flow_id",
+        "parent_flow_id",
+        "root_flow_id",
         "parent_id",
         "root_id",
         "correlation_id",
@@ -128,7 +157,13 @@ class FlowWakeSubscriptionRegistry:
         self._item: FlowWakeSubscription | None = None
 
     def remember(self, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> bool:
-        item = FlowWakeSubscription(args, dict(kwargs))
+        # Subscription filters contain caller-owned ``states`` and
+        # ``partition_keys`` lists.  Snapshot collection values so reconnects
+        # keep the filter that was actually installed on live connections.
+        snapshot = {
+            key: list(value) if isinstance(value, list) else value for key, value in kwargs.items()
+        }
+        item = FlowWakeSubscription(args, snapshot)
         with self._lock:
             changed = item != self._item
             self._item = item

@@ -8,6 +8,7 @@ from concurrent.futures import Future
 from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
+from ferricstore.config_validation import validate_optional_thread_wait_seconds
 from ferricstore.errors import (
     FerricStoreError,
     InvalidCommandError,
@@ -16,12 +17,15 @@ from ferricstore.lifecycle_core import (
     RetryableResourceSet,
     SyncCloseCoordinator,
     close_resources_sync,
+    register_event_listener_transactionally,
 )
 from ferricstore.protocol_common import (
     _close_adapter_sync,
     _notify_event_listeners,
+    _pool_topology_options,
     _protocol_connection_count,
 )
+from ferricstore.protocol_planning import PreparedCommand
 from ferricstore.protocol_sync import (
     ProtocolAdapter,
     ProtocolPipeline,
@@ -57,19 +61,16 @@ class ProtocolAdapterPool:
         self._event_poll_fallback = False
         self._close_coordinator = SyncCloseCoordinator()
         self._close_adapters = RetryableResourceSet(adapters)
-        for adapter in adapters:
-            add_listener = getattr(adapter, "add_event_listener", None)
-            if callable(add_listener):
-                add_listener(self._event_listener)
-            else:
-                self._event_poll_fallback = True
+        self._event_poll_fallback = register_event_listener_transactionally(
+            adapters,
+            self._event_listener,
+        )
 
     @classmethod
     def from_url(
         cls, url: str, **kwargs: Any
     ) -> ProtocolAdapterPool | ProtocolAdapter | TopologyProtocolAdapterPool:
-        seeds = kwargs.pop("seeds", None)
-        ha_routing = bool(kwargs.pop("ha_routing", False))
+        seeds, ha_routing = _pool_topology_options(kwargs)
         if seeds is not None or ha_routing:
             urls = [url]
             if seeds is not None:
@@ -136,6 +137,10 @@ class ProtocolAdapterPool:
         return list(self._idle_listeners)
 
     def wait_event(self, timeout: float | None = None) -> Any | None:
+        timeout = validate_optional_thread_wait_seconds(
+            timeout,
+            name="wait_event timeout",
+        )
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             with self._condition:
@@ -229,6 +234,20 @@ class ProtocolAdapterPool:
         finally:
             self._release_adapter(index)
 
+    def execute_prepared_command_on_lane(
+        self,
+        prepared: PreparedCommand,
+        lane_id: int,
+    ) -> Any:
+        index, adapter = self._acquire_adapter()
+        try:
+            execute_prepared = getattr(adapter, "execute_prepared_command_on_lane", None)
+            if callable(execute_prepared):
+                return execute_prepared(prepared, lane_id)
+            return adapter.execute_command_on_lane(prepared.args, lane_id)
+        finally:
+            self._release_adapter(index)
+
     def execute_command_with_trace(self, *args: Any) -> dict[str, Any]:
         index, adapter = self._acquire_adapter()
         try:
@@ -247,6 +266,24 @@ class ProtocolAdapterPool:
         finally:
             self._release_adapter(index)
 
+    def execute_prepared_command_with_trace_on_lane(
+        self,
+        prepared: PreparedCommand,
+        lane_id: int,
+    ) -> dict[str, Any]:
+        index, adapter = self._acquire_adapter()
+        try:
+            execute_prepared = getattr(
+                adapter,
+                "execute_prepared_command_with_trace_on_lane",
+                None,
+            )
+            if callable(execute_prepared):
+                return cast(dict[str, Any], execute_prepared(prepared, lane_id))
+            return adapter.execute_command_with_trace_on_lane(prepared.args, lane_id)
+        finally:
+            self._release_adapter(index)
+
     def submit_command(self, *args: Any) -> Future[Any]:
         return self._submit_tracked(lambda adapter: adapter.submit_command(*args))
 
@@ -256,6 +293,19 @@ class ProtocolAdapterPool:
         lane_id: int,
     ) -> Future[Any]:
         return self._submit_tracked(lambda adapter: adapter.submit_command_on_lane(args, lane_id))
+
+    def submit_prepared_command_on_lane(
+        self,
+        prepared: PreparedCommand,
+        lane_id: int,
+    ) -> Future[Any]:
+        return self._submit_tracked(
+            lambda adapter: (
+                adapter.submit_prepared_command_on_lane(prepared, lane_id)
+                if callable(getattr(adapter, "submit_prepared_command_on_lane", None))
+                else adapter.submit_command_on_lane(prepared.args, lane_id)
+            )
+        )
 
     def submit_commands(self, commands: list[tuple[Any, ...]]) -> list[Future[Any]]:
         index, adapter = self._acquire_adapter()
@@ -281,10 +331,51 @@ class ProtocolAdapterPool:
         self._track_futures(index, self._wire_futures(futures))
         return futures
 
+    def submit_prepared_commands_on_lane(
+        self,
+        prepared_commands: list[PreparedCommand],
+        lane_id: int,
+    ) -> list[Future[Any]]:
+        index, adapter = self._acquire_adapter()
+        try:
+            submit_prepared = getattr(adapter, "submit_prepared_commands_on_lane", None)
+            futures = (
+                submit_prepared(prepared_commands, lane_id)
+                if callable(submit_prepared)
+                else adapter.submit_commands_on_lane(
+                    [prepared.args for prepared in prepared_commands],
+                    lane_id,
+                )
+            )
+        except BaseException:
+            self._release_adapter(index)
+            raise
+        self._track_futures(index, self._wire_futures(futures))
+        return futures
+
     def submit_batch(self, commands: list[tuple[Any, ...]]) -> Future[list[Any]]:
         return cast(
             Future[list[Any]],
             self._submit_tracked(lambda adapter: adapter.submit_batch(commands)),
+        )
+
+    def submit_prepared_batch_on_lane(
+        self,
+        prepared_commands: list[PreparedCommand],
+        lane_id: int,
+    ) -> Future[list[Any]]:
+        return cast(
+            Future[list[Any]],
+            self._submit_tracked(
+                lambda adapter: (
+                    adapter.submit_prepared_batch_on_lane(prepared_commands, lane_id)
+                    if callable(getattr(adapter, "submit_prepared_batch_on_lane", None))
+                    else adapter.submit_batch_on_lane(
+                        [prepared.args for prepared in prepared_commands],
+                        lane_id,
+                    )
+                )
+            ),
         )
 
     def submit_batch_on_lane(
@@ -457,6 +548,23 @@ class ProtocolAdapterPool:
         finally:
             self._release_adapter(index)
 
+    def execute_prepared_batch_on_lane(
+        self,
+        prepared_commands: list[PreparedCommand],
+        lane_id: int,
+    ) -> list[Any]:
+        index, adapter = self._acquire_adapter()
+        try:
+            execute_prepared = getattr(adapter, "execute_prepared_batch_on_lane", None)
+            if callable(execute_prepared):
+                return cast(list[Any], execute_prepared(prepared_commands, lane_id))
+            return adapter.execute_batch_on_lane(
+                [prepared.args for prepared in prepared_commands],
+                lane_id,
+            )
+        finally:
+            self._release_adapter(index)
+
     def acquire_session(self) -> _ProtocolAdapterSession:
         with self._condition:
             if self._closed:
@@ -479,6 +587,14 @@ class ProtocolAdapterPool:
                 if self._session_waiters == 0:
                     self._event_ready.set()
                 self._condition.notify_all()
+
+    def acquire_dedicated_session(self) -> ProtocolAdapter:
+        """Create an independent connection without retaining a pooled adapter lease."""
+        index, adapter = self._acquire_adapter()
+        try:
+            return adapter.acquire_session()
+        finally:
+            self._release_adapter(index)
 
     def acquire_session_on_lane(self, lane_id: int) -> ProtocolAdapter:
         index, adapter = self._acquire_adapter()
@@ -529,6 +645,8 @@ class ProtocolAdapterPool:
 
 
 class _ProtocolAdapterSession:
+    requires_explicit_session = False
+
     def __init__(
         self,
         pool: ProtocolAdapterPool,

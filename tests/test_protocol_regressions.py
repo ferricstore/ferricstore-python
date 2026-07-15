@@ -3,18 +3,29 @@ from __future__ import annotations
 import asyncio
 import gc
 import random
+import socket
 import struct
+import subprocess
+import sys
 import threading
 import time
 import tracemalloc
 import zlib
 from concurrent.futures import Future
+from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import pytest
 
+import ferricstore.flow_options as flow_options_module
 import ferricstore.protocol as protocol_module
-from ferricstore.errors import FerricStoreError
+import ferricstore.protocol_sync_batch as protocol_sync_batch_module
+from ferricstore.async_client import AsyncFlowClient
+from ferricstore.client import FlowClient
+from ferricstore.errors import FerricStoreError, InvalidCommandError
+from ferricstore.flow_routing import flow_command_route_keys
+from ferricstore.lifecycle_core import RetryableResourceSet
 from ferricstore.protocol import (
     AsyncProtocolAdapter,
     AsyncProtocolAdapterPool,
@@ -22,16 +33,24 @@ from ferricstore.protocol import (
     ProtocolAdapterPool,
     ProtocolCommand,
     ProtocolResponse,
+    RoutingTopology,
     TopologyProtocolAdapterPool,
+    build_protocol_command,
 )
 from ferricstore.protocol_codec import encode_value
-from ferricstore.protocol_framing import decompress_response
-from ferricstore.topology_lifecycle import SyncSingleFlight
+from ferricstore.protocol_common import _endpoint_adapter_is_idle, _endpoint_from_url
+from ferricstore.protocol_framing import decompress_response, send_frames
+from ferricstore.topology_lifecycle import EndpointAdapterLifecycle, SyncSingleFlight
 
 
-def _single_shard_topology(host: str = "leader.local", port: int = 6391) -> dict[str, Any]:
+def _single_shard_topology(
+    host: str = "leader.local",
+    port: int = 6391,
+    *,
+    route_epoch: int = 1,
+) -> dict[str, Any]:
     return {
-        "route_epoch": 1,
+        "route_epoch": route_epoch,
         "shard_count": 1,
         "ranges": [
             {
@@ -49,12 +68,458 @@ def _single_shard_topology(host: str = "leader.local", port: int = 6391) -> dict
     }
 
 
+def _routing_topology(epoch: int, host: str) -> RoutingTopology:
+    payload = _single_shard_topology(host)
+    payload["route_epoch"] = epoch
+    return RoutingTopology.build(payload)
+
+
+def _bare_topology_pool(pool_type: type[Any]) -> Any:
+    pool = object.__new__(pool_type)
+    pool._seed_endpoint_keys = set()
+    pool._tls = False
+    pool._endpoint_lifecycle = EndpointAdapterLifecycle(is_idle=_endpoint_adapter_is_idle)
+    pool._cleanup_adapters = RetryableResourceSet(())
+    pool._topology_generation = 0
+    pool.topology = RoutingTopology.empty()
+    return pool
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["timeout", "heartbeat_interval", "heartbeat_timeout"],
+)
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        -1.0,
+        True,
+        threading.TIMEOUT_MAX + 1.0,
+    ],
+)
+def test_protocol_timing_rejects_unsafe_wait_values(
+    monkeypatch: pytest.MonkeyPatch,
+    option: str,
+    invalid: float,
+) -> None:
+    monkeypatch.setattr(ProtocolAdapter, "_ensure_connected", lambda self: None)
+
+    with pytest.raises(ValueError, match=option):
+        ProtocolAdapter(**{option: invalid})
+    with pytest.raises(ValueError, match=option):
+        AsyncProtocolAdapter(**{option: invalid})
+
+
+@pytest.mark.parametrize("url", ["ferric://store.example:0", "ferrics://store.example:0"])
+def test_protocol_urls_reject_explicit_zero_port(url: str) -> None:
+    with pytest.raises(ValueError, match="port must be between 1 and 65535"):
+        ProtocolAdapter.from_url(url)
+    with pytest.raises(ValueError, match="port must be between 1 and 65535"):
+        AsyncProtocolAdapter.from_url(url)
+    with pytest.raises(ValueError, match="port must be between 1 and 65535"):
+        _endpoint_from_url(url)
+
+
+@pytest.mark.parametrize(
+    "pool_type",
+    [TopologyProtocolAdapterPool, protocol_module.AsyncTopologyProtocolAdapterPool],
+)
+def test_topology_install_rejects_stale_route_epoch(pool_type: type[Any]) -> None:
+    pool = _bare_topology_pool(pool_type)
+    pool._install_topology(_routing_topology(20, "new-leader.example"))
+    generation = pool._topology_generation
+
+    with pytest.raises(FerricStoreError, match=r"stale.*route_epoch"):
+        pool._install_topology(_routing_topology(19, "old-leader.example"))
+
+    assert pool.topology.route_epoch == 20
+    assert pool.topology.slots[0]["endpoint"]["host"] == "new-leader.example"
+    assert pool._topology_generation == generation
+
+
+@pytest.mark.parametrize(
+    "pool_type",
+    [TopologyProtocolAdapterPool, protocol_module.AsyncTopologyProtocolAdapterPool],
+)
+def test_topology_install_rejects_conflicting_same_epoch(pool_type: type[Any]) -> None:
+    pool = _bare_topology_pool(pool_type)
+    topology = _routing_topology(20, "leader-a.example")
+    pool._install_topology(topology)
+    generation = pool._topology_generation
+
+    assert pool._install_topology(topology) == []
+    with pytest.raises(FerricStoreError, match=r"conflicting.*route_epoch"):
+        pool._install_topology(_routing_topology(20, "leader-b.example"))
+
+    assert pool.topology == topology
+    assert pool._topology_generation == generation
+
+
+def test_tls_topology_keeps_distinct_physical_destinations() -> None:
+    topology = RoutingTopology.build(
+        {
+            "route_epoch": 1,
+            "shard_count": 2,
+            "ranges": [
+                {
+                    "first_slot": 0,
+                    "last_slot": 511,
+                    "shard": 0,
+                    "lane_id": 1,
+                    "endpoint": {
+                        "node": "node-a",
+                        "host": "shared.example",
+                        "native_port": 6388,
+                        "native_tls_port": 6389,
+                    },
+                },
+                {
+                    "first_slot": 512,
+                    "last_slot": 1023,
+                    "shard": 1,
+                    "lane_id": 1,
+                    "endpoint": {
+                        "node": "node-b",
+                        "host": "shared.example",
+                        "native_port": 6388,
+                        "native_tls_port": 6390,
+                    },
+                },
+            ],
+        }
+    )
+
+    assert len(topology.endpoints) == 2
+    assert len(topology.route_destinations) == 2
+    assert {route["endpoint"]["native_tls_port"] for route in topology.route_destinations} == {
+        6389,
+        6390,
+    }
+
+
+def test_shared_protocol_adapter_requires_transaction_session() -> None:
+    adapter = ProtocolAdapter(timeout=None, heartbeat_interval=None)
+    client = FlowClient(adapter)
+    try:
+        with pytest.raises(InvalidCommandError, match=r"client\.transaction"):
+            client.multi()
+
+        session = adapter.acquire_session()
+        try:
+            assert adapter.requires_explicit_session is True
+            assert session.requires_explicit_session is False
+        finally:
+            session.close()
+    finally:
+        client.close()
+
+
+def test_shared_async_protocol_adapter_requires_transaction_session() -> None:
+    async def run() -> None:
+        adapter = AsyncProtocolAdapter(timeout=None, heartbeat_interval=None)
+        client = AsyncFlowClient(adapter)
+        try:
+            with pytest.raises(InvalidCommandError, match=r"client\.transaction"):
+                await client.multi()
+
+            session = await adapter.acquire_session()
+            try:
+                assert adapter.requires_explicit_session is True
+                assert session.requires_explicit_session is False
+            finally:
+                await session.close()
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
+def test_flow_partitions_negative_count_is_rejected_without_hanging() -> None:
+    script = """
+from ferricstore.errors import InvalidCommandError
+from ferricstore.protocol import build_protocol_command
+try:
+    build_protocol_command('FLOW.CLAIM_DUE', 'jobs', 'PARTITIONS', -2)
+except InvalidCommandError:
+    raise SystemExit(0)
+raise SystemExit(1)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        timeout=2,
+        check=False,
+    )
+    assert completed.returncode == 0
+
+
+@pytest.mark.parametrize("count", [True, 5])
+def test_flow_partitions_requires_exact_nonnegative_count(count: Any) -> None:
+    with pytest.raises(InvalidCommandError, match="PARTITIONS"):
+        build_protocol_command("FLOW.CLAIM_DUE", "jobs", "PARTITIONS", count, "only-one")
+
+
+def test_flow_items_ext_requires_declared_item_and_nested_counts() -> None:
+    one_item = ("flow-1", "-", b"payload", 0, 0)
+    with pytest.raises(InvalidCommandError, match="ITEMS_EXT"):
+        build_protocol_command("FLOW.CREATE_MANY", "AUTO", "ITEMS_EXT", 2, *one_item)
+
+    with pytest.raises(InvalidCommandError, match="ITEMS_EXT"):
+        build_protocol_command(
+            "FLOW.CREATE_MANY",
+            "AUTO",
+            "ITEMS_EXT",
+            1,
+            "flow-1",
+            "-",
+            b"payload",
+            -1,
+            0,
+        )
+
+
+def test_flow_option_routing_tokenization_is_linear(monkeypatch: Any) -> None:
+    token_calls = 0
+    original_token = flow_options_module._token
+
+    def counted_token(value: Any) -> str:
+        nonlocal token_calls
+        token_calls += 1
+        return original_token(value)
+
+    monkeypatch.setattr(flow_options_module, "_token", counted_token)
+    args = ("state",) + (b"PAYLOAD",) * 512
+
+    assert flow_command_route_keys("FLOW.SEARCH", args) == ()
+    assert token_calls <= len(args) * 4
+
+
+def _effective_url_credentials(url: str, kwargs: dict[str, Any]) -> tuple[str | None, str | None]:
+    parsed = urlparse(url)
+    username = kwargs.get("username")
+    password = kwargs.get("password")
+    if "username" not in kwargs and parsed.username is not None:
+        username = unquote(parsed.username)
+    if "password" not in kwargs and parsed.password is not None:
+        password = unquote(parsed.password)
+    return username, password
+
+
+def test_topology_scopes_url_credentials_to_each_seed_and_not_learned_endpoints(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, tuple[str | None, str | None]] = {}
+
+    class FakeAdapter:
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        def execute_command(self, *args: Any) -> Any:
+            if args[0] == "SHARDS":
+                return _single_shard_topology("seed-a.example", 6388)
+            return b"OK"
+
+        def close(self) -> None:
+            pass
+
+    def from_url(url: str, **kwargs: Any) -> FakeAdapter:
+        captured[url] = _effective_url_credentials(url, kwargs)
+        return FakeAdapter(url)
+
+    monkeypatch.setattr(ProtocolAdapter, "from_url", from_url)
+    seeds = [
+        "ferric://alice:first@seed-a.example:6388",
+        "ferric://bob:second@seed-b.example:6388",
+    ]
+    pool = TopologyProtocolAdapterPool(seeds, endpoint_policy="any")
+    try:
+        pool._adapter_for_endpoint({"host": "seed-b.example", "native_port": 6388})
+        pool._adapter_for_endpoint({"host": "learned.example", "native_port": 6388})
+    finally:
+        pool.close()
+
+    assert captured == {
+        seeds[0]: ("alice", "first"),
+        seeds[1]: ("bob", "second"),
+        "ferric://learned.example:6388": (None, None),
+    }
+
+
+def test_async_topology_scopes_url_credentials_to_each_seed_and_not_learned_endpoints(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, tuple[str | None, str | None]] = {}
+
+    class FakeAdapter:
+        def add_event_listener(self, _listener: Any) -> None:
+            pass
+
+        def register_flow_wake_subscription(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+    def from_url(url: str, **kwargs: Any) -> FakeAdapter:
+        captured[url] = _effective_url_credentials(url, kwargs)
+        return FakeAdapter()
+
+    monkeypatch.setattr(AsyncProtocolAdapter, "from_url", from_url)
+    seeds = [
+        "ferric://alice:first@seed-a.example:6388",
+        "ferric://bob:second@seed-b.example:6388",
+    ]
+
+    async def run() -> None:
+        pool = protocol_module.AsyncTopologyProtocolAdapterPool(seeds, endpoint_policy="any")
+        pool._adapter_for_url(seeds[0])
+        pool._adapter_for_endpoint({"host": "seed-b.example", "native_port": 6388})
+        pool._adapter_for_endpoint({"host": "learned.example", "native_port": 6388})
+        await pool.close()
+
+    asyncio.run(run())
+    assert captured == {
+        seeds[0]: ("alice", "first"),
+        seeds[1]: ("bob", "second"),
+        "ferric://learned.example:6388": (None, None),
+    }
+
+
+@pytest.mark.parametrize("async_pool", [False, True])
+def test_topology_rejects_mixed_plaintext_and_tls_seeds_before_connecting(
+    monkeypatch: Any,
+    async_pool: bool,
+) -> None:
+    def unexpected_adapter(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("invalid topology configuration attempted to create an adapter")
+
+    monkeypatch.setattr(ProtocolAdapter, "from_url", unexpected_adapter)
+    monkeypatch.setattr(AsyncProtocolAdapter, "from_url", unexpected_adapter)
+    pool_type = (
+        protocol_module.AsyncTopologyProtocolAdapterPool
+        if async_pool
+        else TopologyProtocolAdapterPool
+    )
+
+    with pytest.raises(ValueError, match="cannot mix ferric:// and ferrics://"):
+        pool_type(
+            [
+                "ferric://127.0.0.1:6388",
+                "ferrics://127.0.0.1:6389",
+            ]
+        )
+
+
+@pytest.mark.parametrize("async_pool", [False, True])
+def test_topology_rejects_invalid_endpoint_policy_before_connecting(
+    monkeypatch: Any,
+    async_pool: bool,
+) -> None:
+    def unexpected_adapter(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("invalid topology configuration attempted to create an adapter")
+
+    monkeypatch.setattr(ProtocolAdapter, "from_url", unexpected_adapter)
+    monkeypatch.setattr(AsyncProtocolAdapter, "from_url", unexpected_adapter)
+    pool_type = (
+        protocol_module.AsyncTopologyProtocolAdapterPool
+        if async_pool
+        else TopologyProtocolAdapterPool
+    )
+
+    with pytest.raises(ValueError, match="invalid endpoint_policy"):
+        pool_type(["ferric://127.0.0.1:6388"], endpoint_policy="typo")
+
+
+@pytest.mark.parametrize("async_pool", [False, True])
+def test_topology_endpoint_policy_none_rejects_every_non_seed_endpoint(
+    monkeypatch: Any,
+    async_pool: bool,
+) -> None:
+    endpoint = {"host": "attacker.example", "native_port": 6388}
+    if async_pool:
+        pool = protocol_module.AsyncTopologyProtocolAdapterPool(
+            ["ferric://seed.example:6388"],
+            endpoint_policy="none",
+            trusted_hosts=["attacker.example"],
+        )
+    else:
+        pool = object.__new__(TopologyProtocolAdapterPool)
+        pool.endpoint_policy = "none"
+        pool.endpoint_validator = None
+        pool._tls = False
+        pool._seed_endpoint_keys = {("seed.example", 6388)}
+        pool._trusted_hosts = {"attacker.example"}
+
+    with pytest.raises(FerricStoreError, match="unsafe learned endpoint"):
+        pool._validate_endpoint(endpoint)
+    pool._validate_endpoint({"host": "SEED.EXAMPLE", "native_port": 6388})
+
+
+@pytest.mark.parametrize("async_pool", [False, True])
+def test_topology_endpoint_validator_none_result_is_allowed(async_pool: bool) -> None:
+    endpoint = {"host": "learned.example", "native_port": 6388}
+    if async_pool:
+        pool = protocol_module.AsyncTopologyProtocolAdapterPool(
+            ["ferric://seed.example:6388"],
+            endpoint_policy="any",
+            endpoint_validator=lambda _endpoint: None,
+        )
+    else:
+        pool = object.__new__(TopologyProtocolAdapterPool)
+        pool.endpoint_policy = "any"
+        pool.endpoint_validator = lambda _endpoint: None
+        pool._tls = False
+        pool._seed_endpoint_keys = {("seed.example", 6388)}
+        pool._trusted_hosts = set()
+
+    pool._validate_endpoint(endpoint)
+
+
 @pytest.mark.parametrize("limit", [None, 1024])
 def test_response_decompression_normalizes_corrupt_zlib_errors(limit: int | None) -> None:
     with pytest.raises(FerricStoreError, match="invalid compressed data") as exc_info:
         decompress_response(b"not-a-zlib-stream", limit)
 
     assert isinstance(exc_info.value.raw, zlib.error)
+
+
+@pytest.mark.parametrize("limit", [None, 1024])
+def test_response_decompression_rejects_trailing_compressed_data(limit: int | None) -> None:
+    body = zlib.compress(b"valid-response") + b"trailing-junk"
+
+    with pytest.raises(FerricStoreError, match="invalid compressed data"):
+        decompress_response(body, limit)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"same": b"text", b"same": b"binary"},
+        {b"same": b"binary", "same": b"text"},
+    ],
+)
+def test_generic_map_encoding_rejects_duplicate_wire_keys(value: dict[Any, bytes]) -> None:
+    with pytest.raises(FerricStoreError, match="duplicate protocol map key"):
+        encode_value(value)
+
+
+@pytest.mark.parametrize("value", [-(2**63) - 1, 2**63])
+def test_generic_encoding_normalizes_out_of_range_integers(value: int) -> None:
+    with pytest.raises(FerricStoreError, match="signed 64-bit"):
+        encode_value(value)
+
+
+def test_generic_encoding_rejects_unsupported_value_types() -> None:
+    with pytest.raises(FerricStoreError, match="unsupported protocol value type"):
+        encode_value(object())
+
+
+def test_generic_map_encoding_rejects_unsupported_key_types() -> None:
+    with pytest.raises(FerricStoreError, match="protocol map key"):
+        encode_value({1: b"value"})
 
 
 def test_generic_map_encoding_uses_near_linear_peak_memory() -> None:
@@ -103,6 +568,286 @@ def test_pending_request_budget_stops_generic_encoding_before_late_values(
                 1,
                 {"large": b"x" * 128, "late": MustNotEncode()},
             )
+    finally:
+        adapter.close()
+
+
+def test_compact_pipeline_respects_pending_budget_before_large_allocation(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(ProtocolAdapter, "_connect", lambda self: None)
+
+    class Socket:
+        def sendall(self, _frame: bytes) -> None:
+            raise AssertionError("an over-budget compact pipeline must not be written")
+
+        def shutdown(self, *_args: Any) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    adapter = ProtocolAdapter(
+        timeout=None,
+        heartbeat_interval=None,
+        max_pending_request_bytes=64,
+    )
+    adapter._sock = Socket()  # type: ignore[assignment]
+    adapter._ensure_connected = lambda: None  # type: ignore[method-assign]
+    value = b"x" * (512 * 1024)
+    commands = [("SET", f"key-{index}", value) for index in range(4)]
+
+    gc.collect()
+    tracemalloc.start()
+    try:
+        with pytest.raises(FerricStoreError, match="max_pending_request_bytes"):
+            adapter.submit_commands(commands)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+        adapter.close()
+
+    assert peak < 512 * 1024
+    assert adapter.pending_request_count == 0
+    assert adapter.pending_request_bytes == 0
+
+
+def test_async_compact_pipeline_respects_pending_budget_before_large_allocation() -> None:
+    class Writer:
+        def write(self, _frame: bytes) -> None:
+            raise AssertionError("an over-budget compact pipeline must not be written")
+
+        async def drain(self) -> None:
+            return None
+
+    async def run() -> None:
+        adapter = AsyncProtocolAdapter(
+            timeout=None,
+            heartbeat_interval=None,
+            max_pending_request_bytes=64,
+        )
+        adapter._writer = Writer()  # type: ignore[assignment]
+
+        async def connected() -> None:
+            return None
+
+        adapter._ensure_connected = connected  # type: ignore[method-assign]
+        value = b"x" * (512 * 1024)
+        commands = [("SET", f"key-{index}", value) for index in range(4)]
+
+        gc.collect()
+        tracemalloc.start()
+        try:
+            with pytest.raises(FerricStoreError, match="max_pending_request_bytes"):
+                await adapter.execute_batch(commands)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+            adapter._writer = None
+            await adapter.close()
+
+        assert peak < 512 * 1024
+        assert adapter.pending_request_count == 0
+        assert adapter.pending_request_bytes == 0
+
+    asyncio.run(run())
+
+
+def test_sync_batch_budget_rejects_before_protocol_command_allocation(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(ProtocolAdapter, "_connect", lambda self: None)
+    adapter = ProtocolAdapter(
+        timeout=None,
+        heartbeat_interval=None,
+        max_pending_request_bytes=64,
+    )
+    adapter._ensure_connected = lambda: None  # type: ignore[method-assign]
+    commands = [("PING",)] * 100_000
+
+    gc.collect()
+    tracemalloc.start()
+    try:
+        with pytest.raises(FerricStoreError, match="max_batch_items"):
+            adapter.submit_commands(commands)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+        adapter.close()
+
+    assert peak < 1_000_000
+    assert adapter.pending_request_count == 0
+
+
+def test_async_compressed_batch_budget_rejects_before_command_allocation() -> None:
+    async def run() -> None:
+        adapter = AsyncProtocolAdapter(
+            timeout=None,
+            heartbeat_interval=None,
+            compression="zlib",
+            max_pending_request_bytes=64,
+        )
+
+        async def connected() -> None:
+            return None
+
+        adapter._ensure_connected = connected  # type: ignore[method-assign]
+        commands = [("GET", "key")] * 50_000
+
+        gc.collect()
+        tracemalloc.start()
+        try:
+            with pytest.raises(FerricStoreError, match="max_batch_items"):
+                await adapter.execute_batch(commands)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+            await adapter.close()
+
+        assert peak < 1_000_000
+        assert adapter.pending_request_count == 0
+
+    asyncio.run(run())
+
+
+def test_sync_topology_batch_budget_rejects_before_command_planning(monkeypatch: Any) -> None:
+    class FakeAdapter:
+        def execute_command(self, *args: Any) -> Any:
+            return _single_shard_topology() if args[0] == "SHARDS" else b"OK"
+
+        def execute_batch(self, commands: list[tuple[Any, ...]]) -> list[bytes]:
+            return [b"OK"] * len(commands)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        ProtocolAdapter,
+        "from_url",
+        lambda *_args, **_kwargs: FakeAdapter(),
+    )
+    pool = TopologyProtocolAdapterPool(
+        ["ferric://seed.local:6388"],
+        endpoint_policy="any",
+        max_batch_items=10,
+    )
+    commands = [("PING",)] * 100_000
+
+    gc.collect()
+    tracemalloc.start()
+    try:
+        with pytest.raises(FerricStoreError, match="max_batch_items"):
+            pool.execute_batch(commands)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+        pool.close()
+
+    assert peak < 1_000_000
+
+
+def test_async_topology_batch_budget_rejects_before_command_planning(monkeypatch: Any) -> None:
+    class FakeAdapter:
+        async def execute_command(self, *args: Any) -> Any:
+            return _single_shard_topology() if args[0] == "SHARDS" else b"OK"
+
+        async def execute_batch(self, commands: list[tuple[Any, ...]]) -> list[bytes]:
+            return [b"OK"] * len(commands)
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        AsyncProtocolAdapter,
+        "from_url",
+        lambda *_args, **_kwargs: FakeAdapter(),
+    )
+    commands = [("PING",)] * 100_000
+
+    async def run() -> int:
+        pool = protocol_module.AsyncTopologyProtocolAdapterPool(
+            ["ferric://seed.local:6388"],
+            endpoint_policy="any",
+            max_batch_items=10,
+        )
+        await pool.refresh_topology()
+        gc.collect()
+        tracemalloc.start()
+        try:
+            with pytest.raises(FerricStoreError, match="max_batch_items"):
+                await pool.execute_batch(commands)
+            _current, peak = tracemalloc.get_traced_memory()
+            return peak
+        finally:
+            tracemalloc.stop()
+            await pool.close()
+
+    assert asyncio.run(run()) < 1_000_000
+
+
+def test_flow_compact_pipeline_counts_utf8_bytes_before_encoding(monkeypatch: Any) -> None:
+    monkeypatch.setattr(ProtocolAdapter, "_connect", lambda self: None)
+    adapter = ProtocolAdapter(
+        timeout=None,
+        heartbeat_interval=None,
+        max_pending_request_bytes=512 * 1024,
+    )
+    flow_id = "🚀" * 150_000
+
+    gc.collect()
+    tracemalloc.start()
+    try:
+        with pytest.raises(FerricStoreError, match="max_pending_request_bytes"):
+            adapter.submit_commands([("FLOW.GET", flow_id)])
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+        adapter.close()
+
+    assert peak < 256 * 1024
+    assert adapter.pending_request_count == 0
+    assert adapter.pending_request_bytes == 0
+
+
+def test_flow_compact_pipeline_stops_at_aggregate_byte_budget(monkeypatch: Any) -> None:
+    monkeypatch.setattr(ProtocolAdapter, "_connect", lambda self: None)
+    adapter = ProtocolAdapter(
+        timeout=None,
+        heartbeat_interval=None,
+        max_pending_request_bytes=256 * 1024,
+    )
+    flow_id = "x" * (64 * 1024)
+    templates = [
+        ("FLOW.GET", flow_id, "PARTITION", "tenant"),
+        ("FLOW.HISTORY", flow_id, "COUNT", 10, "PARTITION", "tenant"),
+        (
+            "FLOW.SIGNAL",
+            flow_id,
+            "SIGNAL",
+            "ready",
+            "IF_STATE",
+            "queued",
+            "TRANSITION_TO",
+            "running",
+            "NOW",
+            123,
+        ),
+    ]
+
+    try:
+        for command in templates:
+            gc.collect()
+            tracemalloc.start()
+            try:
+                with pytest.raises(FerricStoreError, match="max_pending_request_bytes"):
+                    adapter.submit_commands([command] * 16)
+                _current, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+
+            assert peak < 512 * 1024
+            assert adapter.pending_request_count == 0
+            assert adapter.pending_request_bytes == 0
     finally:
         adapter.close()
 
@@ -790,7 +1535,11 @@ def test_sync_multiframe_write_failure_retires_transport(
     monkeypatch: Any,
 ) -> None:
     monkeypatch.setattr(ProtocolAdapter, "_connect", lambda self: None)
-    monkeypatch.setattr(protocol_module, "_pipeline_frame_supported", lambda _commands: False)
+    monkeypatch.setattr(
+        protocol_sync_batch_module,
+        "_pipeline_frame_supported",
+        lambda _commands: False,
+    )
 
     class FailingSocket:
         def __init__(self) -> None:
@@ -824,16 +1573,19 @@ def test_sync_write_preserves_primary_error_when_timeout_restore_fails(
 
     class FailingSocket:
         def __init__(self) -> None:
-            self.settimeout_calls = 0
+            self.setsockopt_calls = 0
             self.closed = False
 
-        def gettimeout(self) -> None:
-            return None
+        def getsockopt(self, *_args: Any) -> bytes:
+            return b"previous"
+
+        def setsockopt(self, *_args: Any) -> None:
+            self.setsockopt_calls += 1
+            if self.setsockopt_calls == 2:
+                raise RuntimeError("timeout restore failed")
 
         def settimeout(self, _value: float | None) -> None:
-            self.settimeout_calls += 1
-            if self.settimeout_calls == 2:
-                raise RuntimeError("timeout restore failed")
+            pytest.fail("a write deadline must not change the shared read timeout")
 
         def sendall(self, _data: bytes) -> None:
             raise OSError("partial write")
@@ -855,6 +1607,235 @@ def test_sync_write_preserves_primary_error_when_timeout_restore_fails(
     assert "timeout restore failed" in str(raised.value.__cause__)
     assert adapter._sock is None
     assert sock.closed is True
+
+
+def test_successful_write_ignores_timeout_restore_after_peer_closed_socket() -> None:
+    class ClosedAfterWriteSocket:
+        def __init__(self) -> None:
+            self.setsockopt_calls = 0
+            self.writes: list[bytes] = []
+
+        def getsockopt(self, *_args: Any) -> bytes:
+            return b"previous"
+
+        def setsockopt(self, *_args: Any) -> None:
+            self.setsockopt_calls += 1
+            if self.setsockopt_calls == 2:
+                raise OSError(9, "Bad file descriptor")
+
+        def settimeout(self, _value: float | None) -> None:
+            pytest.fail("a write deadline must not change the shared read timeout")
+
+        def fileno(self) -> int:
+            return -1
+
+        def sendall(self, data: bytes) -> None:
+            self.writes.append(data)
+
+    sock = ClosedAfterWriteSocket()
+
+    send_frames(sock, [b"complete request"], timeout=0.1)
+
+    assert sock.writes == [b"complete request"]
+
+
+def test_send_frames_never_mutates_the_shared_read_timeout() -> None:
+    class Socket:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+            self.timeout_options: list[bytes] = []
+
+        def getsockopt(self, *_args: Any) -> bytes:
+            return b"previous"
+
+        def setsockopt(self, _level: int, _option: int, value: bytes) -> None:
+            self.timeout_options.append(value)
+
+        def settimeout(self, _value: float | None) -> None:
+            raise AssertionError("a write deadline must not mutate the reader timeout")
+
+        def sendall(self, data: bytes) -> None:
+            self.writes.append(data)
+
+    sock = Socket()
+
+    send_frames(sock, [b"request"], timeout=0.1)
+
+    assert sock.writes == [b"request"]
+    assert len(sock.timeout_options) == 2
+
+
+def test_sync_write_deadline_does_not_timeout_a_concurrent_reader() -> None:
+    left, right = socket.socketpair()
+    left.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4_096)
+    left.settimeout(None)
+    reader_finished = threading.Event()
+    reader_errors: list[BaseException] = []
+
+    def read() -> None:
+        try:
+            left.recv(1)
+        except BaseException as exc:
+            reader_errors.append(exc)
+        finally:
+            reader_finished.set()
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    try:
+        with pytest.raises((TimeoutError, OSError)):
+            send_frames(left, [b"x" * (4 * 1024 * 1024)], timeout=0.05)
+
+        assert not reader_finished.wait(0.02)
+        assert reader_errors == []
+        assert left.gettimeout() is None
+    finally:
+        left.close()
+        right.close()
+        reader.join(timeout=1)
+
+
+def test_submit_commands_starts_response_deadline_after_connection(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(ProtocolAdapter, "_connect", lambda self: None)
+    monkeypatch.setattr(
+        protocol_sync_batch_module,
+        "_pipeline_frame_supported",
+        lambda _commands: False,
+    )
+
+    class RecordingSocket:
+        def __init__(self) -> None:
+            self.timeout: float | None = None
+            self.writes: list[bytes] = []
+
+        def gettimeout(self) -> float | None:
+            return self.timeout
+
+        def settimeout(self, value: float | None) -> None:
+            self.timeout = value
+
+        def sendall(self, data: bytes) -> None:
+            self.writes.append(data)
+
+    adapter = ProtocolAdapter(timeout=0.1, heartbeat_interval=None)
+    sock = RecordingSocket()
+    adapter._sock = sock  # type: ignore[assignment]
+    connected_at = 0.0
+
+    def slow_connect() -> None:
+        nonlocal connected_at
+        time.sleep(0.03)
+        connected_at = time.monotonic()
+
+    adapter._ensure_connected = slow_connect  # type: ignore[method-assign]
+    registered_deadlines: list[float] = []
+    register = adapter._register_pending_request
+
+    def record_deadline(*args: Any, **kwargs: Any) -> Any:
+        expires_at = kwargs.get("expires_at")
+        if expires_at is not None:
+            registered_deadlines.append(expires_at)
+        return register(*args, **kwargs)
+
+    adapter._register_pending_request = record_deadline  # type: ignore[method-assign]
+    futures = adapter.submit_commands([("PING",), ("MULTI",)])
+    try:
+        assert len(futures) == 2
+        assert len(sock.writes) == 2
+        assert len(registered_deadlines) == 2
+        assert all(deadline >= connected_at + 0.09 for deadline in registered_deadlines)
+    finally:
+        for request_id, future in list(adapter._pending.items()):
+            adapter._discard_pending_request(request_id, expected_future=future)
+        adapter._sock = None
+        adapter.close()
+
+
+def test_flow_option_analysis_does_not_decode_opaque_binary_payload() -> None:
+    class OpaquePayload(bytes):
+        def decode(self, *_args: Any, **_kwargs: Any) -> str:
+            raise AssertionError("opaque payload must not be decoded as command grammar")
+
+    payload = OpaquePayload(b"\xff" * 1024)
+
+    command = build_protocol_command(
+        "FLOW.CREATE",
+        "flow-1",
+        "TYPE",
+        "job",
+        "PAYLOAD",
+        payload,
+    )
+
+    assert command.payload["payload"] is payload
+
+
+def test_flow_option_analysis_bounds_binary_payload_peak_memory() -> None:
+    payload = b"\xff" * (1024 * 1024)
+    gc.collect()
+    tracemalloc.start()
+    try:
+        command = build_protocol_command(
+            "FLOW.CREATE",
+            "flow-1",
+            "TYPE",
+            "job",
+            "PAYLOAD",
+            payload,
+        )
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert command.payload["payload"] is payload
+    assert peak < 2 * 1024 * 1024
+
+
+def test_flow_routing_bounds_large_partition_key_peak_memory() -> None:
+    partition_key = b"x" * (8 * 1024 * 1024)
+
+    gc.collect()
+    tracemalloc.start()
+    try:
+        route_keys = flow_command_route_keys(
+            "FLOW.CLAIM_DUE",
+            ("job", "PARTITION", partition_key),
+        )
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert len(route_keys) == 1
+    assert peak < 512 * 1024
+
+
+def test_flow_routing_streams_large_text_keys() -> None:
+    routing_value = "🚀" * (1024 * 1024)
+    encoded = routing_value.encode()
+    expected_partition_route = flow_command_route_keys(
+        "FLOW.CLAIM_DUE",
+        ("job", "PARTITION", encoded),
+    )
+    expected_id_route = flow_command_route_keys("FLOW.GET", (encoded,))
+    del encoded
+
+    gc.collect()
+    tracemalloc.start()
+    try:
+        partition_route = flow_command_route_keys(
+            "FLOW.CLAIM_DUE",
+            ("job", "PARTITION", routing_value),
+        )
+        id_route = flow_command_route_keys("FLOW.GET", (routing_value,))
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert partition_route == expected_partition_route
+    assert id_route == expected_id_route
+    assert peak < 512 * 1024
 
 
 def test_async_drain_failure_retires_transport_and_fails_all_pending() -> None:
@@ -885,6 +1866,7 @@ def test_async_drain_failure_retires_transport_and_fails_all_pending() -> None:
         )
         writer = FailingWriter()
         adapter._writer = writer  # type: ignore[assignment]
+        adapter._connection_ready = True
         unrelated = asyncio.get_running_loop().create_future()
         adapter._pending[99] = unrelated
 
@@ -896,6 +1878,58 @@ def test_async_drain_failure_retires_transport_and_fails_all_pending() -> None:
         assert unrelated.done() is True
         with pytest.raises(FerricStoreError):
             await unrelated
+
+    asyncio.run(run())
+
+
+def test_async_request_timeout_does_not_wait_for_blocked_transport_cleanup() -> None:
+    class BlockingWriter:
+        def __init__(self) -> None:
+            self.drain_entered = asyncio.Event()
+            self.wait_closed_entered = asyncio.Event()
+            self.release_close = asyncio.Event()
+            self.closed = False
+
+        def is_closing(self) -> bool:
+            return self.closed
+
+        def write(self, _frame: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            self.drain_entered.set()
+            await asyncio.Event().wait()
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            self.wait_closed_entered.set()
+            await self.release_close.wait()
+
+    async def run() -> None:
+        adapter = AsyncProtocolAdapter(
+            timeout=0.01,
+            heartbeat_interval=None,
+            write_drain_bytes=0,
+        )
+        writer = BlockingWriter()
+        adapter._writer = writer  # type: ignore[assignment]
+
+        async def connected() -> None:
+            return None
+
+        adapter._ensure_connected = connected  # type: ignore[method-assign]
+        request = asyncio.create_task(adapter.execute_command("GET", "key"))
+        await asyncio.wait_for(writer.drain_entered.wait(), timeout=1)
+
+        with pytest.raises(FerricStoreError, match="protocol request timed out"):
+            await asyncio.wait_for(request, timeout=0.1)
+
+        await asyncio.wait_for(writer.wait_closed_entered.wait(), timeout=1)
+        assert not writer.release_close.is_set()
+        writer.release_close.set()
+        await adapter.close()
 
     asyncio.run(run())
 
@@ -1241,6 +2275,263 @@ def test_sync_topology_refresh_does_not_hold_routing_lock_and_is_singleflight(
     pool.close()
 
 
+def test_sync_topology_refresh_cannot_close_adapter_selected_by_inflight_command(
+    monkeypatch: Any,
+) -> None:
+    current = {"host": "leader-1.local", "port": 6391, "epoch": 1}
+    selected = threading.Event()
+    proceed = threading.Event()
+    selected_adapters: list[Any] = []
+
+    class FakeAdapter:
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self.closed = False
+
+        def execute_command(self, *args: Any) -> Any:
+            if args[0] == "SHARDS":
+                return _single_shard_topology(
+                    current["host"], current["port"], route_epoch=current["epoch"]
+                )
+            if self.closed:
+                raise RuntimeError("used closed adapter")
+            return b"OK"
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        ProtocolAdapter,
+        "from_url",
+        lambda url, **_kwargs: FakeAdapter(url),
+    )
+    pool = protocol_module.TopologyProtocolAdapterPool(
+        ["ferric://seed.local:6388"], endpoint_policy="any"
+    )
+    execute_selected = pool._execute_protocol_command
+
+    def pause_after_selection(
+        adapter: Any,
+        prepared: Any,
+        lane_id: int,
+    ) -> Any:
+        selected_adapters.append(adapter)
+        selected.set()
+        assert proceed.wait(1)
+        return execute_selected(adapter, prepared, lane_id)
+
+    pool._execute_protocol_command = pause_after_selection  # type: ignore[method-assign]
+    values: list[Any] = []
+    errors: list[BaseException] = []
+
+    def execute() -> None:
+        try:
+            values.append(pool.execute_command("GET", "key-1"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=execute)
+    thread.start()
+    assert selected.wait(1)
+    current.update(host="leader-2.local", port=6392, epoch=2)
+    pool.refresh_topology()
+    assert selected_adapters[0].closed is False
+    proceed.set()
+    thread.join(1)
+
+    assert errors == []
+    assert values == [b"OK"]
+    assert selected_adapters[0].closed is True
+    pool.close()
+
+
+def test_async_topology_refresh_cannot_close_adapter_selected_by_inflight_command(
+    monkeypatch: Any,
+) -> None:
+    async def run() -> None:
+        current = {"host": "leader-1.local", "port": 6391, "epoch": 1}
+        selected = asyncio.Event()
+        proceed = asyncio.Event()
+        selected_adapters: list[Any] = []
+
+        class FakeAdapter:
+            def __init__(self, url: str) -> None:
+                self.url = url
+                self.closed = False
+
+            async def execute_command(self, *args: Any) -> Any:
+                if args[0] == "SHARDS":
+                    return _single_shard_topology(
+                        current["host"], current["port"], route_epoch=current["epoch"]
+                    )
+                if self.closed:
+                    raise RuntimeError("used closed adapter")
+                return b"OK"
+
+            async def close(self) -> None:
+                self.closed = True
+
+        monkeypatch.setattr(
+            AsyncProtocolAdapter,
+            "from_url",
+            lambda url, **_kwargs: FakeAdapter(url),
+        )
+        pool = protocol_module.AsyncTopologyProtocolAdapterPool(
+            ["ferric://seed.local:6388"], endpoint_policy="any"
+        )
+        await pool.refresh_topology()
+        execute_selected = pool._execute_protocol_command
+
+        async def pause_after_selection(
+            adapter: Any,
+            prepared: Any,
+            lane_id: int,
+        ) -> Any:
+            selected_adapters.append(adapter)
+            selected.set()
+            await asyncio.wait_for(proceed.wait(), 1)
+            return await execute_selected(adapter, prepared, lane_id)
+
+        pool._execute_protocol_command = pause_after_selection  # type: ignore[method-assign]
+        task = asyncio.create_task(pool.execute_command("GET", "key-1"))
+        await asyncio.wait_for(selected.wait(), 1)
+        current.update(host="leader-2.local", port=6392, epoch=2)
+        await pool.refresh_topology()
+        assert selected_adapters[0].closed is False
+        proceed.set()
+
+        assert await asyncio.wait_for(task, 1) == b"OK"
+        await asyncio.sleep(0)
+        assert selected_adapters[0].closed is True
+        await pool.close()
+
+    asyncio.run(run())
+
+
+def test_sync_topology_reselects_route_when_generation_changes_before_lease(
+    monkeypatch: Any,
+) -> None:
+    current = {"host": "leader-1.local", "port": 6391, "epoch": 1}
+    calls: list[str] = []
+
+    class FakeAdapter:
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self.closed = False
+
+        def execute_command(self, *args: Any) -> Any:
+            if args[0] == "SHARDS":
+                return _single_shard_topology(
+                    current["host"], current["port"], route_epoch=current["epoch"]
+                )
+            if self.closed:
+                raise RuntimeError("used closed adapter")
+            calls.append(self.url)
+            return b"OK"
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        ProtocolAdapter,
+        "from_url",
+        lambda url, **_kwargs: FakeAdapter(url),
+    )
+    pool = protocol_module.TopologyProtocolAdapterPool(
+        ["ferric://seed.local:6388"], endpoint_policy="any"
+    )
+    lease_adapter = pool._leased_adapter_for_endpoint
+    refreshed = False
+
+    def refresh_before_first_lease(endpoint: Any, *, generation: int) -> Any:
+        nonlocal refreshed
+        if not refreshed:
+            refreshed = True
+            current.update(host="leader-2.local", port=6392, epoch=2)
+            pool.refresh_topology()
+        return lease_adapter(endpoint, generation=generation)
+
+    pool._leased_adapter_for_endpoint = refresh_before_first_lease  # type: ignore[method-assign]
+    try:
+        assert pool.execute_command("GET", "key-1") == b"OK"
+    finally:
+        pool.close()
+
+    assert calls == ["ferric://leader-2.local:6392"]
+
+
+def test_sync_topology_batch_holds_endpoint_lease_through_execution(
+    monkeypatch: Any,
+) -> None:
+    current = {"host": "leader-1.local", "port": 6391, "epoch": 1}
+    created: dict[str, Any] = {}
+    planned = threading.Event()
+    proceed = threading.Event()
+
+    class FakeAdapter:
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self.closed = False
+
+        def execute_command(self, *args: Any) -> Any:
+            if args[0] == "SHARDS":
+                return _single_shard_topology(
+                    current["host"], current["port"], route_epoch=current["epoch"]
+                )
+            if self.closed:
+                raise RuntimeError("used closed adapter")
+            return b"OK"
+
+        def execute_batch(self, commands: list[tuple[Any, ...]]) -> list[Any]:
+            if self.closed:
+                raise RuntimeError("used closed adapter")
+            return [b"OK"] * len(commands)
+
+        def close(self) -> None:
+            self.closed = True
+
+    def from_url(url: str, **_kwargs: Any) -> FakeAdapter:
+        adapter = FakeAdapter(url)
+        created[url] = adapter
+        return adapter
+
+    monkeypatch.setattr(ProtocolAdapter, "from_url", from_url)
+    pool = protocol_module.TopologyProtocolAdapterPool(
+        ["ferric://seed.local:6388"], endpoint_policy="any"
+    )
+    run_groups = pool._batch_fanout.run
+
+    def pause_after_plan(*args: Any, **kwargs: Any) -> Any:
+        planned.set()
+        assert proceed.wait(1)
+        return run_groups(*args, **kwargs)
+
+    pool._batch_fanout.run = pause_after_plan  # type: ignore[method-assign]
+    values: list[Any] = []
+    errors: list[BaseException] = []
+
+    def execute() -> None:
+        try:
+            values.extend(pool.execute_batch([("GET", "key-1"), ("GET", "key-2")]))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=execute)
+    thread.start()
+    assert planned.wait(1)
+    leader = created["ferric://leader-1.local:6391"]
+    current.update(host="leader-2.local", port=6392, epoch=2)
+    pool.refresh_topology()
+    assert leader.closed is False
+    proceed.set()
+    thread.join(1)
+
+    assert errors == []
+    assert values == [b"OK", b"OK"]
+    assert leader.closed is True
+    pool.close()
+
+
 def test_sync_topology_event_snapshots_hold_the_registry_lock() -> None:
     pool = object.__new__(TopologyProtocolAdapterPool)
     lock = threading.Lock()
@@ -1262,7 +2553,7 @@ def test_sync_topology_event_snapshots_hold_the_registry_lock() -> None:
 def test_sync_topology_endpoint_connect_does_not_hold_lock_and_is_singleflight(
     monkeypatch: Any,
 ) -> None:
-    current = {"host": "leader-1.local", "port": 6391}
+    current = {"host": "leader-1.local", "port": 6391, "epoch": 1}
     entered = threading.Event()
     release = threading.Event()
     created: list[str] = []
@@ -1273,7 +2564,9 @@ def test_sync_topology_endpoint_connect_does_not_hold_lock_and_is_singleflight(
 
         def execute_command(self, *args: Any) -> Any:
             if args[0] == "SHARDS":
-                return _single_shard_topology(current["host"], current["port"])
+                return _single_shard_topology(
+                    current["host"], current["port"], route_epoch=current["epoch"]
+                )
             return b"OK"
 
         def close(self) -> None:
@@ -1290,7 +2583,7 @@ def test_sync_topology_endpoint_connect_does_not_hold_lock_and_is_singleflight(
     pool = protocol_module.TopologyProtocolAdapterPool(
         ["ferric://seed.local:6388"], endpoint_policy="any"
     )
-    current.update(host="leader-2.local", port=6392)
+    current.update(host="leader-2.local", port=6392, epoch=2)
     pool.refresh_topology()
     endpoint = next(iter(pool.topology.endpoints.values()))
     results: list[Any] = []
@@ -1375,7 +2668,7 @@ def test_async_topology_refresh_does_not_hold_routing_lock_and_is_singleflight(
 def test_sync_retired_endpoint_closes_when_it_becomes_idle_without_refresh(
     monkeypatch: Any,
 ) -> None:
-    current = {"host": "leader-1.local", "port": 6391}
+    current = {"host": "leader-1.local", "port": 6391, "epoch": 1}
 
     class FakeAdapter:
         def __init__(self, url: str) -> None:
@@ -1386,7 +2679,9 @@ def test_sync_retired_endpoint_closes_when_it_becomes_idle_without_refresh(
 
         def execute_command(self, *args: Any) -> Any:
             if args[0] == "SHARDS":
-                return _single_shard_topology(current["host"], current["port"])
+                return _single_shard_topology(
+                    current["host"], current["port"], route_epoch=current["epoch"]
+                )
             return b"OK"
 
         def add_idle_listener(self, listener: Any) -> None:
@@ -1415,7 +2710,7 @@ def test_sync_retired_endpoint_closes_when_it_becomes_idle_without_refresh(
     retired = pool._adapter_for_endpoint(next(iter(pool.topology.endpoints.values())))
     retired._active[0] = 1
 
-    current.update(host="leader-2.local", port=6392)
+    current.update(host="leader-2.local", port=6392, epoch=2)
     pool.refresh_topology()
     assert retired.closed is False
 
@@ -1427,7 +2722,7 @@ def test_sync_retired_endpoint_closes_when_it_becomes_idle_without_refresh(
 def test_sync_failed_retired_cleanup_retries_on_next_topology_refresh(
     monkeypatch: Any,
 ) -> None:
-    current = {"host": "leader-1.local", "port": 6391}
+    current = {"host": "leader-1.local", "port": 6391, "epoch": 1}
 
     class FakeAdapter:
         def __init__(self, url: str) -> None:
@@ -1437,7 +2732,9 @@ def test_sync_failed_retired_cleanup_retries_on_next_topology_refresh(
 
         def execute_command(self, *args: Any) -> Any:
             if args[0] == "SHARDS":
-                return _single_shard_topology(current["host"], current["port"])
+                return _single_shard_topology(
+                    current["host"], current["port"], route_epoch=current["epoch"]
+                )
             return b"OK"
 
         def close(self) -> None:
@@ -1455,9 +2752,9 @@ def test_sync_failed_retired_cleanup_retries_on_next_topology_refresh(
     )
     retired = pool._adapter_for_endpoint(next(iter(pool.topology.endpoints.values())))
 
-    current.update(host="leader-2.local", port=6392)
+    current.update(host="leader-2.local", port=6392, epoch=2)
     pool.refresh_topology()
-    current.update(host="leader-3.local", port=6393)
+    current.update(host="leader-3.local", port=6393, epoch=3)
     pool.refresh_topology()
     calls_before_pool_close = retired.close_calls
     pool.close()
@@ -1470,7 +2767,7 @@ def test_async_retired_endpoint_closes_when_it_becomes_idle_without_refresh(
     monkeypatch: Any,
 ) -> None:
     async def run() -> None:
-        current = {"host": "leader-1.local", "port": 6391}
+        current = {"host": "leader-1.local", "port": 6391, "epoch": 1}
 
         class FakeAdapter:
             def __init__(self, url: str) -> None:
@@ -1481,7 +2778,9 @@ def test_async_retired_endpoint_closes_when_it_becomes_idle_without_refresh(
 
             async def execute_command(self, *args: Any) -> Any:
                 if args[0] == "SHARDS":
-                    return _single_shard_topology(current["host"], current["port"])
+                    return _single_shard_topology(
+                        current["host"], current["port"], route_epoch=current["epoch"]
+                    )
                 return b"OK"
 
             def add_idle_listener(self, listener: Any) -> None:
@@ -1511,7 +2810,7 @@ def test_async_retired_endpoint_closes_when_it_becomes_idle_without_refresh(
         retired = pool._adapter_for_endpoint(next(iter(pool.topology.endpoints.values())))
         retired._active[0] = 1
 
-        current.update(host="leader-2.local", port=6392)
+        current.update(host="leader-2.local", port=6392, epoch=2)
         await pool.refresh_topology()
         assert retired.closed is False
 
@@ -1527,7 +2826,7 @@ def test_async_failed_retired_cleanup_retries_on_next_topology_refresh(
     monkeypatch: Any,
 ) -> None:
     async def run() -> None:
-        current = {"host": "leader-1.local", "port": 6391}
+        current = {"host": "leader-1.local", "port": 6391, "epoch": 1}
 
         class FakeAdapter:
             def __init__(self, url: str) -> None:
@@ -1537,7 +2836,9 @@ def test_async_failed_retired_cleanup_retries_on_next_topology_refresh(
 
             async def execute_command(self, *args: Any) -> Any:
                 if args[0] == "SHARDS":
-                    return _single_shard_topology(current["host"], current["port"])
+                    return _single_shard_topology(
+                        current["host"], current["port"], route_epoch=current["epoch"]
+                    )
                 return b"OK"
 
             async def close(self) -> None:
@@ -1556,9 +2857,9 @@ def test_async_failed_retired_cleanup_retries_on_next_topology_refresh(
         await pool.refresh_topology()
         retired = pool._adapter_for_endpoint(next(iter(pool.topology.endpoints.values())))
 
-        current.update(host="leader-2.local", port=6392)
+        current.update(host="leader-2.local", port=6392, epoch=2)
         await pool.refresh_topology()
-        current.update(host="leader-3.local", port=6393)
+        current.update(host="leader-3.local", port=6393, epoch=3)
         await pool.refresh_topology()
         while pool._cleanup_tasks:
             await asyncio.gather(*tuple(pool._cleanup_tasks))
@@ -1655,7 +2956,7 @@ def test_async_topology_subscription_updates_cannot_finish_stale() -> None:
     asyncio.run(run())
 
 
-def test_pipeline_target_cancellation_does_not_fail_sibling_future() -> None:
+def test_pipeline_targets_are_running_after_wire_submission() -> None:
     adapter = object.__new__(ProtocolAdapter)
     source: Future[ProtocolResponse] = Future()
     adapter._submit_pipeline_request = lambda *args, **kwargs: source
@@ -1677,12 +2978,12 @@ def test_pipeline_target_cancellation_does_not_fail_sibling_future() -> None:
     )
     completion.start()
     assert decode_entered.wait(timeout=1)
-    assert targets[0].cancel()
+    assert targets[0].cancel() is False
     release_decode.set()
     completion.join(timeout=1)
 
     assert completion.is_alive() is False
-    assert targets[0].cancelled()
+    assert targets[0].result(timeout=1) == b"first"
     assert targets[1].result(timeout=1) == b"second"
 
 
@@ -1838,7 +3139,10 @@ def test_async_pool_rechecks_buffered_events_after_session_waiter_is_served() ->
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("limit_name", ["max_inflight_requests", "max_pending_request_bytes"])
+@pytest.mark.parametrize(
+    "limit_name",
+    ["max_inflight_requests", "max_pending_request_bytes", "max_batch_items"],
+)
 @pytest.mark.parametrize("invalid", [0, -1, True])
 def test_protocol_pending_limits_require_positive_integers(
     monkeypatch: Any,
@@ -1885,7 +3189,11 @@ def test_sync_protocol_bounds_total_pending_request_bytes(monkeypatch: Any) -> N
     )
     adapter._sock = object()  # type: ignore[assignment]
     sent: list[Any] = []
-    monkeypatch.setattr(protocol_module, "_send_frames", lambda *args, **kwargs: sent.append(args))
+    monkeypatch.setattr(
+        protocol_sync_batch_module,
+        "_send_frames",
+        lambda *args, **kwargs: sent.append(args),
+    )
 
     with pytest.raises(FerricStoreError, match="max_pending_request_bytes"):
         adapter._submit_request(protocol_module._OP_SET, 1, b"x" * 65)

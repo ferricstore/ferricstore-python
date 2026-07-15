@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import threading
 import zlib
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -9,6 +12,7 @@ from typing import Any
 import pytest
 
 import ferricstore.batch_core as batch_core_module
+import ferricstore.flow_routing as flow_routing_module
 from ferricstore.batch_core import (
     batch_fingerprint,
     batch_values_equal,
@@ -28,6 +32,34 @@ from ferricstore.command_core import (
 )
 from ferricstore.errors import FerricStoreError, OverloadedError, StaleLeaseError
 from ferricstore.worker_core import CloseDeadline, many_item_error
+
+
+def _flow_partition_route_key(value: str | bytes) -> str:
+    encoded = value if isinstance(value, bytes) else value.encode()
+    text = encoded.decode(errors="replace")
+    if text.startswith("__flow_auto__:"):
+        bucket = text.removeprefix("__flow_auto__:")
+        if bucket.isdigit() and str(int(bucket)) == bucket and int(bucket) < 256:
+            return f"f:{{fa:{bucket}}}:route"
+    digest = base64.urlsafe_b64encode(hashlib.sha256(encoded).digest()).rstrip(b"=").decode()
+    return f"f:{{f:{digest}}}:route"
+
+
+def _flow_id_route_key(value: str | bytes) -> str:
+    encoded = value if isinstance(value, bytes) else value.encode()
+    return f"f:{{fa:{zlib.crc32(encoded) % 256}}}:route"
+
+
+def test_flow_partition_digest_cache_does_not_retain_oversized_keys() -> None:
+    flow_routing_module._cached_logical_partition_routing_key.cache_clear()
+
+    flow_routing_module.flow_logical_partition_routing_key("tenant:small")
+    before = flow_routing_module._cached_logical_partition_routing_key.cache_info()
+    flow_routing_module.flow_logical_partition_routing_key("x" * 4_097)
+    after = flow_routing_module._cached_logical_partition_routing_key.cache_info()
+
+    assert before.currsize == 1
+    assert after.currsize == before.currsize
 
 
 def test_batch_fingerprint_preserves_encoded_type_distinctions() -> None:
@@ -129,6 +161,19 @@ def test_close_deadline_does_not_start_cleanup_after_deadline_expired() -> None:
         assert reports == []
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf"), -1.0, True])
+def test_close_deadline_rejects_non_finite_negative_or_boolean_timeout(
+    invalid: float,
+) -> None:
+    with pytest.raises(ValueError, match="close timeout must be non-negative and finite"):
+        CloseDeadline.start(invalid)
+
+
+def test_close_deadline_rejects_timeout_above_platform_wait_limit() -> None:
+    with pytest.raises(ValueError, match="close timeout exceeds platform wait limit"):
+        CloseDeadline.start(threading.TIMEOUT_MAX + 1.0)
 
 
 def test_close_deadline_consumes_cleanup_failure_after_waiter_cancellation() -> None:
@@ -469,6 +514,11 @@ def test_flow_auto_partition_helpers_share_one_canonical_mapping() -> None:
     )
 
 
+def test_flow_auto_partition_index_rejects_non_text_identifiers_explicitly() -> None:
+    with pytest.raises(TypeError, match="id must be str or bytes"):
+        flow_auto_partition_index(42)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     ("name", "args", "keys"),
     [
@@ -490,37 +540,37 @@ def test_flow_auto_partition_helpers_share_one_canonical_mapping() -> None:
         (
             "FLOW.CREATE",
             ("flow-auto", "TYPE", "order"),
-            (f"__flow_auto__:{zlib.crc32(b'flow-auto') % 256}",),
+            (_flow_id_route_key("flow-auto"),),
         ),
         (
             "FLOW.CREATE",
             ("flow-explicit", "TYPE", "order", "PARTITION", "tenant:1"),
-            ("tenant:1",),
+            (_flow_partition_route_key("tenant:1"),),
         ),
         (
             "FLOW.CREATE",
             (b"flow-explicit", "TYPE", "order", b"PARTITION", b"tenant:bytes"),
-            (b"tenant:bytes",),
+            (_flow_partition_route_key(b"tenant:bytes"),),
         ),
         (
             "FLOW.CREATE",
             ("PARTITION", "TYPE", "order"),
-            (flow_auto_partition_key("PARTITION"),),
+            (_flow_id_route_key("PARTITION"),),
         ),
         (
             "FLOW.CREATE",
             ("flow-attribute", "TYPE", "order", "ATTRIBUTE", "name", "PARTITION", "NOW", 1),
-            (flow_auto_partition_key("flow-attribute"),),
+            (_flow_id_route_key("flow-attribute"),),
         ),
         (
             "FLOW.COMPLETE",
             ("flow-lease", "PARTITION", "FENCING", 1),
-            (flow_auto_partition_key("flow-lease"),),
+            (_flow_id_route_key("flow-lease"),),
         ),
         (
             "FLOW.CREATE_MANY",
             ("tenant:2", "TYPE", "order", "ITEMS", "flow-1", b"payload"),
-            ("tenant:2",),
+            (_flow_partition_route_key("tenant:2"),),
         ),
         (
             "FLOW.CREATE_MANY",
@@ -530,18 +580,77 @@ def test_flow_auto_partition_helpers_share_one_canonical_mapping() -> None:
         (
             "FLOW.CLAIM_DUE",
             ("order", "STATE", "queued", "PARTITION", "tenant:3"),
-            ("tenant:3",),
+            (_flow_partition_route_key("tenant:3"),),
         ),
+        (
+            "FLOW.CLAIM_DUE",
+            ("order", "PARTITIONS", 2, "tenant:3", "tenant:4"),
+            (
+                _flow_partition_route_key("tenant:3"),
+                _flow_partition_route_key("tenant:4"),
+            ),
+        ),
+        ("FLOW.CLAIM_DUE", ("order", "PARTITION", "ANY"), ()),
+        ("FLOW.CLAIM_DUE", ("order", "PARTITION", "GLOBAL"), ("f:{f}:route",)),
         (
             "FLOW.GET",
             ("flow-payload", "PAYLOAD", "PARTITION", "tenant:payload"),
-            ("tenant:payload",),
+            (_flow_partition_route_key("tenant:payload"),),
         ),
         (
             "FLOW.GET",
             (b"flow-payload", "PAYLOAD", "PARTITION", b"tenant:bytes"),
-            (b"tenant:bytes",),
+            (_flow_partition_route_key(b"tenant:bytes"),),
         ),
+        (
+            b"FLOW.GET",
+            (b"flow-payload", b"PAYLOAD", b"PARTITION", b"tenant:all-bytes"),
+            (_flow_partition_route_key(b"tenant:all-bytes"),),
+        ),
+        (
+            "XREADGROUP",
+            ("GROUP", "STREAMS", "consumer", "STREAMS", "orders", ">"),
+            ("orders",),
+        ),
+        (
+            b"XREADGROUP",
+            (b"GROUP", b"group", b"STREAMS", b"STREAMS", b"orders", b">"),
+            (b"orders",),
+        ),
+        ("FLOW.APPROVAL.GET", ("approval-1",), (_flow_partition_route_key("approval-1"),)),
+        ("FLOW.BUDGET.GET", ("tenant-scope",), (_flow_partition_route_key("tenant-scope"),)),
+        (
+            "FLOW.VALUE.PUT",
+            (b"value", "OWNER_FLOW_ID", "flow-owner", "NAME", "result"),
+            (_flow_id_route_key("flow-owner"),),
+        ),
+        (
+            "FLOW.VALUE.PUT",
+            (b"value", "OWNER_FLOW_ID", "flow-owner"),
+            ("f:{f}:route",),
+        ),
+        (
+            "FLOW.VALUE.PUT",
+            (
+                b"value",
+                "PARTITION",
+                "tenant:value",
+                "OWNER_FLOW_ID",
+                "flow-owner",
+                "NAME",
+                "result",
+            ),
+            (_flow_partition_route_key("tenant:value"),),
+        ),
+        ("FLOW.VALUE.PUT", (b"value", "NOW", 1), ("f:{f}:route",)),
+        ("FLOW.POLICY.GET", ("order",), ("f:{f}:route",)),
+        ("FLOW.BY_PARENT", ("parent-1",), ("f:{f}:route",)),
+        (
+            "FLOW.BY_PARENT",
+            ("parent-1", "PARTITION", "tenant:parent"),
+            (_flow_partition_route_key("tenant:parent"),),
+        ),
+        ("FLOW.SCHEDULE.GET", ("daily-report",), ()),
         ("PING", (), ()),
     ],
 )

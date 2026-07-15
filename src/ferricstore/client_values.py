@@ -8,10 +8,11 @@ from ferricstore.client_helpers import (
     _append,
     _append_bool,
     _append_named_values,
+    _append_priority,
     _now_ms,
 )
 from ferricstore.client_state import _ClientMixinBase
-from ferricstore.types import _normalize_ref_meta
+from ferricstore.model_core import _normalize_ref_meta
 
 
 class _ClientValuesMixin(_ClientMixinBase):
@@ -85,7 +86,7 @@ class _ClientValuesMixin(_ClientMixinBase):
         _append(args, "TRANSITION_TO", transition_to)
         _append(args, "RUN_AT", run_at_ms)
         _append(args, "NOW", now_ms if now_ms is not None else _now_ms())
-        _append(args, "PRIORITY", priority)
+        _append_priority(args, priority)
         _append_named_values(
             args,
             self.codec,

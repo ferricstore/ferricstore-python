@@ -600,7 +600,12 @@ Distributed limits:
 
 ```python
 lease = client.limit_lease("tenant-a:email", shard_id=0, amount=10, ttl_ms=30_000)
-client.limit_release("tenant-a:email", shard_id=0, amount=10)
+spent = client.limit_spend("tenant-a:email", shard_id=0, amount=2)
+client.limit_release(
+    "tenant-a:email",
+    shard_id=0,
+    amount=2,
+)
 ```
 
 Circuits:

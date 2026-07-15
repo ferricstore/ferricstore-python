@@ -12,6 +12,10 @@ from urllib.parse import urlparse
 from ferricstore.batch_core import (
     run_async_fanout,
 )
+from ferricstore.config_validation import (
+    validate_optional_positive_int,
+    validate_optional_thread_wait_seconds,
+)
 from ferricstore.errors import (
     FerricStoreError,
     InvalidCommandError,
@@ -24,9 +28,7 @@ from ferricstore.lifecycle_core import (
 from ferricstore.protocol_async import (
     AsyncProtocolPipeline,
 )
-from ferricstore.protocol_async_pool import (
-    AsyncProtocolAdapterPool,
-)
+from ferricstore.protocol_async_endpoints import AsyncTopologyEndpointMixin
 from ferricstore.protocol_commands import (
     build_protocol_command,
 )
@@ -37,23 +39,22 @@ from ferricstore.protocol_common import (
     _command_name,
     _connection_endpoint_key,
     _endpoint_adapter_is_idle,
-    _endpoint_from_url,
     _is_retryable_route_error,
     _is_safe_control_retry,
-    _map_get,
-    _normalized_host_set,
     _protocol_connection_count,
-    _set_seed_auth_defaults,
-    _text_or_none,
-    _url_from_endpoint,
 )
 from ferricstore.protocol_constants import (
     _ASYNC_ADAPTER_FANOUT_LIMIT,
     _CONTROL_OPCODES,
     _FLAG_TRACE,
     _TLS_SCHEMES,
-    ProtocolCommand,
 )
+from ferricstore.protocol_lifecycle import (
+    DEFAULT_MAX_BATCH_ITEMS,
+    PendingRequestCapacityError,
+    check_batch_item_limit,
+)
+from ferricstore.protocol_planning import PreparedCommand, prepare_protocol_command
 from ferricstore.topology_core import (
     ControlEndpointSelector,
     FlowWakeSubscriptionRegistry,
@@ -65,11 +66,19 @@ from ferricstore.topology_core import (
 )
 from ferricstore.topology_lifecycle import (
     AsyncSingleFlight,
+    EndpointAdapterLease,
     EndpointAdapterLifecycle,
+)
+from ferricstore.topology_security import (
+    TopologyEndpointTrust,
+    TopologyRuntimeConfig,
+    seed_urls_by_endpoint,
+    validate_seed_credential_consistency,
+    validate_topology_configuration,
 )
 
 
-class AsyncTopologyProtocolAdapterPool:
+class AsyncTopologyProtocolAdapterPool(AsyncTopologyEndpointMixin):
     """Async topology-aware native pool backed by the server SHARDS slot table."""
 
     client: AsyncTopologyProtocolAdapterPool
@@ -88,25 +97,38 @@ class AsyncTopologyProtocolAdapterPool:
     ) -> None:
         if not urls:
             raise ValueError("AsyncTopologyProtocolAdapterPool requires at least one seed URL")
+        validate_topology_configuration(urls, endpoint_policy)
+        runtime_config = TopologyRuntimeConfig.build(
+            warm_connections=warm_connections,
+            trusted_hosts=trusted_hosts,
+            endpoint_validator=endpoint_validator,
+            tls=kwargs.get("tls", False),
+        )
         self.seed_urls = list(urls)
         self.client = self
         self.endpoint_policy = endpoint_policy
-        self.endpoint_validator = endpoint_validator
-        self.warm_connections = warm_connections
+        self.endpoint_validator = runtime_config.endpoint_validator
+        self.warm_connections = runtime_config.warm_connections
         self._max_connections = _protocol_connection_count(kwargs.pop("max_connections", 1))
-        self._tls = bool(kwargs.get("tls")) or any(
+        self._tls = runtime_config.tls or any(
             urlparse(url).scheme.lower() in _TLS_SCHEMES for url in self.seed_urls
         )
+        self.max_batch_items = validate_optional_positive_int(
+            kwargs.get("max_batch_items", DEFAULT_MAX_BATCH_ITEMS),
+            name="max_batch_items",
+        )
         self._adapter_kwargs = dict(kwargs)
-        _set_seed_auth_defaults(self.seed_urls, self._adapter_kwargs)
-        self._seed_endpoint_keys = {
-            _connection_endpoint_key(
-                _endpoint_from_url(url),
-                tls=urlparse(url).scheme.lower() in _TLS_SCHEMES,
-            )
-            for url in self.seed_urls
-        }
-        self._trusted_hosts = _normalized_host_set(list(trusted_hosts or []))
+        validate_seed_credential_consistency(self.seed_urls, self._adapter_kwargs)
+        self._seed_urls_by_endpoint = seed_urls_by_endpoint(self.seed_urls)
+        self._seed_endpoint_keys = set(self._seed_urls_by_endpoint)
+        self._endpoint_trust = TopologyEndpointTrust(
+            policy=endpoint_policy,
+            seed_endpoint_keys=self._seed_endpoint_keys,
+            trusted_hosts=runtime_config.trusted_hosts,
+            tls=self._tls,
+            validator=runtime_config.endpoint_validator,
+        )
+        self._trusted_hosts = set(self._endpoint_trust.trusted_hosts)
         self._endpoint_lifecycle = EndpointAdapterLifecycle[tuple[str, int]](
             is_idle=_endpoint_adapter_is_idle
         )
@@ -144,6 +166,10 @@ class AsyncTopologyProtocolAdapterPool:
         return ("async-topology-protocol", tuple(sorted(self.seed_urls)))
 
     async def wait_event(self, timeout: float | None = None) -> Any | None:
+        timeout = validate_optional_thread_wait_seconds(
+            timeout,
+            name="wait_event timeout",
+        )
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             if self._closed:
@@ -177,16 +203,30 @@ class AsyncTopologyProtocolAdapterPool:
                     return None
 
     async def _take_event(self) -> Any | None:
-        for adapter in list(self._adapters.values()):
-            wait_event = getattr(adapter, "wait_event", None)
-            if not callable(wait_event):
-                continue
-            event = wait_event(timeout=0.0)
-            if inspect.isawaitable(event):
-                event = await event
-            if event is not None:
-                return event
-        return None
+        lifecycle = getattr(self, "_endpoint_lifecycle", None)
+        leases: list[EndpointAdapterLease[tuple[str, int]]] = []
+        if lifecycle is None:
+            adapters = list(self._adapters.values())
+        else:
+            for key, adapter in self._adapters.items():
+                lease = lifecycle.acquire(key, adapter)
+                if lease is not None:
+                    leases.append(lease)
+            adapters = [lease.adapter for lease in leases]
+        try:
+            for adapter in adapters:
+                wait_event = getattr(adapter, "wait_event", None)
+                if not callable(wait_event):
+                    continue
+                event = wait_event(timeout=0.0)
+                if inspect.isawaitable(event):
+                    event = await event
+                if event is not None:
+                    return event
+            return None
+        finally:
+            for lease in reversed(leases):
+                self._release_adapter_lease(lease)
 
     async def close(self) -> None:
         coordinator = getattr(self, "_close_coordinator", None)
@@ -270,8 +310,10 @@ class AsyncTopologyProtocolAdapterPool:
         if key is None:
             return await self.acquire_session()
         route = await self.route(key)
+        lease: EndpointAdapterLease[tuple[str, int]] | None = None
         try:
-            adapter = self._adapter_for_endpoint(route["endpoint"])
+            lease = self._leased_adapter_for_endpoint(route["endpoint"])
+            adapter = lease.adapter
             acquire_session = getattr(adapter, "acquire_session_on_lane", None)
             if callable(acquire_session):
                 session = acquire_session(int(route["lane_id"]))
@@ -290,6 +332,9 @@ class AsyncTopologyProtocolAdapterPool:
                 with contextlib.suppress(Exception):
                     await self.refresh_topology()
             raise
+        finally:
+            if lease is not None:
+                self._release_adapter_lease(lease)
 
     def pipeline(self, transaction: bool = False) -> AsyncProtocolPipeline:
         if transaction:
@@ -345,15 +390,20 @@ class AsyncTopologyProtocolAdapterPool:
         if route_data is None:
             return await self._execute_control_method("execute_command", args)
 
-        command, route = route_data
+        prepared, route = route_data
+        lease: EndpointAdapterLease[tuple[str, int]] | None = None
         try:
-            adapter = self._adapter_for_endpoint(route["endpoint"])
-            return await self._execute_protocol_command(adapter, command, route["lane_id"], args)
+            lease = self._leased_adapter_for_endpoint(route["endpoint"])
+            adapter = lease.adapter
+            return await self._execute_protocol_command(adapter, prepared, route["lane_id"])
         except Exception as exc:
             if _is_retryable_route_error(exc):
                 with contextlib.suppress(Exception):
                     await self.refresh_topology()
             raise
+        finally:
+            if lease is not None:
+                self._release_adapter_lease(lease)
 
     async def execute_command_with_trace(self, *args: Any) -> dict[str, Any]:
         route_data = await self._route_data(args)
@@ -363,9 +413,23 @@ class AsyncTopologyProtocolAdapterPool:
                 await self._execute_control_method("execute_command_with_trace", args),
             )
 
-        command, route = route_data
+        prepared, route = route_data
+        command = prepared.command
+        lease: EndpointAdapterLease[tuple[str, int]] | None = None
         try:
-            adapter = self._adapter_for_endpoint(route["endpoint"])
+            lease = self._leased_adapter_for_endpoint(route["endpoint"])
+            adapter = lease.adapter
+            execute_prepared = getattr(
+                adapter,
+                "execute_prepared_command_with_trace_on_lane",
+                None,
+            )
+            if callable(execute_prepared):
+                result = execute_prepared(prepared, int(route["lane_id"]))
+                return cast(
+                    dict[str, Any],
+                    await result if inspect.isawaitable(result) else result,
+                )
             execute_on_lane = getattr(adapter, "execute_command_with_trace_on_lane", None)
             if callable(execute_on_lane):
                 result = execute_on_lane(args, int(route["lane_id"]))
@@ -392,6 +456,9 @@ class AsyncTopologyProtocolAdapterPool:
                 with contextlib.suppress(Exception):
                     await self.refresh_topology()
             raise
+        finally:
+            if lease is not None:
+                self._release_adapter_lease(lease)
 
     async def _execute_control_method(self, method: str, args: tuple[Any, ...]) -> Any:
         adapter = self._control_adapter()
@@ -427,8 +494,23 @@ class AsyncTopologyProtocolAdapterPool:
 
         async def execute_group(
             target: RoutedBatchTarget[Any],
-            group_commands: list[tuple[Any, ...]],
+            group_commands: list[PreparedCommand],
         ) -> list[Any]:
+            execute_prepared = (
+                getattr(target.adapter, "execute_prepared_batch_on_lane", None)
+                if target.lane_id is not None
+                else None
+            )
+            if callable(execute_prepared):
+                values = execute_prepared(
+                    group_commands,
+                    target.lane_id,
+                    ordered=ordered,
+                )
+                if inspect.isawaitable(values):
+                    values = await values
+                return list(values)
+            raw_commands = [prepared.args for prepared in group_commands]
             execute_batch = None
             if target.lane_id is not None:
                 method_name = (
@@ -436,26 +518,25 @@ class AsyncTopologyProtocolAdapterPool:
                 )
                 execute_batch = getattr(target.adapter, method_name, None)
             if callable(execute_batch):
-                values = execute_batch(group_commands, target.lane_id)
+                values = execute_batch(raw_commands, target.lane_id)
                 if inspect.isawaitable(values):
                     values = await values
                 return list(values)
             method_name = "execute_batch_ordered" if ordered else "execute_batch"
             execute_batch = getattr(target.adapter, method_name, None)
             if callable(execute_batch):
-                values = execute_batch(group_commands)
+                values = execute_batch(raw_commands)
                 if inspect.isawaitable(values):
                     values = await values
                 return list(values)
-            return [await target.adapter.execute_command(*args) for args in group_commands]
+            return [await target.adapter.execute_command(*args) for args in raw_commands]
 
         async def execute_planned_group(group: Any) -> list[Any]:
             return await execute_group(group.target, group.commands)
 
+        leases: list[EndpointAdapterLease[tuple[str, int]]] = []
         try:
-            routed_commands = [
-                (await self._batch_target_for_command(args), args) for args in commands
-            ]
+            routed_commands, leases = await self._prepare_routed_batch(commands)
             plan = RouteBatchPlan.build(
                 routed_commands,
                 group_key=lambda target: (id(target.adapter), target.lane_id),
@@ -471,6 +552,9 @@ class AsyncTopologyProtocolAdapterPool:
                 with contextlib.suppress(Exception):
                     await self.refresh_topology()
             raise
+        finally:
+            for lease in reversed(leases):
+                self._release_adapter_lease(lease)
 
     async def subscribe_flow_wake(self, *args: Any, **kwargs: Any) -> Any:
         update_lock = getattr(self, "_subscription_update_lock", None)
@@ -505,8 +589,17 @@ class AsyncTopologyProtocolAdapterPool:
             return replies[0] if len(replies) == 1 else replies
 
     async def _execute_protocol_command(
-        self, adapter: Any, command: ProtocolCommand, lane_id: int, args: tuple[Any, ...]
+        self,
+        adapter: Any,
+        prepared: PreparedCommand,
+        lane_id: int,
     ) -> Any:
+        execute_prepared = getattr(adapter, "execute_prepared_command_on_lane", None)
+        if callable(execute_prepared):
+            result = execute_prepared(prepared, int(lane_id))
+            return await result if inspect.isawaitable(result) else result
+        args = prepared.args
+        command = prepared.command
         execute_on_lane = getattr(adapter, "execute_command_on_lane", None)
         if callable(execute_on_lane):
             result = execute_on_lane(args, int(lane_id))
@@ -536,15 +629,20 @@ class AsyncTopologyProtocolAdapterPool:
 
     async def _route_data(
         self, args: tuple[Any, ...]
-    ) -> tuple[ProtocolCommand, dict[str, Any]] | None:
+    ) -> tuple[PreparedCommand, dict[str, Any]] | None:
         if not args:
             return None
         try:
-            command = build_protocol_command(*args)
+            prepared = prepare_protocol_command(args, builder=build_protocol_command)
         except Exception:
             return None
+        route = await self._route_prepared(prepared)
+        return None if route is None else (prepared, route)
+
+    async def _route_prepared(self, prepared: PreparedCommand) -> dict[str, Any] | None:
+        command = prepared.command
         decision = route_for_command(
-            args,
+            prepared.args,
             opcode=command.opcode,
             payload=command.payload,
             control_opcodes=_CONTROL_OPCODES,
@@ -554,7 +652,56 @@ class AsyncTopologyProtocolAdapterPool:
         key = decision.require_routable_key()
         if key is None:
             return None
-        return command, await self.route(key)
+        route = dict(await self.route(key))
+        route["_sdk_generation"] = self._topology_generation
+        return route
+
+    async def _prepare_routed_batch(
+        self,
+        commands: Sequence[tuple[Any, ...]],
+    ) -> tuple[
+        list[tuple[RoutedBatchTarget[Any], PreparedCommand]],
+        list[EndpointAdapterLease[tuple[str, int]]],
+    ]:
+        try:
+            check_batch_item_limit(len(commands), self.max_batch_items)
+        except PendingRequestCapacityError as exc:
+            raise FerricStoreError(str(exc)) from exc
+        prepared_commands = [
+            prepare_protocol_command(args, builder=build_protocol_command) for args in commands
+        ]
+        while True:
+            generation = self._topology_generation
+            routed_commands: list[tuple[RoutedBatchTarget[Any], PreparedCommand]] = []
+            leases: list[EndpointAdapterLease[tuple[str, int]]] = []
+            leases_by_endpoint: dict[tuple[str, int], EndpointAdapterLease[tuple[str, int]]] = {}
+            try:
+                for prepared in prepared_commands:
+                    route = await self._route_prepared(prepared)
+                    if route is None:
+                        target = RoutedBatchTarget(self._control_adapter(), None)
+                    elif int(route["_sdk_generation"]) != generation:
+                        break
+                    else:
+                        key = _connection_endpoint_key(route["endpoint"], tls=self._tls)
+                        lease = leases_by_endpoint.get(key)
+                        if lease is None:
+                            lease = self._leased_adapter_for_endpoint(route["endpoint"])
+                            leases_by_endpoint[key] = lease
+                            leases.append(lease)
+                        target = RoutedBatchTarget(lease.adapter, int(route["lane_id"]))
+                    routed_commands.append((target, prepared))
+                if (
+                    len(routed_commands) == len(prepared_commands)
+                    and generation == self._topology_generation
+                ):
+                    return routed_commands, leases
+            except BaseException:
+                for lease in reversed(leases):
+                    self._release_adapter_lease(lease)
+                raise
+            for lease in reversed(leases):
+                self._release_adapter_lease(lease)
 
     def _single_shard_key(self, keys: Sequence[Any]) -> str | bytes | None:
         decision = route_for_keys(keys, slot_for_key=RoutingTopology.slot_for_key)
@@ -578,198 +725,6 @@ class AsyncTopologyProtocolAdapterPool:
             self._adapter_for_endpoint(route["endpoint"]),
             int(route["lane_id"]),
         )
-
-    def _control_adapter(self) -> Any:
-        if self._closed:
-            raise FerricStoreError("protocol topology pool is closed")
-        for url in self._refresh_candidate_urls():
-            with contextlib.suppress(Exception):
-                return self._adapter_for_url(url)
-        return self._adapter_for_url(self.seed_urls[0])
-
-    def _adapter_for_url(self, url: str) -> Any:
-        endpoint = _endpoint_from_url(url)
-        key = _connection_endpoint_key(
-            endpoint,
-            tls=urlparse(url).scheme.lower() in _TLS_SCHEMES,
-        )
-        if key not in self._seed_endpoint_keys:
-            self._validate_endpoint(endpoint)
-        if self._closed:
-            raise FerricStoreError("protocol topology pool is closed")
-        adapter = self._endpoint_lifecycle.get(key)
-        if adapter is None:
-            adapter = self._new_endpoint_adapter(url)
-            try:
-                self._register_adapter(adapter)
-            except BaseException:
-                self._schedule_adapter_cleanup(adapter)
-                raise
-            self._endpoint_lifecycle.put(key, adapter)
-        return adapter
-
-    def _adapter_for_endpoint(self, endpoint: Mapping[str, Any]) -> Any:
-        self._validate_endpoint(endpoint)
-        if self._closed:
-            raise FerricStoreError("protocol topology pool is closed")
-        key = _connection_endpoint_key(endpoint, tls=self._tls)
-        adapter = self._endpoint_lifecycle.get(key)
-        if adapter is None:
-            adapter = self._new_endpoint_adapter(_url_from_endpoint(endpoint, tls=self._tls))
-            try:
-                self._register_adapter(adapter)
-            except BaseException:
-                self._schedule_adapter_cleanup(adapter)
-                raise
-            self._endpoint_lifecycle.put(key, adapter)
-        return adapter
-
-    def _install_topology(self, topology: RoutingTopology) -> list[Any]:
-        live_keys = set(self._seed_endpoint_keys)
-        live_keys.update(
-            _connection_endpoint_key(endpoint, tls=self._tls)
-            for endpoint in topology.endpoints.values()
-        )
-        ready = self._endpoint_lifecycle.install(
-            live_keys,
-            self._retired_adapter_became_idle,
-        )
-        self._topology_generation = self._endpoint_lifecycle.generation
-        self.topology = topology
-        for adapter in ready:
-            self._cleanup_adapters.add(adapter)
-        return ready
-
-    def _retired_adapter_became_idle(
-        self,
-        key: tuple[str, int],
-        adapter: Any,
-    ) -> None:
-        if self._closed:
-            return
-        ready = self._endpoint_lifecycle.claim_idle(key, adapter)
-        if ready is None:
-            return
-        self._cleanup_adapters.add(ready)
-        self._schedule_retained_adapter_cleanup()
-
-    def _new_endpoint_adapter(self, url: str) -> Any:
-        return AsyncProtocolAdapterPool.from_url(
-            url,
-            max_connections=self._max_connections,
-            **self._adapter_kwargs,
-        )
-
-    def _register_adapter(self, adapter: Any) -> None:
-        add_listener = getattr(adapter, "add_event_listener", None)
-        if callable(add_listener):
-            add_listener(self._event_listener)
-        else:
-            self._event_poll_fallback = True
-        self._subscription_registry.register_for_reconnect(adapter)
-
-    def _schedule_adapter_cleanup(self, adapter: Any) -> None:
-        self._cleanup_adapters.add(adapter)
-        identity = id(adapter)
-        retry_requested = getattr(self, "_cleanup_retry_requested", None)
-        if retry_requested is None:
-            retry_requested = set()
-            self._cleanup_retry_requested = retry_requested
-        if self._closed:
-            return
-        existing = self._cleanup_tasks_by_adapter.get(identity)
-        if existing is not None and not existing.done():
-            retry_requested.add(identity)
-            return
-        if existing is not None:
-            self._cleanup_tasks.discard(existing)
-            self._cleanup_tasks_by_adapter.pop(identity, None)
-
-        async def cleanup() -> None:
-            try:
-                await _close_adapter_async(adapter, self._event_listener)
-            except BaseException:
-                return
-            self._cleanup_adapters.complete(adapter)
-
-        task = asyncio.create_task(cleanup())
-        self._cleanup_tasks.add(task)
-        self._cleanup_tasks_by_adapter[identity] = task
-
-        def finished(completed: asyncio.Task[None]) -> None:
-            self._cleanup_tasks.discard(completed)
-            if self._cleanup_tasks_by_adapter.get(identity) is completed:
-                self._cleanup_tasks_by_adapter.pop(identity, None)
-            should_retry = (
-                identity in retry_requested
-                and not self._closed
-                and self._cleanup_adapters.contains(adapter)
-            )
-            retry_requested.discard(identity)
-            if should_retry:
-                self._schedule_adapter_cleanup(adapter)
-
-        task.add_done_callback(finished)
-
-    def _schedule_retained_adapter_cleanup(self) -> None:
-        for adapter in self._cleanup_adapters.snapshot():
-            self._schedule_adapter_cleanup(adapter)
-
-    async def _safe_warm_endpoint(self, endpoint: Mapping[str, Any]) -> None:
-        adapter = self._adapter_for_endpoint(endpoint)
-        connections = getattr(adapter, "adapters", None)
-        if isinstance(connections, Sequence) and connections:
-            await run_async_fanout(
-                tuple(connections),
-                self._safe_warm_connection,
-                concurrent=True,
-            )
-            return
-        await self._safe_warm_connection(adapter)
-
-    async def _safe_warm_connection(self, adapter: Any) -> None:
-        ensure_connected = getattr(adapter, "_ensure_connected", None)
-        if callable(ensure_connected):
-            try:
-                async with self._warm_semaphore:
-                    result = ensure_connected()
-                    if inspect.isawaitable(result):
-                        await result
-            except Exception:
-                return
-
-    def _validate_endpoint(self, endpoint: Mapping[str, Any]) -> None:
-        host = _text_or_none(_map_get(endpoint, "host", "native_host"))
-        if host is None:
-            raise FerricStoreError("invalid learned endpoint", raw=endpoint)
-        allowed = False
-        policy = self.endpoint_policy
-        if policy in {"any", "none"}:
-            allowed = True
-        elif policy == "seed_hosts":
-            allowed = (
-                _connection_endpoint_key(endpoint, tls=self._tls) in self._seed_endpoint_keys
-                or host.lower() in self._trusted_hosts
-            )
-        elif isinstance(policy, tuple) and len(policy) == 2 and policy[0] == "allow_hosts":
-            allowed = host.lower() in _normalized_host_set(policy[1])
-        else:
-            raise FerricStoreError(f"invalid endpoint_policy {policy!r}")
-        if not allowed:
-            raise FerricStoreError("unsafe learned endpoint", raw=endpoint)
-        if self.endpoint_validator is not None and not self.endpoint_validator(endpoint):
-            raise FerricStoreError("unsafe learned endpoint", raw=endpoint)
-
-    def _refresh_candidate_urls(self) -> list[str]:
-        discovered_urls = [
-            _url_from_endpoint(endpoint, tls=self._tls)
-            for endpoint in self.topology.endpoints.values()
-        ]
-        live_urls = set(self.seed_urls)
-        live_urls.update(discovered_urls)
-        return [
-            url for url in self._control_endpoints.candidates(discovered_urls) if url in live_urls
-        ]
 
 
 __all__ = [

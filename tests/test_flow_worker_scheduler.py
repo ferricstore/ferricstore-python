@@ -8,7 +8,8 @@ import pytest
 import ferricstore.worker as worker_module
 from ferricstore import ExceptionPolicy, QueueClient, RetryPolicy, ValueConfig, WorkerConfig
 from ferricstore.types import ClaimedFlow, resolve_worker_connection_counts
-from ferricstore.worker import QueueFlowWorker, QueueFlowWorkerResult
+from ferricstore.worker import QueueFlowWorker, QueueFlowWorkerResult, Worker
+from ferricstore.worker_core import validate_worker_idle_timing
 
 
 class FakeFlowClient:
@@ -114,6 +115,54 @@ class FakeWakeFlowClient(FakeFlowClient):
         if not self.events:
             return None
         return self.events.pop(0)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"idle_sleep_s": -0.001},
+        {"max_idle_sleep_s": -0.001},
+    ],
+)
+def test_queue_flow_worker_rejects_negative_idle_timing(kwargs) -> None:
+    with pytest.raises(ValueError, match="idle_sleep_s must be non-negative"):
+        QueueFlowWorker(FakeFlowClient([]), type="email", **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"idle_sleep_s": -0.001},
+        {"max_idle_sleep_s": -0.001},
+    ],
+)
+def test_legacy_worker_rejects_negative_idle_timing(kwargs) -> None:
+    workflow = type("FakeWorkflow", (), {"_states": {"queued": object()}})()
+
+    with pytest.raises(ValueError, match="idle_sleep_s must be non-negative"):
+        Worker(workflow, worker="worker-1", **kwargs)
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf"), -1.0, True])
+@pytest.mark.parametrize("field", ["idle_sleep_s", "max_idle_sleep_s"])
+def test_worker_idle_timing_rejects_non_finite_negative_or_boolean_values(
+    field: str, invalid: float
+) -> None:
+    values = {"idle_sleep_s": 0.1, "max_idle_sleep_s": 1.0}
+    values[field] = invalid
+
+    with pytest.raises(ValueError, match=rf"{field} must be non-negative and finite"):
+        validate_worker_idle_timing(**values)
+
+
+@pytest.mark.parametrize("field", ["empty_claim_cooldown_s", "partial_claim_cooldown_s"])
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf"), -1.0, True])
+def test_queue_worker_claim_cooldowns_require_finite_nonnegative_values(
+    field: str,
+    invalid: float,
+) -> None:
+    with pytest.raises(ValueError, match=rf"{field} must be non-negative and finite"):
+        QueueFlowWorker(FakeFlowClient([]), type="email", **{field: invalid})
 
 
 def test_flow_worker_validates_completion_clients_before_opening_owned_clients(monkeypatch):
@@ -602,6 +651,44 @@ def test_flow_worker_protocol_wake_hints_subscribes_to_claim_filter():
     ]
     assert worker._wait_for_protocol_wake_hint(0.01) is True
     assert client.wait_timeouts == [0.01]
+
+
+def test_flow_worker_owns_an_isolated_wake_subscription_session():
+    dedicated_clients: list[FakeWakeFlowClient] = []
+
+    class DedicatedWakeClient(FakeWakeFlowClient):
+        def __init__(self) -> None:
+            super().__init__([], [{"event": "FLOW_WAKE"}])
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class SharedClaimClient(FakeWakeFlowClient):
+        def __init__(self) -> None:
+            super().__init__([], [])
+
+        def _acquire_subscription_client(self):
+            dedicated = DedicatedWakeClient()
+            dedicated_clients.append(dedicated)
+            return dedicated, True
+
+    shared = SharedClaimClient()
+    first = QueueFlowWorker(shared, type="email", protocol_wake_hints=True)
+    second = QueueFlowWorker(shared, type="sms", protocol_wake_hints=True)
+    try:
+        assert shared.wake_subscriptions == []
+        assert len(dedicated_clients) == 2
+        assert [client.wake_subscriptions[0][0] for client in dedicated_clients] == [
+            "email",
+            "sms",
+        ]
+        assert first._wait_for_protocol_wake_hint(0.01) is True
+    finally:
+        first.close()
+        second.close()
+
+    assert all(client.closed for client in dedicated_clients)
 
 
 def test_flow_worker_prefetches_blocking_claims_with_protocol_future_client():

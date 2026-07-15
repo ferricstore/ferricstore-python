@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-import asyncio
+import contextlib
 import inspect
 import threading
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
 from concurrent.futures import InvalidStateError as ConcurrentInvalidStateError
 from types import TracebackType
-from typing import Any, NoReturn, TypeVar, cast
+from typing import TYPE_CHECKING, Any, NoReturn, TypeVar, cast
+
+from ferricstore.config_validation import validate_positive_int
+
+if TYPE_CHECKING:
+    import asyncio
 
 _DEFAULT_ASYNC_CLEANUP_CONCURRENCY = 16
 _T = TypeVar("_T")
@@ -78,6 +83,36 @@ class RetryableResourceSet:
             self._resources.pop(id(resource), None)
 
 
+def register_event_listener_transactionally(
+    resources: Sequence[Any],
+    listener: Callable[[], None],
+) -> bool:
+    """Attach one listener everywhere and undo partial registration on failure.
+
+    Returns whether at least one resource lacks push-listener support and
+    therefore needs polling fallback.
+    """
+
+    registered: list[Any] = []
+    poll_fallback = False
+    try:
+        for resource in resources:
+            add_listener = getattr(resource, "add_event_listener", None)
+            if callable(add_listener):
+                add_listener(listener)
+                registered.append(resource)
+            else:
+                poll_fallback = True
+    except BaseException:
+        for resource in reversed(registered):
+            remove_listener = getattr(resource, "remove_event_listener", None)
+            if callable(remove_listener):
+                with contextlib.suppress(BaseException):
+                    remove_listener(listener)
+        raise
+    return poll_fallback
+
+
 class AsyncCloseTaskRegistry:
     """Retain independently owned async close operations across deadline retries."""
 
@@ -90,6 +125,8 @@ class AsyncCloseTaskRegistry:
         close: Callable[[], Any],
         wait: Callable[[asyncio.Future[Any]], Awaitable[Any]],
     ) -> Any:
+        import asyncio
+
         identity = id(resource)
         state = self._tasks.get(identity)
         if state is not None:
@@ -253,15 +290,34 @@ class AsyncCloseCoordinator:
     def started(self) -> bool:
         return self._started
 
-    async def run(self, close: Callable[[], Awaitable[Any]]) -> None:
-        if self._complete:
-            return
+    @property
+    def current_task(self) -> asyncio.Future[Any] | None:
+        return self._task
+
+    def task(self, close: Callable[[], Awaitable[Any]]) -> asyncio.Future[Any]:
+        """Return the shared cleanup task without coupling it to a caller wait."""
+        import asyncio
+
         task = self._task
+        if task is not None and task.done() and (task.cancelled() or task.exception() is not None):
+            self._task = None
+            task = None
         if task is None:
+            if self._complete:
+                task = asyncio.get_running_loop().create_future()
+                task.set_result(None)
+                self._task = task
+                return task
             self._started = True
             task = asyncio.ensure_future(close())
             self._task = task
             task.add_done_callback(self._close_finished)
+        return task
+
+    async def run(self, close: Callable[[], Awaitable[Any]]) -> None:
+        if self._complete:
+            return
+        task = self.task(close)
 
         try:
             await await_cancellation_safe(task)
@@ -291,6 +347,8 @@ def consume_async_future_exception(future: asyncio.Future[Any]) -> None:
 
 def try_set_future_result(future: Any, result: Any) -> bool:
     """Complete a future without losing a concurrent cancellation/completion race."""
+    import asyncio
+
     try:
         future.set_result(result)
     except (asyncio.InvalidStateError, ConcurrentInvalidStateError):
@@ -300,6 +358,8 @@ def try_set_future_result(future: Any, result: Any) -> bool:
 
 def try_set_future_exception(future: Any, error: BaseException) -> bool:
     """Fail a future without allowing completion races to abort resource cleanup."""
+    import asyncio
+
     try:
         future.set_exception(error)
     except (asyncio.InvalidStateError, ConcurrentInvalidStateError):
@@ -309,6 +369,8 @@ def try_set_future_exception(future: Any, error: BaseException) -> bool:
 
 async def await_cancellation_safe(awaitable: Awaitable[_T]) -> _T:
     """Keep independently owned cleanup running if its caller is cancelled."""
+    import asyncio
+
     task = asyncio.ensure_future(awaitable)
     try:
         return await asyncio.shield(task)
@@ -328,6 +390,13 @@ def raise_primary_with_cleanup(
     raise primary.with_traceback(traceback)
 
 
+def chain_cleanup_errors(
+    errors: Sequence[BaseException | None],
+) -> BaseException | None:
+    """Retain every cleanup failure in deterministic attempt order."""
+    return _chain_cleanup_errors([error for error in errors if error is not None])
+
+
 def close_resources_sync(resources: Sequence[Callable[[], Any]]) -> None:
     """Attempt every cleanup in order and preserve the first failure."""
     errors: list[tuple[BaseException, TracebackType | None]] = []
@@ -345,8 +414,9 @@ async def close_resources_async(
     max_concurrency: int = _DEFAULT_ASYNC_CLEANUP_CONCURRENCY,
 ) -> None:
     """Cancellation-safe, bounded async cleanup that attempts every resource."""
-    if max_concurrency <= 0:
-        raise ValueError("max_concurrency must be positive")
+    import asyncio
+
+    max_concurrency = validate_positive_int(max_concurrency, name="max_concurrency")
     if not resources:
         return
 

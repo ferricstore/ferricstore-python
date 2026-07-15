@@ -18,6 +18,7 @@ from ferricstore import (
     OverloadedError,
     StaleLeaseError,
 )
+from ferricstore.async_commands import AsyncDataCommandsMixin
 from ferricstore.backpressure import BackpressureController
 from ferricstore.commands import DataCommandsMixin
 from ferricstore.errors import InvalidCommandError
@@ -755,14 +756,21 @@ def test_async_session_and_blocking_helpers_are_named_commands():
 
 def test_async_data_command_helper_parity_with_sync_mixin():
     sync_methods = {
-        name
+        name: value
         for name, value in DataCommandsMixin.__dict__.items()
         if callable(value) and not name.startswith("_")
     }
-    missing = sorted(name for name in sync_methods if not hasattr(AsyncFlowClient, name))
+    async_methods = {
+        name: value
+        for name, value in AsyncDataCommandsMixin.__dict__.items()
+        if callable(value) and not name.startswith("_")
+    }
 
-    assert missing == []
-    for name in sync_methods - {"command"}:
+    assert async_methods.keys() == sync_methods.keys()
+    for name, sync_method in sync_methods.items():
+        assert inspect.signature(async_methods[name]) == inspect.signature(sync_method), name
+    for name in sync_methods.keys() - {"command"}:
+        assert getattr(AsyncFlowClient, name) is async_methods[name]
         assert inspect.iscoroutinefunction(getattr(AsyncFlowClient, name)), name
 
 
@@ -1418,7 +1426,7 @@ def test_async_reclaim_exposes_claim_due_response_options_and_partitions():
             "order",
             worker="worker-1",
             partition_keys=["p1", "p2"],
-            priority=5,
+            priority=2,
             limit=10,
             now_ms=100,
             include_record=False,
@@ -1444,7 +1452,7 @@ def test_async_reclaim_exposes_claim_due_response_options_and_partitions():
             "p1",
             "p2",
             "PRIORITY",
-            5,
+            2,
             "RETURN",
             "JOBS_COMPACT_ATTRS",
             "NOPAYLOAD",
@@ -1522,7 +1530,7 @@ def test_async_enqueue_many_groups_explicit_partitions_and_pins_one_now(monkeypa
         }
         assert {call[call.index("NOW") + 1] for call in executor.calls} == {123_456}
 
-    monkeypatch.setattr(async_client_module, "_now_ms", lambda: 123_456)
+    monkeypatch.setattr("ferricstore.async_client_producer._now_ms", lambda: 123_456)
     run(main())
 
 
@@ -2433,7 +2441,9 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
 
         schedule = await client.schedule_create(
             "daily-report",
-            target={"id": "flow-1", "type": "report", "state": "queued"},
+            target={"id_prefix": "flow", "type": "report", "state": "queued"},
+            kind="cron",
+            cron="0 9 * * *",
             timezone="Asia/Jerusalem",
             overwrite=True,
             now_ms=100,
@@ -2444,10 +2454,14 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         assert executor.calls[-1] == (
             "FLOW.SCHEDULE.CREATE",
             "daily-report",
+            "KIND",
+            "cron",
+            "CRON",
+            "0 9 * * *",
             "TIMEZONE",
             "Asia/Jerusalem",
             "TARGET",
-            {"id": "flow-1", "type": "report", "state": "queued"},
+            {"id_prefix": "flow", "type": "report", "state": "queued"},
             "OVERWRITE",
             "true",
             "NOW",
@@ -2501,6 +2515,8 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         effect = await client.effect_confirm(
             "flow-1",
             "send-email",
+            lease_token=b"lease",
+            fencing_token=7,
             external_id="mail-1",
             latency_ms=42,
         )
@@ -2511,6 +2527,10 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
             "flow-1",
             "EFFECT_KEY",
             "send-email",
+            "LEASE_TOKEN",
+            b"lease",
+            "FENCING",
+            7,
             "EXTERNAL_ID",
             "mail-1",
             "LATENCY_MS",
@@ -2520,6 +2540,8 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         effect = await client.effect_fail(
             "flow-1",
             "send-email",
+            lease_token=b"lease",
+            fencing_token=7,
             error="smtp down",
             reason="provider_unavailable",
             latency_ms=84,
@@ -2531,6 +2553,10 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
             "flow-1",
             "EFFECT_KEY",
             "send-email",
+            "LEASE_TOKEN",
+            b"lease",
+            "FENCING",
+            7,
             "ERROR",
             "smtp down",
             "REASON",

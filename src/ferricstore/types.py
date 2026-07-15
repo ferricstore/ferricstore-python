@@ -1,102 +1,40 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, fields
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from ferricstore.config_validation import (
+    validate_optional_positive_int,
+    validate_positive_int,
+)
+from ferricstore.model_core import (
+    _bytes,
+    _get,
+    _int,
+    _MappingResult,
+    _normalize_ref_meta,
+    _optional_int,
+    _optional_str,
+    _optional_str_or_int,
+    _raw_map,
+    _str,
+    _str_key_map,
+)
+from ferricstore.schedule_types import ScheduleResult as ScheduleResult
 
-class ExceptionPolicy(str, Enum):
-    """Policy for unexpected Python handler exceptions."""
-
-    RETRY = "retry"
-    FAIL = "fail"
-    RAISE = "raise"
-
-
-_EXCEPTION_POLICY_VALUES = {policy.value for policy in ExceptionPolicy}
-
-
-def normalize_exception_policy(
-    value: ExceptionPolicy | str | None,
-    *,
-    argument: str = "exception_policy",
-) -> str:
-    if value is None:
-        return ExceptionPolicy.RETRY.value
-    if isinstance(value, ExceptionPolicy):
-        return value.value
-    if isinstance(value, str) and value in _EXCEPTION_POLICY_VALUES:
-        return value
-    raise ValueError(
-        f"{argument} must be ExceptionPolicy.RETRY, ExceptionPolicy.FAIL, "
-        "ExceptionPolicy.RAISE, or 'retry', 'fail', 'raise'"
+if TYPE_CHECKING:
+    from ferricstore.retry_policy import RetryPolicy as RetryPolicy
+    from ferricstore.worker_config import ExceptionPolicy as ExceptionPolicy
+    from ferricstore.worker_config import ValueConfig as ValueConfig
+    from ferricstore.worker_config import WorkerConfig as WorkerConfig
+    from ferricstore.worker_config import (
+        normalize_exception_policy as normalize_exception_policy,
     )
-
-
-def _get(mapping: dict[Any, Any], key: str, default: Any = None) -> Any:
-    if key in mapping:
-        return mapping[key]
-    raw = key.encode()
-    if raw in mapping:
-        return mapping[raw]
-    return default
-
-
-def _str(value: Any, default: str = "") -> str:
-    if value is None:
-        return default
-    if isinstance(value, bytes):
-        return value.decode()
-    return str(value)
-
-
-def _bytes(value: Any) -> bytes:
-    if value is None:
-        return b""
-    if isinstance(value, bytes):
-        return value
-    return str(value).encode()
-
-
-def _int(value: Any, default: int = 0) -> int:
-    if value is None:
-        return default
-    return int(value)
-
-
-def _optional_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    return int(value)
-
-
-def _str_key_map(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        return {}
-    return {_str(key): _normalize_ref_meta(item) for key, item in value.items()}
-
-
-def _normalize_ref_meta(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {_str(key): _normalize_ref_meta(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_normalize_ref_meta(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_normalize_ref_meta(item) for item in value)
-    if isinstance(value, bytes):
-        return value.decode()
-    return value
-
-
-@dataclass(frozen=True, slots=True)
-class RetryPolicy:
-    max_retries: int = 3
-    backoff: str = "fixed"
-    base_ms: int = 100
-    max_ms: int = 1_000
-    jitter_pct: int = 0
-    exhausted_to: str = "failed"
+    from ferricstore.worker_config import (
+        resolve_worker_connection_counts as resolve_worker_connection_counts,
+    )
 
 
 class FlowStateMode(str, Enum):
@@ -138,6 +76,9 @@ class FlowStatePolicy:
     mode: FlowStateMode | str | None = None
     retry: RetryPolicy | None = None
 
+    def __post_init__(self) -> None:
+        normalize_flow_state_mode(self.mode)
+
     @classmethod
     def fifo(cls, *, retry: RetryPolicy | None = None) -> FlowStatePolicy:
         return cls(mode=FlowStateMode.FIFO, retry=retry)
@@ -147,7 +88,10 @@ class FlowStatePolicy:
         return cls(mode=FlowStateMode.PARALLEL, retry=retry)
 
 
-FlowStatePolicyLike = RetryPolicy | FlowStatePolicy
+if TYPE_CHECKING:
+    FlowStatePolicyLike = RetryPolicy | FlowStatePolicy
+else:
+    FlowStatePolicyLike = Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +109,17 @@ class BudgetPolicy:
     window_ms: int | None = None
     usage_key: str = "amount"
     attribute_prefix: str = "governance_budget"
+
+    def __post_init__(self) -> None:
+        if not callable(self.scope) and not (isinstance(self.scope, str) and self.scope != ""):
+            raise ValueError("scope must be a non-empty string or callable")
+        validate_positive_int(self.amount, name="amount")
+        validate_optional_positive_int(self.limit, name="limit")
+        validate_optional_positive_int(self.window_ms, name="window_ms")
+        if not isinstance(self.usage_key, str) or not self.usage_key:
+            raise ValueError("usage_key must be a non-empty string")
+        if not isinstance(self.attribute_prefix, str) or not self.attribute_prefix:
+            raise ValueError("attribute_prefix must be a non-empty string")
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,26 +204,6 @@ class BudgetResult:
 
     def items(self) -> Iterator[tuple[str, Any]]:
         return iter(self.to_dict().items())
-
-
-class _MappingResult:
-    raw: dict[str, Any] | None
-
-    def to_dict(self) -> dict[str, Any]:
-        return dict(self.raw or {})
-
-    def __getitem__(self, key: str) -> Any:
-        return self.to_dict()[key]
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self.to_dict().get(key, default)
-
-    def items(self) -> Iterator[tuple[str, Any]]:
-        return iter(self.to_dict().items())
-
-
-def _raw_map(value: dict[Any, Any]) -> dict[str, Any]:
-    return {_str(key): _normalize_ref_meta(item) for key, item in value.items()}
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,6 +296,9 @@ class EffectResult(_MappingResult):
 
     id: str = ""
     flow_id: str = ""
+    partition_key: str | None = None
+    flow_type: str | None = None
+    state: str | None = None
     effect_key: str = ""
     effect_type: str = ""
     status: str = ""
@@ -371,6 +309,11 @@ class EffectResult(_MappingResult):
     reason: str | None = None
     operation_digest: str | None = None
     idempotency_key: str | None = None
+    policy_hash: str | None = None
+    policy_version: str | int | None = None
+    latency_ms: int | None = None
+    created_at_ms: int | None = None
+    updated_at_ms: int | None = None
     reserved_at_ms: int | None = None
     confirmed_at_ms: int | None = None
     failed_at_ms: int | None = None
@@ -380,12 +323,22 @@ class EffectResult(_MappingResult):
     @classmethod
     def from_resp(cls, value: dict[Any, Any]) -> EffectResult:
         raw = _raw_map(value)
+        status = _str(raw.get("status"))
+        created_at_ms = _optional_int(raw.get("created_at_ms"))
+        updated_at_ms = _optional_int(raw.get("updated_at_ms"))
+        reserved_at_ms = _optional_int(raw.get("reserved_at_ms"))
+        confirmed_at_ms = _optional_int(raw.get("confirmed_at_ms"))
+        failed_at_ms = _optional_int(raw.get("failed_at_ms"))
+        compensated_at_ms = _optional_int(raw.get("compensated_at_ms"))
         return cls(
             id=_str(raw.get("id")),
             flow_id=_str(raw.get("flow_id")),
+            partition_key=_optional_str(raw.get("partition_key")),
+            flow_type=_optional_str(raw.get("type")),
+            state=_optional_str(raw.get("state")),
             effect_key=_str(raw.get("effect_key")),
             effect_type=_str(raw.get("effect_type")),
-            status=_str(raw.get("status")),
+            status=status,
             decision=_optional_str(raw.get("decision")),
             scope=_optional_str(raw.get("scope")),
             external_id=_optional_str(raw.get("external_id")),
@@ -393,10 +346,21 @@ class EffectResult(_MappingResult):
             reason=_optional_str(raw.get("reason")),
             operation_digest=_optional_str(raw.get("operation_digest")),
             idempotency_key=_optional_str(raw.get("idempotency_key")),
-            reserved_at_ms=_optional_int(raw.get("reserved_at_ms")),
-            confirmed_at_ms=_optional_int(raw.get("confirmed_at_ms")),
-            failed_at_ms=_optional_int(raw.get("failed_at_ms")),
-            compensated_at_ms=_optional_int(raw.get("compensated_at_ms")),
+            policy_hash=_optional_str(raw.get("policy_hash")),
+            policy_version=_optional_str_or_int(raw.get("policy_version")),
+            latency_ms=_optional_int(raw.get("latency_ms")),
+            created_at_ms=created_at_ms,
+            updated_at_ms=updated_at_ms,
+            reserved_at_ms=created_at_ms if reserved_at_ms is None else reserved_at_ms,
+            confirmed_at_ms=(updated_at_ms if status == "confirmed" else None)
+            if confirmed_at_ms is None
+            else confirmed_at_ms,
+            failed_at_ms=(updated_at_ms if status == "failed" else None)
+            if failed_at_ms is None
+            else failed_at_ms,
+            compensated_at_ms=(updated_at_ms if status == "compensated" else None)
+            if compensated_at_ms is None
+            else compensated_at_ms,
             raw=raw,
         )
 
@@ -412,9 +376,10 @@ class ApprovalResult(_MappingResult):
     reason: str | None = None
     requested_by: str | None = None
     approver: str | None = None
+    decision_reason: str | None = None
     assignees: list[str] | None = None
     policy_hash: str | None = None
-    policy_version: str | None = None
+    policy_version: str | int | None = None
     requested_at_ms: int | None = None
     decided_at_ms: int | None = None
     expires_at_ms: int | None = None
@@ -431,15 +396,22 @@ class ApprovalResult(_MappingResult):
             status=_str(raw.get("status")),
             reason=_optional_str(raw.get("reason")),
             requested_by=_optional_str(raw.get("requested_by")),
-            approver=_optional_str(raw.get("approver")),
+            approver=_optional_str(raw.get("approver", raw.get("decided_by"))),
+            decision_reason=_optional_str(raw.get("decision_reason")),
             assignees=[_str(item) for item in assignees] if isinstance(assignees, list) else None,
             policy_hash=_optional_str(raw.get("policy_hash")),
-            policy_version=_optional_str(raw.get("policy_version")),
+            policy_version=_optional_str_or_int(raw.get("policy_version")),
             requested_at_ms=_optional_int(raw.get("requested_at_ms")),
             decided_at_ms=_optional_int(raw.get("decided_at_ms")),
             expires_at_ms=_optional_int(raw.get("expires_at_ms")),
             raw=raw,
         )
+
+    @property
+    def decided_by(self) -> str | None:
+        """KV-native alias for ``approver``."""
+
+        return self.approver
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,10 +434,12 @@ class CircuitBreakerStatus(_MappingResult):
     half_open_success_threshold: int = 1
     half_open_in_flight: int = 0
     half_open_successes: int = 0
+    half_open_started_at_ms: int | None = None
     last_failure_ms: int | None = None
     last_success_ms: int | None = None
     updated_at_ms: int | None = None
     events: list[dict[str, Any]] | None = None
+    event_count: int = 0
     retry_after_ms: int | None = None
     raw: dict[str, Any] | None = None
 
@@ -491,50 +465,13 @@ class CircuitBreakerStatus(_MappingResult):
             half_open_success_threshold=_int(raw.get("half_open_success_threshold") or 1),
             half_open_in_flight=_int(raw.get("half_open_in_flight")),
             half_open_successes=_int(raw.get("half_open_successes")),
+            half_open_started_at_ms=_optional_int(raw.get("half_open_started_at_ms")),
             last_failure_ms=_optional_int(raw.get("last_failure_ms")),
             last_success_ms=_optional_int(raw.get("last_success_ms")),
             updated_at_ms=_optional_int(raw.get("updated_at_ms")),
             events=raw.get("events") if isinstance(raw.get("events"), list) else None,
+            event_count=_int(raw.get("event_count")),
             retry_after_ms=_optional_int(raw.get("retry_after_ms")),
-            raw=raw,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class ScheduleResult(_MappingResult):
-    """Typed response for Flow scheduler commands."""
-
-    id: str = ""
-    kind: str = ""
-    status: str = ""
-    target: dict[str, Any] | None = None
-    timezone: str | None = None
-    cron: str | None = None
-    overlap_policy: str | None = None
-    next_fire_at_ms: int | None = None
-    last_fire_at_ms: int | None = None
-    fires: int = 0
-    max_fires: int | None = None
-    end_at_ms: int | None = None
-    raw: dict[str, Any] | None = None
-
-    @classmethod
-    def from_resp(cls, value: dict[Any, Any]) -> ScheduleResult:
-        raw = _raw_map(value)
-        target = raw.get("target")
-        return cls(
-            id=_str(raw.get("id")),
-            kind=_str(raw.get("kind")),
-            status=_str(raw.get("status")),
-            target=target if isinstance(target, dict) else None,
-            timezone=_optional_str(raw.get("timezone")),
-            cron=_optional_str(raw.get("cron")),
-            overlap_policy=_optional_str(raw.get("overlap_policy")),
-            next_fire_at_ms=_optional_int(raw.get("next_fire_at_ms")),
-            last_fire_at_ms=_optional_int(raw.get("last_fire_at_ms")),
-            fires=_int(raw.get("fires")),
-            max_fires=_optional_int(raw.get("max_fires")),
-            end_at_ms=_optional_int(raw.get("end_at_ms")),
             raw=raw,
         )
 
@@ -547,6 +484,7 @@ class GovernanceOverview(_MappingResult):
     approvals: list[ApprovalResult] | None = None
     budgets: list[BudgetResult] | None = None
     limits: list[dict[str, Any]] | None = None
+    circuits: list[CircuitBreakerStatus] | None = None
     effects: list[EffectResult] | None = None
     raw: dict[str, Any] | None = None
 
@@ -555,6 +493,7 @@ class GovernanceOverview(_MappingResult):
         raw = _raw_map(value)
         approvals = raw.get("approvals")
         budgets = raw.get("budgets")
+        circuits = raw.get("circuits")
         effects = raw.get("effects")
         limits = raw.get("limits")
         counts = raw.get("counts")
@@ -571,115 +510,16 @@ class GovernanceOverview(_MappingResult):
             limits=[_raw_map(item) for item in limits if isinstance(item, dict)]
             if isinstance(limits, list)
             else None,
+            circuits=[
+                CircuitBreakerStatus.from_resp(item) for item in circuits if isinstance(item, dict)
+            ]
+            if isinstance(circuits, list)
+            else None,
             effects=[EffectResult.from_resp(item) for item in effects if isinstance(item, dict)]
             if isinstance(effects, list)
             else None,
             raw=raw,
         )
-
-
-@dataclass(frozen=True, slots=True)
-class ValueConfig:
-    """Named-value hydration defaults for queue/workflow handlers.
-
-    Keep ``local_cache`` disabled unless a handler reads the same named value
-    repeatedly. Large values should stay explicit and capped with
-    ``value_max_bytes``.
-    """
-
-    value_max_bytes: int | None = None
-    local_cache: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class WorkerConfig:
-    """Runtime defaults for high-level queue/workflow workers.
-
-    The normal knobs are ``concurrency``, ``batch_size``, ``lease_ms``,
-    retry/exception policy, and named-value hydration. ``command_connections``
-    and ``claim_connections`` are advanced transport overrides: for
-    ``ferric://`` high-level clients, the latency-first default is one
-    multiplexed protocol connection unless the caller explicitly opts into more.
-    """
-
-    workers: int | None = None
-    concurrency: int | None = None
-    command_connections: int | None = None
-    claim_connections: int | None = None
-    batch_size: int | None = 10
-    lease_ms: int | None = None
-    priority: int | None = None
-    reclaim_expired: bool | None = None
-    reclaim_ratio: int | None = None
-    claim_values: Sequence[str] | None = None
-    value_max_bytes: int | None = None
-    block_ms: int | None = None
-    claim_scan_block_ms: int | None = None
-    idle_sleep_s: float | None = None
-    max_idle_sleep_s: float | None = None
-    exception_policy: ExceptionPolicy | str | None = None
-    complete_independent: bool | None = None
-    claim_partition_batch_size: int | None = 1
-    claim_drain_batches: int | None = None
-    claim_prefetch: int | None = None
-    protocol_wake_hints: bool | None = None
-    scan_before_blocking: bool | None = None
-    complete_async_depth: int | None = None
-    fuse_complete_claim: bool | None = None
-    apply_async_depth: int | None = 0
-    server_shards: int | None = None
-    producer_loop_thread: bool | None = None
-    empty_claim_cooldown_s: float | None = None
-    partial_claim_cooldown_s: float | None = None
-
-    def to_kwargs(self, allowed: set[str] | frozenset[str] | None = None) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {}
-        for field in fields(self):
-            name = field.name
-            if allowed is not None and name not in allowed:
-                continue
-            value = getattr(self, name)
-            if value is not None:
-                kwargs[name] = value
-        return kwargs
-
-
-def resolve_worker_connection_counts(
-    *,
-    workers: int | None = None,
-    concurrency: int | None = None,
-    command_connections: int | None = None,
-    claim_connections: int | None = None,
-    worker_config: WorkerConfig | None = None,
-    default_workers: int = 1,
-) -> tuple[int, int]:
-    """Return bounded command/claim pool sizes for blocking worker clients."""
-
-    if worker_config is not None:
-        workers = workers if workers is not None else worker_config.workers
-        concurrency = concurrency if concurrency is not None else worker_config.concurrency
-        command_connections = (
-            command_connections
-            if command_connections is not None
-            else worker_config.command_connections
-        )
-        claim_connections = (
-            claim_connections if claim_connections is not None else worker_config.claim_connections
-        )
-
-    worker_count = workers if workers is not None else concurrency
-    if worker_count is None:
-        worker_count = default_workers
-    if worker_count <= 0:
-        raise ValueError("workers/concurrency must be positive for connection sizing")
-
-    command_count = command_connections if command_connections is not None else max(2, worker_count)
-    claim_count = claim_connections if claim_connections is not None else worker_count
-    if command_count <= 0:
-        raise ValueError("command_connections must be positive")
-    if claim_count <= 0:
-        raise ValueError("claim_connections must be positive")
-    return command_count, claim_count
 
 
 @dataclass(frozen=True, slots=True)
@@ -971,7 +811,23 @@ class FlowRecord:
         )
 
 
-def _optional_str(value: Any) -> str | None:
-    if value is None or value == b"" or value == "":
-        return None
-    return _str(value)
+def __getattr__(name: str) -> Any:
+    if name == "RetryPolicy":
+        from ferricstore.retry_policy import RetryPolicy
+
+        globals()[name] = RetryPolicy
+        return RetryPolicy
+    worker_config_exports = {
+        "ExceptionPolicy",
+        "ValueConfig",
+        "WorkerConfig",
+        "normalize_exception_policy",
+        "resolve_worker_connection_counts",
+    }
+    if name in worker_config_exports:
+        from ferricstore import worker_config
+
+        value = getattr(worker_config, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

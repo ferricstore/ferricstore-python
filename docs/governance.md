@@ -149,10 +149,18 @@ lease = client.limit_lease(
     ttl_ms=30_000,
 )
 
+spent_amount = 10
+spent = None
 try:
-    send_batch(lease["amount"])
+    spent = client.limit_spend("tenant:acme:email", shard_id=0, amount=spent_amount)
+    send_batch(spent_amount)
 finally:
-    client.limit_release("tenant:acme:email", shard_id=0, amount=50)
+    if spent is not None:
+        client.limit_release(
+            "tenant:acme:email",
+            shard_id=0,
+            amount=spent_amount,
+        )
 ```
 
 The worker fast path can use cached credits. Durable `in_use` can remain visible

@@ -126,6 +126,19 @@ only within the same transport endpoint or pool, so an overloaded cluster does
 not delay clients connected to an unrelated cluster. Set `shared=False` only
 when a producer needs an independent retry window.
 
+Timing values must be numeric, finite, and non-negative. Durations that reach a
+threading wait (`base_delay_ms`, `max_delay_ms`, worker idle timing, autobatch
+delay, close deadlines, and protocol timeout/heartbeat timing) must also fit the
+platform's maximum wait after conversion to seconds. Oversized configuration is
+rejected immediately; an oversized server `retry_after_ms` hint is capped at the
+platform limit instead of crashing a worker thread.
+
+Collection-valued options such as `states`, `partition_keys`, `partition_by`,
+and `claim_values` require a sequence of non-empty strings. A scalar string is
+rejected instead of being interpreted as one entry per character. Async
+auto-partition runtimes require `server_shards` to be an integer from 1 through
+the protocol's 1,024 routing slots.
+
 ## ExceptionPolicy
 
 `ExceptionPolicy` controls what the SDK does when Python handler code raises.
@@ -219,6 +232,11 @@ WorkerConfig(
 )
 ```
 
+`protocol_wake_hints=True` reserves one dedicated native subscription connection
+per wake coordinator. That connection is closed with the worker/coordinator, so
+filters from independent workers cannot overwrite one another or outlive their
+owner.
+
 Explicit worker kwargs always win:
 
 ```python
@@ -264,6 +282,7 @@ client = QueueClient.from_url(
     lanes=8,
     max_inflight_requests=4_096,
     max_pending_request_bytes=64 * 1024 * 1024,
+    max_batch_items=10_000,
     max_response_chunks=1_024,
     max_event_queue_size=10_000,
     max_decoded_collection_items=100_000,
@@ -277,6 +296,10 @@ and `lanes`. Protocol push events use a bounded deque; the default
 silently losing an event. Set it to `None` only when another layer provides a
 strict memory bound.
 
+Protocol URLs use port `6388` for `ferric://` and `6389` for `ferrics://` only
+when the port is omitted. An explicit port must be between 1 and 65535; `:0` is
+rejected rather than being interpreted as the default port.
+
 Each native connection admits at most `max_inflight_requests=4_096` requests
 and 64 MiB of cumulative encoded request data by default. Capacity is reserved
 before a frame is written and released when its response, timeout, cancellation,
@@ -287,6 +310,11 @@ protocol adapters expose `pending_request_count` and `pending_request_bytes` for
 observability. Sync futures returned by `submit_*` also expire at the adapter's
 configured `timeout`; use `timeout=None` only when lifecycle ownership supplies
 another bound.
+
+Batch planning is separately capped at `max_batch_items=10_000`. The adapter
+checks this limit before creating per-command protocol objects, including for
+compressed pipelines. Set it to `None` only when the caller has another strict
+item-count or memory bound.
 
 Chunked responses are limited to `max_response_chunks=1_024` by default in
 addition to the encoded and decompressed byte limits. This bounds continuation

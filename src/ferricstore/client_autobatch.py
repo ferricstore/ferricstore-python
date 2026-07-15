@@ -8,14 +8,26 @@ import time
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
+from ferricstore.client_autobatch_dispatch import run_autobatch_dispatcher
+from ferricstore.client_autobatch_queue import (
+    drain_reentrant_until,
+    pending_future_done,
+    take_pending_locked,
+)
 from ferricstore.client_helpers import (
     _FLOW_MANY_BATCH_LIMIT,
     _auto_partition_key_for_id,
     _batch_key_value,
     _batch_named_key,
     _flow_return,
+)
+from ferricstore.config_validation import (
+    validate_positive_int,
+    validate_thread_wait_milliseconds,
+    validate_thread_wait_seconds,
 )
 from ferricstore.errors import FerricStoreError
 from ferricstore.lifecycle_core import (
@@ -41,6 +53,8 @@ class _BatchOp:
     key: tuple[Any, ...]
     args: dict[str, Any]
     future: Future[Any]
+    queued: bool = False
+    cancelled_while_queued: bool = False
 
 
 class AutobatchFlowClient:
@@ -54,15 +68,19 @@ class AutobatchFlowClient:
         max_delay_ms: float = 1.0,
         max_pending: int = 10_000,
     ) -> None:
-        if max_pending <= 0:
-            raise ValueError("max_pending must be positive")
+        max_batch = validate_positive_int(max_batch, name="max_batch")
+        max_pending = validate_positive_int(max_pending, name="max_pending")
+        delay_ms = validate_thread_wait_milliseconds(max_delay_ms, name="max_delay_ms")
+        delay_s = delay_ms / 1000.0
         self.client = client
         self.max_batch = min(_FLOW_MANY_BATCH_LIMIT, max(1, max_batch))
-        self.max_delay_s = max(0.0, max_delay_ms) / 1000.0
+        self.max_delay_s = delay_s
         self.max_pending = max_pending
         self._condition = threading.Condition()
         self._pending: deque[_BatchOp] = deque()
+        self._cancelled_pending = 0
         self._closed = False
+        self._terminal_error: BaseException | None = None
         self._worker = threading.Thread(
             target=self._run, name="ferricstore-flow-autobatch", daemon=True
         )
@@ -73,6 +91,8 @@ class AutobatchFlowClient:
         return getattr(self.client, name)
 
     def close(self, timeout: float | None = 5.0) -> None:
+        if timeout is not None:
+            timeout = validate_thread_wait_seconds(timeout, name="close timeout")
         with self._condition:
             self._closed = True
             self._condition.notify_all()
@@ -638,46 +658,35 @@ class AutobatchFlowClient:
             with self._condition:
                 while len(self._pending) >= self.max_pending and not self._closed:
                     if reentrant:
-                        immediate = self._take_pending_locked()
+                        immediate = take_pending_locked(self)
                         break
                     self._condition.wait()
                 if self._closed:
+                    if self._terminal_error is not None:
+                        raise RuntimeError("autobatch dispatcher failed") from self._terminal_error
                     raise RuntimeError("autobatch client is closed")
                 if not immediate:
+                    op.queued = True
                     self._pending.append(op)
+                    op.future.add_done_callback(partial(pending_future_done, self, op))
                     self._condition.notify()
                     break
             self._process_ops(immediate)
 
         if reentrant:
-            self._drain_reentrant_until(op.future)
+            drain_reentrant_until(self, op.future)
 
     def _run(self) -> None:
-        while True:
-            ops = self._take_batch()
-            if not ops:
-                return
-            self._process_ops(ops)
+        run_autobatch_dispatcher(self)
 
     def _process_ops(self, ops: builtins.list[_BatchOp]) -> None:
+        active = [op for op in ops if op.future.set_running_or_notify_cancel()]
+        if not active:
+            return
         try:
-            self._flush_ops(ops)
+            self._flush_ops(active)
         except BaseException as exc:
-            self._fail_group(ops, exc)
-
-    def _take_pending_locked(self) -> builtins.list[_BatchOp]:
-        count = min(self.max_batch, len(self._pending))
-        ops = [self._pending.popleft() for _ in range(count)]
-        self._condition.notify_all()
-        return ops
-
-    def _drain_reentrant_until(self, target: Future[Any]) -> None:
-        while not target.done():
-            with self._condition:
-                ops = self._take_pending_locked()
-            if not ops:
-                raise RuntimeError("autobatch reentrant operation was not queued")
-            self._process_ops(ops)
+            self._fail_group(active, exc)
 
     def _take_batch(self) -> builtins.list[_BatchOp]:
         with self._condition:
@@ -687,13 +696,17 @@ class AutobatchFlowClient:
                 return []
 
             deadline = time.monotonic() + self.max_delay_s
-            while len(self._pending) < self.max_batch and not self._closed:
+            while (
+                len(self._pending) < self.max_batch
+                and not self._closed
+                and not self.__dict__.get("_cancelled_pending", 0)
+            ):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 self._condition.wait(remaining)
 
-            return self._take_pending_locked()
+            return take_pending_locked(self)
 
     def _flush_ops(self, ops: builtins.list[_BatchOp]) -> None:
         groups: builtins.list[builtins.list[_BatchOp]] = []

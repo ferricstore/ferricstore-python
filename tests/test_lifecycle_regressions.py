@@ -8,10 +8,106 @@ from typing import Any
 
 import pytest
 
+import ferricstore.async_wake as async_wake_module
+import ferricstore.worker_core as worker_core_module
 from ferricstore import complete
+from ferricstore.async_producer import AsyncProducerLoop
+from ferricstore.async_wake import AsyncFlowWakeCoordinator
 from ferricstore.async_worker import AsyncQueueFlow, AsyncQueueFlowWorker, AsyncWorkflow
 from ferricstore.lifecycle_core import SyncCloseTaskRegistry
 from ferricstore.protocol_lifecycle import SyncDeadlineScheduler
+from ferricstore.worker_core import CloseDeadline, CloseTimeoutError
+
+
+def test_async_producer_loop_retries_client_close_before_retiring_thread() -> None:
+    class RetryableCloseClient:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def ping(self) -> str:
+            return "PONG"
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("first close failed")
+
+    async def run() -> None:
+        client = RetryableCloseClient()
+        producer = AsyncProducerLoop(
+            "ferric://localhost:6388",
+            client_kwargs={},
+            client_factory=lambda *_args, **_kwargs: client,
+        )
+
+        assert await producer.run(lambda background: background.ping()) == "PONG"
+        thread = producer._thread
+        assert thread is not None
+
+        with pytest.raises(RuntimeError, match="first close failed"):
+            await producer.close()
+
+        assert thread.is_alive()
+        await producer.close()
+
+        assert client.close_calls == 2
+        assert thread.is_alive() is False
+
+    asyncio.run(run())
+
+
+def test_async_wake_catches_python_310_asyncio_timeout(monkeypatch: Any) -> None:
+    class LegacyAsyncioTimeout(Exception):
+        pass
+
+    async def raise_timeout(awaitable: Any, timeout: float) -> None:
+        awaitable.close()
+        raise LegacyAsyncioTimeout
+
+    async def run() -> None:
+        coordinator = AsyncFlowWakeCoordinator(
+            object(),
+            type="jobs",
+            state=None,
+            states=None,
+            partition_key=None,
+            partition_keys=None,
+            priority=None,
+            limit=1,
+            enabled=True,
+        )
+        coordinator._enabled = True
+        monkeypatch.setattr(
+            async_wake_module,
+            "AsyncioTimeoutError",
+            LegacyAsyncioTimeout,
+        )
+        monkeypatch.setattr(async_wake_module.asyncio, "wait_for", raise_timeout)
+
+        assert await coordinator.wait(0, 0.01) == (False, 0)
+
+    asyncio.run(run())
+
+
+def test_close_deadline_catches_python_310_future_timeout(monkeypatch: Any) -> None:
+    class LegacyFutureTimeout(Exception):
+        pass
+
+    class PendingFuture:
+        def done(self) -> bool:
+            return False
+
+        def result(self, *, timeout: float | None = None) -> None:
+            raise LegacyFutureTimeout
+
+    monkeypatch.setattr(
+        worker_core_module,
+        "FutureTimeoutError",
+        LegacyFutureTimeout,
+    )
+
+    with pytest.raises(CloseTimeoutError, match="close timed out"):
+        CloseDeadline.start(0.1).future_result(PendingFuture(), "close timed out")
 
 
 def test_sync_close_task_registry_rolls_back_failed_thread_start(monkeypatch: Any) -> None:
@@ -171,6 +267,90 @@ def test_async_queue_worker_reuses_timed_out_resource_close_operation() -> None:
 
         assert client.close_calls == 1
         assert client.closed.is_set() is True
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("runtime", ["worker", "queue", "workflow"])
+def test_concurrent_async_close_callers_use_independent_deadlines(runtime: str) -> None:
+    class SlowCloseClient(_BlockingClaimClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            self.close_started.set()
+            await self.release_close.wait()
+            self.closed.set()
+
+    async def run() -> None:
+        client = SlowCloseClient()
+        if runtime == "worker":
+            owner: AsyncQueueFlowWorker | AsyncQueueFlow | AsyncWorkflow = AsyncQueueFlowWorker(
+                client, type="jobs", close_client=True
+            )
+        elif runtime == "queue":
+            owner = AsyncQueueFlow(client, type="jobs")
+            owner._owns_client = True
+        else:
+            owner = AsyncWorkflow(client, type="orders", states=["queued"])
+            owner._owns_client = True
+
+        long_close = asyncio.create_task(owner.close(timeout=0.2))
+        await client.close_started.wait()
+        started = time.monotonic()
+        try:
+            with pytest.raises(CloseTimeoutError, match="close timed out"):
+                await owner.close(timeout=0.01)
+            assert time.monotonic() - started < 0.08
+            assert long_close.done() is False
+        finally:
+            client.release_close.set()
+        await long_close
+        assert client.close_calls == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("runtime", ["worker", "queue", "workflow"])
+def test_long_close_caller_can_rejoin_cleanup_after_short_caller_times_out(runtime: str) -> None:
+    class SlowCloseClient(_BlockingClaimClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            self.close_started.set()
+            await self.release_close.wait()
+            self.closed.set()
+
+    async def run() -> None:
+        client = SlowCloseClient()
+        if runtime == "worker":
+            owner: AsyncQueueFlowWorker | AsyncQueueFlow | AsyncWorkflow = AsyncQueueFlowWorker(
+                client, type="jobs", close_client=True
+            )
+        elif runtime == "queue":
+            owner = AsyncQueueFlow(client, type="jobs")
+            owner._owns_client = True
+        else:
+            owner = AsyncWorkflow(client, type="orders", states=["queued"])
+            owner._owns_client = True
+
+        short_close = asyncio.create_task(owner.close(timeout=0.01))
+        await client.close_started.wait()
+        long_close = asyncio.create_task(owner.close(timeout=0.2))
+        with pytest.raises(CloseTimeoutError, match="close timed out"):
+            await short_close
+        assert long_close.done() is False
+
+        client.release_close.set()
+        await long_close
+        assert client.close_calls == 1
 
     asyncio.run(run())
 

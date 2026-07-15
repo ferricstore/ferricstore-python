@@ -4,20 +4,21 @@ import heapq
 import threading
 from collections.abc import Callable
 
+from ferricstore.config_validation import validate_optional_positive_int
+
 DEFAULT_MAX_INFLIGHT_REQUESTS = 4_096
 DEFAULT_MAX_PENDING_REQUEST_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_BATCH_ITEMS = 10_000
 
 
 class PendingRequestCapacityError(RuntimeError):
     """Raised before a request is written when its pending budget is exhausted."""
 
 
-def validated_pending_limit(value: int | None, *, name: str) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError(f"{name} must be a positive integer or None")
-    return value
+def check_batch_item_limit(count: int, limit: int | None) -> None:
+    """Reject batches before allocating one protocol object per item."""
+    if limit is not None and count > limit:
+        raise PendingRequestCapacityError(f"protocol batch items exceed max_batch_items={limit}")
 
 
 class PendingRequestBudget:
@@ -33,11 +34,11 @@ class PendingRequestBudget:
         max_requests: int | None,
         max_bytes: int | None,
     ) -> None:
-        self.max_requests = validated_pending_limit(
+        self.max_requests = validate_optional_positive_int(
             max_requests,
             name="max_inflight_requests",
         )
-        self.max_bytes = validated_pending_limit(
+        self.max_bytes = validate_optional_positive_int(
             max_bytes,
             name="max_pending_request_bytes",
         )
