@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+import ssl
 import time
 from urllib.parse import urlparse
 
@@ -18,7 +19,11 @@ def native_is_ready(url: str) -> bool:
     try:
         from ferricstore import FlowClient
 
-        client = FlowClient.from_url(url, timeout=1.0)
+        kwargs = {}
+        ca_file = os.environ.get("FERRICSTORE_TLS_CA_FILE")
+        if ca_file:
+            kwargs["ssl_context"] = ssl.create_default_context(cafile=ca_file)
+        client = FlowClient.from_url(url, timeout=1.0, **kwargs)
         try:
             return client.command("PING") in (b"PONG", "PONG")
         finally:

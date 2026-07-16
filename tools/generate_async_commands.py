@@ -139,6 +139,7 @@ from ferricstore.command_helpers import (
     _set_args,
     _xread_args,
 )
+from ferricstore.config_validation import validate_bool
 
 {class_source}
 

@@ -52,6 +52,9 @@ class AsyncWorkflowExecutionHost(Protocol):
 async def handle_claimed_batch(
     self: AsyncWorkflowExecutionHost, state_name: str, jobs: Sequence[AsyncFlowJob]
 ) -> int:
+    if not jobs:
+        return 0
+
     handler = self.handlers.get(state_name)
     if handler is None:
         raise ValueError(f"no handler for workflow state: {state_name!r}")
@@ -60,8 +63,9 @@ async def handle_claimed_batch(
 
     async def run_one(job: AsyncFlowJob) -> Transition | Complete | Retry | Fail:
         ctx = AsyncWorkflowContext(cast(Any, self), job, state_name)
-        budget = ctx._state_budget(self.budget_policies.get(state_name))
+        budget = None
         try:
+            budget = ctx._state_budget(self.budget_policies.get(state_name))
             if budget is not None:
                 await budget.__aenter__()
             value = handler(ctx)

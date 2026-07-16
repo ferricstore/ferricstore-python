@@ -127,35 +127,36 @@ def test_protocol_urls_reject_explicit_zero_port(url: str) -> None:
     "pool_type",
     [TopologyProtocolAdapterPool, protocol_module.AsyncTopologyProtocolAdapterPool],
 )
-def test_topology_install_rejects_stale_route_epoch(pool_type: type[Any]) -> None:
+def test_topology_install_does_not_order_route_epoch_hashes(pool_type: type[Any]) -> None:
     pool = _bare_topology_pool(pool_type)
     pool._install_topology(_routing_topology(20, "new-leader.example"))
     generation = pool._topology_generation
 
-    with pytest.raises(FerricStoreError, match=r"stale.*route_epoch"):
-        pool._install_topology(_routing_topology(19, "old-leader.example"))
+    pool._install_topology(_routing_topology(19, "other-slot-map.example"))
 
-    assert pool.topology.route_epoch == 20
-    assert pool.topology.slots[0]["endpoint"]["host"] == "new-leader.example"
-    assert pool._topology_generation == generation
+    assert pool.topology.route_epoch == 19
+    assert pool.topology.slots[0]["endpoint"]["host"] == "other-slot-map.example"
+    assert pool._topology_generation == generation + 1
 
 
 @pytest.mark.parametrize(
     "pool_type",
     [TopologyProtocolAdapterPool, protocol_module.AsyncTopologyProtocolAdapterPool],
 )
-def test_topology_install_rejects_conflicting_same_epoch(pool_type: type[Any]) -> None:
+def test_topology_install_accepts_leader_change_with_same_route_epoch_hash(
+    pool_type: type[Any],
+) -> None:
     pool = _bare_topology_pool(pool_type)
     topology = _routing_topology(20, "leader-a.example")
     pool._install_topology(topology)
     generation = pool._topology_generation
 
     assert pool._install_topology(topology) == []
-    with pytest.raises(FerricStoreError, match=r"conflicting.*route_epoch"):
-        pool._install_topology(_routing_topology(20, "leader-b.example"))
+    pool._install_topology(_routing_topology(20, "leader-b.example"))
 
-    assert pool.topology == topology
-    assert pool._topology_generation == generation
+    assert pool.topology.route_epoch == topology.route_epoch
+    assert pool.topology.slots[0]["endpoint"]["host"] == "leader-b.example"
+    assert pool._topology_generation == generation + 1
 
 
 def test_tls_topology_keeps_distinct_physical_destinations() -> None:

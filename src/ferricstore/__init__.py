@@ -3,7 +3,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 _EXPORTS: dict[str, tuple[str, str]] = {
     "ApprovalResult": ("ferricstore.types", "ApprovalResult"),
@@ -53,6 +53,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "Complete": ("ferricstore.workflow_types", "Complete"),
     "CreateItem": ("ferricstore.types", "CreateItem"),
     "EffectResult": ("ferricstore.types", "EffectResult"),
+    "EffectAlreadyReservedError": ("ferricstore.errors", "EffectAlreadyReservedError"),
     "ExceptionPolicy": ("ferricstore.worker_config", "ExceptionPolicy"),
     "Fail": ("ferricstore.workflow_types", "Fail"),
     "FencedItem": ("ferricstore.types", "FencedItem"),
@@ -160,6 +161,7 @@ if TYPE_CHECKING:
     )
     from ferricstore.codecs import Codec, JsonCodec, RawCodec
     from ferricstore.errors import (
+        EffectAlreadyReservedError,
         FerricStoreError,
         FlowAlreadyExistsError,
         FlowNotFoundError,
@@ -274,6 +276,7 @@ __all__ = [
     "CommandPipeline",
     "Complete",
     "CreateItem",
+    "EffectAlreadyReservedError",
     "EffectResult",
     "ExceptionPolicy",
     "Fail",

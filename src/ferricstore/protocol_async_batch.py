@@ -6,7 +6,6 @@ from ferricstore.batch_core import require_batch_items, run_async_fanout
 from ferricstore.errors import FerricStoreError
 from ferricstore.protocol_commands import (
     _compact_pipeline_payload_from_raw,
-    build_protocol_command,
 )
 from ferricstore.protocol_common import _compact_payload_budget
 from ferricstore.protocol_constants import (
@@ -62,6 +61,8 @@ class AsyncProtocolBatchMixin:
         ) -> ProtocolResponse: ...
 
         def _response_value(self, response: ProtocolResponse) -> Any: ...
+
+        def _build_protocol_command(self, *args: Any) -> ProtocolCommand: ...
 
         def _batch_item_value(self, item: Any) -> Any: ...
 
@@ -224,7 +225,7 @@ class AsyncProtocolBatchMixin:
             return values
 
         if protocol_commands is None:
-            protocol_commands = [build_protocol_command(*command) for command in commands]
+            protocol_commands = [self._build_protocol_command(*command) for command in commands]
         if not _pipeline_frame_supported(protocol_commands):
             if routed_lane is None:
                 return [await self.execute_command(*command) for command in commands]

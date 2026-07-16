@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import struct
 from collections.abc import Callable, Sequence
 from typing import Any, cast
@@ -13,8 +14,13 @@ from ferricstore.protocol_common import (
     _coerce_bool,
     _command_name,
     _command_token,
-    _pending_request_capacity_error,
     _text,
+)
+from ferricstore.protocol_compact_budget import (
+    _binary_wire_size,
+    _bounded_maybe_bytes,
+    _bounded_optional_bytes,
+    _CompactPayloadBudget,
 )
 from ferricstore.protocol_constants import (
     _COMPACT_F64,
@@ -72,6 +78,7 @@ from ferricstore.protocol_flow_codec import (
     _compact_optional_binary,
     _maybe_bytes,
     _optional_bytes,
+    _raw_int,
 )
 from ferricstore.protocol_pipeline_mutations import (
     _compact_pipeline_hmget_payload_from_raw,
@@ -136,7 +143,7 @@ def _expected_command_collection_items(args: Sequence[Any]) -> int | None:
     name = _command_name(args[0])
     if name == "MGET":
         return max(len(args) - 1, 0)
-    if name in {"SET", "MSET"}:
+    if name == "MSET":
         return 1
     if name == "FLOW.VALUE.MGET":
         refs, _max_bytes = split_flow_value_mget(args[1:])
@@ -356,11 +363,13 @@ def _compact_zadd_pipeline_item(payload: dict[str, Any], key: bytes) -> tuple[by
         return None
     score_arg, member_arg = item
     member = _maybe_bytes(member_arg)
-    if member is None:
+    if member is None or isinstance(score_arg, bool):
         return None
     try:
         score = float(score_arg)
     except (OverflowError, TypeError, ValueError):
+        return None
+    if not math.isfinite(score):
         return None
     return _compact_binary(key), _COMPACT_F64.pack(score), _compact_binary(member)
 
@@ -487,87 +496,6 @@ def _compact_flow_get_pipeline_payload(
             parts.append(_compact_optional_binary(partition_key))
 
     return b"".join(parts)
-
-
-def _binary_wire_size(value: Any) -> int | None:
-    """Return compact length-prefix plus UTF-8 bytes without allocating the encoding."""
-    if isinstance(value, bytes):
-        return 4 + len(value)
-    if not isinstance(value, str):
-        return None
-    if value.isascii():
-        return 4 + len(value)
-    size = 4
-    for character in value:
-        codepoint = ord(character)
-        if codepoint <= 0x7F:
-            size += 1
-        elif codepoint <= 0x7FF:
-            size += 2
-        elif 0xD800 <= codepoint <= 0xDFFF:
-            return None
-        elif codepoint <= 0xFFFF:
-            size += 3
-        else:
-            size += 4
-    return size
-
-
-class _CompactPayloadBudget:
-    """Track exact compact wire bytes before each corresponding allocation."""
-
-    __slots__ = ("_max_payload_bytes", "_pending_limit", "size")
-
-    def __init__(
-        self,
-        max_payload_bytes: int | None,
-        pending_limit: int | None,
-        *,
-        initial_size: int = 0,
-    ) -> None:
-        self._max_payload_bytes = max_payload_bytes
-        self._pending_limit = pending_limit
-        self.size = 0
-        self.reserve(initial_size)
-
-    def reserve(self, size: int) -> None:
-        if self._max_payload_bytes is not None and size > self._max_payload_bytes - self.size:
-            raise _pending_request_capacity_error(self._pending_limit)
-        self.size += size
-
-
-def _bounded_maybe_bytes(
-    value: Any,
-    max_payload_bytes: int | None,
-    pending_limit: int | None,
-    *,
-    budget: _CompactPayloadBudget | None = None,
-) -> bytes | None:
-    wire_size = _binary_wire_size(value)
-    if wire_size is not None:
-        if budget is not None:
-            budget.reserve(wire_size)
-        elif max_payload_bytes is not None and wire_size > max_payload_bytes:
-            raise _pending_request_capacity_error(pending_limit)
-    return _maybe_bytes(value)
-
-
-def _bounded_optional_bytes(
-    value: Any,
-    max_payload_bytes: int | None,
-    pending_limit: int | None,
-    *,
-    budget: _CompactPayloadBudget | None = None,
-) -> bytes | None | bool:
-    if value is None:
-        return None
-    encoded = _bounded_maybe_bytes(
-        value,
-        max_payload_bytes,
-        pending_limit,
-        budget=budget,
-    )
-    return encoded if encoded is not None else False
 
 
 def _compact_flow_get_pipeline_payload_from_raw(
@@ -708,11 +636,7 @@ def _compact_flow_history_pipeline_payload_from_raw(
             value = command[option_index + 1]
 
             if option == "COUNT":
-                try:
-                    parsed_count = int(value)
-                except (OverflowError, TypeError, ValueError):
-                    return None
-                compact_count = _compact_i64(parsed_count)
+                compact_count = _compact_i64(_raw_int(value))
                 if compact_count is None:
                     return None
                 item_count = compact_count

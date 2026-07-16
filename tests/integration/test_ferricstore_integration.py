@@ -24,6 +24,7 @@ from ferricstore import (
     JsonCodec,
     RetryPolicy,
 )
+from ferricstore.command_core import normalize_command_name
 from ferricstore.commands import DataCommandsMixin
 
 pytestmark = pytest.mark.skipif(
@@ -109,23 +110,164 @@ _NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED: dict[str, str] = {
     "SELECT": "single-database compatibility command, not normal SDK app surface",
 }
 
-_NATIVE_PROTOCOL_INTEGRATION_EXERCISED: set[str] = _NATIVE_PROTOCOL_COMMANDS - set(
-    _NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED
-)
+_NATIVE_PROTOCOL_INTEGRATION_OBSERVED: set[str] = set()
+_NATIVE_PROTOCOL_INTEGRATION_OBSERVED_LOCK = threading.Lock()
+
+
+def _observe_command(args: tuple[Any, ...]) -> None:
+    if not args:
+        return
+    try:
+        name = normalize_command_name(args[0])
+        if name == "COMMAND_EXEC" and len(args) > 1:
+            name = normalize_command_name(args[1])
+    except (TypeError, ValueError):
+        return
+    names = {name}
+    if name.startswith("CLIENT."):
+        names.add("CLIENT")
+    with _NATIVE_PROTOCOL_INTEGRATION_OBSERVED_LOCK:
+        _NATIVE_PROTOCOL_INTEGRATION_OBSERVED.update(names)
+
+
+def _observe_commands(commands: list[tuple[Any, ...]]) -> None:
+    for command in commands:
+        _observe_command(command)
+
+
+class _ObservedExecutor:
+    """Record commands at the client/executor boundary used by live integration tests."""
+
+    _OPTIONAL_CAPABILITIES = frozenset(
+        {
+            "acquire_dedicated_session",
+            "acquire_session",
+            "acquire_session_for_key",
+            "acquire_session_for_keys",
+            "acquire_session_on_lane",
+            "execute_batch",
+            "execute_batch_on_lane",
+            "execute_batch_ordered",
+            "execute_command_on_lane",
+            "execute_command_with_trace",
+            "execute_command_with_trace_on_lane",
+            "submit_batch",
+            "submit_batch_on_lane",
+            "submit_command",
+            "submit_command_on_lane",
+            "submit_commands",
+            "submit_commands_on_lane",
+        }
+    )
+
+    def __init__(self, executor: Any) -> None:
+        self._executor = executor
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in object.__getattribute__(self, "_OPTIONAL_CAPABILITIES"):
+            executor = object.__getattribute__(self, "_executor")
+            if not callable(getattr(executor, name, None)):
+                raise AttributeError(name)
+        return object.__getattribute__(self, name)
+
+    def execute_command(self, *args: Any) -> Any:
+        _observe_command(args)
+        return self._executor.execute_command(*args)
+
+    def execute_command_on_lane(self, args: tuple[Any, ...], lane_id: int) -> Any:
+        _observe_command(args)
+        return self._executor.execute_command_on_lane(args, lane_id)
+
+    def execute_command_with_trace(self, *args: Any) -> Any:
+        _observe_command(args)
+        return self._executor.execute_command_with_trace(*args)
+
+    def execute_command_with_trace_on_lane(
+        self,
+        args: tuple[Any, ...],
+        lane_id: int,
+    ) -> Any:
+        _observe_command(args)
+        return self._executor.execute_command_with_trace_on_lane(args, lane_id)
+
+    def submit_command(self, *args: Any) -> Any:
+        _observe_command(args)
+        return self._executor.submit_command(*args)
+
+    def submit_command_on_lane(self, args: tuple[Any, ...], lane_id: int) -> Any:
+        _observe_command(args)
+        return self._executor.submit_command_on_lane(args, lane_id)
+
+    def execute_batch(self, commands: list[tuple[Any, ...]]) -> Any:
+        _observe_commands(commands)
+        return self._executor.execute_batch(commands)
+
+    def execute_batch_ordered(self, commands: list[tuple[Any, ...]]) -> Any:
+        _observe_commands(commands)
+        return self._executor.execute_batch_ordered(commands)
+
+    def execute_batch_on_lane(self, commands: list[tuple[Any, ...]], lane_id: int) -> Any:
+        _observe_commands(commands)
+        return self._executor.execute_batch_on_lane(commands, lane_id)
+
+    def submit_commands(self, commands: list[tuple[Any, ...]]) -> Any:
+        _observe_commands(commands)
+        return self._executor.submit_commands(commands)
+
+    def submit_commands_on_lane(self, commands: list[tuple[Any, ...]], lane_id: int) -> Any:
+        _observe_commands(commands)
+        return self._executor.submit_commands_on_lane(commands, lane_id)
+
+    def submit_batch(self, commands: list[tuple[Any, ...]]) -> Any:
+        _observe_commands(commands)
+        return self._executor.submit_batch(commands)
+
+    def submit_batch_on_lane(self, commands: list[tuple[Any, ...]], lane_id: int) -> Any:
+        _observe_commands(commands)
+        return self._executor.submit_batch_on_lane(commands, lane_id)
+
+    def acquire_session(self, *args: Any, **kwargs: Any) -> _ObservedExecutor:
+        return _ObservedExecutor(self._executor.acquire_session(*args, **kwargs))
+
+    def acquire_session_for_key(self, *args: Any, **kwargs: Any) -> _ObservedExecutor:
+        return _ObservedExecutor(self._executor.acquire_session_for_key(*args, **kwargs))
+
+    def acquire_session_for_keys(self, *args: Any, **kwargs: Any) -> _ObservedExecutor:
+        return _ObservedExecutor(self._executor.acquire_session_for_keys(*args, **kwargs))
+
+    def acquire_dedicated_session(self, *args: Any, **kwargs: Any) -> _ObservedExecutor:
+        return _ObservedExecutor(self._executor.acquire_dedicated_session(*args, **kwargs))
+
+    def acquire_session_on_lane(self, *args: Any, **kwargs: Any) -> _ObservedExecutor:
+        return _ObservedExecutor(self._executor.acquire_session_on_lane(*args, **kwargs))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._executor, name)
+
+
+def _observe_client(client: FlowClient) -> FlowClient:
+    executor = client.executor._executor
+    if not isinstance(executor, _ObservedExecutor):
+        client.executor._executor = _ObservedExecutor(executor)
+    return client
 
 
 def _client() -> FlowClient:
-    return FlowClient.from_url(
-        _integration_url(),
-        codec=JsonCodec(),
+    return _observe_client(
+        FlowClient.from_url(
+            _integration_url(),
+            codec=JsonCodec(),
+        )
     )
 
 
 def _topology_client() -> FlowClient:
-    return FlowClient.from_urls(
-        _integration_urls(),
-        codec=JsonCodec(),
-        endpoint_policy=os.environ.get("FERRICSTORE_ENDPOINT_POLICY", "any"),
+    return _observe_client(
+        FlowClient.from_urls(
+            _integration_urls(),
+            codec=JsonCodec(),
+            endpoint_policy=os.environ.get("FERRICSTORE_ENDPOINT_POLICY", "any"),
+        )
     )
 
 
@@ -232,7 +374,7 @@ def _cluster_member_count(value: Any) -> int:
     return len([item for item in _text(value).split(",") if item.strip()])
 
 
-def _wait_cluster_synced(*, timeout: float = 120.0) -> None:
+def _wait_cluster_synced(*, minimum_members: int = 3, timeout: float = 120.0) -> None:
     deadline = time.monotonic() + timeout
     last_status: Any = None
     last_error: Exception | None = None
@@ -249,7 +391,9 @@ def _wait_cluster_synced(*, timeout: float = 120.0) -> None:
             if (
                 _field(status, "sync_status") == "synced"
                 and shard_members
-                and all(_cluster_member_count(members) >= 3 for members in shard_members)
+                and all(
+                    _cluster_member_count(members) >= minimum_members for members in shard_members
+                )
             ):
                 return
         except Exception as exc:  # pragma: no cover - exercised by Docker integration only
@@ -265,6 +409,35 @@ def _wait_cluster_synced(*, timeout: float = 120.0) -> None:
 def _require_protocol_transport() -> None:
     if not _integration_url().startswith(("ferric://", "ferrics://")):
         pytest.skip("native protocol coverage runs with FERRICSTORE_URL=ferric://...")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _assert_observed_native_protocol_coverage() -> Any:
+    with _NATIVE_PROTOCOL_INTEGRATION_OBSERVED_LOCK:
+        _NATIVE_PROTOCOL_INTEGRATION_OBSERVED.clear()
+    if os.environ.get("FERRICSTORE_SKIP_CATALOG_COVERAGE") == "1":
+        yield
+        return
+    yield
+
+    if not _integration_url().startswith(("ferric://", "ferrics://")):
+        return
+    client = _client()
+    try:
+        catalog_names = _command_catalog_names(client.command("COMMAND"))
+    finally:
+        client.close()
+
+    unknown = catalog_names - _NATIVE_PROTOCOL_COMMANDS
+    missing = (
+        catalog_names
+        - _NATIVE_PROTOCOL_INTEGRATION_OBSERVED
+        - set(_NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED)
+    )
+    assert unknown == set(), f"server command catalog is missing from SDK contract: {unknown}"
+    assert missing == set(), (
+        f"native commands were not exercised by live integration tests: {missing}"
+    )
 
 
 def _suffix() -> str:
@@ -438,18 +611,6 @@ def test_real_ferricstore_native_protocol_command_coverage_contract() -> None:
         catalog_names = _command_catalog_names(client.command("COMMAND"))
         assert catalog_names <= _NATIVE_PROTOCOL_COMMANDS
         assert set(_NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED) <= _NATIVE_PROTOCOL_COMMANDS
-        assert (
-            catalog_names
-            - _NATIVE_PROTOCOL_INTEGRATION_EXERCISED
-            - set(_NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED)
-        ) == set()
-
-        missing = (
-            _NATIVE_PROTOCOL_COMMANDS
-            - _NATIVE_PROTOCOL_INTEGRATION_EXERCISED
-            - set(_NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED)
-        )
-        assert missing == set()
     finally:
         client.close()
 
@@ -1145,6 +1306,7 @@ def test_real_ferricstore_native_protocol_store_and_admin_surface() -> None:
         assert client.command("PING") in (b"PONG", "PONG", True)
         assert _ok(client.command("CLIENT.SETNAME", f"py-sdk-native-{suffix}"))
         assert client.command("CLIENT.INFO") is not None
+        assert client.command("FERRICSTORE.DOCTOR", "LIST") is not None
         assert _ok(client.command("SET", string_key, "abc", "PX", 60_000))
         assert client.command("GET", string_key) in (b"abc", "abc")
         assert _ok(client.command("MSET", second_key, "2", third_key, "3"))
@@ -2396,7 +2558,11 @@ def test_real_ferricstore_topology_client_reroutes_after_leader_node_stop() -> N
         if stopped_url is not None:
             _wait_native_url(stopped_url, timeout=90)
         if stopped_service is not None:
-            _wait_cluster_synced(timeout=120)
+            # FerricStore removes a stopped voter before it is restarted.  The
+            # restored process is reachable again, but the surviving quorum is
+            # intentionally a two-voter membership until an administrative
+            # rejoin.  That server lifecycle is separate from SDK rerouting.
+            _wait_cluster_synced(minimum_members=2, timeout=120)
         with suppress(Exception):
             client.delete(key)
         client.close()

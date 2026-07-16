@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ferricstore"
-version = "0.4.0"
+dynamic = ["version"]
 description = "Python SDK for FerricStore and FerricFlow"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,6 +27,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Database",
   "Topic :: Software Development :: Libraries :: Python Modules",
   "Topic :: System :: Distributed Computing",
@@ -38,6 +39,7 @@ dependencies = []
 dev = [
   "bandit[toml]>=1.8,<2",
   "build>=1.2,<2",
+  "hypothesis>=6,<7",
   "pip-audit>=2.9,<3",
   "pytest>=9.0.3,<10",
   "pytest-cov>=6,<8",
@@ -45,6 +47,7 @@ dev = [
   "mypy>=1.11",
   "msgpack>=1.2.1,<2",
   "twine>=6,<7",
+  "tomli>=2,<3; python_version < '3.11'",
 ]
 
 [project.urls]
@@ -56,6 +59,9 @@ Changelog = "https://github.com/ferricstore/ferricstore-python/blob/main/CHANGEL
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ferricstore"]
+
+[tool.hatch.version]
+path = "src/ferricstore/__init__.py"
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/ferricstore/py.typed" = "ferricstore/py.typed"
@@ -107,6 +113,22 @@ omit = ["src/ferricstore/async_commands.py"]
 fail_under = 72.8
 show_missing = true
 skip_covered = false
+
+[tool.ferricstore.critical_coverage]
+"src/ferricstore/config_validation.py" = 95.0
+"src/ferricstore/errors.py" = 98.0
+"src/ferricstore/lifecycle_core.py" = 80.0
+"src/ferricstore/protocol_codec.py" = 78.0
+"src/ferricstore/protocol_command_schema.py" = 97.0
+"src/ferricstore/protocol_commands.py" = 88.0
+"src/ferricstore/protocol_compact_budget.py" = 80.0
+"src/ferricstore/protocol_framing.py" = 88.0
+"src/ferricstore/protocol_lifecycle.py" = 88.0
+"src/ferricstore/protocol_pipeline_raw.py" = 73.0
+"src/ferricstore/protocol_response_contracts.py" = 93.0
+"src/ferricstore/protocol_tls.py" = 93.0
+"src/ferricstore/topology_lifecycle.py" = 87.0
+"src/ferricstore/workflow_effect_core.py" = 80.0
 
 [tool.bandit]
 exclude_dirs = [".venv", "build", "dist"]

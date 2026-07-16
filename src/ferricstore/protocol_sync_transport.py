@@ -142,7 +142,10 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
         raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         connected_sock: socket.socket | ssl.SSLSocket
         if self.tls:
-            context = self.ssl_context or ssl.create_default_context()
+            context = self._tls_context()
+            if context is None:
+                raw_sock.close()
+                raise FerricStoreError("TLS context is unavailable")
             try:
                 raw_sock.settimeout(_timeout_with_deadline(self.timeout, deadline))
                 connected_sock = context.wrap_socket(raw_sock, server_hostname=self.host)

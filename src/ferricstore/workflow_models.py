@@ -20,7 +20,11 @@ from ferricstore.types import (
     FlowRecord,
 )
 from ferricstore.workflow_budget import WorkflowBudget as WorkflowBudget
-from ferricstore.workflow_effect_core import resolve_external_id, resolve_operation_digest
+from ferricstore.workflow_effect_core import (
+    resolve_effect_replay,
+    resolve_external_id,
+    resolve_operation_digest,
+)
 
 if TYPE_CHECKING:
     from ferricstore.client_core import FlowClient
@@ -511,6 +515,7 @@ class WorkflowEffect:
         "governance_scope",
         "idempotency_key",
         "operation_digest",
+        "replay",
         "reservation",
     )
 
@@ -524,6 +529,7 @@ class WorkflowEffect:
         idempotency_key: str | None = None,
         governance_scope: str | None = None,
         external_id: str | Callable[[Any], str | None] | None = None,
+        replay: Callable[[EffectResult], Any] | None = None,
     ) -> None:
         self.ctx = ctx
         self.effect_key = effect_key
@@ -537,6 +543,7 @@ class WorkflowEffect:
         self.idempotency_key = idempotency_key
         self.governance_scope = governance_scope
         self.external_id = external_id
+        self.replay = replay
         self.reservation: EffectResult | None = None
         self._result: EffectResult | None = None
         self._started_at: float | None = None
@@ -604,7 +611,10 @@ class WorkflowEffect:
         return self._result
 
     def call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        self.reserve()
+        reservation = self.reserve()
+        replayed, replay_value = resolve_effect_replay(reservation, self.replay)
+        if replayed:
+            return replay_value
         try:
             result = func(*args, **kwargs)
         except BaseException as exc:
@@ -819,6 +829,7 @@ class WorkflowContext:
         idempotency_key: str | None = None,
         governance_scope: str | None = None,
         external_id: str | Callable[[Any], str | None] | None = None,
+        replay: Callable[[EffectResult], Any] | None = None,
     ) -> WorkflowEffect:
         return WorkflowEffect(
             self,
@@ -828,6 +839,7 @@ class WorkflowContext:
             idempotency_key=idempotency_key,
             governance_scope=governance_scope,
             external_id=external_id,
+            replay=replay,
         )
 
     def _state_budget(self, policy: BudgetPolicy | None) -> WorkflowBudget | None:

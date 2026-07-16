@@ -216,8 +216,10 @@ class TransactionSession:
                 raise_primary_with_cleanup(exc, tb, cleanup)
 
     def execute(self) -> Any:
+        if self._active_client is None:
+            raise RuntimeError("transaction session is not active")
         self.closed = True
-        session_client = self._active_client or self.client
+        session_client = self._active_client
         try:
             result = session_client.transaction_exec()
         except BaseException as primary:
@@ -236,8 +238,10 @@ class TransactionSession:
         return result
 
     def discard(self) -> Any:
+        if self._active_client is None:
+            raise RuntimeError("transaction session is not active")
         self.closed = True
-        session_client = self._active_client or self.client
+        session_client = self._active_client
         try:
             result = session_client.discard()
         except BaseException as primary:

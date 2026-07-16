@@ -221,8 +221,10 @@ class AsyncTransactionSession:
                 raise_primary_with_cleanup(exc, tb, cleanup)
 
     async def execute(self) -> Any:
+        if self._active_client is None:
+            raise RuntimeError("transaction session is not active")
         self.closed = True
-        session_client = self._active_client or self.client
+        session_client = self._active_client
         try:
             result = await session_client.transaction_exec()
         except BaseException as primary:
@@ -241,8 +243,10 @@ class AsyncTransactionSession:
         return result
 
     async def discard(self) -> Any:
+        if self._active_client is None:
+            raise RuntimeError("transaction session is not active")
         self.closed = True
-        session_client = self._active_client or self.client
+        session_client = self._active_client
         try:
             result = await session_client.discard()
         except BaseException as primary:

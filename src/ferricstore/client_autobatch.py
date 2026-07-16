@@ -144,29 +144,33 @@ class AutobatchFlowClient:
             or correlation_id is not None
             or state_meta is not None
         ):
-            try:
-                future.set_result(
-                    self.client.create(
-                        id,
-                        type=type,
-                        state=state,
-                        payload=payload,
-                        partition_key=partition_key,
-                        parent_flow_id=parent_flow_id,
-                        root_flow_id=root_flow_id,
-                        correlation_id=correlation_id,
-                        run_at_ms=run_at_ms,
-                        now_ms=now_ms,
-                        priority=priority,
-                        idempotent=idempotent,
-                        state_meta=state_meta,
-                        values=values,
-                        value_refs=value_refs,
-                        return_record=return_record,
-                    )
+            self._enqueue(
+                _BatchOp(
+                    "direct",
+                    ("direct", builtins.id(future)),
+                    {
+                        "call": lambda: self.client.create(
+                            id,
+                            type=type,
+                            state=state,
+                            payload=payload,
+                            partition_key=partition_key,
+                            parent_flow_id=parent_flow_id,
+                            root_flow_id=root_flow_id,
+                            correlation_id=correlation_id,
+                            run_at_ms=run_at_ms,
+                            now_ms=now_ms,
+                            priority=priority,
+                            idempotent=idempotent,
+                            state_meta=state_meta,
+                            values=values,
+                            value_refs=value_refs,
+                            return_record=return_record,
+                        )
+                    },
+                    future,
                 )
-            except BaseException as exc:
-                future.set_exception(exc)
+            )
             return future
 
         auto_partition = partition_key is None
@@ -266,27 +270,31 @@ class AutobatchFlowClient:
     ) -> Future[FlowRecord | bytes]:
         future: Future[FlowRecord | bytes] = DeferredCallbackFuture()
         if return_record or partition_key is None or state_meta is not None:
-            try:
-                future.set_result(
-                    self.client.complete(
-                        id,
-                        lease_token=lease_token,
-                        fencing_token=fencing_token,
-                        partition_key=partition_key,
-                        result=result,
-                        payload=payload,
-                        values=values,
-                        value_refs=value_refs,
-                        drop_values=drop_values,
-                        override_values=override_values,
-                        state_meta=state_meta,
-                        ttl_ms=ttl_ms,
-                        now_ms=now_ms,
-                        return_record=return_record,
-                    )
+            self._enqueue(
+                _BatchOp(
+                    "direct",
+                    ("direct", builtins.id(future)),
+                    {
+                        "call": lambda: self.client.complete(
+                            id,
+                            lease_token=lease_token,
+                            fencing_token=fencing_token,
+                            partition_key=partition_key,
+                            result=result,
+                            payload=payload,
+                            values=values,
+                            value_refs=value_refs,
+                            drop_values=drop_values,
+                            override_values=override_values,
+                            state_meta=state_meta,
+                            ttl_ms=ttl_ms,
+                            now_ms=now_ms,
+                            return_record=return_record,
+                        )
+                    },
+                    future,
                 )
-            except BaseException as exc:
-                future.set_exception(exc)
+            )
             return future
 
         self._enqueue(
@@ -718,7 +726,14 @@ class AutobatchFlowClient:
         for group in groups:
             if group[0].kind == "flush":
                 for op in group:
-                    self._set_future_result(op.future, None)
+                    try_set_future_result(op.future, None)
+                continue
+            if group[0].kind == "direct":
+                for op in group:
+                    try:
+                        try_set_future_result(op.future, op.args["call"]())
+                    except BaseException as exc:
+                        try_set_future_exception(op.future, exc)
                 continue
             self._flush_group(group)
 
@@ -839,17 +854,17 @@ class AutobatchFlowClient:
                         raw=response,
                     )
                     for op in group:
-                        self._set_future_exception(op.future, error)
+                        try_set_future_exception(op.future, error)
                     return
                 for op, item in zip(group, response, strict=True):
                     item_error = many_item_error(item)
                     if item_error is None:
-                        self._set_future_result(op.future, item)
+                        try_set_future_result(op.future, item)
                     else:
-                        self._set_future_exception(op.future, item_error)
+                        try_set_future_exception(op.future, item_error)
                 return
             for op in group:
-                self._set_future_result(op.future, response)
+                try_set_future_result(op.future, response)
         finally:
             self._release_group_callbacks(deferred)
 
@@ -857,7 +872,7 @@ class AutobatchFlowClient:
         deferred = self._defer_group_callbacks(group)
         try:
             for op in group:
-                self._set_future_exception(op.future, exc)
+                try_set_future_exception(op.future, exc)
         finally:
             self._release_group_callbacks(deferred)
 
@@ -874,14 +889,6 @@ class AutobatchFlowClient:
     def _release_group_callbacks(futures: builtins.list[DeferredCallbackFuture]) -> None:
         for future in futures:
             future.release_callbacks()
-
-    @staticmethod
-    def _set_future_result(future: Future[Any], value: Any) -> None:
-        try_set_future_result(future, value)
-
-    @staticmethod
-    def _set_future_exception(future: Future[Any], exc: BaseException) -> None:
-        try_set_future_exception(future, exc)
 
     def _claimed_item(self, op: _BatchOp) -> ClaimedFlow:
         return ClaimedFlow(

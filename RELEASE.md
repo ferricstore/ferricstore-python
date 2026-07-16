@@ -31,6 +31,7 @@ bandit -q -r src/ferricstore
 pip-audit
 python -m build
 twine check dist/*
+python scripts/check_release_version.py "v$(python -c 'import ferricstore; print(ferricstore.__version__)')"
 ```
 
 Run the real FerricStore integration test:
@@ -44,11 +45,12 @@ docker compose down -v
 
 Then:
 
-1. Update `pyproject.toml` version.
+1. Update `src/ferricstore/__init__.py` `__version__` (the build reads this single source).
 2. Update README status if needed.
 3. Update benchmark docs if results are cited.
-4. Tag the release.
-5. Publish package artifacts.
+4. Tag the release with the exact version, for example `v0.4.1`.
+5. Push the tag; the publish workflow validates it, reruns unit and live-server
+   integration tests, builds the distribution, and publishes only after both jobs pass.
 
 ## Public-alpha language
 

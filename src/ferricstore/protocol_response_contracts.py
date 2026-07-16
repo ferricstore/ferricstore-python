@@ -15,7 +15,6 @@ from ferricstore.protocol_constants import (
     _OP_MGET,
     _OP_MSET,
     _OP_PIPELINE,
-    _OP_SET,
 )
 
 
@@ -28,7 +27,6 @@ _RESPONSE_CARDINALITY_POLICIES = {
     _OP_PIPELINE: _CardinalityPolicy.EXACT_COLLECTION,
     _OP_MGET: _CardinalityPolicy.EXACT_COLLECTION,
     _OP_FLOW_VALUE_MGET: _CardinalityPolicy.EXACT_COLLECTION,
-    _OP_SET: _CardinalityPolicy.OK_OR_EXACT_COLLECTION,
     _OP_MSET: _CardinalityPolicy.OK_OR_EXACT_COLLECTION,
     _OP_FLOW_CREATE_MANY: _CardinalityPolicy.OK_OR_EXACT_COLLECTION,
     _OP_FLOW_COMPLETE_MANY: _CardinalityPolicy.OK_OR_EXACT_COLLECTION,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from ferricstore.protocol_common import _command_name
@@ -10,7 +11,7 @@ from ferricstore.protocol_constants import (
     _COMPACT_PIPELINE_REQUEST,
     _COMPACT_U32,
 )
-from ferricstore.protocol_flow_codec import _compact_i64, _maybe_bytes
+from ferricstore.protocol_flow_codec import _compact_i64, _maybe_bytes, _raw_int
 
 
 def _compact_pipeline_range_payload_from_raw(
@@ -47,11 +48,8 @@ def _compact_pipeline_range_payload_from_raw(
         key = _maybe_bytes(command[1])
         if key is None:
             return None
-        try:
-            start = _compact_i64(int(command[2]))
-            stop = _compact_i64(int(command[3]))
-        except (OverflowError, TypeError, ValueError):
-            return None
+        start = _compact_i64(_raw_int(command[2]))
+        stop = _compact_i64(_raw_int(command[3]))
         if start is None or stop is None:
             return None
         extend(pack_u32(len(key)))
@@ -141,9 +139,13 @@ def _compact_pipeline_zadd_payload_from_raw(
         member = _maybe_bytes(command[3])
         if key is None or member is None:
             return None
+        if isinstance(command[2], bool):
+            return None
         try:
             score = float(command[2])
         except (OverflowError, TypeError, ValueError):
+            return None
+        if not math.isfinite(score):
             return None
         extend(pack_u32(len(key)))
         extend(key)

@@ -3,6 +3,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from ferricstore.errors import EffectAlreadyReservedError
+from ferricstore.types import EffectResult
+
 
 def resolve_operation_digest(
     effect_type: str,
@@ -35,4 +38,16 @@ def resolve_external_id(
     return None
 
 
-__all__ = ["resolve_external_id", "resolve_operation_digest"]
+def resolve_effect_replay(
+    reservation: EffectResult,
+    replay: Callable[[EffectResult], Any] | None,
+) -> tuple[bool, Any]:
+    """Resolve an existing durable reservation without calling the effect again."""
+    if reservation.decision != "already_reserved":
+        return False, None
+    if replay is None:
+        raise EffectAlreadyReservedError(reservation)
+    return True, replay(reservation)
+
+
+__all__ = ["resolve_effect_replay", "resolve_external_id", "resolve_operation_digest"]

@@ -15,15 +15,17 @@ from ferricstore.protocol_common import (
     _close_adapter_async,
     _connection_endpoint_key,
     _endpoint_from_url,
+    _topology_candidate_urls,
     _topology_update_required,
     _url_from_endpoint,
 )
 from ferricstore.protocol_constants import _TLS_SCHEMES
+from ferricstore.protocol_transport_commands import TopologyCommandPlanningMixin
 from ferricstore.topology_lifecycle import EndpointAdapterLease, EndpointAdapterLifecycle
 from ferricstore.topology_security import TopologyEndpointTrust
 
 
-class AsyncTopologyEndpointMixin:
+class AsyncTopologyEndpointMixin(TopologyCommandPlanningMixin):
     """Own endpoint creation, retirement, cleanup, warming, and trust checks."""
 
     if TYPE_CHECKING:
@@ -188,11 +190,19 @@ class AsyncTopologyEndpointMixin:
             self._cleanup_tasks_by_adapter.pop(identity, None)
 
         async def cleanup() -> None:
-            try:
-                await _close_adapter_async(adapter, self._event_listener)
-            except BaseException:
-                return
-            self._cleanup_adapters.complete(adapter)
+            retry_delays = (0.01, 0.05, 0.25)
+            for attempt in range(len(retry_delays) + 1):
+                try:
+                    await _close_adapter_async(adapter, self._event_listener)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    if self._closed or attempt == len(retry_delays):
+                        return
+                    await asyncio.sleep(retry_delays[attempt])
+                else:
+                    self._cleanup_adapters.complete(adapter)
+                    return
 
         task = asyncio.create_task(cleanup())
         self._cleanup_tasks.add(task)
@@ -254,15 +264,9 @@ class AsyncTopologyEndpointMixin:
         trust.validate(endpoint)
 
     def _refresh_candidate_urls(self) -> list[str]:
-        discovered_urls = [
-            _url_from_endpoint(endpoint, tls=self._tls)
-            for endpoint in self.topology.endpoints.values()
-        ]
-        live_urls = set(self.seed_urls)
-        live_urls.update(discovered_urls)
-        return [
-            url for url in self._control_endpoints.candidates(discovered_urls) if url in live_urls
-        ]
+        return _topology_candidate_urls(
+            self._control_endpoints, self.seed_urls, self.topology, tls=self._tls
+        )
 
 
 __all__ = ["AsyncTopologyEndpointMixin"]

@@ -1,0 +1,203 @@
+name: Extended validation
+
+on:
+  schedule:
+    - cron: "17 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    name: Python ${{ matrix.python-version }} / FerricStore ${{ matrix.server-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
+        server-version: ["0.7.4", "0.7.5"]
+    env:
+      FERRICSTORE_IMAGE: ghcr.io/ferricstore/ferricstore:${{ matrix.server-version }}
+      FERRICSTORE_PORT: "56400"
+      FERRICSTORE_NATIVE_ADVERTISE_PORT: "56400"
+      FERRICSTORE_URL: ferric://127.0.0.1:56400
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install package
+        run: python -m pip install -e ".[dev]"
+      - name: Start FerricStore
+        run: |
+          docker compose -p sdk-compat up -d ferricstore
+          python scripts/wait_for_ferricstore.py
+      - name: Run compatibility smoke
+        run: python -m pytest -q tests/compatibility
+        env:
+          FERRICSTORE_COMPATIBILITY: "1"
+      - name: FerricStore logs
+        if: always()
+        run: docker compose -p sdk-compat logs ferricstore
+      - name: Stop FerricStore
+        if: always()
+        run: docker compose -p sdk-compat down -v
+
+  tls-auth:
+    name: TLS and ACL authentication
+    runs-on: ubuntu-latest
+    env:
+      FERRICSTORE_IMAGE: ghcr.io/ferricstore/ferricstore:0.7.5
+      FERRICSTORE_SECURITY_PLAIN_PORT: "56420"
+      FERRICSTORE_SECURITY_TLS_PORT: "56421"
+      FERRICSTORE_TLS_URL: ferrics://127.0.0.1:56421
+      FERRICSTORE_PLAIN_URL: ferric://127.0.0.1:56420
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install package
+        run: python -m pip install -e ".[dev]"
+      - name: Generate ephemeral test certificate
+        run: |
+          mkdir -p "$RUNNER_TEMP/ferricstore-tls"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout "$RUNNER_TEMP/ferricstore-tls/server.key" \
+            -out "$RUNNER_TEMP/ferricstore-tls/server.crt" \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+          chmod 0644 "$RUNNER_TEMP/ferricstore-tls/server.key"
+      - name: Start TLS FerricStore
+        run: |
+          docker compose -p sdk-security -f docker-compose.security.yml up -d
+          FERRICSTORE_URL="$FERRICSTORE_TLS_URL" \
+          FERRICSTORE_TLS_CA_FILE="$RUNNER_TEMP/ferricstore-tls/server.crt" \
+          FERRICSTORE_PORT="$FERRICSTORE_SECURITY_TLS_PORT" \
+          python scripts/wait_for_ferricstore.py
+        env:
+          FERRICSTORE_TLS_DIR: ${{ runner.temp }}/ferricstore-tls
+      - name: Run TLS and ACL tests
+        run: python -m pytest -q tests/integration/test_security_integration.py
+        env:
+          FERRICSTORE_SECURITY_INTEGRATION: "1"
+          FERRICSTORE_TLS_CA_FILE: ${{ runner.temp }}/ferricstore-tls/server.crt
+      - name: FerricStore logs
+        if: always()
+        run: docker compose -p sdk-security -f docker-compose.security.yml logs
+        env:
+          FERRICSTORE_TLS_DIR: ${{ runner.temp }}/ferricstore-tls
+      - name: Stop FerricStore
+        if: always()
+        run: docker compose -p sdk-security -f docker-compose.security.yml down -v
+        env:
+          FERRICSTORE_TLS_DIR: ${{ runner.temp }}/ferricstore-tls
+
+  restart-recovery:
+    name: Prolonged outage and restart recovery
+    runs-on: ubuntu-latest
+    env:
+      FERRICSTORE_IMAGE: ghcr.io/ferricstore/ferricstore:0.7.5
+      FERRICSTORE_PORT: "56410"
+      FERRICSTORE_NATIVE_ADVERTISE_PORT: "56410"
+      FERRICSTORE_URL: ferric://127.0.0.1:56410
+      FERRICSTORE_RECOVERY_PROJECT: sdk-recovery
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install package
+        run: python -m pip install -e ".[dev]"
+      - name: Start FerricStore
+        run: |
+          docker compose -p sdk-recovery up -d ferricstore
+          python scripts/wait_for_ferricstore.py
+      - name: Run restart recovery test
+        run: python -m pytest -q tests/integration/test_recovery_integration.py
+        env:
+          FERRICSTORE_RECOVERY_INTEGRATION: "1"
+          FERRICSTORE_OUTAGE_SECONDS: "10"
+      - name: FerricStore logs
+        if: always()
+        run: docker compose -p sdk-recovery logs ferricstore
+      - name: Stop FerricStore
+        if: always()
+        run: docker compose -p sdk-recovery down -v
+
+  cluster-failover:
+    name: Three-node leader failover
+    runs-on: ubuntu-latest
+    env:
+      FERRICSTORE_IMAGE: ghcr.io/ferricstore/ferricstore:0.7.5
+      FERRICSTORE_CLUSTER_PORT_0: "56430"
+      FERRICSTORE_CLUSTER_PORT_1: "56431"
+      FERRICSTORE_CLUSTER_PORT_2: "56432"
+      FERRICSTORE_URL: ferric://127.0.0.1:56430
+      FERRICSTORE_URLS: ferric://127.0.0.1:56430,ferric://127.0.0.1:56431,ferric://127.0.0.1:56432
+      FERRICSTORE_CLUSTER_COMPOSE_PROJECT: sdk-cluster
+      FERRICSTORE_CLUSTER_COMPOSE_FILE: docker-compose.cluster.yml
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install package
+        run: python -m pip install -e ".[dev]"
+      - name: Start FerricStore cluster
+        run: |
+          docker compose -p sdk-cluster -f docker-compose.cluster.yml up -d
+          for port in 56430 56431 56432; do
+            FERRICSTORE_URL="ferric://127.0.0.1:$port" FERRICSTORE_PORT="$port" \
+              python scripts/wait_for_ferricstore.py
+          done
+      - name: Run node-stop failover test
+        run: >-
+          python -m pytest -q
+          tests/integration/test_cluster_failover_integration.py
+        env:
+          FERRICSTORE_CLUSTER_INTEGRATION: "1"
+      - name: FerricStore logs
+        if: always()
+        run: docker compose -p sdk-cluster -f docker-compose.cluster.yml logs
+      - name: Stop FerricStore cluster
+        if: always()
+        run: docker compose -p sdk-cluster -f docker-compose.cluster.yml down -v
+
+  soak:
+    name: Sync and async soak
+    runs-on: ubuntu-latest
+    env:
+      FERRICSTORE_IMAGE: ghcr.io/ferricstore/ferricstore:0.7.5
+      FERRICSTORE_PORT: "56440"
+      FERRICSTORE_NATIVE_ADVERTISE_PORT: "56440"
+      FERRICSTORE_URL: ferric://127.0.0.1:56440
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install package
+        run: python -m pip install -e ".[dev]"
+      - name: Start FerricStore
+        run: |
+          docker compose -p sdk-soak up -d ferricstore
+          python scripts/wait_for_ferricstore.py
+      - name: Run sustained correctness/load test
+        run: python scripts/soak_sdk.py
+        env:
+          FERRICSTORE_SOAK_SECONDS: "120"
+          FERRICSTORE_SOAK_CONCURRENCY: "16"
+          FERRICSTORE_SOAK_MODE: both
+      - name: FerricStore logs
+        if: always()
+        run: docker compose -p sdk-soak logs ferricstore
+      - name: Stop FerricStore
+        if: always()
+        run: docker compose -p sdk-soak down -v

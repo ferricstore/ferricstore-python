@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
@@ -10,17 +11,20 @@ from ferricstore.protocol_common import (
     _close_adapters_sync,
     _connection_endpoint_key,
     _endpoint_from_url,
+    _topology_candidate_urls,
     _topology_update_required,
     _unique_adapters,
     _url_from_endpoint,
 )
 from ferricstore.protocol_constants import _TLS_SCHEMES
+from ferricstore.protocol_lifecycle import SyncDeadlineScheduler
 from ferricstore.protocol_sync_pool import ProtocolAdapterPool
+from ferricstore.protocol_transport_commands import TopologyCommandPlanningMixin
 from ferricstore.topology_lifecycle import EndpointAdapterLease, EndpointAdapterLifecycle
 from ferricstore.topology_security import TopologyEndpointTrust
 
 
-class SyncTopologyEndpointMixin:
+class SyncTopologyEndpointMixin(TopologyCommandPlanningMixin):
     """Own sync endpoint creation, retirement, cleanup, and trust checks."""
 
     if TYPE_CHECKING:
@@ -141,18 +145,74 @@ class SyncTopologyEndpointMixin:
     def _cleanup_retired_adapters(self, adapters: Sequence[Any]) -> None:
         retained = self._cleanup_adapters.snapshot()
         for adapter in _unique_adapters([*adapters, *retained]):
+            failed = False
             with self._adapter_cleanup_lock:
                 if not self._cleanup_adapters.contains(adapter):
                     continue
                 try:
                     _close_adapters_sync([adapter], self._event_listener)
                 except BaseException:
-                    continue
-                self._cleanup_adapters.complete(adapter)
+                    failed = True
+                else:
+                    self._cleanup_adapters.complete(adapter)
+                    attempts = getattr(self, "_cleanup_retry_attempts", None)
+                    if attempts is not None:
+                        attempts.pop(id(adapter), None)
+                    scheduler = getattr(self, "_cleanup_retry_scheduler", None)
+                    if scheduler is not None:
+                        scheduler.cancel(id(adapter))
+            if failed:
+                self._schedule_retired_cleanup_retry(adapter)
+                continue
             with self._lock:
                 snapshot = self._close_adapters_snapshot
                 if snapshot is not None:
                     snapshot[:] = [candidate for candidate in snapshot if candidate is not adapter]
+
+    def _schedule_retired_cleanup_retry(self, adapter: Any) -> None:
+        retry_delays = (0.01, 0.05, 0.25)
+        identity = id(adapter)
+        with self._adapter_cleanup_lock:
+            if self._closed or not self._cleanup_adapters.contains(adapter):
+                return
+            attempts = getattr(self, "_cleanup_retry_attempts", None)
+            if attempts is None:
+                attempts = {}
+                self._cleanup_retry_attempts = attempts
+            state = attempts.get(identity)
+            attempt = (state[1] if state is not None and state[0] is adapter else 0) + 1
+            if attempt > len(retry_delays):
+                return
+            attempts[identity] = (adapter, attempt)
+            scheduler = getattr(self, "_cleanup_retry_scheduler", None)
+            if scheduler is None:
+                scheduler = SyncDeadlineScheduler(
+                    self._retry_retired_adapter_cleanup,
+                    thread_name="ferricstore-topology-cleanup",
+                )
+                self._cleanup_retry_scheduler = scheduler
+        try:
+            scheduler.schedule(identity, time.monotonic() + retry_delays[attempt - 1])
+        except BaseException:
+            # The retained resource remains available to the next topology or
+            # pool-close cleanup attempt even if the retry scheduler cannot start.
+            return
+
+    def _retry_retired_adapter_cleanup(self, identity: int) -> None:
+        with self._adapter_cleanup_lock:
+            attempts = getattr(self, "_cleanup_retry_attempts", None)
+            state = attempts.get(identity) if attempts is not None else None
+            if state is None or self._closed:
+                return
+            adapter = state[0]
+            if not self._cleanup_adapters.contains(adapter):
+                return
+        self._cleanup_retired_adapters([adapter])
+
+    def _close_cleanup_retry_scheduler(self) -> None:
+        scheduler = getattr(self, "_cleanup_retry_scheduler", None)
+        if scheduler is not None:
+            scheduler.close()
 
     def _new_endpoint_adapter(self, url: str) -> Any:
         return ProtocolAdapterPool.from_url(
@@ -182,15 +242,9 @@ class SyncTopologyEndpointMixin:
         trust.validate(endpoint)
 
     def _refresh_candidate_urls(self) -> list[str]:
-        discovered_urls = [
-            _url_from_endpoint(endpoint, tls=self._tls)
-            for endpoint in self.topology.endpoints.values()
-        ]
-        live_urls = set(self.seed_urls)
-        live_urls.update(discovered_urls)
-        return [
-            url for url in self._control_endpoints.candidates(discovered_urls) if url in live_urls
-        ]
+        return _topology_candidate_urls(
+            self._control_endpoints, self.seed_urls, self.topology, tls=self._tls
+        )
 
 
 __all__ = ["SyncTopologyEndpointMixin"]

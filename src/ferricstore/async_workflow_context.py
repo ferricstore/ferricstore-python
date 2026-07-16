@@ -25,7 +25,11 @@ from ferricstore.types import (
     EffectResult,
     FlowRecord,
 )
-from ferricstore.workflow_effect_core import resolve_external_id, resolve_operation_digest
+from ferricstore.workflow_effect_core import (
+    resolve_effect_replay,
+    resolve_external_id,
+    resolve_operation_digest,
+)
 
 if TYPE_CHECKING:
     from ferricstore.async_workflow_runtime import AsyncWorkflow
@@ -496,6 +500,7 @@ class AsyncWorkflowEffect:
         idempotency_key: str | None = None,
         governance_scope: str | None = None,
         external_id: str | Callable[[Any], str | None] | None = None,
+        replay: Callable[[EffectResult], Any] | None = None,
     ) -> None:
         self.ctx = ctx
         self.effect_key = effect_key
@@ -509,6 +514,7 @@ class AsyncWorkflowEffect:
         self.idempotency_key = idempotency_key
         self.governance_scope = governance_scope
         self.external_id = external_id
+        self.replay = replay
         self.reservation: EffectResult | None = None
         self._result: EffectResult | None = None
         self._started_at: float | None = None
@@ -646,7 +652,12 @@ class AsyncWorkflowEffect:
                 raise
 
     async def call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        await self.reserve()
+        reservation = await self.reserve()
+        replayed, replay_value = resolve_effect_replay(reservation, self.replay)
+        if replayed:
+            if inspect.isawaitable(replay_value):
+                replay_value = await replay_value
+            return replay_value
         try:
             result = func(*args, **kwargs)
             if inspect.isawaitable(result):
@@ -829,6 +840,7 @@ class AsyncWorkflowContext:
         idempotency_key: str | None = None,
         governance_scope: str | None = None,
         external_id: str | Callable[[Any], str | None] | None = None,
+        replay: Callable[[EffectResult], Any] | None = None,
     ) -> AsyncWorkflowEffect:
         return AsyncWorkflowEffect(
             self,
@@ -838,6 +850,7 @@ class AsyncWorkflowContext:
             idempotency_key=idempotency_key,
             governance_scope=governance_scope,
             external_id=external_id,
+            replay=replay,
         )
 
     def _state_budget(self, policy: BudgetPolicy | None) -> AsyncWorkflowBudget | None:

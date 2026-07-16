@@ -4,7 +4,7 @@ import builtins
 from typing import Any
 
 from ferricstore.codecs import Codec
-from ferricstore.config_validation import validate_bool
+from ferricstore.config_validation import validate_bool, validate_optional_positive_int
 
 
 def _append(args: builtins.list[Any], name: str, value: Any) -> None:
@@ -33,7 +33,20 @@ def _set_args(
     keepttl: bool = False,
     encode: bool = True,
 ) -> builtins.list[Any]:
+    ex = validate_optional_positive_int(ex, name="EX")
+    px = validate_optional_positive_int(px, name="PX")
+    exat = validate_optional_positive_int(exat, name="EXAT")
+    pxat = validate_optional_positive_int(pxat, name="PXAT")
+    nx = validate_bool(nx, name="NX")
+    xx = validate_bool(xx, name="XX")
+    get = validate_bool(get, name="GET")
+    keepttl = validate_bool(keepttl, name="KEEPTTL")
     encode = validate_bool(encode, name="encode")
+    expiry_count = sum(value is not None for value in (ex, px, exat, pxat))
+    if expiry_count > 1 or (keepttl and expiry_count):
+        raise ValueError("SET expiry options and keepttl are mutually exclusive")
+    if nx and xx:
+        raise ValueError("SET nx and xx are mutually exclusive")
     args: builtins.list[Any] = ["SET", key, codec.encode(value) if encode else value]
     _append(args, "EX", ex)
     _append(args, "PX", px)

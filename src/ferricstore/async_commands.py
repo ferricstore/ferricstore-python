@@ -11,6 +11,7 @@ from ferricstore.command_helpers import (
     _set_args,
     _xread_args,
 )
+from ferricstore.config_validation import validate_bool
 
 
 class AsyncDataCommandsMixin:
@@ -539,13 +540,31 @@ class AsyncDataCommandsMixin:
         return await self.command("GEOSEARCHSTORE", destination, source, *args)
 
     async def xadd(
-        self, key: str, fields: dict[str, Any], *, id: str = "*", encode: bool = True, **opts: Any
+        self,
+        key: str,
+        fields: dict[str, Any],
+        *,
+        id: str = "*",
+        encode: bool = True,
+        maxlen: Any | None = None,
+        minid: Any | None = None,
+        nomkstream: bool = False,
+        approximate: bool = False,
     ) -> Any:
+        encode = validate_bool(encode, name="encode")
+        nomkstream = validate_bool(nomkstream, name="nomkstream")
+        approximate = validate_bool(approximate, name="approximate")
+        if maxlen is not None and minid is not None:
+            raise ValueError("xadd accepts exactly one of maxlen or minid")
+        if approximate and maxlen is None and minid is None:
+            raise ValueError("xadd approximate requires maxlen or minid")
         args: builtins.list[Any] = ["XADD", key]
-        if "maxlen" in opts:
-            args.extend(["MAXLEN", opts["maxlen"]])
-        if "minid" in opts:
-            args.extend(["MINID", opts["minid"]])
+        if nomkstream:
+            args.append("NOMKSTREAM")
+        if maxlen is not None:
+            args.extend(["MAXLEN", *(["~"] if approximate else []), maxlen])
+        if minid is not None:
+            args.extend(["MINID", *(["~"] if approximate else []), minid])
         args.append(id)
         for field, value in fields.items():
             args.extend([field, self.codec.encode(value) if encode else value])

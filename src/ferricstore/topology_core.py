@@ -62,8 +62,6 @@ def route_for_keys(
 ) -> RouteDecision:
     first_key: str | bytes | None = None
     first_slot = 0
-    same_slot_count = 0
-    cross_slots: list[int] | None = None
     for key in keys:
         if not isinstance(key, (str, bytes)):
             continue
@@ -71,19 +69,11 @@ def route_for_keys(
         if first_key is None:
             first_key = key
             first_slot = slot
-            same_slot_count = 1
-        elif cross_slots is not None:
-            cross_slots.append(slot)
-        elif slot == first_slot:
-            same_slot_count += 1
-        else:
-            cross_slots = [first_slot] * same_slot_count
-            cross_slots.append(slot)
+        elif slot != first_slot:
+            return RouteDecision(RouteKind.CROSS_SHARD, slots=(first_slot, slot))
 
     if first_key is None:
         return RouteDecision(RouteKind.CONTROL)
-    if cross_slots is not None:
-        return RouteDecision(RouteKind.CROSS_SHARD, slots=tuple(cross_slots))
     return RouteDecision(RouteKind.SINGLE_SHARD, key=first_key, slots=(first_slot,))
 
 

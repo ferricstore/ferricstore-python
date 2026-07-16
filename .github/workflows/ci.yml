@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - name: Checkout
@@ -48,7 +48,10 @@ jobs:
         run: python -m mypy src/ferricstore
 
       - name: Pytest
-        run: python -m pytest --cov=ferricstore --cov-report=term-missing
+        run: python -m pytest --cov=ferricstore --cov-report=term-missing --cov-report=json:coverage.json
+
+      - name: Critical module coverage
+        run: python scripts/check_critical_coverage.py coverage.json
 
       - name: Dependency consistency
         run: python -m pip check

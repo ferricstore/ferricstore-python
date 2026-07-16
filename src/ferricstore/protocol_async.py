@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import ssl
 import time
 from dataclasses import replace
 from typing import Any, cast
-from urllib.parse import unquote, urlparse
 
 from ferricstore.errors import (
     FerricStoreError,
@@ -20,12 +18,13 @@ from ferricstore.lifecycle_core import (
 )
 from ferricstore.protocol_async_batch import AsyncProtocolBatchMixin
 from ferricstore.protocol_async_state import _AsyncProtocolStateMixin
-from ferricstore.protocol_commands import _compact_flow_many_payloads_from_raw
+from ferricstore.protocol_commands import (
+    _compact_flow_many_payloads_from_raw,
+    build_protocol_command,  # noqa: F401 - historical monkeypatch seam
+)
 from ferricstore.protocol_common import (
     _encode_request_body,
-    _normalize_protocol_url_kwargs,
     _notify_event_listeners,
-    _protocol_url_port,
     _request_body_byte_limit,
     _response_identity_map,
     _response_item_count_map,
@@ -43,8 +42,6 @@ from ferricstore.protocol_constants import (
     _OPCODES,
     _REQUEST_VERSION,
     _RESPONSE_VERSION,
-    _SUPPORTED_SCHEMES,
-    _TLS_SCHEMES,
     _USE_ADAPTER_TIMEOUT,
     ProtocolCommand,
     ProtocolResponse,
@@ -55,18 +52,22 @@ from ferricstore.protocol_framing import (
     ResponseIdentity,
     validate_response_identity,
 )
-from ferricstore.protocol_lifecycle import (
-    PendingRequestCapacityError,
-)
+from ferricstore.protocol_lifecycle import PendingRequestCapacityError
 from ferricstore.protocol_pipeline_codec import _expected_payload_collection_items
 from ferricstore.protocol_pipelines import AsyncProtocolPipeline
-from ferricstore.protocol_planning import PreparedCommand, prepare_protocol_command
+from ferricstore.protocol_planning import PreparedCommand
 from ferricstore.protocol_responses import (
     _batch_item_value,
     _decode_protocol_response,
     _response_value,
 )
 from ferricstore.protocol_subscriptions import AsyncProtocolSubscriptionMixin
+from ferricstore.protocol_transport_commands import (
+    adapter_from_url,
+    build_adapter_protocol_command,
+    compact_flow_many_for_adapter,
+    prepare_adapter_protocol_command,
+)
 
 
 class AsyncProtocolAdapter(
@@ -81,35 +82,27 @@ class AsyncProtocolAdapter(
     supports_concurrent_fanout = True
     _request_ensures_connection = True
 
+    def _build_protocol_command(self, *args: Any) -> ProtocolCommand:
+        return build_adapter_protocol_command(self, args)
+
+    def _prepare_protocol_command(self, args: tuple[Any, ...]) -> PreparedCommand:
+        return prepare_adapter_protocol_command(self, args)
+
     def _compact_flow_many_payloads(
         self,
         commands: list[tuple[Any, ...]],
         protocol_commands: list[ProtocolCommand] | None,
     ) -> list[tuple[int, bytes, int]] | None:
-        if protocol_commands is None:
-            return _compact_flow_many_payloads_from_raw(commands)
-        return _compact_flow_many_payloads_from_raw(
+        return compact_flow_many_for_adapter(
+            self,
+            _compact_flow_many_payloads_from_raw,
             commands,
-            protocol_commands=protocol_commands,
+            protocol_commands,
         )
 
     @classmethod
     def from_url(cls, url: str, **kwargs: Any) -> AsyncProtocolAdapter:
-        parsed = urlparse(url)
-        scheme = parsed.scheme.lower()
-        tls = scheme in _TLS_SCHEMES
-        if scheme not in _SUPPORTED_SCHEMES:
-            raise ValueError(f"unsupported FerricStore URL scheme: {parsed.scheme}")
-
-        host = parsed.hostname or "127.0.0.1"
-        port = _protocol_url_port(parsed, tls=tls)
-        username = unquote(parsed.username) if parsed.username else None
-        password = unquote(parsed.password) if parsed.password else None
-        _normalize_protocol_url_kwargs(kwargs)
-        kwargs.setdefault("username", username)
-        kwargs.setdefault("password", password)
-        kwargs.setdefault("tls", tls)
-        return cls(host, port, **kwargs)
+        return adapter_from_url(cls, url, kwargs)
 
     def pipeline(self, transaction: bool = False) -> AsyncProtocolPipeline:
         if transaction:
@@ -117,7 +110,7 @@ class AsyncProtocolAdapter(
         return AsyncProtocolPipeline(self)
 
     async def execute_command(self, *args: Any) -> Any:
-        return await self.execute_prepared_command(prepare_protocol_command(args))
+        return await self.execute_prepared_command(self._prepare_protocol_command(args))
 
     async def execute_prepared_command(self, prepared: PreparedCommand) -> Any:
         command = prepared.command
@@ -134,7 +127,7 @@ class AsyncProtocolAdapter(
     async def execute_command_on_lane(self, args: tuple[Any, ...], lane_id: int) -> Any:
         """Execute a routed command on the exact topology lane."""
         return await self.execute_prepared_command_on_lane(
-            prepare_protocol_command(args),
+            self._prepare_protocol_command(args),
             lane_id,
         )
 
@@ -155,7 +148,7 @@ class AsyncProtocolAdapter(
         return self._response_value(response)
 
     async def execute_command_with_trace(self, *args: Any) -> dict[str, Any]:
-        return await self.execute_prepared_command_with_trace(prepare_protocol_command(args))
+        return await self.execute_prepared_command_with_trace(self._prepare_protocol_command(args))
 
     async def execute_prepared_command_with_trace(
         self,
@@ -178,7 +171,7 @@ class AsyncProtocolAdapter(
         lane_id: int,
     ) -> dict[str, Any]:
         return await self.execute_prepared_command_with_trace_on_lane(
-            prepare_protocol_command(args),
+            self._prepare_protocol_command(args),
             lane_id,
         )
 
@@ -245,9 +238,7 @@ class AsyncProtocolAdapter(
                 for startup_attempt in range(2):
                     reader = None
                     writer = None
-                    context = (
-                        (self.ssl_context or ssl.create_default_context()) if self.tls else None
-                    )
+                    context = self._tls_context()
                     reader, writer = await asyncio.open_connection(
                         self.host,
                         self.port,

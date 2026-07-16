@@ -17,7 +17,7 @@ from ferricstore.lifecycle_core import (
     try_set_future_result,
 )
 from ferricstore.protocol_commands import (
-    _compact_flow_many_payloads_from_raw,
+    _compact_flow_many_payloads_from_raw,  # noqa: F401 - historical monkeypatch seam
     _compact_pipeline_payload_from_raw,
 )
 from ferricstore.protocol_common import _compact_payload_budget, _set_wire_future_sources
@@ -68,6 +68,12 @@ class SyncProtocolBatchHost(Protocol):
     def execute_command(self, *args: Any) -> Any: ...
 
     def _build_protocol_command(self, *args: Any) -> ProtocolCommand: ...
+
+    def _compact_flow_many_payloads(
+        self,
+        commands: list[tuple[Any, ...]],
+        protocol_commands: list[ProtocolCommand] | None,
+    ) -> list[tuple[int, bytes, int]] | None: ...
 
     def _ensure_connected(self) -> None: ...
 
@@ -346,14 +352,7 @@ class SyncProtocolBatchMixin(_SyncProtocolBatchBase):
             self._complete_batch_future(response_future, len(commands), future)
             return future
 
-        flow_many_payloads = (
-            _compact_flow_many_payloads_from_raw(commands)
-            if protocol_commands is None
-            else _compact_flow_many_payloads_from_raw(
-                commands,
-                protocol_commands=protocol_commands,
-            )
-        )
+        flow_many_payloads = self._compact_flow_many_payloads(commands, protocol_commands)
         if flow_many_payloads is not None:
             self._submit_flow_many_batch(
                 flow_many_payloads,
@@ -671,14 +670,7 @@ class SyncProtocolBatchMixin(_SyncProtocolBatchBase):
             if prepared_commands is not None
             else None
         )
-        flow_many_payloads = (
-            _compact_flow_many_payloads_from_raw(commands)
-            if protocol_commands is None
-            else _compact_flow_many_payloads_from_raw(
-                commands,
-                protocol_commands=protocol_commands,
-            )
-        )
+        flow_many_payloads = self._compact_flow_many_payloads(commands, protocol_commands)
         if flow_many_payloads is not None:
             values: list[Any] = []
             for opcode, payload, count in flow_many_payloads:

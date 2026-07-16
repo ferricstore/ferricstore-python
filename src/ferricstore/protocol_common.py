@@ -35,6 +35,10 @@ from ferricstore.lifecycle_core import (
 from ferricstore.protocol_codec import (
     encode_value_into,
 )
+from ferricstore.protocol_compact_budget import (
+    _compact_payload_budget,
+    _pending_request_capacity_error,
+)
 from ferricstore.protocol_constants import (
     _ASYNC_ADAPTER_FANOUT_LIMIT,
     _CONTROL_OPCODES,
@@ -56,14 +60,7 @@ from ferricstore.protocol_framing import (
 )
 from ferricstore.protocol_lifecycle import (
     PendingRequestBudget,
-    PendingRequestCapacityError,
 )
-
-
-def _pending_request_capacity_error(max_bytes: int | None) -> PendingRequestCapacityError:
-    return PendingRequestCapacityError(
-        f"protocol pending request bytes exceed max_pending_request_bytes={max_bytes}"
-    )
 
 
 def _request_body_byte_limit(
@@ -83,23 +80,6 @@ def _request_body_byte_limit(
     if body_limit < 0:
         raise _pending_request_capacity_error(budget.max_bytes)
     return body_limit
-
-
-def _compact_payload_budget(
-    max_pending_request_bytes: int | None,
-    compression: str,
-) -> tuple[bool, int | None]:
-    """Return whether eager compact encoding is safe and its raw body budget."""
-    if max_pending_request_bytes is None:
-        return True, None
-    if compression == "zlib":
-        # Generic encoding can stream directly into the compressor. Eager compact
-        # encoding would first materialize the entire uncompressed body.
-        return False, None
-    body_limit = max_pending_request_bytes - _HEADER.size
-    if body_limit < 0:
-        raise _pending_request_capacity_error(max_pending_request_bytes)
-    return True, body_limit
 
 
 class _RequestBodyBuffer:
@@ -701,6 +681,18 @@ def _url_from_endpoint(endpoint: Mapping[str, Any], *, tls: bool) -> str:
     return f"{scheme}://{_url_host(host)}:{port}"
 
 
+def _topology_candidate_urls(
+    selector: Any,
+    seed_urls: Sequence[str],
+    topology: RoutingTopology,
+    *,
+    tls: bool,
+) -> list[str]:
+    discovered = [_url_from_endpoint(endpoint, tls=tls) for endpoint in topology.endpoints.values()]
+    live = {*seed_urls, *discovered}
+    return [url for url in selector.candidates(discovered) if url in live]
+
+
 def _connection_endpoint_key(
     endpoint: Mapping[str, Any],
     *,
@@ -719,23 +711,13 @@ def _topology_update_required(
     current: RoutingTopology,
     candidate: RoutingTopology,
 ) -> bool:
-    """Validate monotonic topology replacement and report whether state must change."""
-    if current.shard_count == 0:
-        return True
-    if candidate.route_epoch < current.route_epoch:
-        raise FerricStoreError(
-            "stale SHARDS route_epoch "
-            f"{candidate.route_epoch}; current route_epoch is {current.route_epoch}",
-            raw=candidate,
-        )
-    if candidate.route_epoch == current.route_epoch:
-        if candidate != current:
-            raise FerricStoreError(
-                f"conflicting SHARDS topology for route_epoch {candidate.route_epoch}",
-                raw=candidate,
-            )
-        return False
-    return True
+    """Report whether a trusted SHARDS observation changes routing state.
+
+    ``route_epoch`` is an opaque hash of the slot map, not an ordered topology
+    revision.  Leader changes therefore legitimately keep the same value, and
+    a changed slot map may produce a numerically smaller value.
+    """
+    return candidate != current
 
 
 def _url_host(host: str) -> str:
@@ -826,7 +808,16 @@ def _error_message(value: Any) -> str:
     return _text(value)
 
 
-def _normalize_protocol_url_kwargs(kwargs: dict[str, Any]) -> None:
+def _normalize_protocol_url_kwargs(
+    kwargs: dict[str, Any],
+    *,
+    tls_from_scheme: bool | None = None,
+) -> None:
+    if tls_from_scheme is not None:
+        explicit_tls = kwargs.get("tls", tls_from_scheme)
+        if not isinstance(explicit_tls, bool) or explicit_tls is not tls_from_scheme:
+            raise ValueError("protocol TLS setting must match the URL scheme")
+        kwargs["tls"] = tls_from_scheme
     if "socket_timeout" in kwargs and "timeout" not in kwargs:
         kwargs["timeout"] = kwargs.pop("socket_timeout")
     if "health_check_interval" in kwargs and "heartbeat_interval" not in kwargs:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -73,7 +74,7 @@ def _build_kv_protocol_command(name: str, args: tuple[Any, ...], opcode: int) ->
             return ProtocolCommand(opcode, compact, flags=_FLAG_CUSTOM_PAYLOAD)
         return ProtocolCommand(opcode, {"keys": list(args)})
     if name == "MSET":
-        if len(args) % 2 != 0:
+        if not args or len(args) % 2 != 0:
             raise InvalidCommandError("MSET requires key/value pairs")
         compact = _compact_kv_set_pairs_payload(args)
         if compact is not None:
@@ -87,13 +88,22 @@ def _build_kv_protocol_command(name: str, args: tuple[Any, ...], opcode: int) ->
             "value": _require_arg(args, 2, name),
         }
         idx = 3
+        expiry_seen = False
         while idx < len(args):
             token = _command_token(args[idx])
             if token == "EX":
-                payload["ttl"] = int(_require_arg(args, idx + 1, "EX")) * 1000
+                if expiry_seen:
+                    raise InvalidCommandError("protocol CAS accepts only one expiry option")
+                payload["ttl"] = (
+                    _positive_int_arg(_require_arg(args, idx + 1, "EX"), "CAS EX") * 1000
+                )
+                expiry_seen = True
                 idx += 2
             elif token == "PX":
-                payload["ttl"] = int(_require_arg(args, idx + 1, "PX"))
+                if expiry_seen:
+                    raise InvalidCommandError("protocol CAS accepts only one expiry option")
+                payload["ttl"] = _positive_int_arg(_require_arg(args, idx + 1, "PX"), "CAS PX")
+                expiry_seen = True
                 idx += 2
             else:
                 raise InvalidCommandError(f"protocol CAS does not support option {token}")
@@ -328,27 +338,62 @@ def _build_basic_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolC
 
 
 def _kv_set_options(args: tuple[Any, ...]) -> dict[str, Any]:
+    if not args:
+        return {}
     payload: dict[str, Any] = {}
+    seen: set[str] = set()
+    expiry: str | None = None
     idx = 0
     while idx < len(args):
         token = _command_token(args[idx])
+        if token in seen:
+            raise InvalidCommandError(f"protocol SET option {token} may only be specified once")
+        seen.add(token)
         if token == "EX":
-            payload["ttl"] = int(_require_arg(args, idx + 1, "EX")) * 1000
+            if expiry is not None:
+                raise InvalidCommandError("protocol SET accepts only one expiry option")
+            payload["ttl"] = _positive_int_arg(_require_arg(args, idx + 1, "EX"), "SET EX") * 1000
+            expiry = token
             idx += 2
         elif token == "PX":
-            payload["ttl"] = int(_require_arg(args, idx + 1, "PX"))
+            if expiry is not None:
+                raise InvalidCommandError("protocol SET accepts only one expiry option")
+            payload["ttl"] = _positive_int_arg(_require_arg(args, idx + 1, "PX"), "SET PX")
+            expiry = token
+            idx += 2
+        elif token == "EXAT":
+            if expiry is not None:
+                raise InvalidCommandError("protocol SET accepts only one expiry option")
+            payload["exat"] = _positive_int_arg(_require_arg(args, idx + 1, "EXAT"), "SET EXAT")
+            expiry = token
+            idx += 2
+        elif token == "PXAT":
+            if expiry is not None:
+                raise InvalidCommandError("protocol SET accepts only one expiry option")
+            payload["pxat"] = _positive_int_arg(_require_arg(args, idx + 1, "PXAT"), "SET PXAT")
+            expiry = token
             idx += 2
         elif token in {"NX", "XX", "GET", "KEEPTTL"}:
             payload[token.lower()] = True
+            if token == "KEEPTTL":
+                if expiry is not None:
+                    raise InvalidCommandError(
+                        "protocol SET expiry options and KEEPTTL are mutually exclusive"
+                    )
+                expiry = token
             idx += 1
         else:
             raise InvalidCommandError(f"protocol SET does not support option {token}")
+    if payload.get("nx") and payload.get("xx"):
+        raise InvalidCommandError("protocol SET NX and XX are mutually exclusive")
     return payload
 
 
 def _field_value_map(command: str, args: tuple[Any, ...]) -> dict[Any, Any]:
     if not args or len(args) % 2 != 0:
         raise InvalidCommandError(f"{command} requires field/value pairs")
+    if any(not isinstance(args[idx], (str, bytes)) for idx in range(0, len(args), 2)):
+        raise InvalidCommandError(f"{command} fields must be strings or bytes")
     return {args[idx]: args[idx + 1] for idx in range(0, len(args), 2)}
 
 
@@ -359,10 +404,19 @@ def _require_values(command: str, args: tuple[Any, ...], start: int) -> None:
 
 
 def _int_arg(value: Any, command: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str, bytes)):
+        raise InvalidCommandError(f"{command} requires integer arguments")
     try:
         return int(value)
-    except (TypeError, ValueError) as exc:
+    except (OverflowError, TypeError, ValueError) as exc:
         raise InvalidCommandError(f"{command} requires integer arguments") from exc
+
+
+def _positive_int_arg(value: Any, command: str) -> int:
+    parsed = _int_arg(value, command)
+    if parsed <= 0:
+        raise InvalidCommandError(f"{command} requires positive integer arguments")
+    return parsed
 
 
 def _zadd_items(args: tuple[Any, ...]) -> list[list[Any]]:
@@ -370,10 +424,14 @@ def _zadd_items(args: tuple[Any, ...]) -> list[list[Any]]:
         raise InvalidCommandError("ZADD requires score/member pairs")
     items: list[list[Any]] = []
     for idx in range(0, len(args), 2):
+        if isinstance(args[idx], bool):
+            raise InvalidCommandError("ZADD score must be numeric")
         try:
             score = float(args[idx])
-        except (TypeError, ValueError) as exc:
+        except (OverflowError, TypeError, ValueError) as exc:
             raise InvalidCommandError("ZADD score must be numeric") from exc
+        if not math.isfinite(score):
+            raise InvalidCommandError("ZADD score must be finite")
         items.append([score, args[idx + 1]])
     return items
 

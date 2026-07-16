@@ -6,6 +6,25 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.4.1
+
+- Fixed topology refresh and sync/async multi-node failover by treating
+  `route_epoch` as the protocol's opaque slot-map hash instead of a monotonic
+  leader revision, while preserving exact endpoint trust validation.
+- Hardened compact pipeline and Flow codecs against lossy numeric coercion,
+  booleans and non-finite scores, mixed-case partition modes, byte sentinels,
+  malformed counts, truncated payloads, and oversized aggregate wire data.
+- Fixed empty async workflow execution batches and budget cleanup, prevented
+  implicit replay of already-reserved external effects, and hardened session
+  ownership, topology adapter retirement, and autobatch cancellation/accounting.
+- Split command schema, compact budgeting, TLS configuration, and transport
+  command construction into bounded modules, retaining thin compatibility
+  facades and a strict one-thousand-line production-module limit.
+- Added property/fuzz tests, high-concurrency sync/async pool stress, full Flow
+  payload/workflow boundaries, TLS and ACL integration, prolonged outage
+  recovery, dual-client cluster failover, Python 3.10-3.14 and FerricStore
+  0.7.4/0.7.5 compatibility, critical coverage gates, and scheduled soak tests.
+
 ## 0.4.0
 
 - Aligned native Flow lineage and distributed-limit release with FerricStore 0.7.5, fixed keyed transaction fallback on direct adapters, kept STARTUP uncompressed until zlib negotiation completes, preserved mutable reconnect subscription snapshots, rejected duplicate workflow states and invalid priority values, bounded oversized Unicode inputs before encoding, and reduced routing/workflow hot-path allocations.

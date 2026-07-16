@@ -44,11 +44,12 @@ from ferricstore.protocol_lifecycle import (
     SyncDeadlineScheduler,
 )
 from ferricstore.protocol_sync_pending import SyncPendingRequestRegistry
+from ferricstore.protocol_tls import ProtocolTLSContextMixin
 
 _StateAdapter = TypeVar("_StateAdapter", bound="_SyncProtocolStateMixin")
 
 
-class _SyncProtocolStateMixin:
+class _SyncProtocolStateMixin(ProtocolTLSContextMixin):
     """Connection lifecycle, event, and pending-request state for the sync adapter."""
 
     def __init__(
@@ -102,6 +103,7 @@ class _SyncProtocolStateMixin:
         self.compression = compression
         self.lanes = runtime_config.lanes
         self.ssl_context = ssl_context
+        self._default_ssl_context: ssl.SSLContext | None = None
         self.heartbeat_interval = runtime_config.heartbeat_interval
         self.heartbeat_timeout = runtime_config.heartbeat_timeout
         self.max_response_bytes = runtime_config.max_response_bytes

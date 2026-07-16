@@ -31,6 +31,19 @@ class FlowAlreadyExistsError(FerricStoreError):
     code = "flow_already_exists"
 
 
+class EffectAlreadyReservedError(FerricStoreError):
+    """Raised instead of replaying an external effect with an existing reservation."""
+
+    code = "effect_already_reserved"
+
+    def __init__(self, reservation: Any) -> None:
+        super().__init__(
+            "workflow effect is already reserved; external call was not replayed",
+            raw=reservation,
+        )
+        self.reservation = reservation
+
+
 class LockHeldError(FerricStoreError):
     code = "lock_held"
 

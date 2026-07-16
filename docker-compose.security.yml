@@ -1,0 +1,25 @@
+services:
+  ferricstore-security:
+    image: ${FERRICSTORE_IMAGE:-ghcr.io/ferricstore/ferricstore:0.7.5}
+    environment:
+      FERRICSTORE_PROTECTED_MODE: "false"
+      FERRICSTORE_SHARD_COUNT: "${FERRICSTORE_SHARD_COUNT:-4}"
+      FERRICSTORE_NATIVE_ENABLED: "true"
+      FERRICSTORE_NATIVE_BIND: "0.0.0.0"
+      FERRICSTORE_NATIVE_PORT: "6388"
+      FERRICSTORE_NATIVE_TLS_PORT: "6389"
+      FERRICSTORE_NATIVE_TLS_CERT_FILE: "/tls/server.crt"
+      FERRICSTORE_NATIVE_TLS_KEY_FILE: "/tls/server.key"
+      FERRICSTORE_REQUIRE_TLS: "true"
+      FERRICSTORE_NATIVE_ADVERTISE_HOST: "127.0.0.1"
+      FERRICSTORE_NATIVE_ADVERTISE_PORT: "${FERRICSTORE_SECURITY_PLAIN_PORT:-56420}"
+      FERRICSTORE_NATIVE_ADVERTISE_TLS_PORT: "${FERRICSTORE_SECURITY_TLS_PORT:-56421}"
+    ports:
+      - "${FERRICSTORE_SECURITY_PLAIN_PORT:-56420}:6388"
+      - "${FERRICSTORE_SECURITY_TLS_PORT:-56421}:6389"
+    volumes:
+      - "${FERRICSTORE_TLS_DIR:?set FERRICSTORE_TLS_DIR}:/tls:ro"
+      - ferricstore-security-data:/data
+
+volumes:
+  ferricstore-security-data:

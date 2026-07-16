@@ -23,9 +23,11 @@ from ferricstore.protocol_common import (
 
 def _flow_create_many_payload(args: tuple[Any, ...]) -> dict[str, Any]:
     wire_partition = _text(_require_arg(args, 0, "FLOW.CREATE_MANY"))
+    partition_mode = _command_token(wire_partition)
+    mixed = partition_mode == "MIXED"
     item_token = _find_item_token(args, 1)
     payload = _option_map(args[1:item_token])
-    if wire_partition not in {"AUTO", "MIXED", "None", "none"}:
+    if partition_mode not in {"AUTO", "MIXED", "NONE"}:
         payload["partition_key"] = args[0]
 
     token = _command_token(args[item_token])
@@ -36,11 +38,11 @@ def _flow_create_many_payload(args: tuple[Any, ...]) -> dict[str, Any]:
         )
         payload["items"] = _parse_create_items_ext(
             args[item_token + 2 :],
-            wire_partition == "MIXED",
+            mixed,
             expected_count=item_count,
         )
     else:
-        payload["items"] = _parse_create_items(args[item_token + 1 :], wire_partition == "MIXED")
+        payload["items"] = _parse_create_items(args[item_token + 1 :], mixed)
     return payload
 
 
@@ -111,7 +113,7 @@ def _parse_spawn_children_ext(
             "payload": values[idx + 3],
         }
         partition = values[idx + 1]
-        if partition != "-":
+        if partition != "-" and partition != b"-":
             child["partition_key"] = partition
         idx += 4
 
@@ -151,11 +153,12 @@ def _parse_spawn_children_ext(
 
 def _flow_claimed_many_payload(name: str, args: tuple[Any, ...]) -> dict[str, Any]:
     wire_partition = _text(_require_arg(args, 0, name))
+    mixed = _command_token(wire_partition) == "MIXED"
     item_token = _find_item_token(args, 1)
     payload = _option_map(args[1:item_token])
-    if wire_partition != "MIXED":
+    if not mixed:
         payload["partition_key"] = args[0]
-    payload["items"] = _parse_claimed_items(args[item_token + 1 :], wire_partition == "MIXED")
+    payload["items"] = _parse_claimed_items(args[item_token + 1 :], mixed)
     return payload
 
 
@@ -163,13 +166,14 @@ def _flow_fenced_many_payload(
     name: str, args: tuple[Any, ...], *, include_lease: bool
 ) -> dict[str, Any]:
     wire_partition = _text(_require_arg(args, 0, name))
+    mixed = _command_token(wire_partition) == "MIXED"
     item_token = _find_item_token(args, 1)
     payload = _option_map(args[1:item_token])
-    if wire_partition != "MIXED":
+    if not mixed:
         payload["partition_key"] = args[0]
     payload["items"] = _parse_fenced_items(
         args[item_token + 1 :],
-        wire_partition == "MIXED",
+        mixed,
         include_lease=include_lease,
     )
     return payload
@@ -203,7 +207,7 @@ def _parse_create_items_ext(
             raise InvalidCommandError("FLOW.CREATE_MANY ITEMS_EXT item is truncated")
         item = {"id": values[idx], "payload": values[idx + 2]}
         partition = values[idx + 1]
-        if mixed or partition != "-":
+        if mixed or (partition != "-" and partition != b"-"):
             item["partition_key"] = partition
         idx += 3
         value_segment = consume_counted_arguments(
@@ -264,7 +268,7 @@ def _parse_fenced_items(
             item["partition_key"] = values[idx + 1]
         if include_lease:
             lease = values[idx + (3 if mixed else 2)]
-            if lease != "-":
+            if lease != "-" and lease != b"-":
                 item["lease_token"] = lease
         items.append(item)
     return items

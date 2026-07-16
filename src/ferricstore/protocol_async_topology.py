@@ -30,7 +30,7 @@ from ferricstore.protocol_async import (
 )
 from ferricstore.protocol_async_endpoints import AsyncTopologyEndpointMixin
 from ferricstore.protocol_commands import (
-    build_protocol_command,
+    build_protocol_command,  # noqa: F401 - historical monkeypatch seam
 )
 from ferricstore.protocol_common import (
     RoutingTopology,
@@ -54,7 +54,7 @@ from ferricstore.protocol_lifecycle import (
     PendingRequestCapacityError,
     check_batch_item_limit,
 )
-from ferricstore.protocol_planning import PreparedCommand, prepare_protocol_command
+from ferricstore.protocol_planning import PreparedCommand
 from ferricstore.topology_core import (
     ControlEndpointSelector,
     FlowWakeSubscriptionRegistry,
@@ -633,7 +633,9 @@ class AsyncTopologyProtocolAdapterPool(AsyncTopologyEndpointMixin):
         if not args:
             return None
         try:
-            prepared = prepare_protocol_command(args, builder=build_protocol_command)
+            prepared = self._prepare_routed_command(args)
+        except PendingRequestCapacityError:
+            raise
         except Exception:
             return None
         route = await self._route_prepared(prepared)
@@ -667,9 +669,7 @@ class AsyncTopologyProtocolAdapterPool(AsyncTopologyEndpointMixin):
             check_batch_item_limit(len(commands), self.max_batch_items)
         except PendingRequestCapacityError as exc:
             raise FerricStoreError(str(exc)) from exc
-        prepared_commands = [
-            prepare_protocol_command(args, builder=build_protocol_command) for args in commands
-        ]
+        prepared_commands = [self._prepare_routed_command(args) for args in commands]
         while True:
             generation = self._topology_generation
             routed_commands: list[tuple[RoutedBatchTarget[Any], PreparedCommand]] = []

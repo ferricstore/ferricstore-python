@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import time
+import threading
 
 from ferricstore.config_validation import (
     validate_bounded_nonnegative_int,
@@ -77,14 +77,17 @@ class Worker:
         self.reclaim_expired = reclaim_expired
         self.reclaim_ratio = reclaim_ratio
         self._running = False
+        self._stop_event = threading.Event()
 
     def run_forever(self) -> None:
+        self._stop_event.clear()
         self._running = True
         idle_sleep_s = self.idle_sleep_s
         while self._running:
             processed = self.run_once()
             if processed == 0:
-                time.sleep(idle_sleep_s)
+                if self._stop_event.wait(idle_sleep_s):
+                    break
                 idle_sleep_s = min(
                     max(self.max_idle_sleep_s, self.idle_sleep_s),
                     max(idle_sleep_s * 2, self.idle_sleep_s),
@@ -94,6 +97,7 @@ class Worker:
 
     def stop(self) -> None:
         self._running = False
+        self._stop_event.set()
 
     def run_once(self) -> int:
         processed = 0
@@ -111,12 +115,14 @@ class Worker:
                 )
                 processed += len(results)
                 if len(results) >= self.limit:
-                    continue
+                    break
                 if len(results) == 0 or retries_left <= 0:
                     break
                 retries_left -= 1
-                if self.partial_retry_delay_s > 0:
-                    time.sleep(self.partial_retry_delay_s)
+                if self.partial_retry_delay_s > 0 and self._stop_event.wait(
+                    self.partial_retry_delay_s
+                ):
+                    return processed
         return processed
 
 

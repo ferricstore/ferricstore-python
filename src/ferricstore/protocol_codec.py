@@ -158,7 +158,11 @@ def _write_value(stream: _ValueWriter, value: Any, *, depth: int) -> None:
         if remaining is not None:
             stream.ensure_capacity(5)
             _require_utf8_within(value, remaining - 5)
-        _write_binary(stream, str.encode(value))
+        try:
+            encoded = str.encode(value)
+        except UnicodeEncodeError as exc:
+            raise FerricStoreError("protocol strings must contain valid UTF-8") from exc
+        _write_binary(stream, encoded)
         return
     if isinstance(value, (bytes, bytearray)):
         _write_binary(stream, value)
@@ -322,5 +326,8 @@ def _key_bytes(value: Any) -> bytes:
     if isinstance(value, bytes):
         return value
     if isinstance(value, str):
-        return value.encode()
+        try:
+            return value.encode()
+        except UnicodeEncodeError as exc:
+            raise FerricStoreError("protocol map keys must contain valid UTF-8") from exc
     raise FerricStoreError("protocol map keys must be str or bytes")

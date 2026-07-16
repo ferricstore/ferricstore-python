@@ -3,6 +3,12 @@ from __future__ import annotations
 import struct
 from typing import Any, cast
 
+from ferricstore.protocol_compact_budget import (
+    _bounded_maybe_bytes,
+    _bounded_optional_bytes,
+    _CompactPayloadBudget,
+    current_compact_encoding_policy,
+)
 from ferricstore.protocol_constants import (
     _COMPACT_FLOW_CANCEL_MANY_OK_REQUEST,
     _COMPACT_FLOW_CANCEL_MANY_REQUEST,
@@ -24,6 +30,13 @@ from ferricstore.protocol_constants import (
 )
 
 _I64_MAX = (1 << 63) - 1
+
+
+def _new_compact_budget(initial_size: int) -> _CompactPayloadBudget | None:
+    policy = current_compact_encoding_policy()
+    if not policy.enabled:
+        return None
+    return _CompactPayloadBudget(initial_size=initial_size, policy=policy)
 
 
 def _compact_i64(value: Any) -> int | None:
@@ -51,8 +64,11 @@ def _compact_flow_create_many_payload(payload: dict[str, Any]) -> bytes | None:
     items = payload.get("items")
     if not isinstance(items, list):
         return None
-    type_value = _maybe_bytes(payload.get("type"))
-    state = _maybe_bytes(payload.get("state"))
+    budget = _new_compact_budget(1 + struct.calcsize(">qqBBI"))
+    if budget is None:
+        return None
+    type_value = _bounded_maybe_bytes(payload.get("type"), budget=budget)
+    state = _bounded_maybe_bytes(payload.get("state"), budget=budget)
     now_ms = _compact_i64(payload.get("now_ms"))
     run_at_ms = _compact_i64(payload.get("run_at_ms"))
     if type_value is None or state is None or now_ms is None or run_at_ms is None:
@@ -60,7 +76,7 @@ def _compact_flow_create_many_payload(payload: dict[str, Any]) -> bytes | None:
     return_mode = _compact_create_many_return_mode(payload.get("return"))
     if return_mode is None:
         return None
-    partition_value = _optional_bytes(payload.get("partition_key"))
+    partition_value = _bounded_optional_bytes(payload.get("partition_key"), budget=budget)
     if partition_value is False:
         return None
     partition_key = cast(bytes | None, partition_value)
@@ -98,13 +114,13 @@ def _compact_flow_create_many_payload(payload: dict[str, Any]) -> bytes | None:
     for item in items:
         if not isinstance(item, list) or len(item) != (3 if mixed else 2):
             return None
-        item_id = _maybe_bytes(item[0])
-        item_payload = _maybe_bytes(item[2] if mixed else item[1])
+        item_id = _bounded_maybe_bytes(item[0], budget=budget)
+        item_payload = _bounded_maybe_bytes(item[2] if mixed else item[1], budget=budget)
         if item_id is None or item_payload is None:
             return None
         parts.append(_compact_binary(item_id))
         if mixed:
-            item_partition = _maybe_bytes(item[1])
+            item_partition = _bounded_maybe_bytes(item[1], budget=budget)
             if item_partition is None:
                 return None
             parts.append(_compact_binary(item_partition))
@@ -131,9 +147,14 @@ def _compact_flow_claim_due_payload(payload: dict[str, Any]) -> bytes | None:
         return None
     if "partition_key" in payload and "partition_keys" in payload:
         return None
-    type_value = _maybe_bytes(payload.get("type"))
-    state = _optional_bytes(payload.get("state"))
-    worker = _maybe_bytes(payload.get("worker"))
+    budget = _new_compact_budget(1 + struct.calcsize(">qqqBqqBB"))
+    if budget is None:
+        return None
+    type_value = _bounded_maybe_bytes(payload.get("type"), budget=budget)
+    state = _bounded_optional_bytes(payload.get("state"), budget=budget)
+    if state is None:
+        budget.reserve(4)
+    worker = _bounded_maybe_bytes(payload.get("worker"), budget=budget)
     lease_ms = _compact_i64(payload.get("lease_ms"))
     limit = _compact_i64(payload.get("limit"))
     block_ms = _compact_i64(payload.get("block_ms", -1))
@@ -154,7 +175,7 @@ def _compact_flow_claim_due_payload(payload: dict[str, Any]) -> bytes | None:
     if return_mode is None:
         return None
 
-    partition_mode, partition_body = _compact_partition_request(payload)
+    partition_mode, partition_body = _compact_partition_request(payload, budget=budget)
     if partition_mode is None:
         return None
 
@@ -203,9 +224,15 @@ def _compact_flow_claimed_many_payload(
     items = payload.get("items")
     if now_ms is None or not isinstance(items, list):
         return None
+    fixed_size = (
+        struct.calcsize(">qqBI") if "run_at_ms" in extra_allowed else struct.calcsize(">qBI")
+    )
+    budget = _new_compact_budget(1 + fixed_size)
+    if budget is None:
+        return None
     return_mode = payload.get("return")
     if return_mode is None:
-        request_kind = _COMPACT_FLOW_COMPLETE_MANY_REQUEST
+        pass
     else:
         if isinstance(return_mode, bytes):
             return_mode_text = return_mode.decode("utf-8", errors="replace")
@@ -214,10 +241,12 @@ def _compact_flow_claimed_many_payload(
         if return_mode_text.upper() != "OK_ON_SUCCESS":
             return None
         request_kind = ok_request_kind
-    partition_value = _optional_bytes(payload.get("partition_key"))
+    partition_value = _bounded_optional_bytes(payload.get("partition_key"), budget=budget)
     if partition_value is False:
         return None
     partition_key = cast(bytes | None, partition_value)
+    if partition_key is None:
+        budget.reserve(4)
 
     pack_u32 = _COMPACT_U32.pack
     pack_i64 = _COMPACT_I64.pack
@@ -255,20 +284,23 @@ def _compact_flow_claimed_many_payload(
     for item in items:
         if not isinstance(item, list) or len(item) not in {3, 4}:
             return None
-        item_id = _maybe_bytes(item[0])
+        item_id = _bounded_maybe_bytes(item[0], budget=budget)
         item_partition = None
         if len(item) == 4:
-            item_partition = _maybe_bytes(item[1])
+            item_partition = _bounded_maybe_bytes(item[1], budget=budget)
             if item_partition is None:
                 return None
-            lease_token = _maybe_bytes(item[2])
+            lease_token = _bounded_maybe_bytes(item[2], budget=budget)
             fencing_token = item[3]
         else:
-            lease_token = _maybe_bytes(item[1])
+            lease_token = _bounded_maybe_bytes(item[1], budget=budget)
             fencing_token = item[2]
         fencing_token = _compact_i64(fencing_token)
         if item_id is None or lease_token is None or fencing_token is None:
             return None
+        if item_partition is None:
+            budget.reserve(4)
+        budget.reserve(_COMPACT_I64.size)
         body.extend(pack_u32(len(item_id)))
         body.extend(item_id)
         if item_partition is None:
@@ -290,6 +322,9 @@ def _compact_flow_cancel_many_payload(payload: dict[str, Any]) -> bytes | None:
     items = payload.get("items")
     if now_ms is None or not isinstance(items, list):
         return None
+    budget = _new_compact_budget(1 + struct.calcsize(">qBI"))
+    if budget is None:
+        return None
     return_mode = payload.get("return")
     if return_mode is None:
         request_kind = _COMPACT_FLOW_CANCEL_MANY_REQUEST
@@ -302,9 +337,11 @@ def _compact_flow_cancel_many_payload(payload: dict[str, Any]) -> bytes | None:
         if return_mode_text.upper() != "OK_ON_SUCCESS":
             return None
         request_kind = _COMPACT_FLOW_CANCEL_MANY_OK_REQUEST
-    partition_key = _optional_bytes(payload.get("partition_key"))
+    partition_key = _bounded_optional_bytes(payload.get("partition_key"), budget=budget)
     if partition_key is False:
         return None
+    if partition_key is None:
+        budget.reserve(4)
 
     parts = [
         bytes([request_kind]),
@@ -314,12 +351,15 @@ def _compact_flow_cancel_many_payload(payload: dict[str, Any]) -> bytes | None:
     for item in items:
         if not isinstance(item, dict):
             return None
-        item_id = _maybe_bytes(item.get("id"))
-        item_partition = _optional_bytes(item.get("partition_key"))
+        item_id = _bounded_maybe_bytes(item.get("id"), budget=budget)
+        item_partition = _bounded_optional_bytes(item.get("partition_key"), budget=budget)
         fencing_token = item.get("fencing_token")
         fencing_token = _compact_i64(fencing_token)
         if item_id is None or item_partition is False or fencing_token is None:
             return None
+        if item_partition is None:
+            budget.reserve(4)
+        budget.reserve(_COMPACT_I64.size)
         parts.append(_compact_binary(item_id))
         parts.append(_compact_optional_binary(cast(bytes | None, item_partition)))
         parts.append(struct.pack(">q", fencing_token))
@@ -339,8 +379,11 @@ def _compact_flow_transition_many_payload(payload: dict[str, Any]) -> bytes | No
     }
     if not set(payload).issubset(allowed):
         return None
-    from_state = _maybe_bytes(payload.get("from_state"))
-    to_state = _maybe_bytes(payload.get("to_state"))
+    budget = _new_compact_budget(1 + struct.calcsize(">qqBI"))
+    if budget is None:
+        return None
+    from_state = _bounded_maybe_bytes(payload.get("from_state"), budget=budget)
+    to_state = _bounded_maybe_bytes(payload.get("to_state"), budget=budget)
     now_ms = _compact_i64(payload.get("now_ms"))
     run_at_ms = _compact_i64(payload.get("run_at_ms"))
     items = payload.get("items")
@@ -364,9 +407,11 @@ def _compact_flow_transition_many_payload(payload: dict[str, Any]) -> bytes | No
         if return_mode_text.upper() != "OK_ON_SUCCESS":
             return None
         request_kind = _COMPACT_FLOW_TRANSITION_MANY_OK_REQUEST
-    partition_key = _optional_bytes(payload.get("partition_key"))
+    partition_key = _bounded_optional_bytes(payload.get("partition_key"), budget=budget)
     if partition_key is False:
         return None
+    if partition_key is None:
+        budget.reserve(4)
 
     parts = [
         bytes([request_kind]),
@@ -384,9 +429,9 @@ def _compact_flow_transition_many_payload(payload: dict[str, Any]) -> bytes | No
     for item in items:
         if not isinstance(item, dict):
             return None
-        item_id = _maybe_bytes(item.get("id"))
-        item_partition = _optional_bytes(item.get("partition_key"))
-        lease_token = _optional_bytes(item.get("lease_token"))
+        item_id = _bounded_maybe_bytes(item.get("id"), budget=budget)
+        item_partition = _bounded_optional_bytes(item.get("partition_key"), budget=budget)
+        lease_token = _bounded_optional_bytes(item.get("lease_token"), budget=budget)
         fencing_token = item.get("fencing_token")
         fencing_token = _compact_i64(fencing_token)
         if (
@@ -396,6 +441,11 @@ def _compact_flow_transition_many_payload(payload: dict[str, Any]) -> bytes | No
             or fencing_token is None
         ):
             return None
+        if item_partition is None:
+            budget.reserve(4)
+        if lease_token is None:
+            budget.reserve(4)
+        budget.reserve(_COMPACT_I64.size)
         parts.append(_compact_binary(item_id))
         parts.append(_compact_optional_binary(cast(bytes | None, item_partition)))
         parts.append(struct.pack(">q", fencing_token))
@@ -412,13 +462,16 @@ def _compact_flow_value_mget_payload(payload: dict[str, Any]) -> bytes | None:
     max_bytes_value = _compact_i64(payload.get("max_bytes", _I64_MIN))
     if max_bytes_value is None:
         return None
+    budget = _new_compact_budget(1 + struct.calcsize(">qI"))
+    if budget is None:
+        return None
 
     parts = [
         bytes([_COMPACT_FLOW_VALUE_MGET_REQUEST]),
         struct.pack(">qI", max_bytes_value, len(refs)),
     ]
     for ref in refs:
-        encoded = _maybe_bytes(ref)
+        encoded = _bounded_maybe_bytes(ref, budget=budget)
         if encoded is None:
             return None
         parts.append(_compact_binary(encoded))
@@ -429,8 +482,13 @@ def _compact_flow_list_payload(payload: dict[str, Any]) -> bytes | None:
     if not set(payload).issubset({"type", "state", "count", "return"}):
         return None
 
-    flow_type = _maybe_bytes(payload.get("type"))
-    state = _optional_bytes(payload.get("state"))
+    budget = _new_compact_budget(1 + struct.calcsize(">qB"))
+    if budget is None:
+        return None
+    flow_type = _bounded_maybe_bytes(payload.get("type"), budget=budget)
+    state = _bounded_optional_bytes(payload.get("state"), budget=budget)
+    if state is None:
+        budget.reserve(4)
     count = _compact_i64(_raw_int(payload.get("count")))
     if flow_type is None or state is False or count is None:
         return None
@@ -452,13 +510,11 @@ def _compact_flow_list_payload(payload: dict[str, Any]) -> bytes | None:
 
 
 def _raw_int(value: Any) -> int | None:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, str, bytes)):
         return None
-    if isinstance(value, int):
-        return value
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return None
 
 
@@ -470,6 +526,9 @@ def _ok_on_success_return_mode(value: Any) -> bool:
 def _compact_flow_value_put_payload(mode: int, items: list[dict[str, Any]]) -> bytes | None:
     if not items:
         return None
+    budget = _new_compact_budget(struct.calcsize(">BBI"))
+    if budget is None:
+        return None
 
     parts = [struct.pack(">BBI", _COMPACT_PIPELINE_REQUEST, 0x80 | mode, len(items))]
     if mode in {7, 15}:
@@ -477,7 +536,11 @@ def _compact_flow_value_put_payload(mode: int, items: list[dict[str, Any]]) -> b
             now_ms = _compact_i64(item.get("now_ms"))
             if now_ms is None:
                 return None
-            parts.append(_compact_binary(cast(bytes, item["value"])))
+            value = _bounded_maybe_bytes(item.get("value"), budget=budget)
+            if value is None:
+                return None
+            budget.reserve(_COMPACT_I64.size)
+            parts.append(_compact_binary(value))
             parts.append(struct.pack(">q", now_ms))
         return b"".join(parts)
 
@@ -486,19 +549,35 @@ def _compact_flow_value_put_payload(mode: int, items: list[dict[str, Any]]) -> b
             now_ms = _compact_i64(item.get("now_ms"))
             if now_ms is None:
                 return None
-            parts.append(_compact_binary(cast(bytes, item["value"])))
-            parts.append(_compact_binary(cast(bytes, item["owner_flow_id"])))
-            parts.append(_compact_binary(cast(bytes, item["name"])))
-            parts.append(_compact_optional_binary(cast(bytes | None, item["partition_key"])))
+            value = _bounded_maybe_bytes(item.get("value"), budget=budget)
+            owner_flow_id = _bounded_maybe_bytes(item.get("owner_flow_id"), budget=budget)
+            name = _bounded_maybe_bytes(item.get("name"), budget=budget)
+            partition_value = _bounded_optional_bytes(
+                item.get("partition_key"),
+                budget=budget,
+            )
+            if value is None or owner_flow_id is None or name is None or partition_value is False:
+                return None
+            if partition_value is None:
+                budget.reserve(4)
+            budget.reserve(_COMPACT_I64.size)
+            parts.append(_compact_binary(value))
+            parts.append(_compact_binary(owner_flow_id))
+            parts.append(_compact_binary(name))
+            parts.append(_compact_optional_binary(cast(bytes | None, partition_value)))
             parts.append(struct.pack(">q", now_ms))
         return b"".join(parts)
 
     return None
 
 
-def _compact_partition_request(payload: dict[str, Any]) -> tuple[int | None, bytes]:
+def _compact_partition_request(
+    payload: dict[str, Any],
+    *,
+    budget: _CompactPayloadBudget | None = None,
+) -> tuple[int | None, bytes]:
     if "partition_key" in payload:
-        value = _maybe_bytes(payload.get("partition_key"))
+        value = _bounded_maybe_bytes(payload.get("partition_key"), budget=budget)
         if value is None:
             return None, b""
         return 1, _compact_binary(value)
@@ -506,9 +585,11 @@ def _compact_partition_request(payload: dict[str, Any]) -> tuple[int | None, byt
         values = payload.get("partition_keys")
         if not isinstance(values, list):
             return None, b""
+        if budget is not None:
+            budget.reserve(_COMPACT_U32.size)
         parts = [struct.pack(">I", len(values))]
         for value in values:
-            encoded = _maybe_bytes(value)
+            encoded = _bounded_maybe_bytes(value, budget=budget)
             if encoded is None:
                 return None, b""
             parts.append(_compact_binary(encoded))
@@ -517,11 +598,7 @@ def _compact_partition_request(payload: dict[str, Any]) -> tuple[int | None, byt
 
 
 def _maybe_bytes(value: Any) -> bytes | None:
-    if isinstance(value, bytes):
-        return value
-    if isinstance(value, str):
-        return value.encode()
-    return None
+    return _bounded_maybe_bytes(value)
 
 
 def _optional_bytes(value: Any) -> bytes | None | bool:

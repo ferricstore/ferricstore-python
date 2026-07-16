@@ -45,11 +45,12 @@ from ferricstore.protocol_lifecycle import (
     PendingRequestBudget,
     PendingRequestCapacityError,
 )
+from ferricstore.protocol_tls import ProtocolTLSContextMixin
 
 _StateAdapter = TypeVar("_StateAdapter", bound="_AsyncProtocolStateMixin")
 
 
-class _AsyncProtocolStateMixin:
+class _AsyncProtocolStateMixin(ProtocolTLSContextMixin):
     """Connection lifecycle, event, and pending-request state for the async adapter."""
 
     if TYPE_CHECKING:
@@ -114,6 +115,7 @@ class _AsyncProtocolStateMixin:
             name="write_drain_bytes",
         )
         self.ssl_context = ssl_context
+        self._default_ssl_context: ssl.SSLContext | None = None
         self.heartbeat_interval = runtime_config.heartbeat_interval
         self.heartbeat_timeout = runtime_config.heartbeat_timeout
         self.max_response_bytes = runtime_config.max_response_bytes

@@ -4,37 +4,36 @@ from collections.abc import Sequence
 from concurrent.futures import Future
 from dataclasses import replace
 from typing import Any
-from urllib.parse import unquote, urlparse
 
 from ferricstore.config_validation import validate_nonnegative_int
 from ferricstore.errors import (
     InvalidCommandError,
 )
-from ferricstore.protocol_commands import build_protocol_command
+from ferricstore.protocol_commands import (
+    _compact_flow_many_payloads_from_raw,
+    build_protocol_command,  # noqa: F401 - historical monkeypatch seam
+)
 from ferricstore.protocol_common import (
     _command_name,
-    _normalize_protocol_url_kwargs,
-    _protocol_url_port,
 )
+from ferricstore.protocol_compact_budget import transport_compact_encoding_policy
 from ferricstore.protocol_constants import (
     _FLAG_CUSTOM_PAYLOAD,
     _OP_FLOW_VALUE_MGET,
     _OP_MGET,
     _OPCODES,
-    _SUPPORTED_SCHEMES,
-    _TLS_SCHEMES,
     ProtocolCommand,
     ProtocolResponse,
 )
+from ferricstore.protocol_lifecycle import DEFAULT_MAX_PENDING_REQUEST_BYTES
 from ferricstore.protocol_pipeline_codec import (
     _blocks_forever,
     _compact_kv_keys_payload,
     _compact_kv_set_keys_value_payload,
-    _compact_kv_set_pairs_payload,
     _expected_command_collection_items,
 )
 from ferricstore.protocol_pipelines import ProtocolPipeline
-from ferricstore.protocol_planning import prepare_protocol_command
+from ferricstore.protocol_planning import PreparedCommand
 from ferricstore.protocol_responses import (
     _batch_item_value,
     _response_value,
@@ -43,6 +42,12 @@ from ferricstore.protocol_subscriptions import SyncProtocolSubscriptionMixin
 from ferricstore.protocol_sync_batch import SyncProtocolBatchMixin
 from ferricstore.protocol_sync_prepared import SyncPreparedCommandMixin
 from ferricstore.protocol_sync_transport import SyncProtocolTransportMixin
+from ferricstore.protocol_transport_commands import (
+    adapter_from_url,
+    build_adapter_protocol_command,
+    compact_flow_many_for_adapter,
+    prepare_adapter_protocol_command,
+)
 
 
 class ProtocolAdapter(
@@ -63,25 +68,26 @@ class ProtocolAdapter(
     supports_concurrent_fanout = True
 
     def _build_protocol_command(self, *args: Any) -> ProtocolCommand:
-        return build_protocol_command(*args)
+        return build_adapter_protocol_command(self, args)
+
+    def _prepare_protocol_command(self, args: tuple[Any, ...]) -> PreparedCommand:
+        return prepare_adapter_protocol_command(self, args)
+
+    def _compact_flow_many_payloads(
+        self,
+        commands: list[tuple[Any, ...]],
+        protocol_commands: list[ProtocolCommand] | None,
+    ) -> list[tuple[int, bytes, int]] | None:
+        return compact_flow_many_for_adapter(
+            self,
+            _compact_flow_many_payloads_from_raw,
+            commands,
+            protocol_commands,
+        )
 
     @classmethod
     def from_url(cls, url: str, **kwargs: Any) -> ProtocolAdapter:
-        parsed = urlparse(url)
-        scheme = parsed.scheme.lower()
-        tls = scheme in _TLS_SCHEMES
-        if scheme not in _SUPPORTED_SCHEMES:
-            raise ValueError(f"unsupported FerricStore URL scheme: {parsed.scheme}")
-
-        host = parsed.hostname or "127.0.0.1"
-        port = _protocol_url_port(parsed, tls=tls)
-        username = unquote(parsed.username) if parsed.username else None
-        password = unquote(parsed.password) if parsed.password else None
-        _normalize_protocol_url_kwargs(kwargs)
-        kwargs.setdefault("username", username)
-        kwargs.setdefault("password", password)
-        kwargs.setdefault("tls", tls)
-        return cls(host, port, **kwargs)
+        return adapter_from_url(cls, url, kwargs)
 
     def pipeline(self, transaction: bool = False) -> ProtocolPipeline:
         if transaction:
@@ -100,7 +106,7 @@ class ProtocolAdapter(
                 expected_collection_items=_expected_command_collection_items(args),
             )
             return self._response_value(response)
-        return self.execute_prepared_command(prepare_protocol_command(args))
+        return self.execute_prepared_command(self._prepare_protocol_command(args))
 
     def execute_command_on_lane(self, args: tuple[Any, ...], lane_id: int) -> Any:
         """Execute a routed command on the exact topology lane."""
@@ -116,10 +122,10 @@ class ProtocolAdapter(
                     expected_collection_items=_expected_command_collection_items(args),
                 )
             )
-        return self.execute_prepared_command_on_lane(prepare_protocol_command(args), lane_id)
+        return self.execute_prepared_command_on_lane(self._prepare_protocol_command(args), lane_id)
 
     def execute_command_with_trace(self, *args: Any) -> dict[str, Any]:
-        return self.execute_prepared_command_with_trace(prepare_protocol_command(args))
+        return self.execute_prepared_command_with_trace(self._prepare_protocol_command(args))
 
     def execute_command_with_trace_on_lane(
         self,
@@ -127,7 +133,7 @@ class ProtocolAdapter(
         lane_id: int,
     ) -> dict[str, Any]:
         return self.execute_prepared_command_with_trace_on_lane(
-            prepare_protocol_command(args),
+            self._prepare_protocol_command(args),
             lane_id,
         )
 
@@ -144,7 +150,7 @@ class ProtocolAdapter(
                 _expire_at_adapter_timeout=not _blocks_forever(args),
             )
             return self._value_future(response_future)
-        return self.submit_prepared_command(prepare_protocol_command(args))
+        return self.submit_prepared_command(self._prepare_protocol_command(args))
 
     def submit_command_on_lane(
         self,
@@ -163,12 +169,20 @@ class ProtocolAdapter(
                 _expire_at_adapter_timeout=not _blocks_forever(args),
             )
             return self._value_future(response_future)
-        return self.submit_prepared_command_on_lane(prepare_protocol_command(args), lane_id)
+        return self.submit_prepared_command_on_lane(self._prepare_protocol_command(args), lane_id)
 
     def submit_mget(self, keys: Sequence[Any]) -> Future[Any]:
-        payload = _compact_kv_keys_payload(keys, 2)
+        with transport_compact_encoding_policy(
+            getattr(
+                self,
+                "max_pending_request_bytes",
+                DEFAULT_MAX_PENDING_REQUEST_BYTES,
+            ),
+            getattr(self, "compression", "none"),
+        ):
+            payload = _compact_kv_keys_payload(keys, 2)
         if payload is None:
-            raise InvalidCommandError("MGET requires one or more string/binary keys")
+            return self.submit_command("MGET", *keys)
         return self.submit_mget_payload(payload)
 
     def submit_mget_payload(self, payload: bytes) -> Future[Any]:
@@ -207,11 +221,18 @@ class ProtocolAdapter(
         return self._value_future(response_future)
 
     def submit_mset_same_value(self, keys: Sequence[Any], value: Any) -> Future[Any]:
-        payload = _compact_kv_set_keys_value_payload(keys, value)
+        with transport_compact_encoding_policy(
+            getattr(
+                self,
+                "max_pending_request_bytes",
+                DEFAULT_MAX_PENDING_REQUEST_BYTES,
+            ),
+            getattr(self, "compression", "none"),
+        ):
+            payload = _compact_kv_set_keys_value_payload(keys, value)
         if payload is None:
-            raise InvalidCommandError(
-                "MSET requires one or more string/binary keys and a string/binary value"
-            )
+            args = tuple(item for key in keys for item in (key, value))
+            return self.submit_command("MSET", *args)
         return self.submit_mset_payload(payload)
 
     def submit_mset_payload(self, payload: bytes) -> Future[Any]:
@@ -328,18 +349,11 @@ class ProtocolAdapter(
             name = _command_name(args[0])
         except Exception:
             return None
-
-        command_args = args[1:]
-        if name == "MGET":
-            payload = _compact_kv_keys_payload(command_args, 2)
-            return (
-                (_OPCODES["MGET"], payload, _FLAG_CUSTOM_PAYLOAD) if payload is not None else None
-            )
-        if name == "MSET":
-            payload = _compact_kv_set_pairs_payload(command_args)
-            return (
-                (_OPCODES["MSET"], payload, _FLAG_CUSTOM_PAYLOAD) if payload is not None else None
-            )
+        if name not in {"MGET", "MSET"}:
+            return None
+        command = self._build_protocol_command(*args)
+        if isinstance(command.payload, bytes) and command.flags == _FLAG_CUSTOM_PAYLOAD:
+            return command.opcode, command.payload, command.flags
         return None
 
     def _response_value(self, response: ProtocolResponse) -> Any:

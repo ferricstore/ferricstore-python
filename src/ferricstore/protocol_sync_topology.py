@@ -27,7 +27,9 @@ from ferricstore.lifecycle_core import (
     try_set_future_exception,
     try_set_future_result,
 )
-from ferricstore.protocol_commands import build_protocol_command
+from ferricstore.protocol_commands import (
+    build_protocol_command,  # noqa: F401 - historical monkeypatch seam
+)
 from ferricstore.protocol_common import (
     RoutingTopology,
     _close_adapter_sync,
@@ -42,8 +44,10 @@ from ferricstore.protocol_constants import (
     _FLAG_TRACE,
     _TLS_SCHEMES,
 )
-from ferricstore.protocol_lifecycle import DEFAULT_MAX_BATCH_ITEMS
-from ferricstore.protocol_planning import PreparedCommand, prepare_protocol_command
+from ferricstore.protocol_lifecycle import (
+    DEFAULT_MAX_BATCH_ITEMS,
+)
+from ferricstore.protocol_planning import PreparedCommand
 from ferricstore.protocol_sync import (
     ProtocolPipeline,
 )
@@ -78,9 +82,6 @@ class TopologyProtocolAdapterPool(SyncTopologyEndpointMixin, SyncTopologyRouting
     client: TopologyProtocolAdapterPool
     requires_explicit_session = True
     supports_concurrent_fanout = True
-
-    def _prepare_routed_command(self, args: tuple[Any, ...]) -> PreparedCommand:
-        return prepare_protocol_command(args, builder=build_protocol_command)
 
     def __init__(
         self,
@@ -266,6 +267,7 @@ class TopologyProtocolAdapterPool(SyncTopologyEndpointMixin, SyncTopologyRouting
                 self._close_adapters_snapshot = adapters
             adapters = list(adapters)
         self._event_ready.set()
+        self._close_cleanup_retry_scheduler()
 
         def close_adapter(adapter: Any) -> None:
             cleanup_adapters = getattr(self, "_cleanup_adapters", None)
