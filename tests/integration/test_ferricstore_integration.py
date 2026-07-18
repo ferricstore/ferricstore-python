@@ -100,6 +100,7 @@ _NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED: dict[str, str] = {
     "FERRICSTORE.NAMESPACE": "management command requires namespace control-plane support",
     "FERRICSTORE.QUOTA": "management command requires quota control-plane support",
     "HELLO": "connection handshake command",
+    "KEY_INFO": ("RESP compatibility alias; native transport uses canonical FERRICSTORE.KEY_INFO"),
     "LASTSAVE": "admin persistence command; not part of normal SDK app command coverage",
     "LOLWUT": "diagnostic compatibility command, not SDK app surface",
     "MODULE": "admin module command; FerricStore does not load modules through SDK tests",
@@ -997,6 +998,15 @@ def test_real_ferricstore_protocol_helpers_and_diagnostics() -> None:
         info = client.key_info(key)
         assert info.type in {"string", "binary", "unknown", ""}
         assert info.raw
+
+        with client.transaction(watch=[key]) as transaction:
+            assert _ok(transaction.unwatch())
+
+        with (
+            pytest.raises(RuntimeError, match="exercise transaction rollback"),
+            client.transaction(watch=[key]),
+        ):
+            raise RuntimeError("exercise transaction rollback")
 
         first = client.fetch_or_compute(cache_key, ttl_ms=60_000, hint="integration")
         assert first.should_compute

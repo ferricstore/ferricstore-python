@@ -6,6 +6,13 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.5.1
+
+- Stabilized FerricStore 0.8 release validation by requiring continuous native
+  readiness before the live suite, exercising affine `UNWATCH` and `DISCARD`
+  transaction paths, and documenting the RESP-only `KEY_INFO` compatibility
+  alias without weakening native command-catalog coverage.
+
 ## 0.5.0
 
 - Raised the minimum server version to FerricStore `0.8.0` without changing

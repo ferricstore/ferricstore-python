@@ -53,10 +53,19 @@ def main() -> None:
         os.environ.get("FERRICSTORE_PORT", os.environ.get("FERRICSTORE_NATIVE_PORT", "6388"))
     )
     deadline = time.monotonic() + int(os.environ.get("FERRICSTORE_WAIT_SECONDS", "180"))
+    stable_seconds = float(os.environ.get("FERRICSTORE_WAIT_STABLE_SECONDS", "0"))
+    if stable_seconds < 0:
+        raise ValueError("FERRICSTORE_WAIT_STABLE_SECONDS must be non-negative")
+    ready_since: float | None = None
 
-    while time.monotonic() < deadline:
+    while (now := time.monotonic()) < deadline:
         if is_ready(host, port):
-            return
+            if ready_since is None:
+                ready_since = now
+            if now - ready_since >= stable_seconds:
+                return
+        else:
+            ready_since = None
         time.sleep(0.5)
 
     raise TimeoutError(f"Timed out waiting for FerricStore at {host}:{port}")

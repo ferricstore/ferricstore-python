@@ -48,6 +48,29 @@ def test_non_native_readiness_uses_tcp(monkeypatch):
     assert calls == [("127.0.0.1", 6388)]
 
 
+def test_main_waits_for_continuous_configured_readiness(monkeypatch):
+    wait = _load_wait_module()
+    readiness = iter([True, True, False, True, True, True])
+    clock = iter([0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5])
+    calls = []
+
+    def fake_is_ready(host: str, port: int) -> bool:
+        calls.append((host, port))
+        return next(readiness)
+
+    sleeps = []
+    monkeypatch.setenv("FERRICSTORE_WAIT_SECONDS", "10")
+    monkeypatch.setenv("FERRICSTORE_WAIT_STABLE_SECONDS", "1")
+    monkeypatch.setattr(wait, "is_ready", fake_is_ready)
+    monkeypatch.setattr(wait.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(wait.time, "sleep", sleeps.append)
+
+    wait.main()
+
+    assert calls == [("127.0.0.1", 6388)] * 6
+    assert sleeps == [0.5] * 5
+
+
 def test_compose_fixtures_target_current_ferricstore_server_version():
     root = Path(__file__).resolve().parents[1]
     for name in ("docker-compose.yml", "docker-compose.cluster.yml", ".env.example"):

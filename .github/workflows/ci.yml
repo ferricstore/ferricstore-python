@@ -114,7 +114,8 @@ jobs:
       - name: Start FerricStore
         run: |
           docker compose up -d ferricstore
-          FERRICSTORE_PORT=6388 python scripts/wait_for_ferricstore.py
+          FERRICSTORE_PORT=6388 FERRICSTORE_WAIT_STABLE_SECONDS=15 \
+            python scripts/wait_for_ferricstore.py
 
       - name: Run native integration tests
         run: python -m pytest tests/integration

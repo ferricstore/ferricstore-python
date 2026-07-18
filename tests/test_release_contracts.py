@@ -41,6 +41,7 @@ def test_publish_requires_tag_validation_and_live_integration() -> None:
     assert "scripts/check_release_version.py" in workflow
     assert "integration:" in workflow
     assert 'FERRICSTORE_INTEGRATION: "1"' in workflow
+    assert "FERRICSTORE_WAIT_STABLE_SECONDS=15" in workflow
     assert "needs: [build, integration]" in workflow
 
 
