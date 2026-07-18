@@ -24,6 +24,7 @@ from ferricstore.protocol_commands import (
 )
 from ferricstore.protocol_common import (
     _encode_request_body,
+    _next_protocol_lane,
     _notify_event_listeners,
     _request_body_byte_limit,
     _response_identity_map,
@@ -32,7 +33,6 @@ from ferricstore.protocol_common import (
 )
 from ferricstore.protocol_constants import (
     _FLAG_COMPRESSED,
-    _FLAG_MORE_CHUNKS,
     _FLAG_TRACE,
     _HEADER,
     _MAGIC,
@@ -47,12 +47,15 @@ from ferricstore.protocol_constants import (
     ProtocolResponse,
 )
 from ferricstore.protocol_framing import (
-    ResponseBodyAccumulator,
-    ResponseFrameBudget,
+    ResponseFrameAssembler,
     ResponseIdentity,
-    validate_response_identity,
 )
 from ferricstore.protocol_lifecycle import PendingRequestCapacityError
+from ferricstore.protocol_negotiation import (
+    apply_hello_negotiation,
+    mark_authenticated,
+    validate_unauthenticated_request_size,
+)
 from ferricstore.protocol_pipeline_codec import _expected_payload_collection_items
 from ferricstore.protocol_pipelines import AsyncProtocolPipeline
 from ferricstore.protocol_planning import PreparedCommand
@@ -61,6 +64,7 @@ from ferricstore.protocol_responses import (
     _decode_protocol_response,
     _response_value,
 )
+from ferricstore.protocol_retry import request_outcome_error
 from ferricstore.protocol_subscriptions import AsyncProtocolSubscriptionMixin
 from ferricstore.protocol_transport_commands import (
     adapter_from_url,
@@ -253,6 +257,19 @@ class AsyncProtocolAdapter(
                     self._reader, self._writer = reader, writer
                     self._reader_task = asyncio.create_task(self._reader_loop(reader, writer))
 
+                    hello: dict[str, Any] = {"compression": self.compression}
+                    if self.client_name is not None:
+                        hello["client_name"] = self.client_name
+                    hello_value = self._response_value(
+                        await self._request(
+                            _OPCODES["HELLO"],
+                            0,
+                            hello,
+                            _skip_connect=True,
+                        )
+                    )
+                    apply_hello_negotiation(self, hello_value)
+
                     startup: dict[str, Any] = {
                         "compression": self.compression,
                         "compact_flow_responses": True,
@@ -261,7 +278,7 @@ class AsyncProtocolAdapter(
                         startup["client_name"] = self.client_name
                         startup["driver_name"] = self.client_name
 
-                    self._response_value(
+                    startup_value = self._response_value(
                         await self._request(
                             _OP_STARTUP,
                             0,
@@ -269,6 +286,7 @@ class AsyncProtocolAdapter(
                             _skip_connect=True,
                         )
                     )
+                    apply_hello_negotiation(self, startup_value)
 
                     if self.password is not None:
                         self._response_value(
@@ -279,6 +297,7 @@ class AsyncProtocolAdapter(
                                 _skip_connect=True,
                             )
                         )
+                        mark_authenticated(self)
                     for payload in list(self._flow_wake_subscriptions):
                         self._response_value(
                             await self._request(
@@ -375,15 +394,7 @@ class AsyncProtocolAdapter(
         return self._request_id
 
     def _next_lane_id(self, lane_id: int) -> int:
-        if lane_id == 0:
-            return lane_id
-        fixed_lane_id = cast(int | None, getattr(self, "_fixed_lane_id", None))
-        if fixed_lane_id is not None:
-            return fixed_lane_id
-        if self.lanes == 1:
-            return lane_id
-        self._lane_cursor = (self._lane_cursor % self.lanes) + 1
-        return self._lane_cursor
+        return _next_protocol_lane(self, lane_id)
 
     async def _send(
         self,
@@ -401,7 +412,15 @@ class AsyncProtocolAdapter(
             payload,
             # Compression is negotiated by STARTUP itself.  KV correctly
             # rejects compressed frames until that request succeeds.
-            compression="none" if opcode == _OP_STARTUP else self.compression,
+            compression=(
+                "none"
+                if opcode in {_OPCODES["HELLO"], _OP_STARTUP}
+                or (
+                    getattr(self, "_auth_required", False)
+                    and not getattr(self, "_authenticated", False)
+                )
+                else self.compression
+            ),
             max_body_bytes=_request_body_byte_limit(pending_budget, request_id),
             pending_limit=getattr(
                 self,
@@ -409,6 +428,7 @@ class AsyncProtocolAdapter(
                 pending_budget.max_bytes,
             ),
         )
+        validate_unauthenticated_request_size(self, len(body))
         flags = extra_flags
         if compressed:
             flags |= _FLAG_COMPRESSED
@@ -462,7 +482,11 @@ class AsyncProtocolAdapter(
         try:
             return await asyncio.wait_for(request, effective_timeout)
         except asyncio.TimeoutError as exc:
-            raise FerricStoreError("protocol request timed out") from exc
+            raise request_outcome_error(
+                opcode,
+                exc,
+                message="protocol request timed out",
+            ) from exc
 
     async def _request_on_lane(
         self,
@@ -553,12 +577,21 @@ class AsyncProtocolAdapter(
                     if future.done() and not future.cancelled():
                         future.exception()
                     if cleanup_error is not None:
-                        raise_primary_with_cleanup(
+                        outcome_error = request_outcome_error(
+                            opcode,
                             write_error,
-                            write_error.__traceback__,
+                            message="protocol write failed",
+                        )
+                        raise_primary_with_cleanup(
+                            outcome_error,
+                            outcome_error.__traceback__,
                             cleanup_error,
                         )
-                    raise
+                    raise request_outcome_error(
+                        opcode,
+                        write_error,
+                        message="protocol write failed",
+                    ) from write_error
                 if trace_enabled and trace is not None:
                     pending_trace = self._pending_traces.get(request_id)
                     if pending_trace is not None:
@@ -611,14 +644,26 @@ class AsyncProtocolAdapter(
             )
 
     def _fail_pending(self, exc: BaseException) -> None:
-        pending = list(self._pending.values())
+        identities = _response_identity_map(self)
+        pending = [
+            (future, identities.get(request_id)) for request_id, future in self._pending.items()
+        ]
         self._pending.clear()
         self._pending_traces.clear()
         _response_item_count_map(self).clear()
         _response_identity_map(self).clear()
         self._pending_request_budget().clear()
-        for future in pending:
-            try_set_future_exception(future, exc)
+        for future, identity in pending:
+            pending_error = (
+                exc
+                if identity is None
+                else request_outcome_error(
+                    identity.opcode,
+                    exc,
+                    message="protocol connection closed",
+                )
+            )
+            try_set_future_exception(future, pending_error)
         self._notify_idle_if_needed()
 
     async def _recv_matching(self, request_id: int) -> ProtocolResponse:
@@ -636,66 +681,45 @@ class AsyncProtocolAdapter(
             )
 
     async def _recv_response(self, reader: asyncio.StreamReader | None = None) -> ProtocolResponse:
-        read_started_ns = time.perf_counter_ns()
-        header = await self._recv_exact(_HEADER.size, reader)
-        magic, version, flags, lane_id, opcode, request_id, body_len = _HEADER.unpack(header)
-        if magic != _MAGIC or version != _RESPONSE_VERSION:
-            raise FerricStoreError("invalid protocol response frame header")
-        _validate_pending_response_identity(
-            self,
-            lane_id=lane_id,
-            opcode=opcode,
-            request_id=request_id,
-        )
-
-        self._check_response_size(body_len)
-        body = await self._recv_exact(body_len, reader)
-        chunks = ResponseBodyAccumulator(body)
-        final_flags = flags
-        budget: ResponseFrameBudget | None = None
-        if final_flags & _FLAG_MORE_CHUNKS:
-            budget = ResponseFrameBudget(
+        assembler = getattr(self, "_response_frame_assembler", None)
+        if assembler is None:
+            assembler = ResponseFrameAssembler(
                 max_body_bytes=self.max_response_bytes,
                 max_chunks=self.max_response_chunks,
             )
-            budget.add_chunk(body_len)
-        while final_flags & _FLAG_MORE_CHUNKS:
-            next_header = await self._recv_exact(_HEADER.size, reader)
-            (
-                next_magic,
-                next_version,
-                next_flags,
-                next_lane_id,
-                next_opcode,
-                next_request_id,
-                next_body_len,
-            ) = _HEADER.unpack(next_header)
-            if next_magic != _MAGIC or next_version != _RESPONSE_VERSION:
-                raise FerricStoreError("invalid protocol chunk continuation")
-            validate_response_identity(
-                ResponseIdentity(lane_id, opcode, request_id),
-                lane_id=next_lane_id,
-                opcode=next_opcode,
-                request_id=next_request_id,
-                message="invalid protocol chunk continuation",
+            self._response_frame_assembler = assembler
+        while True:
+            frame_started_ns = time.perf_counter_ns()
+            header = await self._recv_exact(_HEADER.size, reader)
+            magic, version, flags, lane_id, opcode, request_id, body_len = _HEADER.unpack(header)
+            if magic != _MAGIC or version != _RESPONSE_VERSION:
+                raise FerricStoreError("invalid protocol response frame header")
+            _validate_pending_response_identity(
+                self,
+                lane_id=lane_id,
+                opcode=opcode,
+                request_id=request_id,
             )
-            if budget is not None:
-                budget.add_chunk(next_body_len)
-            chunks.append(await self._recv_exact(next_body_len, reader))
-            final_flags = next_flags
-
-        body = chunks.finish()
-        read_done_ns = time.perf_counter_ns()
-        return _decode_protocol_response(
-            self,
-            lane_id=lane_id,
-            opcode=opcode,
-            request_id=request_id,
-            flags=final_flags,
-            body=body,
-            read_started_ns=read_started_ns,
-            read_done_ns=read_done_ns,
-        )
+            self._check_response_size(body_len)
+            assembled = assembler.add(
+                ResponseIdentity(lane_id, opcode, request_id),
+                flags,
+                await self._recv_exact(body_len, reader),
+                read_started_ns=frame_started_ns,
+            )
+            if assembled is None:
+                continue
+            read_done_ns = time.perf_counter_ns()
+            return _decode_protocol_response(
+                self,
+                lane_id=assembled.identity.lane_id,
+                opcode=assembled.identity.opcode,
+                request_id=assembled.identity.request_id,
+                flags=assembled.flags,
+                body=assembled.body,
+                read_started_ns=assembled.read_started_ns,
+                read_done_ns=read_done_ns,
+            )
 
     async def _recv_exact(self, size: int, reader: asyncio.StreamReader | None = None) -> bytes:
         if reader is None:
@@ -726,7 +750,10 @@ class AsyncProtocolAdapter(
         return self._writer
 
     def _response_value(self, response: ProtocolResponse) -> Any:
-        return _response_value(response)
+        value = _response_value(response)
+        if getattr(response, "opcode", None) == _OP_AUTH:
+            mark_authenticated(self)
+        return value
 
     def _batch_item_value(self, item: Any) -> Any:
         return _batch_item_value(item)

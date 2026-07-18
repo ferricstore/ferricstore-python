@@ -11,16 +11,10 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Any
 
-from ferricstore.async_worker import (
-    _auto_partition_index_for_id,
-    _auto_partition_key,
-    _auto_partition_server_shard,
-)
 from ferricstore.client import (
     FlowClient,
     _append,
     _append_encoded,
-    _auto_partition_key_for_id,
 )
 from ferricstore.types import ClaimedFlow
 
@@ -134,8 +128,8 @@ def flow_id_for(spec: WorkflowSpec) -> str:
     return f"{spec.run_id}:flow:{spec.index}"
 
 
-def effective_partition_key(spec: WorkflowSpec) -> str:
-    return spec.partition_key or _auto_partition_key_for_id(flow_id_for(spec))
+def effective_partition_key(spec: WorkflowSpec) -> str | None:
+    return spec.partition_key
 
 
 def predicted_lease_token(worker: str, now_ms: int, fencing_token: int) -> bytes:
@@ -277,11 +271,11 @@ def start_and_claim_command(
         lease_ms,
         "NOW",
         now_ms,
-        "PARTITION",
-        effective_partition_key(spec),
         "RETURN",
         "JOBS_COMPACT",
     ]
+    if spec.partition_key is not None:
+        command.extend(["PARTITION", spec.partition_key])
     if payload is not None:
         command.extend(["PAYLOAD", payload])
     return tuple(command)
@@ -320,7 +314,7 @@ def predicted_step_job_for(spec: WorkflowSpec, *, start_now_ms: int, step: int) 
         flow_id_for(spec),
         predicted_lease_token(spec.worker, token_now_ms, step),
         step,
-        partition_key=effective_partition_key(spec),
+        partition_key=spec.partition_key,
         run_state=state_name(step),
     )
 
@@ -332,7 +326,7 @@ def predicted_terminal_job_for(spec: WorkflowSpec, *, start_now_ms: int, steps: 
         flow_id_for(spec),
         predicted_lease_token(spec.worker, token_now_ms, fencing_token),
         fencing_token,
-        partition_key=effective_partition_key(spec),
+        partition_key=spec.partition_key,
         run_state=state_name(steps),
     )
 
@@ -589,22 +583,8 @@ def run_steps_many_auto_shard_local_wave_batches(
     if steps <= 0:
         raise ValueError("steps must be positive")
 
-    shard_count = max(server_shards, 1)
-    groups: dict[int, list[tuple[int, dict[str, str]]]] = {}
-    for offset in range(count):
-        index = start + offset
-        flow_id = f"{run_id}:flow:{index}"
-        partition_index = _auto_partition_index_for_id(flow_id)
-        shard = _auto_partition_server_shard(partition_index, shard_count)
-        groups.setdefault(shard, []).append(
-            (
-                index,
-                {
-                    "id": flow_id,
-                    "partition_key": _auto_partition_key(partition_index),
-                },
-            )
-        )
+    del executor, server_shards
+    group = [(index, {"id": f"{run_id}:flow:{index}"}) for index in range(start, start + count)]
 
     states = [state_name(step) for step in range(1, steps + 1)]
 
@@ -648,17 +628,7 @@ def run_steps_many_auto_shard_local_wave_batches(
             )
         return group[0][0], len(group), elapsed_ns
 
-    ordered_groups = [groups[shard] for shard in sorted(groups)]
-    if len(ordered_groups) == 1:
-        return [submit_group(ordered_groups[0])]
-
-    if executor is not None:
-        futures = [executor.submit(submit_group, group) for group in ordered_groups]
-        return [future.result() for future in futures]
-
-    with ThreadPoolExecutor(max_workers=min(len(ordered_groups), shard_count)) as local_executor:
-        futures = [local_executor.submit(submit_group, group) for group in ordered_groups]
-        return [future.result() for future in futures]
+    return [submit_group(group)]
 
 
 def wave_partition_key_for_index(

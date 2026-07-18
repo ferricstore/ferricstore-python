@@ -14,6 +14,7 @@ from ferricstore.client_helpers import (
     _normalize_admin_response,
     _ok_response,
     _parse_kv_response,
+    _validate_ownership_token,
 )
 from ferricstore.client_state import _ClientMixinBase
 from ferricstore.types import FetchOrComputeResult, KeyInfo, RateLimitResult
@@ -65,23 +66,36 @@ class _ClientManagementMixin(_ClientMixinBase):
         if hint is not None:
             args.append(hint)
         response = self.executor.execute_command(*args)
-        status = response[0].decode() if isinstance(response[0], bytes) else str(response[0])
+        return FetchOrComputeResult.from_resp(response, decode=self.codec.decode)
 
-        if status == "hit":
-            return FetchOrComputeResult(status="hit", value=self.codec.decode(response[1]))
-        return FetchOrComputeResult(status="compute", compute_token=response[1])
-
-    def fetch_or_compute_result(self, key: str, value: Any, *, ttl_ms: int) -> bool:
+    def fetch_or_compute_result(
+        self,
+        key: str,
+        ownership_token: bytes,
+        value: Any,
+        *,
+        ttl_ms: int,
+    ) -> bool:
+        _validate_ownership_token(ownership_token)
         response = self.executor.execute_command(
             "FETCH_OR_COMPUTE_RESULT",
             key,
+            ownership_token,
             self.codec.encode(value),
             ttl_ms,
         )
         return _ok_response(response)
 
-    def fetch_or_compute_error(self, key: str, message: str) -> bool:
-        return _ok_response(self.executor.execute_command("FETCH_OR_COMPUTE_ERROR", key, message))
+    def fetch_or_compute_error(self, key: str, ownership_token: bytes, message: str) -> bool:
+        _validate_ownership_token(ownership_token)
+        return _ok_response(
+            self.executor.execute_command(
+                "FETCH_OR_COMPUTE_ERROR",
+                key,
+                ownership_token,
+                message,
+            )
+        )
 
     def cluster_health(self) -> Any:
         return _parse_kv_response(self.executor.execute_command("CLUSTER.HEALTH"))

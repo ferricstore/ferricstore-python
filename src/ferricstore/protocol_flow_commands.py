@@ -53,6 +53,11 @@ from ferricstore.protocol_flow_payloads import (
 
 
 def _build_flow_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolCommand:
+    # The v0.8 native query opcode handlers still name these positional inputs
+    # with removed lineage aliases. COMMAND_EXEC preserves the canonical public
+    # contract without constructing either legacy field on the wire.
+    if name in {"FLOW.BY_PARENT", "FLOW.BY_ROOT"}:
+        return _command_exec_protocol_command(name, args)
     command = _build_native_flow_protocol_command(name, args)
     payload = command.payload
     if isinstance(payload, dict) and (
@@ -96,6 +101,8 @@ def _build_flow_mutation_protocol_command(
     if name in {"FLOW.COMPLETE", "FLOW.RETRY", "FLOW.FAIL", "FLOW.EXTEND_LEASE"}:
         payload = {"id": _require_arg(args, 0, name), "lease_token": _require_arg(args, 1, name)}
         payload.update(_option_map(args[2:]))
+        if name in {"FLOW.COMPLETE", "FLOW.RETRY", "FLOW.FAIL"}:
+            _require_mutation_guards(name, payload, "fencing_token")
         return ProtocolCommand(opcode, payload)
     if name == "FLOW.TRANSITION":
         payload = {
@@ -104,6 +111,7 @@ def _build_flow_mutation_protocol_command(
             "to_state": _require_arg(args, 2, name),
         }
         payload.update(_option_map(args[3:]))
+        _require_mutation_guards(name, payload, "lease_token", "fencing_token")
         return ProtocolCommand(opcode, payload)
     if name == "FLOW.STEP_CONTINUE":
         payload = {
@@ -126,9 +134,17 @@ def _build_flow_mutation_protocol_command(
     if name == "FLOW.CANCEL":
         payload = {"id": _require_arg(args, 0, name)}
         payload.update(_option_map(args[1:]))
+        _require_mutation_guards(name, payload, "fencing_token")
         return ProtocolCommand(opcode, payload)
 
     raise InvalidCommandError(f"unsupported flow mutation command {name}")
+
+
+def _require_mutation_guards(name: str, payload: dict[str, Any], *fields: str) -> None:
+    missing = [field for field in fields if field not in payload]
+    if missing:
+        names = ", ".join(missing)
+        raise InvalidCommandError(f"{name} requires {names}")
 
 
 def _build_flow_many_protocol_command(
@@ -179,8 +195,8 @@ _FLOW_ID_QUERY_ARGUMENTS = {
     "FLOW.GET": "id",
     "FLOW.HISTORY": "id",
     "FLOW.REWIND": "id",
-    "FLOW.BY_PARENT": "parent_id",
-    "FLOW.BY_ROOT": "root_id",
+    "FLOW.BY_PARENT": "parent_flow_id",
+    "FLOW.BY_ROOT": "root_flow_id",
     "FLOW.BY_CORRELATION": "correlation_id",
     "FLOW.SIGNAL": "id",
 }

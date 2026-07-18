@@ -18,6 +18,7 @@ from ferricstore.client_helpers import (
     _shared_create_many_state_meta,
 )
 from ferricstore.codecs import Codec
+from ferricstore.config_validation import normalize_optional_max_active_ms
 from ferricstore.types import CreateItem
 
 
@@ -35,6 +36,7 @@ def _create_many_args(
     independent: bool | None = None,
     return_ok_on_success: bool = False,
     retention_ttl_ms: int | None = None,
+    max_active_ms: int | float | str | None = None,
     values: dict[str, Any] | None = None,
     value_refs: dict[str, str] | None = None,
     attributes: dict[str, Any] | None = None,
@@ -70,14 +72,18 @@ def _create_many_args(
     if return_ok_on_success:
         _append(args, "RETURN", "OK_ON_SUCCESS")
     _append(args, "RETENTION_TTL_MS", retention_ttl_ms)
+    _append(args, "MAX_ACTIVE_MS", normalize_optional_max_active_ms(max_active_ms))
     _append_attributes(args, attributes=attributes)
     _append_state_meta(args, state_meta)
-    extended_items = _has_named_item_values(items) or (
-        mixed and any(item.partition_key is None for item in items)
+    has_item_max_active = any(item.max_active_ms is not None for item in items)
+    extended_items = (
+        _has_named_item_values(items)
+        or has_item_max_active
+        or (mixed and any(item.partition_key is None for item in items))
     )
 
     if extended_items:
-        args.extend(["ITEMS_EXT", len(items)])
+        args.extend(["ITEMS_EXT_V2" if has_item_max_active else "ITEMS_EXT", len(items)])
         for item in items:
             item_partition = item.partition_key if mixed else None
             item_values = _merge_named_map(values, item.values)
@@ -89,6 +95,9 @@ def _create_many_args(
                     codec.encode(item.payload),
                 ]
             )
+            if has_item_max_active:
+                item_max_active = normalize_optional_max_active_ms(item.max_active_ms)
+                args.append(item_max_active if item_max_active is not None else "-")
             _append_named_counts(args, codec, item_values, item_refs)
     else:
         _append_named_values(args, codec, values=values, value_refs=value_refs)

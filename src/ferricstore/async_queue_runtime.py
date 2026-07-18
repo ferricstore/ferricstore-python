@@ -14,8 +14,6 @@ from ferricstore.async_ownership import (
     rollback_async_resources,
 )
 from ferricstore.async_partitioning import (
-    _owned_auto_partition_keys,
-    _validate_auto_partition_workers,
     _validate_server_shards,
 )
 from ferricstore.async_wake import AsyncFlowWakeCoordinator
@@ -213,18 +211,8 @@ class AsyncQueueFlowWorker(AsyncWorkerCompletionMixin):
             auto_partitions=auto_partitions,
             close_client=close_client,
         )
-        if runtime_config.auto_partitions:
-            _validate_auto_partition_workers(runtime_config.workers)
         if runtime_config.partition_keys is not None:
             resolved_partition_keys = runtime_config.partition_keys
-        elif partition_key is None and runtime_config.auto_partitions:
-            resolved_partition_keys = _owned_auto_partition_keys(
-                worker_index=worker_index,
-                workers=runtime_config.workers,
-                server_shards=server_shards,
-            )
-            if not resolved_partition_keys:
-                raise ValueError("worker owns no auto partitions")
         else:
             resolved_partition_keys = None
 
@@ -763,7 +751,7 @@ class AsyncQueueFlowWorker(AsyncWorkerCompletionMixin):
         if self.partition_keys is None:
             return None, None
         if not self.partition_keys:
-            raise RuntimeError("worker owns no auto partitions")
+            raise RuntimeError("worker has no configured partitions")
 
         count = min(self.claim_partition_batch_size, len(self.partition_keys))
         keys = [
@@ -777,20 +765,6 @@ class AsyncQueueFlowWorker(AsyncWorkerCompletionMixin):
 
 
 _ASYNC_QUEUE_API_EXPORTS = frozenset({"AsyncQueue", "AsyncQueueClient", "AsyncQueueFlow"})
-_ASYNC_PARTITIONING_EXPORTS = frozenset(
-    {
-        "AUTO_PARTITION_BUCKETS",
-        "AUTO_PARTITION_PREFIX",
-        "SERVER_SLOT_COUNT",
-        "_auto_partition_assignments",
-        "_auto_partition_index_for_id",
-        "_auto_partition_key",
-        "_auto_partition_owner",
-        "_auto_partition_owners",
-        "_auto_partition_server_shard",
-        "_server_shard_for_slot",
-    }
-)
 
 
 def __getattr__(name: str) -> Any:
@@ -798,12 +772,8 @@ def __getattr__(name: str) -> Any:
         from ferricstore import async_queue_api
 
         return getattr(async_queue_api, name)
-    if name in _ASYNC_PARTITIONING_EXPORTS:
-        from ferricstore import async_partitioning
-
-        return getattr(async_partitioning, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | _ASYNC_QUEUE_API_EXPORTS | _ASYNC_PARTITIONING_EXPORTS)
+    return sorted(set(globals()) | _ASYNC_QUEUE_API_EXPORTS)

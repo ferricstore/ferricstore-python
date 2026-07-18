@@ -5,14 +5,7 @@ import time
 from collections.abc import Callable
 from typing import Any, cast
 
-from ferricstore.batch_core import (
-    is_pipeline_status_batch,
-)
-from ferricstore.errors import (
-    FerricStoreError,
-    OverloadedError,
-    classify_server_error,
-)
+from ferricstore.errors import FerricStoreError
 from ferricstore.protocol_codec import (
     DecodeBudget,
     DecodedCollectionLimitError,
@@ -22,10 +15,7 @@ from ferricstore.protocol_codec import (
     decode_value_at as _decode_value_at,
 )
 from ferricstore.protocol_common import (
-    _error_message,
     _map_get,
-    _optional_int,
-    _optional_text,
     _pop_response_item_count,
 )
 from ferricstore.protocol_constants import (
@@ -51,23 +41,12 @@ from ferricstore.protocol_constants import (
     _FLAG_TRACE,
     _FLOW_RECORD_FIELD_KEYS,
     _FLOW_RECORD_FIELD_KEYS_LEN,
-    _FLOW_RECORD_LIST_OPCODES,
     _NULL_U32,
-    _OP_FLOW_CANCEL_MANY,
     _OP_FLOW_CLAIM_DUE,
-    _OP_FLOW_COMPLETE_MANY,
-    _OP_FLOW_CREATE_MANY,
-    _OP_FLOW_FAIL_MANY,
-    _OP_FLOW_GET,
-    _OP_FLOW_RETRY_MANY,
-    _OP_FLOW_VALUE_MGET,
-    _OP_GET,
-    _OP_MGET,
     _OP_MSET,
     _OP_PIPELINE,
     _OP_SET,
     _STATUS,
-    _STATUS_BUSY,
     _STATUS_OK,
     ProtocolResponse,
 )
@@ -94,6 +73,14 @@ from ferricstore.protocol_response_primitives import (
     _read_tagged_i64,
     _read_u32,
     _require_available,
+)
+from ferricstore.protocol_response_values import (
+    _batch_item_value,
+    _flow_many_group_values,
+    _ok_scalar,
+    _pipeline_pair_list,
+    _response_value,
+    _status_text,
 )
 
 
@@ -146,6 +133,34 @@ def _try_fast_response_value_at(
     max_collection_items: int | None = _DEFAULT_MAX_DECODED_COLLECTION_ITEMS,
     expected_collection_items: int | None = None,
 ) -> Any | None:
+    """Decode compact data for legacy direct codec tests.
+
+    Production response decoding uses HELLO's codec name for the opcode.  This
+    marker-based helper remains for compatibility with the SDK's low-level
+    codec tests and does not act as a capability table.
+    """
+    codec_name = _legacy_compact_codec_name(opcode, data, offset)
+    if codec_name is None:
+        return None
+    return _try_compact_response_value_at(
+        codec_name,
+        opcode,
+        data,
+        offset,
+        max_collection_items=max_collection_items,
+        expected_collection_items=expected_collection_items,
+    )
+
+
+def _try_compact_response_value_at(
+    codec_name: str,
+    opcode: int,
+    data: bytes,
+    offset: int,
+    *,
+    max_collection_items: int | None,
+    expected_collection_items: int | None,
+) -> Any | None:
     if not _preflight_compact_collection(
         data,
         offset,
@@ -153,16 +168,45 @@ def _try_fast_response_value_at(
         expected_collection_items=expected_collection_items,
     ):
         return None
-    decoder = _FAST_RESPONSE_DECODERS.get(opcode)
+    decoder = _COMPACT_RESPONSE_CODEC_DECODERS.get(codec_name)
     if decoder is None:
         return None
-    return decoder(data, offset, DecodeBudget(max_collection_items))
+    budget = DecodeBudget(max_collection_items)
+    if codec_name == "ok_list_v1":
+        values = _try_decode_custom_ok_list(data, offset, budget=budget)
+        if values is None:
+            return None
+        if opcode in {_OP_SET, _OP_MSET}:
+            return b"OK" if len(values) == 1 else None
+        return values
+    return decoder(data, offset, budget)
 
 
 _FastResponseDecoder = Callable[[bytes, int, DecodeBudget], Any | None]
-_FAST_RESPONSE_DECODERS: dict[int, _FastResponseDecoder] = {}
+_COMPACT_RESPONSE_CODEC_DECODERS: dict[str, _FastResponseDecoder] = {}
 _PIPELINE_MARKER_DECODERS: dict[int, Callable[..., Any | None]] = {}
 _MGET_MARKER_DECODERS: dict[int, Callable[..., Any | None]] = {}
+
+
+def _legacy_compact_codec_name(opcode: int, data: bytes, offset: int) -> str | None:
+    if offset >= len(data):
+        return None
+    marker = data[offset]
+    if opcode == _OP_PIPELINE:
+        return "pipeline_v1"
+    if marker == _COMPACT_KV_GET:
+        return "kv_get_v1"
+    if marker in {_COMPACT_KV_MGET, _COMPACT_KV_MGET_FIXED}:
+        return "kv_mget_v1"
+    if marker == _COMPACT_FLOW_RECORD:
+        return "flow_record_v1"
+    if marker == _COMPACT_FLOW_RECORD_LIST:
+        return "flow_record_list_v1"
+    if marker == _COMPACT_FLOW_CLAIM_JOBS or opcode == _OP_FLOW_CLAIM_DUE:
+        return "flow_claim_jobs_v1"
+    if marker == _COMPACT_OK_LIST:
+        return "ok_list_v1"
+    return None
 
 
 def _try_fast_pipeline(data: bytes, offset: int, budget: DecodeBudget) -> Any | None:
@@ -289,9 +333,9 @@ def _try_decode_custom_pipeline_response(
         return None
 
 
-def _is_custom_compact_nil(opcode: int, data: bytes, offset: int) -> bool:
+def _is_custom_compact_nil(codec_name: str | None, data: bytes, offset: int) -> bool:
     return (
-        opcode == _OP_GET
+        codec_name == "kv_get_v1"
         and len(data) == offset + 2
         and data[offset] == _COMPACT_KV_GET
         and data[offset + 1] == 0
@@ -538,10 +582,12 @@ def _read_custom_flow_record(
         elif key_id < field_keys_len:
             key = field_keys[key_id]
         else:
-            raise FerricStoreError("protocol compact Flow record key is unknown")
+            key = None
+        value, offset = decode_record_value(data, offset, data_len, budget=budget)
+        if key is None:
+            continue
         if key in record:
             raise DuplicateProtocolMapKeyError("duplicate protocol map key while decoding")
-        value, offset = decode_record_value(data, offset, data_len, budget=budget)
         record[key] = value
     return record, offset
 
@@ -715,24 +761,17 @@ _MGET_MARKER_DECODERS.update(
         _COMPACT_KV_MGET_FIXED: _try_decode_custom_kv_mget_fixed,
     }
 )
-_FAST_RESPONSE_DECODERS.update(
+_COMPACT_RESPONSE_CODEC_DECODERS.update(
     {
-        _OP_PIPELINE: _try_fast_pipeline,
-        _OP_GET: _try_fast_get,
-        _OP_SET: _try_fast_ok,
-        _OP_MSET: _try_fast_ok,
-        _OP_MGET: _try_fast_mget,
-        _OP_FLOW_VALUE_MGET: _try_fast_mget,
-        _OP_FLOW_GET: _try_fast_flow_record,
-        _OP_FLOW_CLAIM_DUE: _try_fast_claim,
-        _OP_FLOW_CREATE_MANY: _try_fast_many,
-        _OP_FLOW_COMPLETE_MANY: _try_fast_many,
-        _OP_FLOW_RETRY_MANY: _try_fast_many,
-        _OP_FLOW_FAIL_MANY: _try_fast_many,
-        _OP_FLOW_CANCEL_MANY: _try_fast_many,
+        "pipeline_v1": _try_fast_pipeline,
+        "kv_get_v1": _try_fast_get,
+        "kv_mget_v1": _try_fast_mget,
+        "flow_record_v1": _try_fast_flow_record,
+        "flow_record_list_v1": _try_fast_flow_record_list,
+        "flow_claim_jobs_v1": _try_fast_claim,
+        "ok_list_v1": _try_fast_many,
     }
 )
-_FAST_RESPONSE_DECODERS.update(dict.fromkeys(_FLOW_RECORD_LIST_OPCODES, _try_fast_flow_record_list))
 
 
 def _extract_traced_value(value: Any) -> tuple[Any, dict[str, Any]]:
@@ -781,18 +820,24 @@ def _decode_protocol_response(
         _DEFAULT_MAX_DECODED_COLLECTION_ITEMS,
     )
     expected_collection_items = _pop_response_item_count(adapter, request_id)
+    compact_codec = getattr(adapter, "_compact_response_codecs", {}).get(opcode)
     value = (
-        _try_fast_response_value_at(
+        _try_compact_response_value_at(
+            compact_codec,
             opcode,
             body,
             _STATUS.size,
             max_collection_items=collection_limit,
             expected_collection_items=expected_collection_items,
         )
-        if status == _STATUS_OK
+        if status == _STATUS_OK and compact_codec is not None
         else None
     )
-    fast_decoded = value is not None or _is_custom_compact_nil(opcode, body, _STATUS.size)
+    fast_decoded = value is not None or _is_custom_compact_nil(
+        compact_codec,
+        body,
+        _STATUS.size,
+    )
     if not fast_decoded:
         value, value_end = _decode_value_at(
             body,
@@ -838,78 +883,6 @@ def _normalize_trace_map(value: Any) -> Any:
             normalized[trace_key] = _normalize_trace_map(item)
         return normalized
     return value
-
-
-def _response_value(response: ProtocolResponse) -> Any:
-    if response.status == _STATUS_OK:
-        return response.value
-
-    message = _error_message(response.value)
-    if response.status == _STATUS_BUSY:
-        raise OverloadedError(
-            message,
-            raw=response.value,
-            retry_after_ms=_optional_int(response.value, "retry_after_ms"),
-            reason=_optional_text(response.value, "reason"),
-        )
-    raise classify_server_error(message, raw=response.value)
-
-
-def _batch_item_value(item: Any) -> Any:
-    if (isinstance(item, list) and len(item) == 2) or (isinstance(item, tuple) and len(item) == 2):
-        status = _status_text(item[0]) or "error"
-        value = item[1]
-        raw: Any = item
-    else:
-        if not isinstance(item, dict):
-            raise FerricStoreError("protocol PIPELINE item is not a map or status pair", raw=item)
-
-        status = _optional_text(item, "status") or "error"
-        value = _map_get(item, "value")
-        raw = item
-
-    if status == "ok":
-        return value
-    message = _error_message(value)
-    if status == "busy":
-        raise OverloadedError(message, raw=raw)
-    raise classify_server_error(message, raw=raw)
-
-
-def _pipeline_pair_list(value: list[Any]) -> bool:
-    return is_pipeline_status_batch(value)
-
-
-def _flow_many_group_values(value: Any, expected_count: int) -> list[Any]:
-    if _ok_scalar(value):
-        return [value] * expected_count
-    if not isinstance(value, list) or len(value) != expected_count:
-        raise FerricStoreError("protocol Flow many returned invalid result", raw=value)
-    if _pipeline_pair_list(value):
-        return [_batch_item_value(item) for item in value]
-    return value
-
-
-def _ok_scalar(value: Any) -> bool:
-    if isinstance(value, bytes):
-        return value.lower() == b"ok"
-    if isinstance(value, str):
-        return value.lower() == "ok"
-    return False
-
-
-def _status_text(value: Any) -> str | None:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, bytes):
-        try:
-            return value.decode()
-        except UnicodeDecodeError as exc:
-            raise FerricStoreError(
-                "protocol PIPELINE status is not valid UTF-8",
-                raw=value,
-            ) from exc
-    return None
 
 
 __all__ = [

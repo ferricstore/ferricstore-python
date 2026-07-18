@@ -9,9 +9,10 @@ from ferricstore.command_helpers import (
     _expire_args,
     _getex_args,
     _set_args,
+    _validate_mset_slots,
     _xread_args,
 )
-from ferricstore.config_validation import validate_bool
+from ferricstore.config_validation import validate_bool, validate_positive_int
 
 
 class AsyncDataCommandsMixin:
@@ -61,6 +62,7 @@ class AsyncDataCommandsMixin:
         return [self.codec.decode(value) if decode else value for value in values]
 
     async def mset(self, mapping: dict[str, Any], *, encode: bool = True) -> Any:
+        _validate_mset_slots(list(mapping))
         args: builtins.list[Any] = ["MSET"]
         for key, value in mapping.items():
             args.extend([key, self.codec.encode(value) if encode else value])
@@ -71,6 +73,7 @@ class AsyncDataCommandsMixin:
         return [self.codec.decode(value) if decode else value for value in values]
 
     async def kv_mset(self, mapping: dict[str, Any], *, encode: bool = True) -> Any:
+        _validate_mset_slots(list(mapping))
         args: builtins.list[Any] = ["MSET"]
         for key, value in mapping.items():
             args.extend([key, self.codec.encode(value) if encode else value])
@@ -127,6 +130,7 @@ class AsyncDataCommandsMixin:
         )
 
     async def msetnx(self, mapping: dict[str, Any], *, encode: bool = True) -> int:
+        _validate_mset_slots(list(mapping))
         args: builtins.list[Any] = ["MSETNX"]
         for key, value in mapping.items():
             args.extend([key, self.codec.encode(value) if encode else value])
@@ -719,8 +723,26 @@ class AsyncDataCommandsMixin:
     async def cms_info(self, key: str) -> Any:
         return await self.command("CMS.INFO", key)
 
-    async def topk_reserve(self, key: str, k: int, *args: Any) -> Any:
-        return await self.command("TOPK.RESERVE", key, k, *args)
+    async def topk_reserve(
+        self,
+        key: str,
+        k: int,
+        *,
+        width: int | None = None,
+        depth: int | None = None,
+    ) -> Any:
+        k = validate_positive_int(k, name="k")
+        if (width is None) != (depth is None):
+            raise ValueError("TOPK.RESERVE width and depth must be provided together")
+        if width is None:
+            return await self.command("TOPK.RESERVE", key, k)
+        return await self.command(
+            "TOPK.RESERVE",
+            key,
+            k,
+            validate_positive_int(width, name="width"),
+            validate_positive_int(depth, name="depth"),
+        )
 
     async def topk_add(self, key: str, *items: Any) -> Any:
         return await self.command("TOPK.ADD", key, *items)

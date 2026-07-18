@@ -27,7 +27,7 @@ ruff check .
 ruff format --check .
 mypy src/ferricstore
 pytest --cov=ferricstore --cov-report=term-missing
-bandit -q -r src/ferricstore
+python -m bandit -q -c pyproject.toml -r src/ferricstore
 pip-audit
 python -m build
 twine check dist/*
@@ -48,7 +48,7 @@ Then:
 1. Update `src/ferricstore/__init__.py` `__version__` (the build reads this single source).
 2. Update README status if needed.
 3. Update benchmark docs if results are cited.
-4. Tag the release with the exact version, for example `v0.4.1`.
+4. Tag the release with the exact version, for example `v0.5.0`.
 5. Push the tag; the publish workflow validates it, reruns unit and live-server
    integration tests, builds the distribution, and publishes only after both jobs pass.
 

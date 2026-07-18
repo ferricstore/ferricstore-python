@@ -17,7 +17,7 @@ _HELPER_EXPORTS = (
     "_append _append_attributes _append_bool _append_claimed_items_args "
     "_append_encoded _append_extra_options _append_named_counts _append_named_values "
     "_append_payload_read _append_read_options _append_search_state_meta "
-    "_append_state_meta _append_value_return _auto_partition_key_for_id "
+    "_append_state_meta _append_value_return "
     "_batch_key_value _batch_named_key _coerce_diag_value "
     "_command_with_request_context _complete_command_args _complete_jobs_command_args "
     "_complete_many_args _expand_many_response _fail_command_args _flow_return "

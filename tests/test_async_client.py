@@ -1,11 +1,9 @@
 import asyncio
 import inspect
 import json
-import zlib
 
 import pytest
 
-import ferricstore.async_client as async_client_module
 from ferricstore import (
     AsyncFlowClient,
     BackpressurePolicy,
@@ -78,12 +76,21 @@ class FakeAsyncExecutor:
         if command == "FLOW.HISTORY":
             return [[b"event-1", {b"event": b"created"}]]
         if command in {
-            "FLOW.CREATE_MANY",
             "FLOW.COMPLETE_MANY",
             "FLOW.RETRY_MANY",
             "FLOW.FAIL_MANY",
         }:
             return [b"OK"]
+        if command == "FLOW.CREATE_MANY":
+            marker = next(
+                token for token in ("ITEMS_EXT_V2", "ITEMS_EXT", "ITEMS") if token in args
+            )
+            if marker != "ITEMS":
+                count = int(args[args.index(marker) + 1])
+            else:
+                width = 3 if args[1] == "MIXED" else 2
+                count = (len(args) - args.index(marker) - 1) // width
+            return [b"OK"] * count
         if command == "FLOW.VALUE.MGET":
             return [b'{"ok": true}']
         if command == "FLOW.ATTRIBUTES":
@@ -355,7 +362,11 @@ class OverloadThenAckAsyncExecutor(FakeAsyncExecutor):
         self.calls.append(args)
         if self.overloads > 0:
             self.overloads -= 1
-            raise OverloadedError("ERR overloaded")
+            raise OverloadedError(
+                "ERR overloaded",
+                retryable=True,
+                safe_to_retry=True,
+            )
         return b"OK"
 
 
@@ -369,7 +380,7 @@ class CreateAckThenGetAsyncExecutor(FakeAsyncExecutor):
                 b"id": args[1].encode() if isinstance(args[1], str) else args[1],
                 b"type": b"order",
                 b"state": b"queued",
-                b"partition_key": args[args.index("PARTITION") + 1].encode(),
+                b"partition_key": b"server-owned",
                 b"version": 1,
             }
         return await super().execute_command(*args)
@@ -1092,12 +1103,10 @@ def test_async_direct_many_methods_noop_on_empty_inputs():
     run(main())
 
 
-def test_async_create_ack_followup_get_uses_auto_partition_when_partition_omitted():
+def test_async_create_ack_followup_get_routes_by_id_when_partition_omitted():
     async def main():
         executor = CreateAckThenGetAsyncExecutor()
         client = AsyncFlowClient(executor)
-        expected_partition = f"__flow_auto__:{zlib.crc32(b'f-auto') % 256}"
-
         record = await client.create(
             "f-auto",
             type="order",
@@ -1108,7 +1117,7 @@ def test_async_create_ack_followup_get_uses_auto_partition_when_partition_omitte
 
         assert record.id == "f-auto"
         assert executor.calls[1][:2] == ("FLOW.GET", "f-auto")
-        assert executor.calls[1][executor.calls[1].index("PARTITION") + 1] == expected_partition
+        assert "PARTITION" not in executor.calls[1]
 
     run(main())
 
@@ -1478,7 +1487,7 @@ def test_async_reclaim_rejects_non_running_state_alias():
     run(main())
 
 
-def test_async_enqueue_many_keeps_auto_bucket_grouping():
+def test_async_enqueue_many_delegates_auto_partitioning_to_one_server_request():
     async def main():
         executor = FakeAsyncExecutor()
         client = AsyncFlowClient(executor)
@@ -1490,8 +1499,8 @@ def test_async_enqueue_many_keeps_auto_bucket_grouping():
         )
 
         assert result == [b"OK", b"OK"]
-        assert all(call[0] == "FLOW.CREATE_MANY" for call in executor.calls)
-        assert all(str(call[1]).startswith("__flow_auto__:") for call in executor.calls)
+        assert len(executor.calls) == 1
+        assert executor.calls[0][:2] == ("FLOW.CREATE_MANY", "AUTO")
 
     run(main())
 
@@ -1526,7 +1535,7 @@ def test_async_enqueue_many_groups_explicit_partitions_and_pins_one_now(monkeypa
             "tenant:a",
             "tenant:b",
             "",
-            async_client_module._auto_partition_key_for_id("flow-d"),
+            "AUTO",
         }
         assert {call[call.index("NOW") + 1] for call in executor.calls} == {123_456}
 
@@ -1560,7 +1569,7 @@ def test_async_enqueue_many_uses_bounded_concurrent_fanout_for_safe_executors():
         assert await client.enqueue_many(items, type="order", now_ms=100) == [
             item.id.encode() for item in items
         ]
-        assert 1 < executor.max_active <= 16
+        assert executor.max_active == 1
 
     run(main())
 
@@ -1670,7 +1679,7 @@ def test_async_backpressure_retry_budget_rejects_wait_that_would_overrun(monkeyp
     run(main())
 
 
-def test_async_enqueue_many_passes_retention_ttl_ms_to_auto_bucket_batches():
+def test_async_enqueue_many_passes_retention_ttl_ms_to_auto_batch():
     async def main():
         executor = FakeAsyncExecutor()
         client = AsyncFlowClient(executor)

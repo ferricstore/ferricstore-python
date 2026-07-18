@@ -151,7 +151,7 @@ def test_sync_workflow_commands_preserve_explicit_falsy_overrides() -> None:
     flow.by_parent("")
     flow.by_root("")
     flow.by_correlation("")
-    flow.spawn_children([], parent_id="")
+    flow.spawn_children([], parent_flow_id="")
 
     calls = {name: (args, kwargs) for name, args, kwargs in client.calls}
     assert calls["create"][1]["type"] == ""

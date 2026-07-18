@@ -19,10 +19,6 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "_AsyncErrorMappingExecutor",
     ),
     "FlowClient": ("ferricstore.client_core", "FlowClient"),
-    "_auto_partition_key_for_id": (
-        "ferricstore.client_helpers",
-        "_auto_partition_key_for_id",
-    ),
     "_now_ms": ("ferricstore.client_helpers", "_now_ms"),
 }
 

@@ -24,7 +24,7 @@ ruff format --check .
 mypy src/ferricstore
 python tools/generate_async_commands.py --check
 pytest --cov=ferricstore --cov-report=term-missing
-bandit -q -r src/ferricstore
+python -m bandit -q -c pyproject.toml -r src/ferricstore
 pip-audit
 python -m build
 twine check dist/*

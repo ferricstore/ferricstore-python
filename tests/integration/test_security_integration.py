@@ -59,6 +59,8 @@ def test_tls_acl_authentication_and_authorization_for_sync_and_async_clients() -
     readonly = f"sdk-readonly-{suffix}"
     secret = f"secret-{suffix}"
     key = f"sdk-security:{suffix}"
+    large_key = f"{key}:large"
+    large_value = b"x" * (65 * 1024)
     admin = FlowClient.from_url(_tls_url(), codec=RawCodec(), ssl_context=_context(), timeout=2.0)
     try:
         admin.acl_set_user(username, ["on", f">{secret}", "~*", "+@all"])
@@ -78,6 +80,8 @@ def test_tls_acl_authentication_and_authorization_for_sync_and_async_clients() -
         try:
             assert authenticated.ping() in {b"PONG", "PONG"}
             assert authenticated.command("GET", key) == b"secured"
+            assert authenticated.command("SET", large_key, large_value) in {b"OK", "OK"}
+            assert authenticated.command("GET", large_key) == large_value
         finally:
             authenticated.close()
 
@@ -121,13 +125,15 @@ def test_tls_acl_authentication_and_authorization_for_sync_and_async_clients() -
             try:
                 assert await client.ping() in {b"PONG", "PONG"}
                 assert await client.command("GET", key) == b"secured"
+                assert await client.command("SET", large_key, large_value) in {b"OK", "OK"}
+                assert await client.command("GET", large_key) == large_value
             finally:
                 await client.close()
 
         asyncio.run(exercise_async())
     finally:
         try:
-            admin.delete(key)
+            admin.delete(key, large_key)
             admin.acl_del_user(username)
             admin.acl_del_user(readonly)
         finally:

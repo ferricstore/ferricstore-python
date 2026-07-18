@@ -137,9 +137,10 @@ from ferricstore.command_helpers import (
     _expire_args,
     _getex_args,
     _set_args,
+    _validate_mset_slots,
     _xread_args,
 )
-from ferricstore.config_validation import validate_bool
+from ferricstore.config_validation import validate_bool, validate_positive_int
 
 {class_source}
 

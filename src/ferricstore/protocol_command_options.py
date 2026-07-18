@@ -6,6 +6,7 @@ from typing import Any
 from ferricstore.command_grammar import (
     consume_counted_arguments,
 )
+from ferricstore.config_validation import normalize_optional_max_active_ms
 from ferricstore.errors import (
     InvalidCommandError,
 )
@@ -171,6 +172,11 @@ def _option_map(args: tuple[Any, ...]) -> dict[str, Any]:
                 f"FerricStore protocol transport does not support option {token}"
             )
         value = _require_arg(args, idx + 1, token)
+        if mapped_field == "max_active_ms":
+            try:
+                value = normalize_optional_max_active_ms(value)
+            except ValueError as exc:
+                raise InvalidCommandError(str(exc)) from exc
         payload[mapped_field] = _coerce_bool(value) if mapped_field in _BOOL_FIELDS else value
         idx += 2
     return payload

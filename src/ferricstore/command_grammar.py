@@ -75,7 +75,7 @@ def find_flow_many_item_marker(
     index = start
     while index < len(args):
         token = command_token(args[index])
-        if token in {"ITEMS", "ITEMS_EXT"}:
+        if token in {"ITEMS", "ITEMS_EXT", "ITEMS_EXT_V2"}:
             return index, token
         width = plan.option_width(index)
         if width is None or index + width > len(args):
@@ -93,7 +93,7 @@ def flow_create_many_item_count(args: Sequence[Any]) -> int | None:
     if marker is None:
         return None
     marker_index, marker_token = marker
-    if marker_token == "ITEMS_EXT":
+    if marker_token in {"ITEMS_EXT", "ITEMS_EXT_V2"}:
         if marker_index + 1 >= len(values):
             return None
         count = values[marker_index + 1]

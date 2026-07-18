@@ -27,10 +27,10 @@ def test_native_flow_create_uses_released_kv_lineage_field_names() -> None:
         "root",
     )
 
-    assert command.payload["parent_id"] == "parent"
-    assert command.payload["root_id"] == "root"
-    assert "parent_flow_id" not in command.payload
-    assert "root_flow_id" not in command.payload
+    assert command.payload["parent_flow_id"] == "parent"
+    assert command.payload["root_flow_id"] == "root"
+    assert "parent_id" not in command.payload
+    assert "root_id" not in command.payload
 
 
 def test_schedule_result_decodes_the_kv_view_shape() -> None:

@@ -297,95 +297,36 @@ def test_async_owned_rollback_finishes_inside_active_event_loop(
     assert opened[0].closed is True
 
 
-@pytest.mark.parametrize("workers", [1, 16, 57, 128, 256])
-def test_auto_partition_ownership_is_complete_and_non_empty(workers):
-    assignments = [
-        async_worker_module._owned_auto_partition_keys(
-            worker_index=worker_index,
-            workers=workers,
-            server_shards=16,
-        )
-        for worker_index in range(workers)
-    ]
-
-    assert all(assignments)
-    flattened = [key for assignment in assignments for key in assignment]
-    assert len(flattened) == async_worker_module.AUTO_PARTITION_BUCKETS
-    assert len(set(flattened)) == async_worker_module.AUTO_PARTITION_BUCKETS
+def test_reserved_auto_partition_constructors_are_not_exposed() -> None:
+    for name in (
+        "AUTO_PARTITION_BUCKETS",
+        "AUTO_PARTITION_PREFIX",
+        "_auto_partition_assignments",
+        "_auto_partition_key",
+        "_owned_auto_partition_keys",
+    ):
+        assert not hasattr(async_worker_module, name)
+        assert not hasattr(async_queue_runtime_module, name)
 
 
-def test_auto_partition_ownership_keeps_each_worker_shard_local():
-    workers = 128
-    assignments = [
-        async_worker_module._owned_auto_partition_keys(
-            worker_index=worker_index,
-            workers=workers,
-            server_shards=16,
-        )
-        for worker_index in range(workers)
-    ]
-
-    for assignment in assignments:
-        shards = {
-            async_worker_module._auto_partition_server_shard(
-                int(key.removeprefix(async_worker_module.AUTO_PARTITION_PREFIX)),
-                16,
-            )
-            for key in assignment
-        }
-        assert len(shards) == 1
-
-
-def test_auto_partition_assignment_plan_is_cached():
-    async_worker_module._auto_partition_assignments.cache_clear()
-
-    first = async_worker_module._auto_partition_assignments(57, 16)
-    second = async_worker_module._auto_partition_assignments(57, 16)
-
-    assert first is second
-    assert async_worker_module._auto_partition_assignments.cache_info().hits == 1
-
-
-@pytest.mark.parametrize("invalid", [True, 1.0])
-def test_auto_partition_cache_does_not_alias_invalid_shard_counts(invalid: Any) -> None:
-    async_worker_module._auto_partition_assignments.cache_clear()
-    async_worker_module._auto_partition_assignments(1, 1)
-
-    with pytest.raises(ValueError, match="server_shards"):
-        async_worker_module._auto_partition_assignments(1, invalid)
-
-
-def test_auto_partition_workers_cannot_exceed_bucket_count():
-    with pytest.raises(ValueError, match="cannot exceed"):
-        async_worker_module._owned_auto_partition_keys(
-            worker_index=0,
-            workers=async_worker_module.AUTO_PARTITION_BUCKETS + 1,
-            server_shards=16,
-        )
-
-
-def test_async_queue_worker_rejects_empty_auto_partition_ownership(monkeypatch):
-    monkeypatch.setattr(
-        "ferricstore.async_queue_runtime._owned_auto_partition_keys",
-        lambda **_: [],
+def test_async_queue_worker_delegates_auto_partition_selection_to_server() -> None:
+    worker = AsyncQueueFlowWorker(
+        FakeExecutor(),
+        type="order",
+        auto_partitions=True,
+        worker_index=17,
+        workers=300,
     )
 
-    with pytest.raises(ValueError, match="no auto partitions"):
-        AsyncQueueFlowWorker(
-            FakeExecutor(),
-            type="order",
-            auto_partitions=True,
-        )
+    assert worker.partition_key is None
+    assert worker.partition_keys is None
+    assert worker._next_claim_partition() == (None, None)
 
 
 @pytest.mark.parametrize("runtime", [AsyncQueueFlow, AsyncWorkflow])
-def test_async_multiworker_runtimes_reject_more_workers_than_auto_partitions(runtime):
-    with pytest.raises(ValueError, match="cannot exceed"):
-        runtime(
-            FakeExecutor(),
-            type="order",
-            workers=async_worker_module.AUTO_PARTITION_BUCKETS + 1,
-        )
+def test_async_multiworker_runtimes_are_not_limited_by_internal_partition_count(runtime):
+    instance = runtime(FakeExecutor(), type="order", workers=300)
+    assert instance.workers == 300
 
 
 @pytest.mark.parametrize(
@@ -486,23 +427,13 @@ def test_async_runtimes_reject_invalid_server_shard_topology(
             AsyncWorkflow(FakeExecutor(), type="order", server_shards=invalid)
 
 
-def test_async_queue_builds_wake_partition_keys_only_when_hints_are_enabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    built: list[int] = []
-
-    def partition_key(index: int) -> str:
-        built.append(index)
-        return f"partition:{index}"
-
-    monkeypatch.setattr(async_queue_api_module, "_auto_partition_key", partition_key)
-
-    AsyncQueueFlow(FakeExecutor(), type="order")
-    assert built == []
-
+def test_async_queue_wake_subscription_uses_server_auto_selection() -> None:
+    disabled = AsyncQueueFlow(FakeExecutor(), type="order")
+    assert disabled._wake_coordinator is None
     enabled = AsyncQueueFlow(FakeExecutor(), type="order", protocol_wake_hints=True)
-    assert built == list(range(async_queue_runtime_module.AUTO_PARTITION_BUCKETS))
     assert enabled._wake_coordinator is not None
+    assert enabled._wake_coordinator._partition_key is None
+    assert enabled._wake_coordinator._partition_keys is None
 
 
 @pytest.mark.parametrize(
@@ -772,10 +703,7 @@ def test_async_queue_workers_share_one_union_wake_subscription():
             args, kwargs = client.subscriptions[0]
             assert args == ("order",)
             assert kwargs["partition_key"] is None
-            assert set(kwargs["partition_keys"]) == {
-                async_worker_module._auto_partition_key(index)
-                for index in range(async_worker_module.AUTO_PARTITION_BUCKETS)
-            }
+            assert kwargs["partition_keys"] is None
         finally:
             await queue.close()
 

@@ -562,23 +562,12 @@ def validate_limit_release(
     scope: object,
     *,
     shard_id: object,
-    reservation_ids: object | None,
-    amount: object | None,
+    reservation_ids: object,
     now_ms: object | None,
-) -> tuple[str, ...] | None:
+) -> tuple[str, ...]:
     validate_nonempty_string(scope, name="scope")
     validate_nonnegative_int(shard_id, name="shard_id")
-    if reservation_ids is None and amount is None:
-        raise ValueError("reservation_ids or amount must be provided")
-    validated_ids = (
-        validate_limit_reservation_ids(reservation_ids) if reservation_ids is not None else None
-    )
-    if amount is not None:
-        validated_amount = validate_positive_int(amount, name="amount")
-        if validated_amount > _MAX_LIMIT_MUTATION_AMOUNT:
-            raise ValueError(f"amount cannot exceed {_MAX_LIMIT_MUTATION_AMOUNT}")
-        if validated_ids is not None and validated_amount != len(validated_ids):
-            raise ValueError("amount must match the number of reservation_ids")
+    validated_ids = validate_limit_reservation_ids(reservation_ids)
     _validate_optional_exact_nonnegative_int(now_ms, name="now_ms")
     return validated_ids
 

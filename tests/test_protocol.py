@@ -75,6 +75,64 @@ def _flow_id_route_key(value: str | bytes) -> str:
     return f"f:{{fa:{zlib.crc32(encoded) % 256}}}:route"
 
 
+def _v080_hello(*, auth_required: bool = False) -> dict[str, Any]:
+    return {
+        "protocol": "ferricstore-native",
+        "version": 1,
+        "auth_required": auth_required,
+        "capabilities": {
+            "response_codecs": {"compact_response_opcodes": {}},
+            "limits": {"max_response_bytes": 64 * 1024 * 1024},
+        },
+    }
+
+
+def _serve_v080_handshake(
+    conn: socket.socket,
+    recv_frame: Any,
+    response: Any,
+    *,
+    auth_required: bool = False,
+) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    frames = []
+    for _ in range(2):
+        frame = recv_frame(conn)
+        frames.append(frame)
+        conn.sendall(
+            response(
+                frame[0],
+                frame[1],
+                frame[2],
+                _v080_hello(auth_required=auth_required),
+            )
+        )
+    return cast(tuple[tuple[Any, ...], tuple[Any, ...]], tuple(frames))
+
+
+async def _serve_async_v080_handshake(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    recv_frame: Any,
+    response: Any,
+    *,
+    auth_required: bool = False,
+) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    frames = []
+    for _ in range(2):
+        frame = await recv_frame(reader)
+        frames.append(frame)
+        writer.write(
+            response(
+                frame[0],
+                frame[1],
+                frame[2],
+                _v080_hello(auth_required=auth_required),
+            )
+        )
+        await writer.drain()
+    return cast(tuple[tuple[Any, ...], tuple[Any, ...]], tuple(frames))
+
+
 def _single_shard_topology(
     host: str = "leader.local",
     port: int = 6391,
@@ -2157,7 +2215,17 @@ def test_topology_protocol_adapter_pool_delegates_helper_methods(monkeypatch):
     assert pool.submit_mset_same_value(["{tenant}:a", "{tenant}:b"], b"value").result()[0] == (
         "submit_mset_same_value"
     )
-    assert pool.submit_mset_payload(b"payload").result()[:2] == (
+    mset_key = b"{tenant}:a"
+    mset_value = b"value"
+    mset_payload = (
+        bytes([_COMPACT_PIPELINE_REQUEST, 1])
+        + struct.pack(">I", 1)
+        + struct.pack(">I", len(mset_key))
+        + mset_key
+        + struct.pack(">I", len(mset_value))
+        + mset_value
+    )
+    assert pool.submit_mset_payload(mset_payload).result()[:2] == (
         "submit_mset_payload",
         "ferric://leader.local:6391",
     )
@@ -2560,7 +2628,11 @@ def test_protocol_connect_keeps_socket_reads_blocking(monkeypatch):
     monkeypatch.setattr(socket, "create_connection", fake_create_connection)
     monkeypatch.setattr(ProtocolAdapter, "_reader_loop", lambda self, *_args: None)
     monkeypatch.setattr(ProtocolAdapter, "_request", lambda self, *args, **kwargs: object())
-    monkeypatch.setattr(ProtocolAdapter, "_response_value", lambda self, response: b"OK")
+    monkeypatch.setattr(
+        ProtocolAdapter,
+        "_response_value",
+        lambda self, response: _v080_hello(),
+    )
 
     adapter = ProtocolAdapter(timeout=7.5)
 
@@ -2899,9 +2971,9 @@ def test_protocol_adapter_retries_transient_startup_reset():
             conn, _addr = listener.accept()
             attempts.append("startup")
             with conn:
-                startup_opcode, startup_lane, startup_id, startup_payload = recv_frame(conn)
+                _hello, startup = _serve_v080_handshake(conn, recv_frame, response)
+                startup_opcode, startup_lane, _startup_id, startup_payload = startup
                 received.append((startup_opcode, startup_lane, startup_payload))
-                conn.sendall(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
@@ -3312,7 +3384,7 @@ def test_protocol_submit_mset_same_value_sends_direct_compact_bulk_frame(monkeyp
     adapter = ProtocolAdapter("127.0.0.1", 6388, lanes=16)
     adapter._sock = FakeSocket()
 
-    future = adapter.submit_mset_same_value(["k1", b"k2"], b"value")
+    future = adapter.submit_mset_same_value(["{tenant}:k1", b"{tenant}:k2"], b"value")
 
     assert not future.done()
     assert adapter._sock.sent[0].count(b"FSNP") == 1
@@ -3646,14 +3718,14 @@ def test_compact_kv_payloads_keep_exact_wire_shape():
         bytes([_COMPACT_PIPELINE_REQUEST, 2]) + struct.pack(">I", 2) + binary(b"k1") + binary(b"k2")
     )
 
-    mset = build_protocol_command("MSET", b"k1", b"v1", "k2", "v2")
+    mset = build_protocol_command("MSET", b"{m}:k1", b"v1", "{m}:k2", "v2")
     assert mset.flags == _FLAG_CUSTOM_PAYLOAD
     assert mset.payload == (
         bytes([_COMPACT_PIPELINE_REQUEST, 1])
         + struct.pack(">I", 2)
-        + binary(b"k1")
+        + binary(b"{m}:k1")
         + binary(b"v1")
-        + binary(b"k2")
+        + binary(b"{m}:k2")
         + binary(b"v2")
     )
 
@@ -4947,7 +5019,7 @@ def test_protocol_builds_native_flow_policy_state_modes_payload():
 
 
 def test_protocol_encodes_mset_and_mget_compact_wire_requests():
-    mset = build_protocol_command("MSET", "k1", "v1", "k2", "v2")
+    mset = build_protocol_command("MSET", "{m}:k1", "v1", "{m}:k2", "v2")
     assert mset.opcode == 0x0105
     assert mset.flags == _FLAG_CUSTOM_PAYLOAD
     assert isinstance(mset.payload, bytes)
@@ -5508,9 +5580,9 @@ def test_protocol_adapter_uses_real_tcp_frames():
         with listener:
             conn, _addr = listener.accept()
             with conn:
-                startup_opcode, startup_lane, startup_id, startup_payload = recv_frame(conn)
+                _hello, startup = _serve_v080_handshake(conn, recv_frame, response)
+                startup_opcode, startup_lane, _startup_id, startup_payload = startup
                 received.append((startup_opcode, startup_lane, startup_payload))
-                conn.sendall(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
 
                 get_opcode, get_lane, get_id, get_payload = recv_frame(conn)
                 received.append((get_opcode, get_lane, get_payload))
@@ -5570,9 +5642,9 @@ def test_protocol_adapter_sends_idle_heartbeat_ping():
             conn, _addr = listener.accept()
             conn.settimeout(1.0)
             with conn:
-                startup_opcode, startup_lane, startup_id, startup_payload = recv_frame(conn)
+                _hello, startup = _serve_v080_handshake(conn, recv_frame, response)
+                startup_opcode, startup_lane, _startup_id, startup_payload = startup
                 received.append((startup_opcode, startup_lane, startup_payload))
-                conn.sendall(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
 
                 ping_opcode, ping_lane, ping_id, ping_payload = recv_frame(conn)
                 received.append((ping_opcode, ping_lane, ping_payload))
@@ -5635,16 +5707,16 @@ def test_protocol_adapter_reconnects_after_server_closes_idle_socket():
         with listener:
             first, _addr = listener.accept()
             with first:
-                startup_opcode, startup_lane, startup_id, startup_payload = recv_frame(first)
+                _hello, startup = _serve_v080_handshake(first, recv_frame, response)
+                startup_opcode, startup_lane, _startup_id, startup_payload = startup
                 received.append((startup_opcode, startup_lane, startup_payload))
-                first.sendall(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
             first_connection_closed.set()
 
             second, _addr = listener.accept()
             with second:
-                startup_opcode, startup_lane, startup_id, startup_payload = recv_frame(second)
+                _hello, startup = _serve_v080_handshake(second, recv_frame, response)
+                startup_opcode, startup_lane, _startup_id, startup_payload = startup
                 received.append((startup_opcode, startup_lane, startup_payload))
-                second.sendall(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
 
                 get_opcode, get_lane, get_id, get_payload = recv_frame(second)
                 received.append((get_opcode, get_lane, get_payload))
@@ -5934,10 +6006,7 @@ def test_protocol_adapter_execute_command_with_trace_unwraps_value_and_timings()
         with listener:
             conn, _addr = listener.accept()
             with conn:
-                startup_opcode, startup_lane, startup_id, _startup_flags, _startup_payload = (
-                    recv_frame(conn)
-                )
-                conn.sendall(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
+                _serve_v080_handshake(conn, recv_frame, response)
 
                 opcode, lane, request_id, flags, _payload = recv_frame(conn)
                 seen_flags.append(flags)
@@ -6771,11 +6840,11 @@ def test_protocol_adapter_trace_command_returns_client_and_server_timings():
         with listener:
             conn, _addr = listener.accept()
             with conn:
-                startup_opcode, startup_lane, startup_id, startup_flags, _startup_payload = (
-                    recv_frame(conn)
+                _hello, startup = _serve_v080_handshake(conn, recv_frame, response)
+                _startup_opcode, _startup_lane, _startup_id, startup_flags, _startup_payload = (
+                    startup
                 )
                 assert startup_flags == 0
-                conn.sendall(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
 
                 opcode, lane, request_id, flags, _payload = recv_frame(conn)
                 assert flags & trace_flag == trace_flag
@@ -6862,8 +6931,7 @@ def test_protocol_adapter_allows_multiple_inflight_requests():
         with listener:
             conn, _addr = listener.accept()
             with conn:
-                startup_opcode, startup_lane, startup_id, _startup_payload = recv_frame(conn)
-                conn.sendall(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
+                _serve_v080_handshake(conn, recv_frame, response)
 
                 first_opcode, first_lane, first_id, _first_payload = recv_frame(conn)
                 second_opcode, second_lane, second_id, _second_payload = recv_frame(conn)
@@ -6924,8 +6992,7 @@ def test_protocol_adapter_submit_command_returns_future_without_waiting():
         with listener:
             conn, _addr = listener.accept()
             with conn:
-                startup_opcode, startup_lane, startup_id, _startup_payload = recv_frame(conn)
-                conn.sendall(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
+                _serve_v080_handshake(conn, recv_frame, response)
 
                 opcode, lane, request_id, _payload = recv_frame(conn)
                 request_received.set()
@@ -6972,11 +7039,7 @@ def test_async_protocol_adapter_allows_multiple_inflight_requests():
             writer: asyncio.StreamWriter,
         ) -> None:
             try:
-                startup_opcode, startup_lane, startup_id, _startup_payload = await recv_frame(
-                    reader
-                )
-                writer.write(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
-                await writer.drain()
+                await _serve_async_v080_handshake(reader, writer, recv_frame, response)
 
                 first_opcode, first_lane, first_id, _first_payload = await recv_frame(reader)
                 second_opcode, second_lane, second_id, _second_payload = await recv_frame(reader)
@@ -7042,6 +7105,18 @@ def test_async_protocol_adapter_waits_for_authenticated_handshake_before_command
         ) -> None:
             get_count = 0
             try:
+                hello_opcode, hello_lane, hello_id, _hello_payload = await recv_frame(reader)
+                observed_opcodes.append(hello_opcode)
+                writer.write(
+                    response(
+                        hello_opcode,
+                        hello_lane,
+                        hello_id,
+                        _v080_hello(auth_required=True),
+                    )
+                )
+                await writer.drain()
+
                 startup_opcode, startup_lane, startup_id, _startup_payload = await recv_frame(
                     reader
                 )
@@ -7060,7 +7135,14 @@ def test_async_protocol_adapter_waits_for_authenticated_handshake_before_command
                     writer.write(response(opcode, lane, request_id, b"value"))
                     await writer.drain()
 
-                writer.write(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
+                writer.write(
+                    response(
+                        startup_opcode,
+                        startup_lane,
+                        startup_id,
+                        _v080_hello(auth_required=True),
+                    )
+                )
                 await writer.drain()
 
                 auth_opcode, auth_lane, auth_id, _auth_payload = await recv_frame(reader)
@@ -7114,7 +7196,7 @@ def test_async_protocol_adapter_waits_for_authenticated_handshake_before_command
 
     asyncio.run(run())
 
-    assert observed_opcodes == [0x000C, 0x0002, 0x0101, 0x0101]
+    assert observed_opcodes == [0x0001, 0x000C, 0x0002, 0x0101, 0x0101]
 
 
 def test_async_protocol_adapter_trace_command_returns_client_and_server_timings():
@@ -7143,16 +7225,20 @@ def test_async_protocol_adapter_trace_command_returns_client_and_server_timings(
             writer: asyncio.StreamWriter,
         ) -> None:
             try:
+                _hello, startup = await _serve_async_v080_handshake(
+                    reader,
+                    writer,
+                    recv_frame,
+                    response,
+                )
                 (
-                    startup_opcode,
-                    startup_lane,
-                    startup_id,
+                    _startup_opcode,
+                    _startup_lane,
+                    _startup_id,
                     startup_flags,
                     _startup_payload,
-                ) = await recv_frame(reader)
+                ) = startup
                 assert startup_flags == 0
-                writer.write(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
-                await writer.drain()
 
                 opcode, lane, request_id, flags, _payload = await recv_frame(reader)
                 assert flags & trace_flag == trace_flag
@@ -7475,10 +7561,14 @@ def test_async_protocol_adapter_sends_idle_heartbeat_ping():
             writer: asyncio.StreamWriter,
         ) -> None:
             try:
-                startup_opcode, startup_lane, startup_id, startup_payload = await recv_frame(reader)
+                _hello, startup = await _serve_async_v080_handshake(
+                    reader,
+                    writer,
+                    recv_frame,
+                    response,
+                )
+                startup_opcode, startup_lane, _startup_id, startup_payload = startup
                 received.append((startup_opcode, startup_lane, startup_payload))
-                writer.write(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
-                await writer.drain()
 
                 ping_opcode, ping_lane, ping_id, ping_payload = await asyncio.wait_for(
                     recv_frame(reader),
@@ -7546,10 +7636,14 @@ def test_async_protocol_adapter_reconnects_after_server_closes_idle_socket():
             nonlocal connected
             connected += 1
             try:
-                startup_opcode, startup_lane, startup_id, startup_payload = await recv_frame(reader)
+                _hello, startup = await _serve_async_v080_handshake(
+                    reader,
+                    writer,
+                    recv_frame,
+                    response,
+                )
+                startup_opcode, startup_lane, _startup_id, startup_payload = startup
                 received.append((startup_opcode, startup_lane, startup_payload))
-                writer.write(response(startup_opcode, startup_lane, startup_id, {"ok": True}))
-                await writer.drain()
 
                 if connected == 1:
                     return
@@ -8352,15 +8446,22 @@ def test_encodes_protocol_protocol_custom_commands():
         lane_id=1,
     )
     assert build_protocol_command(
-        "FETCH_OR_COMPUTE_RESULT", "cache:k", b"v", 1000
+        "FETCH_OR_COMPUTE_RESULT", "cache:k", b"ownership", b"v", 1000
     ) == ProtocolCommand(
         opcode=0x010C,
-        payload={"key": "cache:k", "value": b"v", "ttl_ms": 1000},
+        payload={
+            "key": "cache:k",
+            "token": b"ownership",
+            "value": b"v",
+            "ttl_ms": 1000,
+        },
         lane_id=1,
     )
-    assert build_protocol_command("FETCH_OR_COMPUTE_ERROR", "cache:k", "failed") == ProtocolCommand(
+    assert build_protocol_command(
+        "FETCH_OR_COMPUTE_ERROR", "cache:k", b"ownership", "failed"
+    ) == ProtocolCommand(
         opcode=0x010D,
-        payload={"key": "cache:k", "message": "failed"},
+        payload={"key": "cache:k", "token": b"ownership", "message": "failed"},
         lane_id=1,
     )
 

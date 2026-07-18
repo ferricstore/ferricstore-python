@@ -31,12 +31,13 @@ def _flow_create_many_payload(args: tuple[Any, ...]) -> dict[str, Any]:
         payload["partition_key"] = args[0]
 
     token = _command_token(args[item_token])
-    if token == "ITEMS_EXT":
+    if token in {"ITEMS_EXT", "ITEMS_EXT_V2"}:
         item_count = require_nonnegative_count(
-            _require_arg(args, item_token + 1, "FLOW.CREATE_MANY ITEMS_EXT"),
-            label="FLOW.CREATE_MANY ITEMS_EXT",
+            _require_arg(args, item_token + 1, f"FLOW.CREATE_MANY {token}"),
+            label=f"FLOW.CREATE_MANY {token}",
         )
-        payload["items"] = _parse_create_items_ext(
+        parser = _parse_create_items_ext_v2 if token == "ITEMS_EXT_V2" else _parse_create_items_ext
+        payload["items"] = parser(
             args[item_token + 2 :],
             mixed,
             expected_count=item_count,
@@ -47,21 +48,21 @@ def _flow_create_many_payload(args: tuple[Any, ...]) -> dict[str, Any]:
 
 
 def _flow_spawn_children_payload(args: tuple[Any, ...]) -> dict[str, Any]:
-    parent_id = _require_arg(args, 0, "FLOW.SPAWN_CHILDREN")
+    parent_flow_id = _require_arg(args, 0, "FLOW.SPAWN_CHILDREN")
     item_token = _find_item_token(args, 1)
-    payload = {"id": parent_id}
+    payload = {"id": parent_flow_id}
     payload.update(_option_map(args[1:item_token]))
 
     token = _command_token(args[item_token])
-    if token == "ITEMS_EXT":
+    if token in {"ITEMS_EXT", "ITEMS_EXT_V2"}:
         item_count = require_nonnegative_count(
             _require_arg(args, item_token + 1, "FLOW.SPAWN_CHILDREN ITEMS_EXT"),
             label="FLOW.SPAWN_CHILDREN ITEMS_EXT",
         )
-        payload["children"] = _parse_spawn_children_ext(
-            args[item_token + 2 :],
-            expected_count=item_count,
+        parser = (
+            _parse_spawn_children_ext_v2 if token == "ITEMS_EXT_V2" else _parse_spawn_children_ext
         )
+        payload["children"] = parser(args[item_token + 2 :], expected_count=item_count)
     else:
         mixed = item_token + 1 < len(args) and _command_token(args[item_token + 1]) == "MIXED"
         start = item_token + 2 if mixed else item_token + 1
@@ -148,6 +149,64 @@ def _parse_spawn_children_ext(
         children.append(child)
     if idx != len(values):
         raise InvalidCommandError("FLOW.SPAWN_CHILDREN ITEMS_EXT count does not match items")
+    return children
+
+
+def _parse_spawn_children_ext_v2(
+    values: tuple[Any, ...],
+    *,
+    expected_count: int,
+) -> list[dict[str, Any]]:
+    if expected_count > len(values) // 7:
+        raise InvalidCommandError("FLOW.SPAWN_CHILDREN ITEMS_EXT_V2 count does not match items")
+    children: list[dict[str, Any]] = []
+    idx = 0
+    for _ in range(expected_count):
+        if idx + 5 > len(values):
+            raise InvalidCommandError("FLOW.SPAWN_CHILDREN ITEMS_EXT_V2 item is truncated")
+        child = {
+            "id": values[idx],
+            "type": values[idx + 2],
+            "payload": values[idx + 3],
+        }
+        partition = values[idx + 1]
+        if partition != "-" and partition != b"-":
+            child["partition_key"] = partition
+        max_active_ms = values[idx + 4]
+        if max_active_ms != "-" and max_active_ms != b"-":
+            child["max_active_ms"] = max_active_ms
+        idx += 5
+
+        value_segment = consume_counted_arguments(
+            values,
+            idx,
+            width=2,
+            label="FLOW.SPAWN_CHILDREN ITEMS_EXT_V2 VALUE",
+        )
+        idx = value_segment.next_index
+        child_values = {
+            _text(value_segment.values[offset]): value_segment.values[offset + 1]
+            for offset in range(0, len(value_segment.values), 2)
+        }
+        if child_values:
+            child["values"] = child_values
+
+        ref_segment = consume_counted_arguments(
+            values,
+            idx,
+            width=2,
+            label="FLOW.SPAWN_CHILDREN ITEMS_EXT_V2 VALUE_REF",
+        )
+        idx = ref_segment.next_index
+        child_refs = {
+            _text(ref_segment.values[offset]): ref_segment.values[offset + 1]
+            for offset in range(0, len(ref_segment.values), 2)
+        }
+        if child_refs:
+            child["value_refs"] = child_refs
+        children.append(child)
+    if idx != len(values):
+        raise InvalidCommandError("FLOW.SPAWN_CHILDREN ITEMS_EXT_V2 count does not match items")
     return children
 
 
@@ -242,6 +301,59 @@ def _parse_create_items_ext(
     return items
 
 
+def _parse_create_items_ext_v2(
+    values: tuple[Any, ...],
+    mixed: bool,
+    *,
+    expected_count: int,
+) -> list[dict[str, Any]]:
+    if expected_count > len(values) // 6:
+        raise InvalidCommandError("FLOW.CREATE_MANY ITEMS_EXT_V2 count does not match items")
+    items: list[dict[str, Any]] = []
+    idx = 0
+    for _ in range(expected_count):
+        if idx + 4 > len(values):
+            raise InvalidCommandError("FLOW.CREATE_MANY ITEMS_EXT_V2 item is truncated")
+        item = {"id": values[idx], "payload": values[idx + 2]}
+        partition = values[idx + 1]
+        if mixed or (partition != "-" and partition != b"-"):
+            item["partition_key"] = partition
+        max_active_ms = values[idx + 3]
+        if max_active_ms != "-" and max_active_ms != b"-":
+            item["max_active_ms"] = max_active_ms
+        idx += 4
+        value_segment = consume_counted_arguments(
+            values,
+            idx,
+            width=2,
+            label="FLOW.CREATE_MANY ITEMS_EXT_V2 VALUE",
+        )
+        idx = value_segment.next_index
+        item_values = {
+            _text(value_segment.values[offset]): value_segment.values[offset + 1]
+            for offset in range(0, len(value_segment.values), 2)
+        }
+        if item_values:
+            item["values"] = item_values
+        ref_segment = consume_counted_arguments(
+            values,
+            idx,
+            width=2,
+            label="FLOW.CREATE_MANY ITEMS_EXT_V2 VALUE_REF",
+        )
+        idx = ref_segment.next_index
+        item_refs = {
+            _text(ref_segment.values[offset]): ref_segment.values[offset + 1]
+            for offset in range(0, len(ref_segment.values), 2)
+        }
+        if item_refs:
+            item["value_refs"] = item_refs
+        items.append(item)
+    if idx != len(values):
+        raise InvalidCommandError("FLOW.CREATE_MANY ITEMS_EXT_V2 count does not match items")
+    return items
+
+
 def _parse_claimed_items(values: tuple[Any, ...], mixed: bool) -> list[list[Any]]:
     width = 4 if mixed else 3
     if len(values) % width != 0:
@@ -306,5 +418,6 @@ __all__ = [
     "_parse_fenced_items",
     "_parse_spawn_children",
     "_parse_spawn_children_ext",
+    "_parse_spawn_children_ext_v2",
     "_split_refs_and_options",
 ]

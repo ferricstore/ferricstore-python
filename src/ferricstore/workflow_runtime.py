@@ -35,7 +35,6 @@ from ferricstore.types import (
 from ferricstore.worker_core import (
     validate_many_result,
 )
-from ferricstore.workflow_core import pop_workflow_partition_key, workflow_partition_key
 from ferricstore.workflow_execution import apply_uniform_batch, handle_known_state_batch
 from ferricstore.workflow_models import (
     WORKFLOW_WORKER_CONFIG_KEYS,
@@ -46,6 +45,7 @@ from ferricstore.workflow_mutations import (
     apply_sync_outcome,
     build_job_mutation,
 )
+from ferricstore.workflow_producer import _WorkflowProducerMixin
 from ferricstore.workflow_types import (
     Complete,
     Fail,
@@ -62,7 +62,7 @@ if TYPE_CHECKING:
     from ferricstore.workflow_worker import WorkflowWorker
 
 
-class Workflow:
+class Workflow(_WorkflowProducerMixin):
     """Base class for explicit FerricFlow state workflows."""
 
     type: str
@@ -109,62 +109,6 @@ class Workflow:
                 for name, config in self._states.items()
             }
 
-    def create(self, id: str, *, payload: Any = None, **attrs: Any) -> FlowRecord | bytes:
-        partition_key = self._resolve_partition_key(attrs)
-        return self.client.create(
-            id,
-            type=self.type,
-            state=attrs.pop("state", self.initial_state),
-            payload=payload,
-            partition_key=partition_key,
-            **attrs,
-        )
-
-    def enqueue(self, id: str, *, payload: Any = None, **attrs: Any) -> FlowRecord | bytes:
-        partition_key = self._resolve_partition_key(attrs)
-        return self.client.enqueue(
-            id,
-            type=self.type,
-            state=attrs.pop("state", self.initial_state),
-            payload=payload,
-            partition_key=partition_key,
-            **attrs,
-        )
-
-    def start_and_claim(
-        self,
-        id: str,
-        *,
-        worker: str,
-        payload: Any = None,
-        initial_state: str | None = None,
-        **attrs: Any,
-    ) -> FlowRecord:
-        partition_key = self._resolve_partition_key(attrs)
-        return self.client.start_and_claim(
-            id,
-            type=self.type,
-            initial_state=self.initial_state if initial_state is None else initial_state,
-            worker=worker,
-            payload=payload,
-            partition_key=partition_key,
-            **attrs,
-        )
-
-    def create_many(
-        self,
-        partition_key: str | None,
-        items: builtins.list[CreateItem],
-        **attrs: Any,
-    ) -> builtins.list[FlowRecord]:
-        return self.client.create_many(
-            partition_key,
-            items,
-            type=self.type,
-            state=attrs.pop("state", self.initial_state),
-            **attrs,
-        )
-
     def run_steps_many(
         self,
         items: builtins.list[str | dict[str, Any] | CreateItem],
@@ -189,22 +133,13 @@ class Workflow:
             **attrs,
         )
 
-    def partition_key(self, attrs: dict[str, Any]) -> str | None:
-        return workflow_partition_key(attrs, self.partition_by)
-
-    def _resolve_partition_key(self, attrs: dict[str, Any]) -> str | None:
-        return pop_workflow_partition_key(
-            attrs,
-            self.partition_by,
-            resolver=self.partition_key,
-        )
-
     def install_policy(
         self,
         *,
         retry_policy: RetryPolicy | None = None,
         retry: RetryPolicy | None = None,
         indexed_state_meta: str | None = None,
+        max_active_ms: int | float | str | None = None,
     ) -> Any:
         if retry_policy is not None and retry is not None:
             raise ValueError("retry_policy and retry are mutually exclusive")
@@ -225,6 +160,8 @@ class Workflow:
         kwargs: dict[str, Any] = {"retry": resolved_retry_policy, "states": state_policies}
         if indexed_state_meta is not None:
             kwargs["indexed_state_meta"] = indexed_state_meta
+        if max_active_ms is not None:
+            kwargs["max_active_ms"] = max_active_ms
         return self.client.install_policy(self.type, **kwargs)
 
     def policy_get(self, *, state: str | None = None) -> dict[Any, Any]:
@@ -425,8 +362,12 @@ class Workflow:
         self,
         parent: FlowRecord,
         children: builtins.list[ChildSpec],
+        *,
+        max_active_ms: int | float | str | None = None,
         **kwargs: Any,
     ) -> Any:
+        if max_active_ms is not None:
+            kwargs["max_active_ms"] = max_active_ms
         kwargs.setdefault("partition_key", parent.partition_key)
         kwargs.setdefault("lease_token", parent.lease_token)
         kwargs.setdefault("fencing_token", parent.fencing_token)
@@ -856,8 +797,20 @@ class FlowWorkflow(Workflow):
     ) -> Callable[[Handler], Handler]:
         return self.state(name, **kwargs)
 
-    def start(self, id: str, *, payload: Any = None, **attrs: Any) -> FlowRecord | bytes:
-        return self.enqueue(id, payload=payload, **attrs)
+    def start(
+        self,
+        id: str,
+        *,
+        payload: Any = None,
+        max_active_ms: int | float | str | None = None,
+        **attrs: Any,
+    ) -> FlowRecord | bytes:
+        return self.enqueue(
+            id,
+            payload=payload,
+            max_active_ms=max_active_ms,
+            **attrs,
+        )
 
 
 _WORKFLOW_CLIENT_EXPORTS = frozenset({"WorkflowClient"})

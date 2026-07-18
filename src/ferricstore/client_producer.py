@@ -23,6 +23,7 @@ from ferricstore.client_helpers import (
     _run_steps_many_items,
 )
 from ferricstore.client_state import _ClientMixinBase
+from ferricstore.config_validation import normalize_optional_max_active_ms
 from ferricstore.errors import map_exception
 from ferricstore.lifecycle_core import (
     try_set_future_exception,
@@ -57,6 +58,7 @@ class _ClientProducerMixin(_ClientMixinBase):
         priority: int | None = None,
         idempotent: bool | None = None,
         retention_ttl_ms: int | None = None,
+        max_active_ms: int | float | str | None = None,
         attributes: dict[str, Any] | None = None,
         state_meta: dict[str, Any] | None = None,
         values: dict[str, Any] | None = None,
@@ -74,6 +76,7 @@ class _ClientProducerMixin(_ClientMixinBase):
         _append_priority(args, priority)
         _append_bool(args, "IDEMPOTENT", idempotent)
         _append(args, "RETENTION_TTL_MS", retention_ttl_ms)
+        _append(args, "MAX_ACTIVE_MS", normalize_optional_max_active_ms(max_active_ms))
         _append_attributes(args, attributes=attributes)
         _append_state_meta(args, state_meta)
         _append_named_values(args, self.codec, values=values, value_refs=value_refs)
@@ -95,6 +98,7 @@ class _ClientProducerMixin(_ClientMixinBase):
         priority: int | None = 0,
         idempotent: bool | None = None,
         retention_ttl_ms: int | None = None,
+        max_active_ms: int | float | str | None = None,
         attributes: dict[str, Any] | None = None,
         state_meta: dict[str, Any] | None = None,
         values: dict[str, Any] | None = None,
@@ -113,6 +117,7 @@ class _ClientProducerMixin(_ClientMixinBase):
             priority=priority,
             idempotent=idempotent,
             retention_ttl_ms=retention_ttl_ms,
+            max_active_ms=max_active_ms,
             attributes=attributes,
             state_meta=state_meta,
             values=values,
@@ -136,6 +141,7 @@ class _ClientProducerMixin(_ClientMixinBase):
         now_ms: int | None = None,
         priority: int | None = None,
         retention_ttl_ms: int | None = None,
+        max_active_ms: int | float | str | None = None,
         attributes: dict[str, Any] | None = None,
         state_meta: dict[str, Any] | None = None,
         values: dict[str, Any] | None = None,
@@ -163,6 +169,7 @@ class _ClientProducerMixin(_ClientMixinBase):
         _append(args, "CORRELATION_ID", correlation_id)
         _append_priority(args, priority)
         _append(args, "RETENTION_TTL_MS", retention_ttl_ms)
+        _append(args, "MAX_ACTIVE_MS", normalize_optional_max_active_ms(max_active_ms))
         _append_attributes(args, attributes=attributes)
         _append_state_meta(args, state_meta)
         _append_named_values(args, self.codec, values=values, value_refs=value_refs)
@@ -230,12 +237,13 @@ class _ClientProducerMixin(_ClientMixinBase):
         independent: bool | None = True,
         return_ok_on_success: bool = False,
         retention_ttl_ms: int | None = None,
+        max_active_ms: int | float | str | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         attributes: dict[str, Any] | None = None,
         state_meta: dict[str, Any] | None = None,
     ) -> builtins.list[Any] | Any:
-        """Create many queued flows, grouping no-partition items by auto bucket."""
+        """Create many queued flows, delegating automatic partitioning to the server."""
         if not items:
             return []
 
@@ -252,6 +260,7 @@ class _ClientProducerMixin(_ClientMixinBase):
                 independent=independent,
                 return_ok_on_success=return_ok_on_success,
                 retention_ttl_ms=retention_ttl_ms,
+                max_active_ms=max_active_ms,
                 values=values,
                 value_refs=value_refs,
                 attributes=attributes,
@@ -273,6 +282,7 @@ class _ClientProducerMixin(_ClientMixinBase):
                 independent=independent,
                 return_ok_on_success=return_ok_on_success,
                 retention_ttl_ms=retention_ttl_ms,
+                max_active_ms=max_active_ms,
                 values=values,
                 value_refs=value_refs,
                 attributes=attributes,
@@ -308,6 +318,7 @@ class _ClientProducerMixin(_ClientMixinBase):
         independent: bool | None = None,
         return_ok_on_success: bool = False,
         retention_ttl_ms: int | None = None,
+        max_active_ms: int | float | str | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         attributes: dict[str, Any] | None = None,
@@ -329,6 +340,7 @@ class _ClientProducerMixin(_ClientMixinBase):
             independent=independent,
             return_ok_on_success=return_ok_on_success,
             retention_ttl_ms=retention_ttl_ms,
+            max_active_ms=max_active_ms,
             values=values,
             value_refs=value_refs,
             attributes=attributes,
@@ -350,6 +362,7 @@ class _ClientProducerMixin(_ClientMixinBase):
         independent: bool | None = None,
         return_ok_on_success: bool = False,
         retention_ttl_ms: int | None = None,
+        max_active_ms: int | float | str | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         attributes: dict[str, Any] | None = None,
@@ -378,6 +391,7 @@ class _ClientProducerMixin(_ClientMixinBase):
             independent=independent,
             return_ok_on_success=return_ok_on_success,
             retention_ttl_ms=retention_ttl_ms,
+            max_active_ms=max_active_ms,
             values=values,
             value_refs=value_refs,
             attributes=attributes,

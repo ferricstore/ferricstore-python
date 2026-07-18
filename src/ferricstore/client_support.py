@@ -6,12 +6,12 @@ from typing import Any, cast
 
 from ferricstore.client_helpers import (
     _append_claimed_items_args,
+    _append_fenced_items_args,
     _append_read_options,
-    _auto_partition_key_for_id,
     _split_flow_state_policy,
 )
 from ferricstore.client_state import _ClientMixinBase
-from ferricstore.errors import OverloadedError
+from ferricstore.errors import FerricStoreError, OverloadedError
 from ferricstore.retry_policy import RetryPolicy
 from ferricstore.types import (
     ClaimedFlow,
@@ -45,25 +45,13 @@ class _ClientSupportMixin(_ClientMixinBase):
         *,
         include_lease: bool = False,
     ) -> builtins.list[Any]:
-        mixed = partition_key is None
-        args.append("ITEMS")
-        for item in items:
-            lease = item.lease_token if item.lease_token is not None else "-"
-            if mixed:
-                if item.partition_key is None:
-                    raise ValueError(f"mixed {command} items require partition_key")
-                args.extend([item.id, item.partition_key, item.fencing_token])
-                if include_lease:
-                    args.append(lease)
-            else:
-                if item.partition_key is not None and item.partition_key != partition_key:
-                    raise ValueError(
-                        f"{command} item partition_key does not match batch partition_key"
-                    )
-                args.extend([item.id, item.fencing_token])
-                if include_lease:
-                    args.append(lease)
-        return args
+        return _append_fenced_items_args(
+            args,
+            partition_key,
+            items,
+            command,
+            include_lease=include_lease,
+        )
 
     def _append_retry_policy(self, args: builtins.list[Any], policy: RetryPolicy) -> None:
         args.extend(
@@ -109,12 +97,9 @@ class _ClientSupportMixin(_ClientMixinBase):
     ) -> FlowRecord:
         if isinstance(value, dict):
             return self._record(value)
-        lookup_partition = (
-            _auto_partition_key_for_id(id) if partition_key is None else partition_key
-        )
         record = cast(
             FlowRecord | None,
-            cast(Any, self).get(id, partition_key=lookup_partition),
+            cast(Any, self).get(id, partition_key=partition_key),
         )
         if record is None:
             raise RuntimeError(f"FLOW command succeeded but record {id!r} was not found")
@@ -139,17 +124,27 @@ class _ClientSupportMixin(_ClientMixinBase):
                 result = self.executor.execute_command(*args)
                 self.backpressure.record_success()
                 return result
-            except OverloadedError as exc:
+            except FerricStoreError as exc:
+                if exc.retryable is not True or exc.safe_to_retry is not True:
+                    raise
                 elapsed_s = time.monotonic() - started
                 if not self.backpressure.can_retry(
                     attempt,
                     elapsed_s=elapsed_s,
                 ):
                     raise
-                if not self.backpressure.record_overload(
-                    attempt,
-                    exc.retry_after_ms,
-                    elapsed_s=elapsed_s,
-                ):
+                retry_scheduled = (
+                    self.backpressure.record_overload(
+                        attempt,
+                        exc.retry_after_ms,
+                        elapsed_s=elapsed_s,
+                    )
+                    if isinstance(exc, OverloadedError)
+                    else self.backpressure.record_retry(
+                        exc.retry_after_ms,
+                        elapsed_s=elapsed_s,
+                    )
+                )
+                if not retry_scheduled:
                     raise
                 attempt += 1

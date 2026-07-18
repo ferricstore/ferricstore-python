@@ -91,8 +91,7 @@ FLOW_OPTION_FIELD_NAMES = {
     "OVERLAP_RETRY_MS": "overlap_retry_ms",
     "OVERWRITE": "overwrite",
     "OWNER_FLOW_ID": "owner_flow_id",
-    "PARENT_FLOW_ID": "parent_id",
-    "PARENT_ID": "parent_id",
+    "PARENT_FLOW_ID": "parent_flow_id",
     "PARTITION": "partition_key",
     "PAYLOAD": "payload",
     "PAYLOAD_MAX_BYTES": "payload_max_bytes",
@@ -112,8 +111,7 @@ FLOW_OPTION_FIELD_NAMES = {
     "RETENTION_TTL_MS": "retention_ttl_ms",
     "RETENTION_TTL": "retention_ttl_ms",
     "REV": "rev",
-    "ROOT_FLOW_ID": "root_id",
-    "ROOT_ID": "root_id",
+    "ROOT_FLOW_ID": "root_flow_id",
     "RUN_AT": "run_at_ms",
     "RUN_AT_MS": "run_at_ms",
     "SIGNAL": "signal",
@@ -165,6 +163,7 @@ FLOW_OPTION_TOKENS = frozenset(FLOW_OPTION_FIELD_NAMES) | frozenset(
         "ATTRIBUTE_MERGE",
         "DROP_VALUE",
         "ITEMS_EXT",
+        "ITEMS_EXT_V2",
         "NOPAYLOAD",
         "OVERRIDE_VALUE",
         "PARTITIONS",
@@ -191,7 +190,7 @@ class FlowOptionPlan:
 
         for index in range(size - 1, -1, -1):
             token = self.tokens[index]
-            if token in {"ITEMS", "ITEMS_EXT"}:
+            if token in {"ITEMS", "ITEMS_EXT", "ITEMS_EXT_V2"}:
                 valid[index] = 1
             elif token not in FLOW_OPTION_TOKENS:
                 continue

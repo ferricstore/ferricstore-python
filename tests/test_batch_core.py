@@ -23,13 +23,7 @@ from ferricstore.batch_core import (
     run_sync_fanout,
     run_sync_fanout_on_executor,
 )
-from ferricstore.command_core import (
-    FLOW_AUTO_PARTITION_BUCKETS,
-    command_route_keys,
-    flow_auto_partition_index,
-    flow_auto_partition_key,
-    flow_auto_partition_key_for_index,
-)
+from ferricstore.command_core import command_route_keys
 from ferricstore.errors import FerricStoreError, OverloadedError, StaleLeaseError
 from ferricstore.worker_core import CloseDeadline, many_item_error
 
@@ -500,23 +494,6 @@ def test_many_item_error_uses_bytes_mapping_reason_without_value() -> None:
     assert isinstance(error, OverloadedError)
     assert "queue full" in str(error)
     assert error.raw is item
-
-
-def test_flow_auto_partition_helpers_share_one_canonical_mapping() -> None:
-    flow_id = "flow-☃"
-    index = zlib.crc32(flow_id.encode()) % FLOW_AUTO_PARTITION_BUCKETS
-
-    assert flow_auto_partition_index(flow_id) == index
-    assert flow_auto_partition_index(flow_id.encode()) == index
-    assert flow_auto_partition_key(flow_id) == flow_auto_partition_key_for_index(index)
-    assert flow_auto_partition_key_for_index(index + FLOW_AUTO_PARTITION_BUCKETS) == (
-        flow_auto_partition_key_for_index(index)
-    )
-
-
-def test_flow_auto_partition_index_rejects_non_text_identifiers_explicitly() -> None:
-    with pytest.raises(TypeError, match="id must be str or bytes"):
-        flow_auto_partition_index(42)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(

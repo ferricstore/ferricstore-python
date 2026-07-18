@@ -4,7 +4,6 @@ import queue
 import threading
 import time
 import uuid
-import zlib
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from urllib.parse import urlparse
@@ -18,9 +17,6 @@ from ferricstore import (
 
 FLOW_TYPE = "dbos_python_sdk_bench"
 QUEUE_STATE = "queued"
-AUTO_PARTITION_PREFIX = "__flow_auto__:"
-AUTO_PARTITION_BUCKETS = 256
-SERVER_SLOT_COUNT = 1024
 PROTOCOL_URL_SCHEMES = {"ferric", "ferrics"}
 
 DBOS_QUEUE_DEFAULTS = {
@@ -301,43 +297,6 @@ def partition_for(index: int, partitions: int, prefix: str) -> str:
     return f"{prefix}:partition:{index % max(partitions, 1)}"
 
 
-def auto_partition_index_for_flow_id(id: str) -> int:
-    return zlib.crc32(id.encode()) % AUTO_PARTITION_BUCKETS
-
-
-def auto_partition_key_for_index(index: int) -> str:
-    return f"{AUTO_PARTITION_PREFIX}{index % AUTO_PARTITION_BUCKETS}"
-
-
-def server_shard_for_slot(slot: int, server_shards: int) -> int:
-    server_shards = max(server_shards, 1)
-    slots_per_shard = SERVER_SLOT_COUNT // server_shards
-    remainder = SERVER_SLOT_COUNT % server_shards
-    wide_slots = (slots_per_shard + 1) * remainder
-    slot = slot % SERVER_SLOT_COUNT
-    if slot < wide_slots:
-        return slot // (slots_per_shard + 1)
-    return remainder + ((slot - wide_slots) // slots_per_shard)
-
-
-def auto_partition_server_shard_for_index(index: int, server_shards: int) -> int:
-    tag = f"fa:{index % AUTO_PARTITION_BUCKETS}"
-    slot = zlib.crc32(tag.encode()) & (SERVER_SLOT_COUNT - 1)
-    return server_shard_for_slot(slot, server_shards)
-
-
-def auto_partition_owner(index: int, workers: int, server_shards: int) -> int:
-    workers = max(workers, 1)
-    server_shards = max(server_shards, 1)
-    shard = auto_partition_server_shard_for_index(index, server_shards)
-    if workers <= server_shards:
-        return shard % workers
-    shard_workers = [worker for worker in range(workers) if worker % server_shards == shard]
-    if not shard_workers:
-        return shard % workers
-    return shard_workers[index % len(shard_workers)]
-
-
 def benchmark_partition_key(
     *,
     partition_mode: str,
@@ -346,7 +305,7 @@ def benchmark_partition_key(
     run_id: str,
 ) -> str:
     if partition_mode == "auto":
-        return auto_partition_key_for_index(partition_index)
+        raise ValueError("automatic Flow partitions must be selected by the server")
     return partition_for(partition_index, partitions, run_id)
 
 
@@ -531,17 +490,11 @@ class BenchFlowClient:
         flow_ids = [f"{run_id}:flow:{index}" for index in indices]
 
         if auto_partition:
-            partition_index = auto_partition_index_for_flow_id(flow_ids[0])
-            if any(
-                auto_partition_index_for_flow_id(flow_id) != partition_index for flow_id in flow_ids
-            ):
-                return None
-            partition_key = auto_partition_key_for_index(partition_index)
-        else:
-            partition_index = indices[0] % max(partitions, 1)
-            if any(index % max(partitions, 1) != partition_index for index in indices):
-                return None
-            partition_key = partition_for(partition_index, partitions, run_id)
+            return None
+        partition_index = indices[0] % max(partitions, 1)
+        if any(index % max(partitions, 1) != partition_index for index in indices):
+            return None
+        partition_key = partition_for(partition_index, partitions, run_id)
 
         items = [CreateItem(flow_id, payload) for flow_id in flow_ids]
         source = submit_create_many(
@@ -905,21 +858,13 @@ def create_flows(
     def publish_created(batch: list[int], batch_count: int) -> None:
         if latency_recorder is not None:
             latency_recorder.mark_created_indices(run_id, batch)
-        if wake_coordinator is not None:
-            if partition_mode == "auto":
-                partition_counts: dict[int, int] = {}
-                for index in batch:
-                    partition_index = auto_partition_index_for_flow_id(f"{run_id}:flow:{index}")
-                    partition_counts[partition_index] = partition_counts.get(partition_index, 0) + 1
-                for partition_index, count in partition_counts.items():
-                    wake_coordinator.notify_partition(partition_index, count)
-            else:
-                partition_counts = {}
-                for index in batch:
-                    partition_index = index % max(partitions, 1)
-                    partition_counts[partition_index] = partition_counts.get(partition_index, 0) + 1
-                for partition_index, count in partition_counts.items():
-                    wake_coordinator.notify_partition(partition_index, count)
+        if wake_coordinator is not None and partition_mode != "auto":
+            partition_counts: dict[int, int] = {}
+            for index in batch:
+                partition_index = index % max(partitions, 1)
+                partition_counts[partition_index] = partition_counts.get(partition_index, 0) + 1
+            for partition_index, count in partition_counts.items():
+                wake_coordinator.notify_partition(partition_index, count)
 
     def finish_create_future(future: Future[int], batch: list[int], batch_count: int) -> None:
         nonlocal created
@@ -993,7 +938,7 @@ def create_flows(
         while len(pending_creates) >= max_inflight:
             drain_one_create()
 
-    if partition_mode in {"auto", "explicit"} and transport == "many":
+    if partition_mode == "explicit" and transport == "many":
         partition_buffers: dict[int, list[int]] = {}
 
         def flush_partition(partition_index: int) -> None:
@@ -1005,11 +950,7 @@ def create_flows(
             partition_buffers[partition_index] = []
 
         for index in indices:
-            partition_index = (
-                auto_partition_index_for_flow_id(f"{run_id}:flow:{index}")
-                if partition_mode == "auto"
-                else index % max(partitions, 1)
-            )
+            partition_index = index % max(partitions, 1)
             bucket = partition_buffers.setdefault(partition_index, [])
             bucket.append(index)
             if len(bucket) >= max(create_batch_size, 1):
@@ -1078,6 +1019,7 @@ def run_claim_worker(
     latency_recorder: QueueLatencyRecorder | None = None,
     client_kwargs: dict[str, object] | None = None,
 ) -> dict[str, int]:
+    claim_any = claim_any or partition_mode == "auto"
     flow = BenchFlowClient(
         url,
         transport,
@@ -1105,30 +1047,23 @@ def run_claim_worker(
     partial_claim_retries = max(partial_claim_retries, 0)
     capacity_enabled = worker_capacity > 0
     worker_capacity = max(worker_capacity, 1) if capacity_enabled else 0
-    if partition_mode == "auto":
-        owned_partitions = [
-            p
-            for p in range(partitions)
-            if auto_partition_owner(p, worker_count, server_shards) == worker_index
+    owned_partitions = (
+        [] if claim_any else [p for p in range(partitions) if p % worker_count == worker_index]
+    )
+    owned_partition_keys = (
+        []
+        if claim_any
+        else [
+            benchmark_partition_key(
+                partition_mode=partition_mode,
+                partition_index=index,
+                partitions=partitions,
+                run_id=run_id,
+            )
+            for index in owned_partitions
         ]
-    else:
-        owned_partitions = [p for p in range(partitions) if p % worker_count == worker_index]
-    owned_partition_keys = [
-        benchmark_partition_key(
-            partition_mode=partition_mode,
-            partition_index=index,
-            partitions=partitions,
-            run_id=run_id,
-        )
-        for index in owned_partitions
-    ]
+    )
     same_partition_group = None
-    if partition_mode == "auto":
-
-        def same_partition_group(first: int, candidate: int) -> bool:
-            return auto_partition_server_shard_for_index(
-                first, server_shards
-            ) == auto_partition_server_shard_for_index(candidate, server_shards)
 
     fallback_round = 0
     complete_executor = (
@@ -1552,6 +1487,7 @@ def run_queue_api_worker(
     latency_recorder: QueueLatencyRecorder | None = None,
     client_kwargs: dict[str, object] | None = None,
 ) -> dict[str, int]:
+    claim_any = claim_any or partition_mode == "auto"
     del (
         complete_batch,
         transport,
@@ -1568,21 +1504,7 @@ def run_queue_api_worker(
     partition_keys = None
     owned_partitions = None
     if not claim_any:
-        if partition_mode == "auto":
-            owned_partitions = [
-                p
-                for p in range(partitions)
-                if auto_partition_owner(p, worker_count, server_shards) == worker_index
-            ]
-        else:
-            owned_partitions = [p for p in range(partitions) if p % worker_count == worker_index]
-        if partition_mode == "auto":
-            owned_partitions.sort(
-                key=lambda partition_index: (
-                    auto_partition_server_shard_for_index(partition_index, server_shards),
-                    partition_index,
-                )
-            )
+        owned_partitions = [p for p in range(partitions) if p % worker_count == worker_index]
         if not owned_partitions:
             return {
                 "completed": 0,
@@ -1742,16 +1664,7 @@ def run_queue_api_worker(
                         idle_sleep_s,
                         max(claim_partition_batch_size, 1),
                         claim_credit_limit,
-                        same_group=(
-                            (
-                                lambda first, other: (
-                                    auto_partition_server_shard_for_index(first, server_shards)
-                                    == auto_partition_server_shard_for_index(other, server_shards)
-                                )
-                            )
-                            if partition_mode == "auto"
-                            else None
-                        ),
+                        same_group=None,
                     )
                 except queue.Empty:
                     if producers_done.is_set() and all_claimed():
@@ -1808,16 +1721,7 @@ def run_queue_api_worker(
                         0.0,
                         max(claim_partition_batch_size, 1) - len(partition_indices),
                         claim_credit_limit - partition_credit,
-                        same_group=(
-                            (
-                                lambda first, other: (
-                                    auto_partition_server_shard_for_index(first, server_shards)
-                                    == auto_partition_server_shard_for_index(other, server_shards)
-                                )
-                            )
-                            if partition_mode == "auto"
-                            else None
-                        ),
+                        same_group=None,
                     )
                     partition_indices.extend(extra_indices)
                     partition_credit += extra_credit
@@ -1989,23 +1893,24 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
         ),
     )
     latency_recorder.add_observer(producer_backpressure.observe_queue_latencies)
+    partition_mode = args.partition_mode
+    if args.claim_any and partition_mode == "explicit":
+        partition_mode = "auto"
+    effective_claim_any = args.claim_any or partition_mode == "auto"
     effective_worker_mode = (
         "queue-api"
         if args.worker_api == "queue"
         else "polling"
-        if args.claim_any
+        if effective_claim_any
         else args.worker_mode
     )
-    partition_mode = args.partition_mode
-    if args.claim_any and partition_mode == "explicit":
-        partition_mode = "auto"
-    worker_partitions = AUTO_PARTITION_BUCKETS if partition_mode == "auto" else args.partitions
+    worker_partitions = args.partitions
     worker_capacity = args.worker_capacity
     worker_lanes = protocol_queue_worker_lanes(
         url=args.url,
         worker_api=args.worker_api,
         workers=args.workers,
-        claim_any=args.claim_any,
+        claim_any=effective_claim_any,
         partitions=worker_partitions,
         server_shards=args.server_shards,
     )
@@ -2040,30 +1945,17 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
     wake_coordinator = None
     if (
         effective_worker_mode in {"blocking", "queue-api"}
-        and not args.claim_any
+        and not effective_claim_any
         and worker_partitions > 0
     ):
-        if partition_mode == "auto":
-            wake_owner = lambda partition_index: auto_partition_owner(  # noqa: E731
-                partition_index,
-                worker_lanes,
-                args.server_shards,
-            )
-        else:
-            wake_owner = lambda partition_index: partition_index % max(worker_lanes, 1)  # noqa: E731
+        wake_owner = lambda partition_index: partition_index % max(worker_lanes, 1)  # noqa: E731
         wake_coordinator = PartitionWakeCoordinator(
             worker_lanes,
             worker_partitions,
             owner_for=wake_owner,
         )
 
-    if partition_mode == "auto" and args.transport == "many":
-        create_ranges = [[] for _ in range(args.producers)]
-        for index in indices:
-            owner = auto_partition_index_for_flow_id(f"{run_id}:flow:{index}") % args.producers
-            create_ranges[owner].append(index)
-    else:
-        create_ranges = [indices[offset :: args.producers] for offset in range(args.producers)]
+    create_ranges = [indices[offset :: args.producers] for offset in range(args.producers)]
     create_started = None
     create_finished = None
     process_started = None
@@ -2114,7 +2006,7 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
                 worker_count=worker_lanes,
                 partitions=worker_partitions,
                 partition_mode=partition_mode,
-                claim_any=args.claim_any,
+                claim_any=effective_claim_any,
                 claim_batch_size=args.claim_batch_size,
                 complete_batch=args.complete_batch,
                 complete_async_depth=args.complete_async_depth,
@@ -2264,7 +2156,7 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
         "worker_lanes": worker_lanes,
         "producers": args.producers,
         "partitions": args.partitions,
-        "claim_any": args.claim_any,
+        "claim_any": effective_claim_any,
         "partition_mode": partition_mode,
         "worker_mode": effective_worker_mode,
         "worker_api": args.worker_api,

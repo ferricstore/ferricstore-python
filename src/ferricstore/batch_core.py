@@ -8,7 +8,6 @@ from enum import Enum
 from importlib import import_module
 from typing import Any, TypeVar, cast
 
-from ferricstore.command_core import flow_auto_partition_key
 from ferricstore.config_validation import validate_positive_int
 from ferricstore.errors import FerricStoreError
 from ferricstore.types import CreateItem
@@ -137,7 +136,7 @@ def ordered_batch_executor(executor: Any) -> Callable[..., Any] | None:
 class CreateManyGroup:
     """One shard-routable group in an ordered create-many plan."""
 
-    partition_key: str
+    partition_key: str | None
     indexed_items: tuple[tuple[int, CreateItem], ...]
 
     @property
@@ -161,14 +160,9 @@ class CreateManyPlan:
         now_ms: int | None,
         clock: Callable[[], int],
     ) -> CreateManyPlan:
-        grouped: dict[str, list[tuple[int, CreateItem]]] = {}
+        grouped: dict[str | None, list[tuple[int, CreateItem]]] = {}
         for index, item in enumerate(items):
-            group_key = (
-                item.partition_key
-                if item.partition_key is not None
-                else flow_auto_partition_key(item.id)
-            )
-            grouped.setdefault(group_key, []).append((index, item))
+            grouped.setdefault(item.partition_key, []).append((index, item))
         groups = tuple(
             CreateManyGroup(partition_key, tuple(indexed_items))
             for partition_key, indexed_items in grouped.items()

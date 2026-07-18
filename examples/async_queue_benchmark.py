@@ -3,7 +3,6 @@ import asyncio
 import math
 import time
 import uuid
-import zlib
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -12,9 +11,6 @@ from ferricstore import AsyncFlowClient, ClaimedFlow, CreateItem
 
 FLOW_TYPE = "dbos_python_sdk_async_bench"
 QUEUE_STATE = "queued"
-AUTO_PARTITION_PREFIX = "__flow_auto__:"
-AUTO_PARTITION_BUCKETS = 256
-SERVER_SLOT_COUNT = 1024
 
 
 def chunks(values: list[int], size: int) -> Iterable[list[int]]:
@@ -57,14 +53,6 @@ def explicit_partition_for(index: int, partitions: int, run_id: str) -> str:
     return f"{run_id}:partition:{index % max(partitions, 1)}"
 
 
-def auto_partition_index_for_flow_id(id: str) -> int:
-    return zlib.crc32(id.encode()) % AUTO_PARTITION_BUCKETS
-
-
-def auto_partition_key_for_index(index: int) -> str:
-    return f"{AUTO_PARTITION_PREFIX}{index % AUTO_PARTITION_BUCKETS}"
-
-
 def partition_key_for_index(
     *,
     partition_mode: str,
@@ -75,47 +63,6 @@ def partition_key_for_index(
     if partition_mode == "auto":
         return None
     return explicit_partition_for(index, partitions, run_id)
-
-
-def claim_partition_key(
-    *,
-    partition_mode: str,
-    partition_index: int,
-    partitions: int,
-    run_id: str,
-) -> str:
-    if partition_mode == "auto":
-        return auto_partition_key_for_index(partition_index)
-    return explicit_partition_for(partition_index, partitions, run_id)
-
-
-def partition_index_for_created_flow(
-    *,
-    partition_mode: str,
-    run_id: str,
-    index: int,
-    partitions: int,
-) -> int:
-    if partition_mode == "auto":
-        return auto_partition_index_for_flow_id(flow_id(run_id, index))
-    return index % max(partitions, 1)
-
-
-def server_shard_for_slot(slot: int, server_shards: int) -> int:
-    server_shards = max(server_shards, 1)
-    slots_per_shard = SERVER_SLOT_COUNT // server_shards
-    remainder = SERVER_SLOT_COUNT % server_shards
-    wide_slots = (slots_per_shard + 1) * remainder
-    slot = slot % SERVER_SLOT_COUNT
-    if slot < wide_slots:
-        return slot // (slots_per_shard + 1)
-    return remainder + ((slot - wide_slots) // slots_per_shard)
-
-
-def auto_partition_server_shard_for_index(index: int, server_shards: int) -> int:
-    tag = f"fa:{index % AUTO_PARTITION_BUCKETS}"
-    slot = zlib.crc32(tag.encode()) & (SERVER_SLOT_COUNT - 1)
-    return server_shard_for_slot(slot, server_shards)
 
 
 @dataclass
@@ -168,16 +115,11 @@ async def create_flows(
     pipeline_max_depth = 0
 
     async def notify(indices_batch: list[int]) -> None:
-        if wake_coordinator is None:
+        if wake_coordinator is None or partition_mode == "auto":
             return
         counts: dict[int, int] = {}
         for index in indices_batch:
-            partition_index = partition_index_for_created_flow(
-                partition_mode=partition_mode,
-                run_id=run_id,
-                index=index,
-                partitions=partitions,
-            )
+            partition_index = index % max(partitions, 1)
             counts[partition_index] = counts.get(partition_index, 0) + 1
         for partition_index, count in counts.items():
             await wake_coordinator.notify_partition(partition_index, count)
@@ -251,7 +193,6 @@ async def create_flows(
             }
 
         if partition_mode == "auto":
-            auto_buffers: dict[int, list[int]] = {}
             pending: list[asyncio.Task[tuple[int, list[int]]]] = []
             create_inflight = max(create_inflight, 1)
 
@@ -275,24 +216,13 @@ async def create_flows(
                     await notify(batch)
                     await apply_backpressure()
 
-            async def flush_auto_bucket(partition_index: int) -> None:
-                batch = auto_buffers.get(partition_index)
-                if not batch:
-                    return
+            async def submit_auto_batch(batch: list[int]) -> None:
                 pending.append(asyncio.create_task(send_auto_batch(batch)))
-                auto_buffers[partition_index] = []
                 if len(pending) >= create_inflight:
                     await drain_one()
 
-            for index in indices:
-                partition_index = auto_partition_index_for_flow_id(flow_id(run_id, index))
-                bucket = auto_buffers.setdefault(partition_index, [])
-                bucket.append(index)
-                if len(bucket) >= max(create_batch_size, 1):
-                    await flush_auto_bucket(partition_index)
-
-            for partition_index in list(auto_buffers):
-                await flush_auto_bucket(partition_index)
+            for batch in chunks(indices, max(create_batch_size, 1)):
+                await submit_auto_batch(batch)
             while pending:
                 await drain_one()
             return {"created": created}
@@ -357,6 +287,7 @@ async def run_worker(
     server_shards: int,
 ) -> dict[str, int | float]:
     client = AsyncFlowClient.from_url(url)
+    claim_any = claim_any or partition_mode == "auto"
     local_completed = 0
     claimed_items = 0
     claim_calls = 0
@@ -376,18 +307,9 @@ async def run_worker(
     complete_inflight = max(complete_inflight, 0)
     claim_partition_batch_size = max(claim_partition_batch_size, 1)
 
-    partition_count = AUTO_PARTITION_BUCKETS if partition_mode == "auto" else partitions
-
-    def owner_for_partition(partition_index: int) -> int:
-        if partition_mode == "auto":
-            return auto_partition_server_shard_for_index(partition_index, server_shards) % workers
-        return partition_index % workers
-
-    owned_partitions = [p for p in range(partition_count) if owner_for_partition(p) == worker_index]
-    if partition_mode == "auto":
-        owned_partitions.sort(
-            key=lambda idx: (auto_partition_server_shard_for_index(idx, server_shards), idx)
-        )
+    owned_partitions = (
+        [] if claim_any else [p for p in range(partitions) if p % workers == worker_index]
+    )
     if not owned_partitions and not claim_any:
         return {
             "completed": 0,
@@ -401,12 +323,6 @@ async def run_worker(
         }
 
     same_group = None
-    if partition_mode == "auto":
-
-        def same_group(first: int, candidate: int) -> bool:
-            return auto_partition_server_shard_for_index(
-                first, server_shards
-            ) == auto_partition_server_shard_for_index(candidate, server_shards)
 
     async def drain_completions(*, block: bool = False, limit: int | None = None) -> int:
         drained_count = 0
@@ -441,25 +357,23 @@ async def run_worker(
         await drain_completions(block=False)
         if await counters.done():
             return 0
-        partition_keys = [
-            claim_partition_key(
-                partition_mode=partition_mode,
-                partition_index=index,
-                partitions=partitions,
-                run_id=run_id,
-            )
-            for index in partition_indices
-        ]
-        partition_key = partition_keys[0] if len(partition_keys) == 1 else None
-        multi_partition_keys = None if partition_key is not None else partition_keys
+        if claim_any:
+            partition_key = None
+            multi_partition_keys = None
+        else:
+            partition_keys = [
+                explicit_partition_for(index, partitions, run_id) for index in partition_indices
+            ]
+            partition_key = partition_keys[0] if len(partition_keys) == 1 else None
+            multi_partition_keys = None if partition_key is not None else partition_keys
         claim_calls += 1
         jobs = await client.claim_jobs(
             flow_type,
             state=claim_state,
             states=claim_states,
             worker=f"{run_id}:worker:{worker_index}",
-            partition_key=None if claim_any else partition_key,
-            partition_keys=None if claim_any else multi_partition_keys,
+            partition_key=partition_key,
+            partition_keys=multi_partition_keys,
             limit=limit,
             priority=claim_priority,
             reclaim_expired=reclaim_expired,
@@ -615,7 +529,8 @@ async def run_queued_throughput(args: argparse.Namespace) -> dict[str, Any]:
     partition_mode = (
         "auto" if args.claim_any and args.partition_mode == "explicit" else args.partition_mode
     )
-    worker_partitions = AUTO_PARTITION_BUCKETS if partition_mode == "auto" else args.partitions
+    effective_claim_any = args.claim_any or partition_mode == "auto"
+    worker_partitions = args.partitions
     payload = payload_bytes(args.payload_bytes)
     result = payload_bytes(args.result_bytes) if args.result_bytes > 0 else None
     claim_states = parse_claim_states(args.claim_states)
@@ -627,13 +542,7 @@ async def run_queued_throughput(args: argparse.Namespace) -> dict[str, Any]:
     wake_coordinator = None
 
     indices = list(range(args.flows))
-    if partition_mode == "auto" and args.create_mode == "many":
-        create_ranges = [[] for _ in range(args.producers)]
-        for index in indices:
-            owner = auto_partition_index_for_flow_id(flow_id(run_id, index)) % args.producers
-            create_ranges[owner].append(index)
-    else:
-        create_ranges = [indices[offset :: args.producers] for offset in range(args.producers)]
+    create_ranges = [indices[offset :: args.producers] for offset in range(args.producers)]
 
     async def create_task(
         batch: list[int],
@@ -664,7 +573,7 @@ async def run_queued_throughput(args: argparse.Namespace) -> dict[str, Any]:
             workers=args.workers,
             partitions=worker_partitions,
             partition_mode=partition_mode,
-            claim_any=args.claim_any,
+            claim_any=effective_claim_any,
             claim_batch_size=args.claim_batch_size,
             claim_partition_batch_size=args.claim_partition_batch_size,
             idle_sleep_ms=args.idle_sleep_ms,
@@ -768,7 +677,7 @@ async def run_queued_throughput(args: argparse.Namespace) -> dict[str, Any]:
         "claim_batch_size": args.claim_batch_size,
         "claim_partition_batch_size": args.claim_partition_batch_size,
         "complete_inflight": args.complete_inflight,
-        "claim_any": args.claim_any,
+        "claim_any": effective_claim_any,
         "claim_state": claim_state or "omitted",
         "claim_states": ",".join(claim_states) if claim_states else "",
         "claim_priority": args.claim_priority,

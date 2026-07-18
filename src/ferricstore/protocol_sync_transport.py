@@ -11,19 +11,16 @@ from typing import TYPE_CHECKING, Any, cast
 from ferricstore.errors import FerricStoreError
 from ferricstore.lifecycle_core import (
     raise_primary_with_cleanup,
-    try_set_future_exception,
     try_set_future_result,
 )
 from ferricstore.protocol_common import (
-    _response_identity_map,
-    _response_item_count_map,
+    _next_protocol_lane,
     _sync_adapter_deadline,
     _timeout_with_deadline,
     _validate_pending_response_identity,
 )
 from ferricstore.protocol_constants import (
     _FLAG_COMPRESSED,
-    _FLAG_MORE_CHUNKS,
     _FLAG_TRACE,
     _HEADER,
     _MAGIC,
@@ -38,16 +35,21 @@ from ferricstore.protocol_constants import (
 )
 from ferricstore.protocol_framing import (
     ResponseBodyAccumulator,
-    ResponseFrameBudget,
+    ResponseFrameAssembler,
     ResponseIdentity,
     frame_parts,
-    validate_response_identity,
 )
 from ferricstore.protocol_framing import send_frames as _send_frames
+from ferricstore.protocol_negotiation import (
+    apply_hello_negotiation,
+    mark_authenticated,
+    validate_unauthenticated_request_size,
+)
 from ferricstore.protocol_pipeline_codec import (
     _expected_payload_collection_items,
 )
 from ferricstore.protocol_responses import _decode_protocol_response
+from ferricstore.protocol_retry import request_outcome_error
 from ferricstore.protocol_sync_state import _SyncProtocolStateMixin
 
 
@@ -85,6 +87,7 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
                             {"username": self.username, "password": self.password},
                         )
                     )
+                    mark_authenticated(self)
                 with self._subscription_lock:
                     subscriptions = list(self._flow_wake_subscriptions)
                 for payload in subscriptions:
@@ -193,6 +196,12 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
                 )
             raise
 
+        hello: dict[str, Any] = {"compression": self.compression}
+        if self.client_name is not None:
+            hello["client_name"] = self.client_name
+        hello_value = self._response_value(self._request(_OPCODES["HELLO"], 0, hello))
+        apply_hello_negotiation(self, hello_value)
+
         startup: dict[str, Any] = {
             "compression": self.compression,
             "compact_flow_responses": True,
@@ -200,7 +209,8 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
         if self.client_name is not None:
             startup["client_name"] = self.client_name
             startup["driver_name"] = self.client_name
-        self._response_value(self._request(_OP_STARTUP, 0, startup))
+        startup_value = self._response_value(self._request(_OP_STARTUP, 0, startup))
+        apply_hello_negotiation(self, startup_value)
 
     def _start_heartbeat(self) -> None:
         if self.heartbeat_interval is None or self.heartbeat_interval <= 0:
@@ -272,15 +282,7 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
         return self._request_id
 
     def _next_lane_id(self, lane_id: int) -> int:
-        if lane_id == 0:
-            return lane_id
-        fixed_lane_id = cast(int | None, getattr(self, "_fixed_lane_id", None))
-        if fixed_lane_id is not None:
-            return fixed_lane_id
-        if self.lanes == 1:
-            return lane_id
-        self._lane_cursor = (self._lane_cursor % self.lanes) + 1
-        return self._lane_cursor
+        return _next_protocol_lane(self, lane_id)
 
     def _send(
         self,
@@ -298,8 +300,14 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
             payload,
             # Compression is negotiated by STARTUP itself.  KV correctly
             # rejects compressed frames until that request succeeds.
-            compression="none" if opcode == _OP_STARTUP else None,
+            compression=(
+                "none"
+                if opcode in {_OPCODES["HELLO"], _OP_STARTUP}
+                or (self._auth_required and not self._authenticated)
+                else None
+            ),
         )
+        validate_unauthenticated_request_size(self, len(body))
         flags = extra_flags
         if compressed:
             flags |= _FLAG_COMPRESSED
@@ -316,6 +324,11 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
         try:
             _send_frames(sock, frame_parts(header, body), timeout=write_timeout)
         except BaseException as write_error:
+            outcome_error = request_outcome_error(
+                opcode,
+                write_error,
+                message="protocol write failed",
+            )
             try:
                 self._close_transport(
                     FerricStoreError("protocol write failed", raw=write_error),
@@ -324,11 +337,11 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
                 )
             except BaseException as cleanup_error:
                 raise_primary_with_cleanup(
-                    write_error,
-                    write_error.__traceback__,
+                    outcome_error,
+                    outcome_error.__traceback__,
                     cleanup_error,
                 )
-            raise
+            raise outcome_error from write_error
         self._last_activity = time.monotonic()
         if not trace_enabled:
             return None
@@ -388,7 +401,11 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
             if request_id is not None:
                 self._discard_pending_request(request_id)
                 self._notify_idle_if_needed()
-            raise FerricStoreError("protocol request timed out") from exc
+            raise request_outcome_error(
+                opcode,
+                exc,
+                message="protocol request timed out",
+            ) from exc
 
     def _request_on_lane(
         self,
@@ -485,6 +502,8 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
                     client_trace["submit_total_us"] = (submit_done_ns - submit_started_ns) // 1000
             except Exception:
                 self._discard_pending_request(request_id, expected_future=future)
+                if future.done() and not future.cancelled():
+                    future.exception()
                 self._notify_idle_if_needed()
                 raise
             return request_id, future
@@ -543,28 +562,10 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
         *,
         transport_generation: int | None = None,
     ) -> None:
-        pending: list[Future[ProtocolResponse]] = []
-        with self._pending_state_lock():
-            bindings = getattr(self, "_pending_transport_bindings", None)
-            for request_id, future in list(self._pending.items()):
-                binding = None if bindings is None else bindings.get(request_id)
-                if (
-                    transport_generation is not None
-                    and binding is not None
-                    and binding[0] != transport_generation
-                ):
-                    continue
-                pending.append(future)
-                self._pending.pop(request_id, None)
-                self._pending_traces.pop(request_id, None)
-                _response_item_count_map(self).pop(request_id, None)
-                _response_identity_map(self).pop(request_id, None)
-                if bindings is not None:
-                    bindings.pop(request_id, None)
-                self._release_pending_lifecycle_locked(request_id)
-        for future in pending:
-            try_set_future_exception(future, exc)
-        self._notify_idle_if_needed()
+        self._pending_registry.fail(
+            exc,
+            transport_generation=transport_generation,
+        )
 
     def _recv_matching(self, request_id: int) -> ProtocolResponse:
         while True:
@@ -584,66 +585,45 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
         self,
         sock: socket.socket | ssl.SSLSocket | None = None,
     ) -> ProtocolResponse:
-        read_started_ns = time.perf_counter_ns()
-        header = self._recv_exact(_HEADER.size, sock)
-        magic, version, flags, lane_id, opcode, request_id, body_len = _HEADER.unpack(header)
-        if magic != _MAGIC or version != _RESPONSE_VERSION:
-            raise FerricStoreError("invalid protocol response frame header")
-        _validate_pending_response_identity(
-            self,
-            lane_id=lane_id,
-            opcode=opcode,
-            request_id=request_id,
-        )
-
-        self._check_response_size(body_len)
-        body = self._recv_exact(body_len, sock)
-        chunks = ResponseBodyAccumulator(body)
-        final_flags = flags
-        budget: ResponseFrameBudget | None = None
-        if final_flags & _FLAG_MORE_CHUNKS:
-            budget = ResponseFrameBudget(
+        assembler = getattr(self, "_response_frame_assembler", None)
+        if assembler is None:
+            assembler = ResponseFrameAssembler(
                 max_body_bytes=self.max_response_bytes,
                 max_chunks=self.max_response_chunks,
             )
-            budget.add_chunk(body_len)
-        while final_flags & _FLAG_MORE_CHUNKS:
-            next_header = self._recv_exact(_HEADER.size, sock)
-            (
-                next_magic,
-                next_version,
-                next_flags,
-                next_lane_id,
-                next_opcode,
-                next_request_id,
-                next_body_len,
-            ) = _HEADER.unpack(next_header)
-            if next_magic != _MAGIC or next_version != _RESPONSE_VERSION:
-                raise FerricStoreError("invalid protocol chunk continuation")
-            validate_response_identity(
-                ResponseIdentity(lane_id, opcode, request_id),
-                lane_id=next_lane_id,
-                opcode=next_opcode,
-                request_id=next_request_id,
-                message="invalid protocol chunk continuation",
+            self._response_frame_assembler = assembler
+        while True:
+            frame_started_ns = time.perf_counter_ns()
+            header = self._recv_exact(_HEADER.size, sock)
+            magic, version, flags, lane_id, opcode, request_id, body_len = _HEADER.unpack(header)
+            if magic != _MAGIC or version != _RESPONSE_VERSION:
+                raise FerricStoreError("invalid protocol response frame header")
+            _validate_pending_response_identity(
+                self,
+                lane_id=lane_id,
+                opcode=opcode,
+                request_id=request_id,
             )
-            if budget is not None:
-                budget.add_chunk(next_body_len)
-            chunks.append(self._recv_exact(next_body_len, sock))
-            final_flags = next_flags
-
-        body = chunks.finish()
-        read_done_ns = time.perf_counter_ns()
-        return _decode_protocol_response(
-            self,
-            lane_id=lane_id,
-            opcode=opcode,
-            request_id=request_id,
-            flags=final_flags,
-            body=body,
-            read_started_ns=read_started_ns,
-            read_done_ns=read_done_ns,
-        )
+            self._check_response_size(body_len)
+            assembled = assembler.add(
+                ResponseIdentity(lane_id, opcode, request_id),
+                flags,
+                self._recv_exact(body_len, sock),
+                read_started_ns=frame_started_ns,
+            )
+            if assembled is None:
+                continue
+            read_done_ns = time.perf_counter_ns()
+            return _decode_protocol_response(
+                self,
+                lane_id=assembled.identity.lane_id,
+                opcode=assembled.identity.opcode,
+                request_id=assembled.identity.request_id,
+                flags=assembled.flags,
+                body=assembled.body,
+                read_started_ns=assembled.read_started_ns,
+                read_done_ns=read_done_ns,
+            )
 
     def _recv_exact(self, size: int, sock: socket.socket | ssl.SSLSocket | None = None) -> bytes:
         if sock is None:

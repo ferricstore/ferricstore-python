@@ -27,6 +27,7 @@ from ferricstore.client_helpers import (
     _retry_command_args,
     _step_continue_args,
     _transition_command_args,
+    _validate_fencing_token,
 )
 from ferricstore.errors import FerricStoreError, map_exception
 from ferricstore.mutation_core import JobMutation, MutationKind
@@ -666,6 +667,7 @@ class _AsyncClientMutationsMixin(_AsyncClientMixinBase):
         now_ms: int | None = None,
         return_record: bool = False,
     ) -> FlowRecord | bytes:
+        _validate_fencing_token(fencing_token)
         args: builtins.list[Any] = [
             "FLOW.CANCEL",
             id,

@@ -40,7 +40,7 @@ def test_protocol_flow_create_many_command_uses_partitioned_compact_shape():
 
     assert command[:16] == (
         "FLOW.CREATE_MANY",
-        "__flow_auto__:2",
+        "protocol-flow-benchmark:2",
         "TYPE",
         "email",
         "STATE",
@@ -78,11 +78,11 @@ def test_protocol_flow_many_command_item_order_matches_wire_parser():
     )[12:] == (
         "ITEMS",
         "r:flow:0",
-        "__flow_auto__:0",
+        "protocol-flow-benchmark:0",
         0,
         None,
         "r:flow:1",
-        "__flow_auto__:0",
+        "protocol-flow-benchmark:0",
         0,
         None,
     )
@@ -100,10 +100,10 @@ def test_protocol_flow_many_command_item_order_matches_wire_parser():
     )[8:] == (
         "ITEMS",
         "r:flow:0",
-        "__flow_auto__:0",
+        "protocol-flow-benchmark:0",
         0,
         "r:flow:1",
-        "__flow_auto__:0",
+        "protocol-flow-benchmark:0",
         0,
     )
 
@@ -117,7 +117,7 @@ def test_protocol_flow_signal_command_uses_configured_batch_partition():
         "SIGNAL",
         "bench_signal",
         "PARTITION",
-        "__flow_auto__:3",
+        "protocol-flow-benchmark:3",
         "IF_STATE",
         "queued",
         "TRANSITION_TO",
@@ -144,7 +144,7 @@ def test_protocol_flow_owned_value_put_command_uses_owner_and_partition():
         "NAME",
         "bench_value",
         "PARTITION",
-        "__flow_auto__:3",
+        "protocol-flow-benchmark:3",
         "NOW",
         command[-3],
         "RETURN",
@@ -157,7 +157,7 @@ def test_protocol_flow_read_query_commands_use_partitioned_shape():
         "FLOW.GET",
         "r:flow:750",
         "PARTITION",
-        "__flow_auto__:3",
+        "protocol-flow-benchmark:3",
     )
     assert bench.flow_history_command("r", 750, 250, 16) == (
         "FLOW.HISTORY",
@@ -165,7 +165,7 @@ def test_protocol_flow_read_query_commands_use_partitioned_shape():
         "COUNT",
         10,
         "PARTITION",
-        "__flow_auto__:3",
+        "protocol-flow-benchmark:3",
         "INCLUDE_COLD",
         False,
     )
@@ -201,7 +201,7 @@ def test_protocol_flow_start_and_claim_uses_balanced_default_batch_size():
 
 
 def test_protocol_flow_step_continue_accepts_compact_job_tuple():
-    command = bench.step_continue_command(("flow-1", "__flow_auto__:2", b"lease-1", 7))
+    command = bench.step_continue_command(("flow-1", "protocol-flow-benchmark:2", b"lease-1", 7))
 
     assert command == (
         "FLOW.STEP_CONTINUE",
@@ -214,7 +214,7 @@ def test_protocol_flow_step_continue_accepts_compact_job_tuple():
         "LEASE_MS",
         30_000,
         "PARTITION",
-        "__flow_auto__:2",
+        "protocol-flow-benchmark:2",
         "NOW",
         command[-1],
     )
@@ -417,8 +417,8 @@ def test_protocol_flow_start_and_claim_payload_batch_uses_compact_shape():
 def test_protocol_flow_step_continue_payload_batch_uses_compact_shape():
     payload = bench.step_continue_payload_batch(
         [
-            ("r:flow:0", "__flow_auto__:0", b"lease-0", 7),
-            ("r:flow:1", "__flow_auto__:0", b"lease-1", 8),
+            ("r:flow:0", "protocol-flow-benchmark:0", b"lease-0", 7),
+            ("r:flow:1", "protocol-flow-benchmark:0", b"lease-1", 8),
         ],
         start=0,
         count=2,
@@ -511,7 +511,7 @@ def test_protocol_flow_setup_batch_defaults_to_fast_partition_shape():
         "FLOW.GET",
         "r:flow:750",
         "PARTITION",
-        "__flow_auto__:1",
+        "protocol-flow-benchmark:1",
     )
 
 
@@ -523,7 +523,7 @@ def test_protocol_flow_explicit_setup_batch_preserves_partition_shape():
         "FLOW.GET",
         "r:flow:750",
         "PARTITION",
-        "__flow_auto__:3",
+        "protocol-flow-benchmark:3",
     )
 
 
@@ -553,7 +553,7 @@ def test_protocol_flow_get_meta_command_requests_meta_return():
         "FLOW.GET",
         "r:flow:750",
         "PARTITION",
-        "__flow_auto__:3",
+        "protocol-flow-benchmark:3",
         "RETURN",
         "META",
     )
@@ -582,9 +582,9 @@ def test_protocol_flow_get_payload_batch_uses_compact_partitioned_pipeline_shape
             2,
         )
         + binary(b"r:flow:750")
-        + binary(b"__flow_auto__:3")
+        + binary(b"protocol-flow-benchmark:3")
         + binary(b"r:flow:751")
-        + binary(b"__flow_auto__:3")
+        + binary(b"protocol-flow-benchmark:3")
     )
 
 
@@ -611,9 +611,9 @@ def test_protocol_flow_get_payload_batch_wraps_duration_reads():
             2,
         )
         + binary(b"r:flow:999")
-        + binary(b"__flow_auto__:3")
+        + binary(b"protocol-flow-benchmark:3")
         + binary(b"r:flow:0")
-        + binary(b"__flow_auto__:0")
+        + binary(b"protocol-flow-benchmark:0")
     )
 
 
@@ -670,9 +670,9 @@ def test_protocol_flow_history_payload_batch_uses_compact_pipeline_shape():
         + bench._COMPACT_I64.pack(10)
         + bytes([bench._COMPACT_BOOL_FALSE, bench._COMPACT_BOOL_FALSE])
         + binary(b"r:flow:750")
-        + binary(b"__flow_auto__:3")
+        + binary(b"protocol-flow-benchmark:3")
         + binary(b"r:flow:751")
-        + binary(b"__flow_auto__:3")
+        + binary(b"protocol-flow-benchmark:3")
     )
 
 
@@ -1221,7 +1221,12 @@ def test_protocol_flow_claim_due_runner_uses_bounded_native_inflight():
             future = Future()
             future.set_result(
                 [
-                    (f"flow-{len(self.commands)}-{index}", "__flow_auto__:0", b"lease", index)
+                    (
+                        f"flow-{len(self.commands)}-{index}",
+                        "protocol-flow-benchmark:0",
+                        b"lease",
+                        index,
+                    )
                     for index in range(limit)
                 ]
             )
@@ -1254,7 +1259,12 @@ def test_protocol_flow_step_setup_requests_compact_jobs():
             if commands and commands[0][0] == "FLOW.START_AND_CLAIM":
                 future.set_result(
                     [
-                        (f"flow-{len(self.batches)}-{index}", "__flow_auto__:0", b"lease", index)
+                        (
+                            f"flow-{len(self.batches)}-{index}",
+                            "protocol-flow-benchmark:0",
+                            b"lease",
+                            index,
+                        )
                         for index, _command in enumerate(commands)
                     ]
                 )

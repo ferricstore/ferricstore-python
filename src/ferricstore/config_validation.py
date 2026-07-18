@@ -5,6 +5,8 @@ import threading
 from collections.abc import Sequence
 from numbers import Real
 
+MAX_FLOW_ACTIVE_MS = 31_536_000_000
+
 
 def validate_positive_int(value: object, *, name: str) -> int:
     """Return a positive integer without accepting bools or lossy coercions."""
@@ -34,6 +36,21 @@ def validate_optional_nonnegative_int(value: object | None, *, name: str) -> int
     if value is None:
         return None
     return validate_nonnegative_int(value, name=name)
+
+
+def normalize_optional_max_active_ms(value: object | None) -> int | str | None:
+    """Normalize FerricFlow's positive duration-or-infinity contract."""
+    if value is None:
+        return None
+    if isinstance(value, str) and value.lower() == "infinity":
+        return "INFINITY"
+    if isinstance(value, float) and math.isinf(value) and value > 0:
+        return "INFINITY"
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("max_active_ms must be a positive integer or infinity")
+    if not 1 <= value <= MAX_FLOW_ACTIVE_MS:
+        raise ValueError(f"max_active_ms must be between 1 and {MAX_FLOW_ACTIVE_MS}, or infinity")
+    return value
 
 
 def validate_optional_flow_priority(value: object | None, *, name: str = "priority") -> int | None:

@@ -148,14 +148,19 @@ def _build_coordination_protocol_command(
             opcode,
             {
                 "key": _require_arg(args, 0, name),
-                "value": _require_arg(args, 1, name),
-                "ttl_ms": _require_arg(args, 2, name),
+                "token": _require_arg(args, 1, name),
+                "value": _require_arg(args, 2, name),
+                "ttl_ms": _require_arg(args, 3, name),
             },
         )
     if name == "FETCH_OR_COMPUTE_ERROR":
         return ProtocolCommand(
             opcode,
-            {"key": _require_arg(args, 0, name), "message": _require_arg(args, 1, name)},
+            {
+                "key": _require_arg(args, 0, name),
+                "token": _require_arg(args, 1, name),
+                "message": _require_arg(args, 2, name),
+            },
         )
 
     raise InvalidCommandError(f"unsupported coordination protocol command {name}")

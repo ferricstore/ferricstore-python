@@ -5,6 +5,7 @@ from typing import Any
 
 from ferricstore.codecs import Codec
 from ferricstore.config_validation import validate_bool, validate_optional_positive_int
+from ferricstore.errors import InvalidCommandError
 
 
 def _append(args: builtins.list[Any], name: str, value: Any) -> None:
@@ -16,6 +17,16 @@ def _append_flag(args: builtins.list[Any], name: str, enabled: bool) -> None:
     enabled = validate_bool(enabled, name=name)
     if enabled:
         args.append(name)
+
+
+def _validate_mset_slots(keys: builtins.list[str | bytes]) -> None:
+    if len(keys) < 2:
+        return
+    from ferricstore.protocol_common import RoutingTopology
+
+    first_slot = RoutingTopology.slot_for_key(keys[0])
+    if any(RoutingTopology.slot_for_key(key) != first_slot for key in keys[1:]):
+        raise InvalidCommandError("MSET and MSETNX keys must hash to the same slot")
 
 
 def _set_args(

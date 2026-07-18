@@ -587,7 +587,7 @@ def test_direct_compact_commands_keep_fast_path_when_admitted(
     "args",
     [
         ("MGET", "key-a", "kéy-b"),
-        ("MSET", "key-a", b"value-a", "key-b", "value-b"),
+        ("MSET", "{budget}:key-a", b"value-a", "{budget}:key-b", "value-b"),
         (
             "FLOW.CREATE_MANY",
             "MIXED",

@@ -16,7 +16,7 @@ PROTOCOL_SCHEMES = {"ferric", "ferrics"}
 FLOW_STATE = "queued"
 RUNNING_STATE = "running"
 NEXT_STATE = "next"
-AUTO_PARTITION_PREFIX = "__flow_auto__:"
+PARTITION_PREFIX = "protocol-flow-benchmark"
 _COMPACT_U32 = struct.Struct(">I")
 _COMPACT_I64 = struct.Struct(">q")
 _COMPACT_PIPELINE_HEADER = struct.Struct(">BBI")
@@ -57,7 +57,7 @@ def flow_id(run_id: str, index: int) -> str:
 
 
 def partition_key(index: int, partitions: int) -> str:
-    return f"{AUTO_PARTITION_PREFIX}{index % max(partitions, 1)}"
+    return f"{PARTITION_PREFIX}:{index % max(partitions, 1)}"
 
 
 def partition_keys(partitions: int) -> list[str]:

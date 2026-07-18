@@ -11,7 +11,10 @@ from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
-from ferricstore.client_autobatch_dispatch import run_autobatch_dispatcher
+from ferricstore.client_autobatch_dispatch import (
+    flush_autobatch_ops,
+    run_autobatch_dispatcher,
+)
 from ferricstore.client_autobatch_queue import (
     drain_reentrant_until,
     pending_future_done,
@@ -19,12 +22,12 @@ from ferricstore.client_autobatch_queue import (
 )
 from ferricstore.client_helpers import (
     _FLOW_MANY_BATCH_LIMIT,
-    _auto_partition_key_for_id,
     _batch_key_value,
     _batch_named_key,
     _flow_return,
 )
 from ferricstore.config_validation import (
+    normalize_optional_max_active_ms,
     validate_positive_int,
     validate_thread_wait_milliseconds,
     validate_thread_wait_seconds,
@@ -131,11 +134,13 @@ class AutobatchFlowClient:
         now_ms: int | None = None,
         priority: int | None = None,
         idempotent: bool | None = None,
+        max_active_ms: int | float | str | None = None,
         state_meta: dict[str, Any] | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
         return_record: bool = False,
     ) -> Future[FlowRecord | bytes]:
+        max_active_ms = normalize_optional_max_active_ms(max_active_ms)
         future: Future[FlowRecord | bytes] = DeferredCallbackFuture()
         if (
             return_record
@@ -162,6 +167,7 @@ class AutobatchFlowClient:
                             now_ms=now_ms,
                             priority=priority,
                             idempotent=idempotent,
+                            max_active_ms=max_active_ms,
                             state_meta=state_meta,
                             values=values,
                             value_refs=value_refs,
@@ -174,7 +180,7 @@ class AutobatchFlowClient:
             return future
 
         auto_partition = partition_key is None
-        batch_partition_key = _auto_partition_key_for_id(id) if auto_partition else partition_key
+        batch_partition_key = partition_key
         batch_key = (
             (
                 "create-auto",
@@ -184,10 +190,19 @@ class AutobatchFlowClient:
                 now_ms,
                 priority,
                 idempotent,
-                batch_partition_key,
+                max_active_ms,
             )
             if auto_partition
-            else ("create", type, state, run_at_ms, now_ms, priority, idempotent)
+            else (
+                "create",
+                type,
+                state,
+                run_at_ms,
+                now_ms,
+                priority,
+                idempotent,
+                max_active_ms,
+            )
         )
         self._enqueue(
             _BatchOp(
@@ -203,6 +218,7 @@ class AutobatchFlowClient:
                     "now_ms": now_ms,
                     "priority": priority,
                     "idempotent": idempotent,
+                    "max_active_ms": max_active_ms,
                     "values": values,
                     "value_refs": value_refs,
                 },
@@ -226,6 +242,7 @@ class AutobatchFlowClient:
         now_ms: int | None = None,
         priority: int | None = None,
         idempotent: bool | None = None,
+        max_active_ms: int | float | str | None = None,
         state_meta: dict[str, Any] | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
@@ -244,6 +261,7 @@ class AutobatchFlowClient:
             now_ms=now_ms,
             priority=priority,
             idempotent=idempotent,
+            max_active_ms=max_active_ms,
             state_meta=state_meta,
             values=values,
             value_refs=value_refs,
@@ -717,25 +735,7 @@ class AutobatchFlowClient:
             return take_pending_locked(self)
 
     def _flush_ops(self, ops: builtins.list[_BatchOp]) -> None:
-        groups: builtins.list[builtins.list[_BatchOp]] = []
-        for op in ops:
-            if not groups or groups[-1][0].key != op.key:
-                groups.append([op])
-            else:
-                groups[-1].append(op)
-        for group in groups:
-            if group[0].kind == "flush":
-                for op in group:
-                    try_set_future_result(op.future, None)
-                continue
-            if group[0].kind == "direct":
-                for op in group:
-                    try:
-                        try_set_future_result(op.future, op.args["call"]())
-                    except BaseException as exc:
-                        try_set_future_exception(op.future, exc)
-                continue
-            self._flush_group(group)
+        flush_autobatch_ops(self, ops)
 
     def _flush_group(self, group: builtins.list[_BatchOp]) -> None:
         kind = group[0].kind
@@ -749,9 +749,9 @@ class AutobatchFlowClient:
                         CreateItem(
                             op.args["id"],
                             op.args["payload"],
-                            partition_key=None
-                            if partition_key is not None
-                            else op.args["partition_key"],
+                            partition_key=(
+                                None if partition_key is not None else op.args["partition_key"]
+                            ),
                             values=op.args.get("values"),
                             value_refs=op.args.get("value_refs"),
                         )
@@ -763,6 +763,7 @@ class AutobatchFlowClient:
                     now_ms=group[0].args["now_ms"],
                     priority=group[0].args["priority"],
                     idempotent=group[0].args["idempotent"],
+                    max_active_ms=group[0].args["max_active_ms"],
                     independent=True,
                 )
             elif kind == "complete":

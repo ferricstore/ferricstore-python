@@ -100,8 +100,11 @@ class AsyncWorkflowFlowCommands:
         payload: Any = None,
         partition_key: str | None | object = _CURRENT_PARTITION,
         return_record: bool = False,
+        max_active_ms: int | float | str | None = None,
         **kwargs: Any,
     ) -> Any:
+        if max_active_ms is not None:
+            kwargs["max_active_ms"] = max_active_ms
         return await self.client.create(
             id,
             type=self._type(type),
@@ -121,8 +124,11 @@ class AsyncWorkflowFlowCommands:
         payload: Any = None,
         partition_key: str | None | object = _CURRENT_PARTITION,
         return_record: bool = False,
+        max_active_ms: int | float | str | None = None,
         **kwargs: Any,
     ) -> Any:
+        if max_active_ms is not None:
+            kwargs["max_active_ms"] = max_active_ms
         return await self.client.enqueue(
             id,
             type=self._type(type),
@@ -142,8 +148,11 @@ class AsyncWorkflowFlowCommands:
         worker: str,
         payload: Any = None,
         partition_key: str | None | object = _CURRENT_PARTITION,
+        max_active_ms: int | float | str | None = None,
         **kwargs: Any,
     ) -> FlowRecord:
+        if max_active_ms is not None:
+            kwargs["max_active_ms"] = max_active_ms
         return await self.client.start_and_claim(
             id,
             type=self._type(type),
@@ -161,8 +170,11 @@ class AsyncWorkflowFlowCommands:
         type: str | None = None,
         state: str | None = None,
         partition_key: str | None | object = _CURRENT_PARTITION,
+        max_active_ms: int | float | str | None = None,
         **kwargs: Any,
     ) -> builtins.list[FlowRecord] | Any:
+        if max_active_ms is not None:
+            kwargs["max_active_ms"] = max_active_ms
         return await self.client.create_many(
             self._partition(partition_key),
             items,
@@ -178,8 +190,11 @@ class AsyncWorkflowFlowCommands:
         type: str | None = None,
         state: str | None = None,
         partition_key: str | None | object = _CURRENT_PARTITION,
+        max_active_ms: int | float | str | None = None,
         **kwargs: Any,
     ) -> builtins.list[Any] | Any:
+        if max_active_ms is not None:
+            kwargs["max_active_ms"] = max_active_ms
         return await self.client.enqueue_many(
             items,
             type=self._type(type),
@@ -465,14 +480,17 @@ class AsyncWorkflowFlowCommands:
         self,
         children: builtins.list[ChildSpec],
         *,
-        parent_id: str | None = None,
+        parent_flow_id: str | None = None,
         partition_key: str | None | object = _CURRENT_PARTITION,
         lease_token: bytes | None = None,
         fencing_token: int | None = None,
+        max_active_ms: int | float | str | None = None,
         **kwargs: Any,
     ) -> Any:
+        if max_active_ms is not None:
+            kwargs["max_active_ms"] = max_active_ms
         return await self.client.spawn_children(
-            self._ctx.id if parent_id is None else parent_id,
+            self._ctx.id if parent_flow_id is None else parent_flow_id,
             children,
             partition_key=self._partition(partition_key),
             lease_token=self._ctx.lease_token if lease_token is None else lease_token,
@@ -480,7 +498,15 @@ class AsyncWorkflowFlowCommands:
             **kwargs,
         )
 
-    async def install_policy(self, type: str | None = None, **kwargs: Any) -> Any:
+    async def install_policy(
+        self,
+        type: str | None = None,
+        *,
+        max_active_ms: int | float | str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        if max_active_ms is not None:
+            kwargs["max_active_ms"] = max_active_ms
         return await self.client.install_policy(self._type(type), **kwargs)
 
     async def policy_get(self, type: str | None = None, **kwargs: Any) -> dict[Any, Any]:

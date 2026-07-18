@@ -231,6 +231,19 @@ def _validated_route_lane(value: Any) -> int | None:
     return value
 
 
+def _next_protocol_lane(adapter: Any, lane_id: int) -> int:
+    """Select the next multiplexed lane while preserving control and fixed lanes."""
+    if lane_id == 0:
+        return lane_id
+    fixed_lane_id = cast(int | None, getattr(adapter, "_fixed_lane_id", None))
+    if fixed_lane_id is not None:
+        return fixed_lane_id
+    if adapter.lanes == 1:
+        return lane_id
+    adapter._lane_cursor = (adapter._lane_cursor % adapter.lanes) + 1
+    return cast(int, adapter._lane_cursor)
+
+
 def _notify_event_listeners(listeners: Sequence[Callable[[], None]]) -> None:
     for listener in listeners:
         with contextlib.suppress(Exception):
@@ -735,12 +748,21 @@ def _is_retryable_route_error(exc: BaseException) -> bool:
         return True
     if not isinstance(exc, FerricStoreError):
         return False
+    if exc.retryable is not None:
+        return exc.retryable
     message = str(exc).lower()
     if any(token in message for token in ("connection", "closed", "reroute", "leader")):
         return True
     raw = getattr(exc, "raw", None)
     reason = _optional_text(raw, "reason")
     return reason is not None and reason.lower() in {"reroute", "leader_changed", "not_leader"}
+
+
+def _server_allows_retry(exc: BaseException) -> bool:
+    """Require both v0.8 retry flags before replaying a server response error."""
+    if isinstance(exc, FerricStoreError):
+        return exc.retryable is True and exc.safe_to_retry is True
+    return isinstance(exc, (OSError, TimeoutError, FutureTimeoutError))
 
 
 def _is_safe_control_retry(args: tuple[Any, ...]) -> bool:

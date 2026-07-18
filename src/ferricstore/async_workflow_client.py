@@ -200,6 +200,7 @@ class AsyncWorkflowClient:
         retry: RetryPolicy | None = None,
         states: dict[str, FlowStatePolicyLike] | None = None,
         indexed_state_meta: str | None = None,
+        max_active_ms: int | float | str | None = None,
     ) -> Any:
         if retry_policy is not None and retry is not None:
             raise ValueError("retry_policy and retry are mutually exclusive")
@@ -213,6 +214,8 @@ class AsyncWorkflowClient:
         kwargs: dict[str, Any] = {"retry": resolved_retry_policy, "states": states}
         if indexed_state_meta is not None:
             kwargs["indexed_state_meta"] = indexed_state_meta
+        if max_active_ms is not None:
+            kwargs["max_active_ms"] = max_active_ms
         return await self.flow.install_policy(type, **kwargs)
 
     async def close(self) -> None:

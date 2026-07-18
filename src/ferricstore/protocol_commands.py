@@ -6,6 +6,7 @@ import ferricstore.protocol_basic_commands as _basic_commands
 import ferricstore.protocol_command_options as _command_options
 import ferricstore.protocol_compact_commands as _compact_commands
 import ferricstore.protocol_flow_commands as _flow_commands
+from ferricstore.command_helpers import _validate_mset_slots
 from ferricstore.errors import InvalidCommandError
 from ferricstore.protocol_basic_commands import *  # noqa: F403
 from ferricstore.protocol_basic_commands import (
@@ -46,6 +47,8 @@ def build_protocol_command(*args: Any) -> ProtocolCommand:
             raise InvalidCommandError("protocol command requires command name")
 
         name = _command_name(args[0])
+        if name in ("MSET", "MSETNX") and len(args) > 1:
+            _validate_mset_slots(list(args[1::2]))
         if name not in _OPCODES:
             return _command_exec_protocol_command(name, args[1:])
 

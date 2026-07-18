@@ -224,7 +224,7 @@ def test_limit_release_sends_exact_spend_reservation_ids() -> None:
     ]
 
 
-def test_limit_release_supports_released_kv_amount_contract() -> None:
+def test_limit_release_rejects_tokenless_amount_contract() -> None:
     class Executor:
         def __init__(self) -> None:
             self.calls: list[tuple[Any, ...]] = []
@@ -236,11 +236,12 @@ def test_limit_release_supports_released_kv_amount_contract() -> None:
     executor = Executor()
     client = FlowClient(executor)
     try:
-        assert client.limit_release("tenant-a", shard_id=0, amount=2) == {"released": 2}
+        with pytest.raises(TypeError):
+            client.limit_release("tenant-a", shard_id=0, amount=2)  # type: ignore[call-arg]
     finally:
         client.close()
 
-    assert executor.calls == [("FLOW.LIMIT.RELEASE", "tenant-a", "SHARD_ID", 0, "AMOUNT", 2)]
+    assert executor.calls == []
 
 
 def test_async_limit_release_sends_exact_spend_reservation_ids() -> None:
@@ -278,7 +279,7 @@ def test_async_limit_release_sends_exact_spend_reservation_ids() -> None:
     asyncio.run(run())
 
 
-def test_async_limit_release_supports_released_kv_amount_contract() -> None:
+def test_async_limit_release_rejects_tokenless_amount_contract() -> None:
     async def run() -> None:
         class Executor:
             def __init__(self) -> None:
@@ -291,11 +292,16 @@ def test_async_limit_release_supports_released_kv_amount_contract() -> None:
         executor = Executor()
         client = AsyncFlowClient(executor)
         try:
-            assert await client.limit_release("tenant-a", shard_id=0, amount=2) == {"released": 2}
+            with pytest.raises(TypeError):
+                await client.limit_release(  # type: ignore[call-arg]
+                    "tenant-a",
+                    shard_id=0,
+                    amount=2,
+                )
         finally:
             await client.close()
 
-        assert executor.calls == [("FLOW.LIMIT.RELEASE", "tenant-a", "SHARD_ID", 0, "AMOUNT", 2)]
+        assert executor.calls == []
 
     asyncio.run(run())
 
@@ -681,30 +687,6 @@ _INVALID_GOVERNANCE_CALLS: list[tuple[str, tuple[Any, ...], dict[str, Any], str]
         ("tenant",),
         {"shard_id": 0, "reservation_ids": ["r-1", "r-1"]},
         "reservation_ids",
-    ),
-    (
-        "limit_release",
-        ("tenant",),
-        {"shard_id": 0, "reservation_ids": ["r-1"], "amount": 2},
-        "amount",
-    ),
-    (
-        "limit_release",
-        ("tenant",),
-        {"shard_id": 0},
-        "reservation_ids or amount",
-    ),
-    (
-        "limit_release",
-        ("tenant",),
-        {"shard_id": 0, "amount": 0},
-        "amount",
-    ),
-    (
-        "limit_release",
-        ("tenant",),
-        {"shard_id": 0, "amount": 1_001},
-        "amount",
     ),
     ("limit_get", ("",), {}, "scope"),
     ("limit_list", (), {"scope": ""}, "scope"),

@@ -37,6 +37,7 @@ from ferricstore.protocol_common import (
     _is_retryable_route_error,
     _is_safe_control_retry,
     _protocol_connection_count,
+    _server_allows_retry,
     _set_wire_future_sources,
     _unique_adapters,
 )
@@ -56,6 +57,7 @@ from ferricstore.protocol_sync_routing import (
     SyncTopologyRoutingMixin,
     _TopologyGenerationChanged,
 )
+from ferricstore.protocol_sync_topology_mset import SyncTopologyMsetMixin
 from ferricstore.topology_core import (
     ControlEndpointSelector,
     FlowWakeSubscriptionRegistry,
@@ -76,7 +78,11 @@ from ferricstore.topology_security import (
 )
 
 
-class TopologyProtocolAdapterPool(SyncTopologyEndpointMixin, SyncTopologyRoutingMixin):
+class TopologyProtocolAdapterPool(
+    SyncTopologyMsetMixin,
+    SyncTopologyEndpointMixin,
+    SyncTopologyRoutingMixin,
+):
     """Topology-aware native pool backed by the server SHARDS slot table."""
 
     client: TopologyProtocolAdapterPool
@@ -482,7 +488,7 @@ class TopologyProtocolAdapterPool(SyncTopologyEndpointMixin, SyncTopologyRouting
             with contextlib.suppress(Exception):
                 self.refresh_topology()
                 refreshed = True
-            if refreshed and _is_safe_control_retry(args):
+            if refreshed and _is_safe_control_retry(args) and _server_allows_retry(exc):
                 return getattr(self._control_adapter(), method)(*args)
             raise
 
@@ -680,30 +686,6 @@ class TopologyProtocolAdapterPool(SyncTopologyEndpointMixin, SyncTopologyRouting
         finally:
             if lease is not None:
                 self._release_adapter_lease(lease)
-
-    def submit_mset_same_value(self, keys: Sequence[Any], value: Any) -> Future[Any]:
-        target, lease = self._leased_batch_target_for_keys(keys)
-        try:
-            submit_on_lane = getattr(target.adapter, "submit_command_on_lane", None)
-            if target.lane_id is not None and callable(submit_on_lane):
-                args: list[Any] = ["MSET"]
-                for key in keys:
-                    args.extend([key, value])
-                return cast(Future[Any], submit_on_lane(tuple(args), target.lane_id))
-            return cast(Future[Any], target.adapter.submit_mset_same_value(keys, value))
-        finally:
-            if lease is not None:
-                self._release_adapter_lease(lease)
-
-    def submit_mset_payload(self, payload: bytes) -> Future[Any]:
-        target, lease = self._leased_opaque_payload_target()
-        try:
-            submit_on_lane = getattr(target.adapter, "submit_mset_payload_on_lane", None)
-            if callable(submit_on_lane):
-                return cast(Future[Any], submit_on_lane(payload, target.lane_id))
-            return cast(Future[Any], target.adapter.submit_mset_payload(payload))
-        finally:
-            self._release_adapter_lease(lease)
 
     def submit_pipeline_payload(self, payload: bytes, count: int) -> Future[list[Any]]:
         target, lease = self._leased_opaque_payload_target()

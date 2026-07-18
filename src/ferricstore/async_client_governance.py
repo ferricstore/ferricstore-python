@@ -15,7 +15,10 @@ from ferricstore.client_helpers import (
     _normalize_admin_response,
     _now_ms,
 )
-from ferricstore.config_validation import validate_string_sequence
+from ferricstore.config_validation import (
+    normalize_optional_max_active_ms,
+    validate_string_sequence,
+)
 from ferricstore.governance_validation import (
     validate_approval_decision,
     validate_approval_list,
@@ -48,7 +51,7 @@ from ferricstore.types import (
 class _AsyncClientGovernanceMixin(_AsyncClientMixinBase):
     async def spawn_children(
         self,
-        parent_id: str,
+        parent_flow_id: str,
         children: builtins.list[ChildSpec],
         *,
         partition_key: str | None = None,
@@ -64,11 +67,12 @@ class _AsyncClientGovernanceMixin(_AsyncClientMixinBase):
         on_parent_closed: str | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
+        max_active_ms: int | float | str | None = None,
         now_ms: int | None = None,
     ) -> Any:
         args: builtins.list[Any] = [
             "FLOW.SPAWN_CHILDREN",
-            parent_id,
+            parent_flow_id,
             "GROUP",
             group_id,
             "WAIT",
@@ -85,9 +89,11 @@ class _AsyncClientGovernanceMixin(_AsyncClientMixinBase):
         _append(args, "FROM_STATE", from_state)
         _append(args, "ON_CHILD_FAILED", on_child_failed)
         _append(args, "ON_PARENT_CLOSED", on_parent_closed)
+        _append(args, "MAX_ACTIVE_MS", normalize_optional_max_active_ms(max_active_ms))
         mixed = any(child.partition_key is not None for child in children)
-        if _has_named_item_values(children):
-            args.extend(["ITEMS_EXT", len(children)])
+        has_child_max_active = any(child.max_active_ms is not None for child in children)
+        if _has_named_item_values(children) or has_child_max_active:
+            args.extend(["ITEMS_EXT_V2" if has_child_max_active else "ITEMS_EXT", len(children)])
             for child in children:
                 if mixed and child.partition_key is None:
                     raise ValueError("mixed spawn_children items require partition_key")
@@ -101,6 +107,9 @@ class _AsyncClientGovernanceMixin(_AsyncClientMixinBase):
                         self.codec.encode(child.payload),
                     ]
                 )
+                if has_child_max_active:
+                    child_max_active = normalize_optional_max_active_ms(child.max_active_ms)
+                    args.append(child_max_active if child_max_active is not None else "-")
                 _append_named_counts(args, self.codec, child_values, child_refs)
         else:
             _append_named_values(args, self.codec, values=values, value_refs=value_refs)
@@ -130,11 +139,13 @@ class _AsyncClientGovernanceMixin(_AsyncClientMixinBase):
         retry: RetryPolicy | None = None,
         states: dict[str, FlowStatePolicyLike] | None = None,
         indexed_state_meta: str | None = None,
+        max_active_ms: int | float | str | None = None,
     ) -> Any:
         validate_nonempty_string(type, name="type")
         if indexed_state_meta is not None:
             validate_nonempty_string(indexed_state_meta, name="indexed_state_meta")
         args: builtins.list[Any] = ["FLOW.POLICY.SET", type]
+        _append(args, "MAX_ACTIVE_MS", normalize_optional_max_active_ms(max_active_ms))
         _append(args, "INDEXED_STATE_META", indexed_state_meta)
         if retry is not None:
             self._append_retry_policy(args, retry)
@@ -553,27 +564,20 @@ class _AsyncClientGovernanceMixin(_AsyncClientMixinBase):
         scope: str,
         *,
         shard_id: int,
-        reservation_ids: Sequence[str] | None = None,
-        amount: int | None = None,
+        reservation_ids: Sequence[str],
         now_ms: int | None = None,
     ) -> dict[str, Any]:
-        """Release credits by amount or by exact server-provided reservation IDs."""
+        """Release credits by their exact server-provided reservation IDs."""
 
         validated_reservation_ids = validate_limit_release(
             scope,
             shard_id=shard_id,
             reservation_ids=reservation_ids,
-            amount=amount,
             now_ms=now_ms,
         )
         args: builtins.list[Any] = ["FLOW.LIMIT.RELEASE", scope]
         _append(args, "SHARD_ID", shard_id)
-        _append(args, "AMOUNT", amount)
-        _append(
-            args,
-            "RESERVATION_IDS",
-            list(validated_reservation_ids) if validated_reservation_ids is not None else None,
-        )
+        _append(args, "RESERVATION_IDS", list(validated_reservation_ids))
         _append(args, "NOW", now_ms)
         return cast(
             dict[str, Any],

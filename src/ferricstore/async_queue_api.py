@@ -13,12 +13,11 @@ from ferricstore.async_ownership import (
     rollback_async_resources,
 )
 from ferricstore.async_partitioning import (
-    AUTO_PARTITION_BUCKETS,
-    _auto_partition_key,
     _validate_auto_partition_workers,
     _validate_server_shards,
 )
 from ferricstore.async_producer import AsyncProducerLoop
+from ferricstore.async_queue_producer import _AsyncQueueProducerMixin
 from ferricstore.async_queue_runtime import (
     ASYNC_QUEUE_WORKER_CONFIG_KEYS,
     FLOW_MANY_BATCH_LIMIT,
@@ -62,7 +61,7 @@ from ferricstore.worker_core import (
 from ferricstore.worker_models import QueueFlowWorkerResult
 
 
-class AsyncQueueFlow:
+class AsyncQueueFlow(_AsyncQueueProducerMixin):
     """Simple async queue facade that hides FerricFlow hot-path tuning."""
 
     def __init__(
@@ -139,11 +138,6 @@ class AsyncQueueFlow:
             if claim_values is not None
             else None
         )
-        wake_partition_keys = (
-            tuple(_auto_partition_key(index) for index in range(AUTO_PARTITION_BUCKETS))
-            if protocol_wake_hints
-            else ()
-        )
         command_pool_size, claim_pool_size = resolve_worker_connection_counts(
             workers=workers,
             concurrency=concurrency,
@@ -203,7 +197,7 @@ class AsyncQueueFlow:
                     state=self.state,
                     states=None,
                     partition_key=None,
-                    partition_keys=wake_partition_keys,
+                    partition_keys=None,
                     priority=0,
                     limit=self.batch_size,
                     enabled=True,
@@ -221,68 +215,6 @@ class AsyncQueueFlow:
         self._close_task: asyncio.Task[None] | None = None
         self._invocations = AsyncWorkerInvocationTracker()
         self._close_operations = AsyncCloseTaskRegistry()
-
-    async def enqueue(self, id: str, *, payload: Any = None, **attrs: Any) -> Any:
-        state = attrs.pop("state", self.state)
-        partition_key = attrs.pop("partition_key", None)
-        return_record = attrs.pop("return_record", False)
-
-        async def send(client: AsyncFlowClient) -> Any:
-            return await client.enqueue(
-                id,
-                type=self.type,
-                state=state,
-                payload=payload,
-                partition_key=partition_key,
-                return_record=return_record,
-                **attrs,
-            )
-
-        result = await self._invocations.run_while_open(
-            lambda: self._run_producer(send),
-            closed_message="queue flow is closed",
-        )
-        return result
-
-    async def signal(self, id: str, **kwargs: Any) -> Any:
-        return await self._invocations.run_while_open(
-            lambda: self.client.signal(id, **kwargs),
-            closed_message="queue flow is closed",
-        )
-
-    async def flow_signal(self, id: str, **kwargs: Any) -> Any:
-        return await self.signal(id, **kwargs)
-
-    async def enqueue_many(
-        self,
-        items: Sequence[CreateItem | tuple[str, Any] | str],
-        **attrs: Any,
-    ) -> Any:
-        state = attrs.pop("state", self.state)
-        independent = attrs.pop("independent", True)
-        create_items = [
-            item
-            if isinstance(item, CreateItem)
-            else CreateItem(item[0], item[1])
-            if isinstance(item, tuple)
-            else CreateItem(item)
-            for item in items
-        ]
-
-        async def send(client: AsyncFlowClient) -> Any:
-            return await client.enqueue_many(
-                create_items,
-                type=self.type,
-                state=state,
-                independent=independent,
-                **attrs,
-            )
-
-        result = await self._invocations.run_while_open(
-            lambda: self._run_producer(send),
-            closed_message="queue flow is closed",
-        )
-        return result
 
     async def run_once(
         self, handler: AsyncFlowHandler, *, worker_index: int = 0
@@ -518,12 +450,6 @@ class AsyncQueueFlow:
             wake_coordinator=self._wake_coordinator,
         )
 
-    async def _run_producer(self, send: Callable[[AsyncFlowClient], Awaitable[Any]]) -> Any:
-        producer_loop = self._producer_loop
-        if producer_loop is None:
-            return await send(self.client)
-        return await producer_loop.run(send)
-
 
 class AsyncQueue:
     """High-level async queue handle bound to one Flow type/state."""
@@ -551,7 +477,16 @@ class AsyncQueue:
         self._producer_url = _producer_url
         self._producer_url_kwargs = dict(_producer_url_kwargs or {})
 
-    async def enqueue(self, id: str, *, payload: Any = None, **attrs: Any) -> Any:
+    async def enqueue(
+        self,
+        id: str,
+        *,
+        payload: Any = None,
+        max_active_ms: int | float | str | None = None,
+        **attrs: Any,
+    ) -> Any:
+        if max_active_ms is not None:
+            attrs["max_active_ms"] = max_active_ms
         return await self.client.enqueue(
             id,
             type=self.type,
@@ -561,8 +496,14 @@ class AsyncQueue:
         )
 
     async def enqueue_many(
-        self, items: Sequence[CreateItem | tuple[str, Any] | str], **attrs: Any
+        self,
+        items: Sequence[CreateItem | tuple[str, Any] | str],
+        *,
+        max_active_ms: int | float | str | None = None,
+        **attrs: Any,
     ) -> Any:
+        if max_active_ms is not None:
+            attrs["max_active_ms"] = max_active_ms
         create_items = [
             item
             if isinstance(item, CreateItem)
@@ -603,6 +544,7 @@ class AsyncQueue:
         retry_policy: RetryPolicy | None = None,
         retry: RetryPolicy | None = None,
         indexed_state_meta: str | None = None,
+        max_active_ms: int | float | str | None = None,
     ) -> Any:
         if retry_policy is not None and retry is not None:
             raise ValueError("retry_policy and retry are mutually exclusive")
@@ -616,6 +558,8 @@ class AsyncQueue:
         kwargs: dict[str, Any] = {"retry": resolved_retry_policy}
         if indexed_state_meta is not None:
             kwargs["indexed_state_meta"] = indexed_state_meta
+        if max_active_ms is not None:
+            kwargs["max_active_ms"] = max_active_ms
         return await self.client.install_policy(self.type, **kwargs)
 
 
@@ -771,6 +715,7 @@ class AsyncQueueClient:
         retry: RetryPolicy | None = None,
         states: dict[str, FlowStatePolicyLike] | None = None,
         indexed_state_meta: str | None = None,
+        max_active_ms: int | float | str | None = None,
     ) -> Any:
         if retry_policy is not None and retry is not None:
             raise ValueError("retry_policy and retry are mutually exclusive")
@@ -784,6 +729,8 @@ class AsyncQueueClient:
         kwargs: dict[str, Any] = {"retry": resolved_retry_policy, "states": states}
         if indexed_state_meta is not None:
             kwargs["indexed_state_meta"] = indexed_state_meta
+        if max_active_ms is not None:
+            kwargs["max_active_ms"] = max_active_ms
         return await self.flow.install_policy(type, **kwargs)
 
     async def close(self) -> None:

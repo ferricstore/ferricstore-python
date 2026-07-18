@@ -20,6 +20,7 @@ from ferricstore.client_helpers import (
     _parse_kv_response,
 )
 from ferricstore.client_state import _ClientMixinBase
+from ferricstore.config_validation import normalize_optional_max_active_ms
 from ferricstore.types import (
     ChildSpec,
     FlowRecord,
@@ -292,7 +293,7 @@ class _ClientQueriesMixin(_ClientMixinBase):
 
     def spawn_children(
         self,
-        parent_id: str,
+        parent_flow_id: str,
         children: builtins.list[ChildSpec],
         *,
         partition_key: str | None = None,
@@ -308,11 +309,12 @@ class _ClientQueriesMixin(_ClientMixinBase):
         on_parent_closed: str | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
+        max_active_ms: int | float | str | None = None,
         now_ms: int | None = None,
     ) -> Any:
         args: builtins.list[Any] = [
             "FLOW.SPAWN_CHILDREN",
-            parent_id,
+            parent_flow_id,
             "GROUP",
             group_id,
             "WAIT",
@@ -329,9 +331,11 @@ class _ClientQueriesMixin(_ClientMixinBase):
         _append(args, "FROM_STATE", from_state)
         _append(args, "ON_CHILD_FAILED", on_child_failed)
         _append(args, "ON_PARENT_CLOSED", on_parent_closed)
+        _append(args, "MAX_ACTIVE_MS", normalize_optional_max_active_ms(max_active_ms))
         mixed = any(child.partition_key is not None for child in children)
-        if _has_named_item_values(children):
-            args.extend(["ITEMS_EXT", len(children)])
+        has_child_max_active = any(child.max_active_ms is not None for child in children)
+        if _has_named_item_values(children) or has_child_max_active:
+            args.extend(["ITEMS_EXT_V2" if has_child_max_active else "ITEMS_EXT", len(children)])
             for child in children:
                 if mixed and child.partition_key is None:
                     raise ValueError("mixed spawn_children items require partition_key")
@@ -345,6 +349,9 @@ class _ClientQueriesMixin(_ClientMixinBase):
                         self.codec.encode(child.payload),
                     ]
                 )
+                if has_child_max_active:
+                    child_max_active = normalize_optional_max_active_ms(child.max_active_ms)
+                    args.append(child_max_active if child_max_active is not None else "-")
                 _append_named_counts(args, self.codec, child_values, child_refs)
         else:
             _append_named_values(args, self.codec, values=values, value_refs=value_refs)

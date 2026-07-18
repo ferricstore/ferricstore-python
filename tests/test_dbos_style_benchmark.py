@@ -256,7 +256,7 @@ def test_create_flows_uses_sync_create_when_protocol_inflight_is_one(monkeypatch
     )
 
     assert result["created"] == 2
-    assert calls == [[0], [1]]
+    assert calls == [[0, 1]]
 
 
 def test_create_flows_passes_retention_ttl(monkeypatch):
@@ -518,12 +518,11 @@ def test_queue_api_passes_claim_drain_batches_to_worker(monkeypatch):
     assert result["effective_claim_prefetch"] == 0
 
 
-def test_lowlevel_blocking_auto_many_enables_wake_coordinator(monkeypatch):
-    seen_wake_coordinators = []
+def test_lowlevel_blocking_auto_many_delegates_partition_selection(monkeypatch):
+    seen_worker_options = []
 
     def fake_create_flows(**kwargs):
-        assert kwargs["wake_coordinator"] is not None
-        kwargs["wake_coordinator"].notify_partition(0, len(kwargs["indices"]))
+        assert kwargs["wake_coordinator"] is None
         return {
             "created": len(kwargs["indices"]),
             "create_pipeline_flushes": 0,
@@ -532,7 +531,7 @@ def test_lowlevel_blocking_auto_many_enables_wake_coordinator(monkeypatch):
         }
 
     def fake_worker(**kwargs):
-        seen_wake_coordinators.append(kwargs["wake_coordinator"])
+        seen_worker_options.append((kwargs["claim_any"], kwargs["wake_coordinator"]))
         if kwargs["worker_index"] == 0:
             with kwargs["completed_lock"]:
                 kwargs["claimed_total"][0] = kwargs["total_flows"]
@@ -610,17 +609,17 @@ def test_lowlevel_blocking_auto_many_enables_wake_coordinator(monkeypatch):
         )
     )
 
-    assert all(coordinator is not None for coordinator in seen_wake_coordinators)
-    assert result["wake_notifications"] > 0
-    assert result["wake_credits"] == 8
+    assert seen_worker_options == [(True, None), (True, None)]
+    assert result["claim_any"] is True
+    assert result["wake_notifications"] == 0
+    assert result["wake_credits"] == 0
 
 
-def test_queue_api_auto_many_enables_wake_coordinator(monkeypatch):
-    seen_wake_coordinators = []
+def test_queue_api_auto_many_delegates_partition_selection(monkeypatch):
+    seen_worker_options = []
 
     def fake_create_flows(**kwargs):
-        assert kwargs["wake_coordinator"] is not None
-        kwargs["wake_coordinator"].notify_partition(0, len(kwargs["indices"]))
+        assert kwargs["wake_coordinator"] is None
         return {
             "created": len(kwargs["indices"]),
             "create_pipeline_flushes": 0,
@@ -629,7 +628,7 @@ def test_queue_api_auto_many_enables_wake_coordinator(monkeypatch):
         }
 
     def fake_queue_worker(**kwargs):
-        seen_wake_coordinators.append(kwargs["wake_coordinator"])
+        seen_worker_options.append((kwargs["claim_any"], kwargs["wake_coordinator"]))
         if kwargs["worker_index"] == 0:
             with kwargs["completed_lock"]:
                 kwargs["claimed_total"][0] = kwargs["total_flows"]
@@ -707,9 +706,10 @@ def test_queue_api_auto_many_enables_wake_coordinator(monkeypatch):
         )
     )
 
-    assert all(coordinator is not None for coordinator in seen_wake_coordinators)
-    assert result["wake_notifications"] > 0
-    assert result["wake_credits"] == 8
+    assert seen_worker_options == [(True, None), (True, None)]
+    assert result["claim_any"] is True
+    assert result["wake_notifications"] == 0
+    assert result["wake_credits"] == 0
 
 
 def test_partition_wake_coordinator_preserves_partial_credit():
@@ -747,17 +747,9 @@ def test_partition_wake_coordinator_uses_custom_owner():
     coordinator = bench.PartitionWakeCoordinator(
         workers=4,
         partitions=16,
-        owner_for=lambda partition_index: bench.auto_partition_owner(
-            partition_index,
-            workers=4,
-            server_shards=4,
-        ),
+        owner_for=lambda partition_index: partition_index % 4,
     )
-    partition_index = next(
-        index
-        for index in range(16)
-        if bench.auto_partition_owner(index, workers=4, server_shards=4) == 2
-    )
+    partition_index = 2
 
     coordinator.notify_partition(partition_index, 7)
 
@@ -827,7 +819,7 @@ def test_queue_api_worker_caps_wake_credit_by_capacity_and_drain_batches(monkeyp
         worker_index=0,
         worker_count=1,
         partitions=16,
-        partition_mode="auto",
+        partition_mode="explicit",
         claim_any=False,
         claim_batch_size=500,
         complete_batch=True,
@@ -918,7 +910,7 @@ def test_queue_api_worker_avoids_fallback_scan_while_waiting_for_wake_credit(mon
         worker_index=0,
         worker_count=1,
         partitions=16,
-        partition_mode="auto",
+        partition_mode="explicit",
         claim_any=False,
         claim_batch_size=500,
         complete_batch=True,
@@ -962,7 +954,7 @@ def test_queue_api_worker_avoids_fallback_scan_while_waiting_for_wake_credit(mon
     assert fallback_calls == []
 
 
-def test_lowlevel_blocking_worker_claims_partition_batches(monkeypatch):
+def test_lowlevel_auto_worker_delegates_partition_selection(monkeypatch):
     seen_claims = []
 
     class Job:
@@ -1043,15 +1035,10 @@ def test_lowlevel_blocking_worker_claims_partition_batches(monkeypatch):
 
     assert result["completed"] == 1
     assert seen_claims[0]["partition_key"] is None
-    assert seen_claims[0]["partition_keys"] == [
-        "__flow_auto__:0",
-        "__flow_auto__:1",
-        "__flow_auto__:2",
-        "__flow_auto__:3",
-    ]
+    assert seen_claims[0]["partition_keys"] is None
 
 
-def test_lowlevel_auto_worker_claim_pages_stay_on_one_server_shard(monkeypatch):
+def test_lowlevel_auto_worker_does_not_use_partition_keys(monkeypatch):
     seen_claims = []
 
     class Job:
@@ -1091,7 +1078,7 @@ def test_lowlevel_auto_worker_claim_pages_stay_on_one_server_shard(monkeypatch):
         flow_type="email",
         worker_index=0,
         worker_count=4,
-        partitions=bench.AUTO_PARTITION_BUCKETS,
+        partitions=16,
         partition_mode="auto",
         claim_any=False,
         claim_batch_size=100,
@@ -1130,17 +1117,8 @@ def test_lowlevel_auto_worker_claim_pages_stay_on_one_server_shard(monkeypatch):
         track_duplicates=False,
     )
 
-    partition_keys = seen_claims[0]["partition_keys"]
-    assert partition_keys is not None
-    assert {
-        bench.auto_partition_owner(int(key.rsplit(":", 1)[1]), workers=4, server_shards=4)
-        for key in partition_keys
-    } == {0}
-    shard_ids = {
-        bench.auto_partition_server_shard_for_index(int(key.rsplit(":", 1)[1]), 4)
-        for key in partition_keys
-    }
-    assert len(shard_ids) == 1
+    assert seen_claims[0]["partition_key"] is None
+    assert seen_claims[0]["partition_keys"] is None
 
 
 def test_lowlevel_worker_scans_owned_partitions_before_drain_block(monkeypatch):
@@ -1186,7 +1164,7 @@ def test_lowlevel_worker_scans_owned_partitions_before_drain_block(monkeypatch):
         worker_index=0,
         worker_count=1,
         partitions=8,
-        partition_mode="auto",
+        partition_mode="explicit",
         claim_any=False,
         claim_batch_size=100,
         complete_batch=True,
@@ -1225,27 +1203,17 @@ def test_lowlevel_worker_scans_owned_partitions_before_drain_block(monkeypatch):
     )
 
     assert [call["partition_keys"] for call in seen_claims] == [
+        ["run:partition:0", "run:partition:1", "run:partition:2", "run:partition:3"],
+        ["run:partition:4", "run:partition:5", "run:partition:6", "run:partition:7"],
         [
-            "__flow_auto__:0",
-            "__flow_auto__:1",
-            "__flow_auto__:2",
-            "__flow_auto__:3",
-        ],
-        [
-            "__flow_auto__:4",
-            "__flow_auto__:5",
-            "__flow_auto__:6",
-            "__flow_auto__:7",
-        ],
-        [
-            "__flow_auto__:0",
-            "__flow_auto__:1",
-            "__flow_auto__:2",
-            "__flow_auto__:3",
-            "__flow_auto__:4",
-            "__flow_auto__:5",
-            "__flow_auto__:6",
-            "__flow_auto__:7",
+            "run:partition:0",
+            "run:partition:1",
+            "run:partition:2",
+            "run:partition:3",
+            "run:partition:4",
+            "run:partition:5",
+            "run:partition:6",
+            "run:partition:7",
         ],
     ]
     assert [call["claim_block_ms"] for call in seen_claims] == [None, None, 50]
@@ -1292,7 +1260,7 @@ def test_lowlevel_worker_does_not_block_while_producers_are_active(monkeypatch):
         worker_index=0,
         worker_count=1,
         partitions=8,
-        partition_mode="auto",
+        partition_mode="explicit",
         claim_any=False,
         claim_batch_size=100,
         complete_batch=True,
@@ -1331,23 +1299,8 @@ def test_lowlevel_worker_does_not_block_while_producers_are_active(monkeypatch):
     )
 
     assert [call["partition_keys"] for call in seen_claims] == [
-        [
-            "__flow_auto__:0",
-            "__flow_auto__:1",
-            "__flow_auto__:2",
-            "__flow_auto__:3",
-        ],
-        [
-            "__flow_auto__:4",
-            "__flow_auto__:5",
-            "__flow_auto__:6",
-            "__flow_auto__:7",
-        ],
-        [
-            "__flow_auto__:0",
-            "__flow_auto__:1",
-            "__flow_auto__:2",
-            "__flow_auto__:3",
-        ],
+        ["run:partition:0", "run:partition:1", "run:partition:2", "run:partition:3"],
+        ["run:partition:4", "run:partition:5", "run:partition:6", "run:partition:7"],
+        ["run:partition:0", "run:partition:1", "run:partition:2", "run:partition:3"],
     ]
     assert [call["claim_block_ms"] for call in seen_claims] == [None, None, None]

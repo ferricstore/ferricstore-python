@@ -402,6 +402,15 @@ class ProtocolAdapterPool:
             lambda adapter: adapter.submit_mset_payload_on_lane(payload, lane_id)
         )
 
+    def _submit_validated_mset_payload_on_lane(
+        self,
+        payload: bytes,
+        lane_id: int,
+    ) -> Future[Any]:
+        return self._submit_tracked(
+            lambda adapter: adapter._submit_validated_mset_payload_on_lane(payload, lane_id)
+        )
+
     def submit_pipeline_payload(self, payload: bytes, count: int) -> Future[list[Any]]:
         return cast(
             Future[list[Any]],

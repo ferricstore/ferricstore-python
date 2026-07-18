@@ -19,6 +19,7 @@ from ferricstore.protocol_common import (
 from ferricstore.protocol_compact_budget import transport_compact_encoding_policy
 from ferricstore.protocol_constants import (
     _FLAG_CUSTOM_PAYLOAD,
+    _OP_AUTH,
     _OP_FLOW_VALUE_MGET,
     _OP_MGET,
     _OPCODES,
@@ -26,6 +27,11 @@ from ferricstore.protocol_constants import (
     ProtocolResponse,
 )
 from ferricstore.protocol_lifecycle import DEFAULT_MAX_PENDING_REQUEST_BYTES
+from ferricstore.protocol_mset import (
+    _validate_compact_mset_payload,
+    _validate_mset_keys,
+)
+from ferricstore.protocol_negotiation import mark_authenticated
 from ferricstore.protocol_pipeline_codec import (
     _blocks_forever,
     _compact_kv_keys_payload,
@@ -221,6 +227,7 @@ class ProtocolAdapter(
         return self._value_future(response_future)
 
     def submit_mset_same_value(self, keys: Sequence[Any], value: Any) -> Future[Any]:
+        _validate_mset_keys(keys)
         with transport_compact_encoding_policy(
             getattr(
                 self,
@@ -233,19 +240,27 @@ class ProtocolAdapter(
         if payload is None:
             args = tuple(item for key in keys for item in (key, value))
             return self.submit_command("MSET", *args)
-        return self.submit_mset_payload(payload)
+        return self._submit_validated_mset_payload(payload)
 
     def submit_mset_payload(self, payload: bytes) -> Future[Any]:
-        if not isinstance(payload, bytes) or not payload:
-            raise InvalidCommandError("MSET payload must be a non-empty compact binary payload")
+        _validate_compact_mset_payload(payload)
+        return self._submit_validated_mset_payload(payload)
+
+    def _submit_validated_mset_payload(self, payload: bytes) -> Future[Any]:
         _request_id, response_future = self._submit_request(
             _OPCODES["MSET"], 1, payload, _FLAG_CUSTOM_PAYLOAD
         )
         return self._value_future(response_future)
 
     def submit_mset_payload_on_lane(self, payload: bytes, lane_id: int) -> Future[Any]:
-        if not isinstance(payload, bytes) or not payload:
-            raise InvalidCommandError("MSET payload must be a non-empty compact binary payload")
+        _validate_compact_mset_payload(payload)
+        return self._submit_validated_mset_payload_on_lane(payload, lane_id)
+
+    def _submit_validated_mset_payload_on_lane(
+        self,
+        payload: bytes,
+        lane_id: int,
+    ) -> Future[Any]:
         _request_id, response_future = self._submit_request_on_lane(
             _OPCODES["MSET"],
             lane_id,
@@ -357,7 +372,10 @@ class ProtocolAdapter(
         return None
 
     def _response_value(self, response: ProtocolResponse) -> Any:
-        return _response_value(response)
+        value = _response_value(response)
+        if getattr(response, "opcode", None) == _OP_AUTH:
+            mark_authenticated(self)
+        return value
 
     def _attach_client_trace(
         self, response: ProtocolResponse, client_trace: dict[str, Any] | None

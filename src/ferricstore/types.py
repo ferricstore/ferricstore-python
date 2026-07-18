@@ -6,9 +6,11 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from ferricstore.config_validation import (
+    normalize_optional_max_active_ms,
     validate_optional_positive_int,
     validate_positive_int,
 )
+from ferricstore.errors import FerricStoreError
 from ferricstore.model_core import (
     _bytes,
     _get,
@@ -531,6 +533,10 @@ class ChildSpec:
     values: dict[str, Any] | None = None
     value_refs: dict[str, str] | None = None
     attributes: dict[str, Any] | None = None
+    max_active_ms: int | float | str | None = None
+
+    def __post_init__(self) -> None:
+        normalize_optional_max_active_ms(self.max_active_ms)
 
 
 @dataclass(frozen=True, slots=True)
@@ -542,6 +548,10 @@ class CreateItem:
     value_refs: dict[str, str] | None = None
     attributes: dict[str, Any] | None = None
     state_meta: dict[str, Any] | None = None
+    max_active_ms: int | float | str | None = None
+
+    def __post_init__(self) -> None:
+        normalize_optional_max_active_ms(self.max_active_ms)
 
 
 @dataclass(frozen=True, slots=True)
@@ -744,7 +754,8 @@ class KeyInfo:
 class FetchOrComputeResult:
     status: str
     value: Any = None
-    compute_token: bytes = b""
+    hint: Any = None
+    ownership_token: bytes = b""
 
     @property
     def hit(self) -> bool:
@@ -753,6 +764,28 @@ class FetchOrComputeResult:
     @property
     def should_compute(self) -> bool:
         return self.status == "compute"
+
+    @classmethod
+    def from_resp(
+        cls,
+        value: Any,
+        *,
+        decode: Callable[[Any], Any],
+    ) -> FetchOrComputeResult:
+        if not isinstance(value, (list, tuple)) or not value:
+            raise FerricStoreError("FETCH_OR_COMPUTE returned an invalid response", raw=value)
+        status = _str(value[0])
+        if status == "hit" and len(value) == 2:
+            return cls(status=status, value=decode(value[1]))
+        if status == "compute" and len(value) == 3:
+            token = value[2]
+            if not isinstance(token, bytes) or not token:
+                raise FerricStoreError(
+                    "FETCH_OR_COMPUTE returned an invalid ownership token",
+                    raw=value,
+                )
+            return cls(status=status, hint=value[1], ownership_token=token)
+        raise FerricStoreError("FETCH_OR_COMPUTE returned an invalid response", raw=value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -777,7 +810,16 @@ class FlowRecord:
     value_sizes: dict[str, Any] | None = None
     value_omitted: dict[str, Any] | None = None
     value_missing: dict[str, Any] | None = None
+    max_active_ms: int | str | None = None
+    result: Any = None
+    error: dict[str, Any] | Any = None
     raw: dict[Any, Any] | None = None
+
+    @property
+    def failure_reason(self) -> str | None:
+        if isinstance(self.error, dict):
+            return _optional_str(self.error.get("reason"))
+        return None
 
     @classmethod
     def from_resp(
@@ -807,6 +849,13 @@ class FlowRecord:
             value_sizes=_str_key_map(_get(value, "value_sizes")),
             value_omitted=_str_key_map(_get(value, "value_omitted")),
             value_missing=_str_key_map(_get(value, "value_missing")),
+            max_active_ms=_optional_str_or_int(_get(value, "max_active_ms")),
+            result=_normalize_ref_meta(_get(value, "result")),
+            error=(
+                _str_key_map(_get(value, "error"))
+                if isinstance(_get(value, "error"), dict)
+                else _normalize_ref_meta(_get(value, "error"))
+            ),
             raw=value,
         )
 

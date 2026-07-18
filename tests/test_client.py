@@ -3,7 +3,6 @@ import json
 import logging
 import threading
 import time
-import zlib
 from collections import deque
 from concurrent.futures import Future
 from typing import Any
@@ -599,7 +598,11 @@ class OverloadThenAckExecutor(FakeExecutor):
         self.calls.append(args)
         if self.overloads > 0:
             self.overloads -= 1
-            raise OverloadedError("ERR overloaded")
+            raise OverloadedError(
+                "ERR overloaded",
+                retryable=True,
+                safe_to_retry=True,
+            )
         return b"OK"
 
 
@@ -608,8 +611,13 @@ class PerItemAckExecutor(FakeExecutor):
         self.calls.append(args)
         command = args[0]
         if command == "FLOW.CREATE_MANY":
-            if "ITEMS_EXT" in args:
-                return [b"OK"] * int(args[args.index("ITEMS_EXT") + 1])
+            marker = (
+                next(token for token in ("ITEMS_EXT_V2", "ITEMS_EXT") if token in args)
+                if "ITEMS" not in args
+                else None
+            )
+            if marker is not None:
+                return [b"OK"] * int(args[args.index(marker) + 1])
             width = 3 if args[1] == "MIXED" else 2
             count = (len(args) - args.index("ITEMS") - 1) // width
             return [b"OK"] * count
@@ -694,7 +702,7 @@ class CreateAckThenGetExecutor(FakeExecutor):
                 b"id": args[1].encode() if isinstance(args[1], str) else args[1],
                 b"type": b"order",
                 b"state": b"queued",
-                b"partition_key": args[args.index("PARTITION") + 1].encode(),
+                b"partition_key": b"server-owned",
                 b"version": 1,
             }
         return super().execute_command(*args)
@@ -776,16 +784,14 @@ def test_flow_client_close_forwards_to_executor():
     assert executor.closed is True
 
 
-def test_create_ack_followup_get_uses_auto_partition_when_partition_omitted():
+def test_create_ack_followup_get_routes_by_id_when_partition_omitted():
     executor = CreateAckThenGetExecutor()
     client = FlowClient(executor)
-    expected_partition = f"__flow_auto__:{zlib.crc32(b'f-auto') % 256}"
-
     record = client.create("f-auto", type="order", payload=b"hello", now_ms=100, return_record=True)
 
     assert record.id == "f-auto"
     assert executor.calls[1][:2] == ("FLOW.GET", "f-auto")
-    assert executor.calls[1][executor.calls[1].index("PARTITION") + 1] == expected_partition
+    assert "PARTITION" not in executor.calls[1]
 
 
 def test_create_can_attach_named_values_and_refs():
@@ -976,8 +982,14 @@ def test_data_command_helpers_are_codec_aware_and_easy_to_use():
     assert executor.calls[-1] == ("MGET", "a", "missing")
 
     executor.responses.append("OK")
-    assert client.kv_mset({"a": {"n": 1}, "b": {"n": 2}}) == "OK"
-    assert executor.calls[-1] == ("MSET", "a", b'{"n":1}', "b", b'{"n":2}')
+    assert client.kv_mset({"{batch}:a": {"n": 1}, "{batch}:b": {"n": 2}}) == "OK"
+    assert executor.calls[-1] == (
+        "MSET",
+        "{batch}:a",
+        b'{"n":1}',
+        "{batch}:b",
+        b'{"n":2}',
+    )
 
 
 def test_data_command_helpers_cover_non_flow_command_families():
@@ -1566,7 +1578,7 @@ def test_enqueue_stops_after_backpressure_retry_budget():
     assert len(executor.calls) == 2
 
 
-def test_enqueue_many_groups_no_partition_items_by_auto_bucket():
+def test_enqueue_many_delegates_auto_partitioning_to_one_server_request():
     executor = PerItemAckExecutor()
     client = FlowClient(executor)
     items = [CreateItem(f"flow-{idx}", b"payload") for idx in range(64)]
@@ -1574,17 +1586,9 @@ def test_enqueue_many_groups_no_partition_items_by_auto_bucket():
     results = client.enqueue_many(items, type="order", now_ms=100)
 
     assert results == [b"OK"] * len(items)
-    assert len(executor.calls) > 1
-
-    for call in executor.calls:
-        bucket = call[1]
-        assert isinstance(bucket, str)
-        assert bucket.startswith("__flow_auto__:")
-        assert "RETENTION_TTL_MS" not in call
-        item_args = call[call.index("ITEMS") + 1 :]
-        ids = item_args[0::2]
-        for id in ids:
-            assert bucket == f"__flow_auto__:{zlib.crc32(id.encode()) % 256}"
+    assert len(executor.calls) == 1
+    assert executor.calls[0][:2] == ("FLOW.CREATE_MANY", "AUTO")
+    assert "RETENTION_TTL_MS" not in executor.calls[0]
 
 
 def test_enqueue_many_uses_bounded_concurrent_fanout_for_safe_executors():
@@ -1636,7 +1640,7 @@ def test_enqueue_many_uses_bounded_concurrent_fanout_for_safe_executors():
     assert client.enqueue_many(items, type="order", now_ms=100) == [
         item.id.encode() for item in items
     ]
-    assert 1 < executor.max_active <= 16
+    assert executor.max_active == 1
     assert codec.max_active == 1
 
 
@@ -1658,7 +1662,7 @@ def test_enqueue_many_groups_per_item_partition_keys_without_mixed_frame():
     assert "MIXED" not in partitions
     assert "tenant:a" in partitions
     assert "tenant:b" in partitions
-    assert f"__flow_auto__:{zlib.crc32(b'flow-3') % 256}" in partitions
+    assert "AUTO" in partitions
 
     by_partition = {call[1]: call for call in executor.calls}
     tenant_a_items = by_partition["tenant:a"][by_partition["tenant:a"].index("ITEMS") + 1 :]
@@ -1771,7 +1775,7 @@ def test_submit_create_many_is_running_after_wire_submission(
     assert caplog.records == []
 
 
-def test_enqueue_many_passes_retention_ttl_ms_to_auto_bucket_batches():
+def test_enqueue_many_passes_retention_ttl_ms_to_auto_batch():
     executor = PerItemAckExecutor()
     client = FlowClient(executor)
 
@@ -1810,9 +1814,11 @@ def test_direct_many_methods_noop_on_empty_inputs():
     assert executor.calls == []
 
 
-def test_autobatch_groups_no_partition_creates_by_auto_bucket():
+def test_autobatch_delegates_no_partition_creates_to_auto_batch():
     executor = PerItemAckExecutor()
-    client = FlowClient(executor).autobatch(max_batch=64, max_delay_ms=0)
+    # Keep the time deadline out of this grouping assertion. Reaching max_batch
+    # still releases the dispatcher immediately, so this does not slow the test.
+    client = FlowClient(executor).autobatch(max_batch=64, max_delay_ms=10_000)
 
     futures = [
         client.create_async(
@@ -1827,16 +1833,9 @@ def test_autobatch_groups_no_partition_creates_by_auto_bucket():
     client.flush()
 
     assert [future.result() for future in futures] == [b"OK"] * len(futures)
-    for call in executor.calls:
-        if call[0] != "FLOW.CREATE_MANY":
-            continue
-        bucket = call[1]
-        assert isinstance(bucket, str)
-        assert bucket.startswith("__flow_auto__:")
-        item_args = call[call.index("ITEMS") + 1 :]
-        ids = item_args[0::2]
-        for id in ids:
-            assert bucket == f"__flow_auto__:{zlib.crc32(id.encode()) % 256}"
+    create_calls = [call for call in executor.calls if call[0] == "FLOW.CREATE_MANY"]
+    assert len(create_calls) == 1
+    assert create_calls[0][1] == "AUTO"
     client.close()
 
 
@@ -3596,9 +3595,14 @@ def test_autobatch_create_uses_create_many_independent_for_ack_calls():
     client.close()
 
     assert results == [b"OK", b"OK", b"OK"]
-    assert executor.calls[0][0] == "FLOW.CREATE_MANY"
-    assert executor.calls[0][1] == "MIXED"
-    assert "INDEPENDENT" in executor.calls[0]
+    assert all(call[0] == "FLOW.CREATE_MANY" for call in executor.calls)
+    assert all("INDEPENDENT" in call for call in executor.calls)
+    submitted_ids = []
+    for call in executor.calls:
+        item_start = call.index("ITEMS") + 1
+        item_width = 3 if call[1] == "MIXED" else 2
+        submitted_ids.extend(call[item_start::item_width])
+    assert sorted(submitted_ids) == ["f0", "f1", "f2"]
 
 
 def test_autobatch_state_meta_uses_direct_mutation_commands():
@@ -4107,7 +4111,7 @@ def test_autobatch_falls_back_only_when_record_response_is_required():
     assert isinstance(ack, FlowRecord)
     assert executor.calls[0][0] == "FLOW.CREATE"
     assert executor.calls[1][0] == "FLOW.CREATE_MANY"
-    assert executor.calls[1][1].startswith("__flow_auto__:")
+    assert executor.calls[1][1] == "AUTO"
 
 
 def test_complete_many_allows_ok_response():
@@ -4367,9 +4371,15 @@ def test_protocol_ferricstore_commands_are_first_class():
     assert computed.value == b"value"
     assert executor.calls[-1] == ("FETCH_OR_COMPUTE", "foc:k", 5000, "expensive")
 
-    assert client.fetch_or_compute_result("foc:k", b"value", ttl_ms=5_000) is True
-    assert executor.calls[-1] == ("FETCH_OR_COMPUTE_RESULT", "foc:k", b"value", 5000)
-    assert client.fetch_or_compute_error("foc:k", "failed") is True
+    assert client.fetch_or_compute_result("foc:k", b"token", b"value", ttl_ms=5_000) is True
+    assert executor.calls[-1] == (
+        "FETCH_OR_COMPUTE_RESULT",
+        "foc:k",
+        b"token",
+        b"value",
+        5000,
+    )
+    assert client.fetch_or_compute_error("foc:k", b"token", "failed") is True
 
     assert client.cluster_keyslot("k") == 42
     assert client.cluster_health()["shard_0"]["keys"] == 12

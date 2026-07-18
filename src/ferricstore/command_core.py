@@ -5,21 +5,6 @@ from typing import Any
 
 from ferricstore.command_grammar import parse_stream_read
 from ferricstore.flow_routing import (
-    FLOW_AUTO_PARTITION_BUCKETS as FLOW_AUTO_PARTITION_BUCKETS,
-)
-from ferricstore.flow_routing import (
-    FLOW_AUTO_PARTITION_PREFIX as FLOW_AUTO_PARTITION_PREFIX,
-)
-from ferricstore.flow_routing import (
-    flow_auto_partition_index as flow_auto_partition_index,
-)
-from ferricstore.flow_routing import (
-    flow_auto_partition_key as flow_auto_partition_key,
-)
-from ferricstore.flow_routing import (
-    flow_auto_partition_key_for_index as flow_auto_partition_key_for_index,
-)
-from ferricstore.flow_routing import (
     flow_command_route_keys,
 )
 

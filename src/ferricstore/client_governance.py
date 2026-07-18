@@ -10,7 +10,10 @@ from ferricstore.client_helpers import (
     _normalize_admin_response,
 )
 from ferricstore.client_state import _ClientMixinBase
-from ferricstore.config_validation import validate_string_sequence
+from ferricstore.config_validation import (
+    normalize_optional_max_active_ms,
+    validate_string_sequence,
+)
 from ferricstore.governance_validation import (
     validate_approval_decision,
     validate_approval_list,
@@ -51,11 +54,13 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         retry: RetryPolicy | None = None,
         states: dict[str, FlowStatePolicyLike] | None = None,
         indexed_state_meta: str | None = None,
+        max_active_ms: int | float | str | None = None,
     ) -> Any:
         validate_nonempty_string(type, name="type")
         if indexed_state_meta is not None:
             validate_nonempty_string(indexed_state_meta, name="indexed_state_meta")
         args: builtins.list[Any] = ["FLOW.POLICY.SET", type]
+        _append(args, "MAX_ACTIVE_MS", normalize_optional_max_active_ms(max_active_ms))
         _append(args, "INDEXED_STATE_META", indexed_state_meta)
         if retry is not None:
             self._append_retry_policy(args, retry)
@@ -440,27 +445,20 @@ class _ClientGovernanceMixin(_ClientMixinBase):
         scope: str,
         *,
         shard_id: int,
-        reservation_ids: Sequence[str] | None = None,
-        amount: int | None = None,
+        reservation_ids: Sequence[str],
         now_ms: int | None = None,
     ) -> dict[str, Any]:
-        """Release credits by amount or by exact server-provided reservation IDs."""
+        """Release credits by their exact server-provided reservation IDs."""
 
         validated_reservation_ids = validate_limit_release(
             scope,
             shard_id=shard_id,
             reservation_ids=reservation_ids,
-            amount=amount,
             now_ms=now_ms,
         )
         args: builtins.list[Any] = ["FLOW.LIMIT.RELEASE", scope]
         _append(args, "SHARD_ID", shard_id)
-        _append(args, "AMOUNT", amount)
-        _append(
-            args,
-            "RESERVATION_IDS",
-            list(validated_reservation_ids) if validated_reservation_ids is not None else None,
-        )
+        _append(args, "RESERVATION_IDS", list(validated_reservation_ids))
         _append(args, "NOW", now_ms)
         return cast(dict[str, Any], _normalize_admin_response(self.executor.execute_command(*args)))
 

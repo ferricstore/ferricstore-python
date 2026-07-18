@@ -113,8 +113,6 @@ def route_for_command(
         "owner_flow_id",
         "parent_flow_id",
         "root_flow_id",
-        "parent_id",
-        "root_id",
         "correlation_id",
         "scope",
     ):

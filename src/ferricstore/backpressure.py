@@ -147,6 +147,35 @@ class BackpressureController:
             await asyncio.sleep(delay)
         return True
 
+    def record_retry(
+        self,
+        retry_after_ms: int | None,
+        *,
+        elapsed_s: float | None = None,
+    ) -> bool:
+        """Honor a non-overload server retry hint without changing pressure state."""
+        delay = self._retry_after_delay(retry_after_ms)
+        if not self._retry_wait_fits_budget(delay, elapsed_s):
+            return False
+        if delay > 0:
+            time.sleep(delay)
+        return True
+
+    async def record_retry_async(
+        self,
+        retry_after_ms: int | None,
+        *,
+        elapsed_s: float | None = None,
+    ) -> bool:
+        import asyncio
+
+        delay = self._retry_after_delay(retry_after_ms)
+        if not self._retry_wait_fits_budget(delay, elapsed_s):
+            return False
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return True
+
     def record_success(self) -> None:
         if not self.policy.enabled:
             return

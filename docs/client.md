@@ -604,7 +604,7 @@ spent = client.limit_spend("tenant-a:email", shard_id=0, amount=2)
 client.limit_release(
     "tenant-a:email",
     shard_id=0,
-    amount=2,
+    reservation_ids=spent["reservation_ids"],
 )
 ```
 
@@ -737,12 +737,14 @@ result = client.fetch_or_compute("report:42", ttl_ms=60_000)
 
 if result.hit:
     report = result.value
-else:
+elif result.should_compute:
     try:
         report = build_report()
-        client.fetch_or_compute_result("report:42", report, ttl_ms=60_000)
+        client.fetch_or_compute_result(
+            "report:42", result.ownership_token, report, ttl_ms=60_000
+        )
     except Exception as exc:
-        client.fetch_or_compute_error("report:42", str(exc))
+        client.fetch_or_compute_error("report:42", result.ownership_token, str(exc))
         raise
 ```
 

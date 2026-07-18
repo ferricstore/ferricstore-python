@@ -1000,7 +1000,12 @@ def test_real_ferricstore_protocol_helpers_and_diagnostics() -> None:
 
         first = client.fetch_or_compute(cache_key, ttl_ms=60_000, hint="integration")
         assert first.should_compute
-        assert client.fetch_or_compute_result(cache_key, {"computed": True}, ttl_ms=60_000)
+        assert client.fetch_or_compute_result(
+            cache_key,
+            first.ownership_token,
+            {"computed": True},
+            ttl_ms=60_000,
+        )
         cached = client.fetch_or_compute(cache_key, ttl_ms=60_000)
         assert cached.hit
         assert cached.value == {"computed": True}
@@ -1008,7 +1013,7 @@ def test_real_ferricstore_protocol_helpers_and_diagnostics() -> None:
         error_key = f"{prefix}cache-error"
         first_error = client.fetch_or_compute(error_key, ttl_ms=60_000)
         assert first_error.should_compute
-        assert client.fetch_or_compute_error(error_key, "boom")
+        assert client.fetch_or_compute_error(error_key, first_error.ownership_token, "boom")
 
         assert isinstance(client.cluster_health(), dict)
         assert isinstance(client.cluster_stats(), dict)
@@ -1031,7 +1036,7 @@ def test_real_ferricstore_raw_store_command_families() -> None:
 
     client = _client()
     suffix = _suffix()
-    prefix = f"py-sdk:store:{suffix}:"
+    prefix = f"py-sdk:store:{{{suffix}}}:"
 
     try:
         string_key = f"{prefix}string"
@@ -1041,7 +1046,16 @@ def test_real_ferricstore_raw_store_command_families() -> None:
         assert client.command("EXISTS", string_key) == 1
         assert client.command("MGET", string_key, f"{prefix}missing")[0] in (b"abc", "abc")
         assert _ok(client.command("MSET", second_key, "2", third_key, "3"))
-        assert client.command("MSETNX", f"{prefix}nx1", "1", f"{prefix}nx2", "2") == 1
+        assert (
+            client.command(
+                "MSETNX",
+                f"{prefix}nx1",
+                "1",
+                f"{prefix}nx2",
+                "2",
+            )
+            == 1
+        )
         assert client.command("INCR", f"{prefix}counter") == 1
         assert client.command("INCRBY", f"{prefix}counter", 4) == 5
         assert client.command("DECR", f"{prefix}counter") == 4
@@ -1291,7 +1305,7 @@ def test_real_ferricstore_native_protocol_store_and_admin_surface() -> None:
 
     client = _client()
     suffix = _suffix()
-    prefix = f"py-sdk:native-store:{suffix}:"
+    prefix = f"py-sdk:native-store:{{{suffix}}}:"
     keys: list[str] = []
 
     def key(name: str) -> str:
@@ -1383,7 +1397,12 @@ def test_real_ferricstore_native_protocol_store_and_admin_surface() -> None:
         cache_key = key("cache")
         first = client.fetch_or_compute(cache_key, ttl_ms=60_000, hint="native-integration")
         assert first.should_compute
-        assert client.fetch_or_compute_result(cache_key, {"computed": True}, ttl_ms=60_000)
+        assert client.fetch_or_compute_result(
+            cache_key,
+            first.ownership_token,
+            {"computed": True},
+            ttl_ms=60_000,
+        )
         cached = client.fetch_or_compute(cache_key, ttl_ms=60_000)
         assert cached.hit
         assert cached.value == {"computed": True}
@@ -1391,7 +1410,11 @@ def test_real_ferricstore_native_protocol_store_and_admin_surface() -> None:
         error_cache_key = key("cache-error")
         first_error = client.fetch_or_compute(error_cache_key, ttl_ms=60_000)
         assert first_error.should_compute
-        assert client.fetch_or_compute_error(error_cache_key, "boom")
+        assert client.fetch_or_compute_error(
+            error_cache_key,
+            first_error.ownership_token,
+            "boom",
+        )
 
         info = client.key_info(string_key)
         assert info.raw
@@ -1719,10 +1742,13 @@ def test_real_ferricstore_native_protocol_flow_admin_surface() -> None:
         spent = client.limit_spend(limit_scope, shard_id=0, amount=2, now_ms=now + 26)
         spent_lease = _field(spent, "lease")
         assert _field(spent_lease, "in_use") == 2
+        reservation_ids = _field(spent, "reservation_ids")
+        assert isinstance(reservation_ids, list)
+        assert len(reservation_ids) == 2
         assert client.limit_release(
             limit_scope,
             shard_id=0,
-            amount=2,
+            reservation_ids=reservation_ids,
             now_ms=now + 27,
         )
         assert client.limit_get(limit_scope, now_ms=now + 28) is not None
@@ -2048,10 +2074,10 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
             partition_key=stuck_job.partition_key,
         )
 
-        parent_id = f"py-sdk:parent:{suffix}"
-        parent_partition = f"{parent_id}:partition"
+        parent_flow_id = f"py-sdk:parent:{suffix}"
+        parent_partition = f"{parent_flow_id}:partition"
         client.create(
-            parent_id,
+            parent_flow_id,
             type=flow_type,
             state="dispatch",
             partition_key=parent_partition,
@@ -2060,10 +2086,10 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
             now_ms=now,
             idempotent=True,
         )
-        parent = client.get(parent_id, partition_key=parent_partition)
+        parent = client.get(parent_flow_id, partition_key=parent_partition)
         assert parent is not None
         assert client.spawn_children(
-            parent_id,
+            parent_flow_id,
             [
                 ChildSpec(f"py-sdk:child:{suffix}:a", flow_type, {"child": "a"}),
                 ChildSpec(f"py-sdk:child:{suffix}:b", flow_type, {"child": "b"}),
@@ -2077,7 +2103,7 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
             success="children_done",
             failure="children_failed",
         )
-        assert isinstance(client.by_parent(parent_id), list)
+        assert isinstance(client.by_parent(parent_flow_id), list)
         assert isinstance(client.by_root(f"root:{suffix}"), list)
         assert isinstance(client.by_correlation(f"corr:{suffix}"), list)
 
@@ -2204,7 +2230,7 @@ def test_real_ferricstore_named_data_helpers_cover_native_protocol_surface() -> 
 
     client = _client()
     suffix = _suffix()
-    prefix = f"py-sdk:native-helper:{suffix}:"
+    prefix = f"py-sdk:native-helper:{{{suffix}}}:"
     keys: list[str] = []
     covered: set[str] = set()
 
@@ -2223,11 +2249,38 @@ def test_real_ferricstore_named_data_helpers_cover_native_protocol_surface() -> 
         assert _ok(call("kv_set", key("kv"), {"answer": 42}, px=60_000))
         assert call("kv_get", keys[-1]) == {"answer": 42}
         assert call("exists", string_key) == 1
-        assert _ok(call("mset", {key("mset-a"): "a", key("mset-b"): "b"}, encode=False))
+        assert _ok(
+            call(
+                "mset",
+                {
+                    key("mset-a"): "a",
+                    key("mset-b"): "b",
+                },
+                encode=False,
+            )
+        )
         assert call("mget", keys[-2], keys[-1], decode=False)[:2] in ([b"a", b"b"], ["a", "b"])
-        assert _ok(call("kv_mset", {key("kmset-a"): {"a": 1}, key("kmset-b"): {"b": 2}}))
+        assert _ok(
+            call(
+                "kv_mset",
+                {
+                    key("kmset-a"): {"a": 1},
+                    key("kmset-b"): {"b": 2},
+                },
+            )
+        )
         assert call("kv_mget", keys[-2], keys[-1]) == [{"a": 1}, {"b": 2}]
-        assert call("msetnx", {key("msetnx-a"): "a", key("msetnx-b"): "b"}, encode=False) == 1
+        assert (
+            call(
+                "msetnx",
+                {
+                    key("msetnx-a"): "a",
+                    key("msetnx-b"): "b",
+                },
+                encode=False,
+            )
+            == 1
+        )
         counter_key = key("counter")
         assert call("incr", counter_key) == 1
         assert call("incrby", counter_key, 4) == 5

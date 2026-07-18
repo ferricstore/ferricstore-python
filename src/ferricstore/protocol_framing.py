@@ -116,6 +116,109 @@ class ResponseFrameBudget:
             raise FerricStoreError("protocol response exceeds max_response_bytes")
 
 
+@dataclass(frozen=True, slots=True)
+class AssembledResponseFrame:
+    identity: ResponseIdentity
+    flags: int
+    body: bytes
+    read_started_ns: int
+
+
+@dataclass(slots=True)
+class _PendingResponseFrames:
+    accumulator: ResponseBodyAccumulator
+    budget: ResponseFrameBudget
+    flags: int
+    read_started_ns: int
+
+
+class ResponseFrameAssembler:
+    """Reassemble independently interleaved response streams by full identity."""
+
+    __slots__ = ("_max_body_bytes", "_max_chunks", "_pending")
+
+    def __init__(self, *, max_body_bytes: int | None, max_chunks: int | None) -> None:
+        self._max_body_bytes = validated_optional_nonnegative_int(
+            max_body_bytes,
+            name="max_response_bytes",
+        )
+        self._max_chunks = validated_response_chunk_limit(max_chunks)
+        self._pending: dict[ResponseIdentity, _PendingResponseFrames] = {}
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
+    def clear(self) -> None:
+        self._pending.clear()
+
+    def reconfigure(self, *, max_body_bytes: int | None, max_chunks: int | None) -> None:
+        """Apply connection-negotiated limits when no response is mid-assembly."""
+        if self._pending:
+            raise FerricStoreError("cannot change response limits while chunks are pending")
+        self._max_body_bytes = validated_optional_nonnegative_int(
+            max_body_bytes,
+            name="max_response_bytes",
+        )
+        self._max_chunks = validated_response_chunk_limit(max_chunks)
+
+    def add(
+        self,
+        identity: ResponseIdentity,
+        flags: int,
+        body: bytes,
+        *,
+        read_started_ns: int,
+    ) -> AssembledResponseFrame | None:
+        from ferricstore.protocol_constants import _FLAG_MORE_CHUNKS
+
+        more = bool(flags & _FLAG_MORE_CHUNKS)
+        logical_flags = flags & ~_FLAG_MORE_CHUNKS
+        pending = self._pending.get(identity)
+        if pending is None and not more:
+            self._check_single_frame(len(body))
+            return AssembledResponseFrame(identity, logical_flags, body, read_started_ns)
+
+        if pending is None:
+            budget = ResponseFrameBudget(
+                max_body_bytes=self._max_body_bytes,
+                max_chunks=self._max_chunks,
+            )
+            budget.add_chunk(len(body))
+            self._pending[identity] = _PendingResponseFrames(
+                accumulator=ResponseBodyAccumulator(body),
+                budget=budget,
+                flags=logical_flags,
+                read_started_ns=read_started_ns,
+            )
+            return None
+
+        try:
+            pending.budget.add_chunk(len(body))
+            pending.accumulator.append(body)
+            pending.flags |= logical_flags
+        except BaseException:
+            self._pending.pop(identity, None)
+            raise
+        if more:
+            return None
+
+        self._pending.pop(identity, None)
+        return AssembledResponseFrame(
+            identity,
+            pending.flags,
+            pending.accumulator.finish(),
+            pending.read_started_ns,
+        )
+
+    def _check_single_frame(self, body_bytes: int) -> None:
+        budget = ResponseFrameBudget(
+            max_body_bytes=self._max_body_bytes,
+            max_chunks=self._max_chunks,
+        )
+        budget.add_chunk(body_bytes)
+
+
 def decompress_response(body: bytes, limit: int | None) -> bytes:
     limit = validated_optional_nonnegative_int(
         limit,

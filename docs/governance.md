@@ -159,13 +159,15 @@ finally:
         client.limit_release(
             "tenant:acme:email",
             shard_id=0,
-            amount=spent_amount,
+            reservation_ids=spent["reservation_ids"],
         )
 ```
 
-The worker fast path can use cached credits. Durable `in_use` can remain visible
-until credits are reused, released, or reclaimed after expiry; this is expected
-and protects correctness under worker death.
+Release must use the exact reservation IDs returned by `limit_spend`; amount-only
+release is not safe and is not part of the FerricStore 0.8 contract. The worker
+fast path can use cached credits. Durable `in_use` can remain visible until
+credits are reused, released, or reclaimed after expiry; this is expected and
+protects correctness under worker death.
 
 ## Circuits
 

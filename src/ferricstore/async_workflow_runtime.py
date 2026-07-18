@@ -16,8 +16,6 @@ from ferricstore.async_ownership import (
     resolve_async_client_pair,
 )
 from ferricstore.async_partitioning import (
-    _owned_auto_partition_keys,
-    _validate_auto_partition_workers,
     _validate_server_shards,
 )
 from ferricstore.async_producer import AsyncProducerLoop
@@ -30,6 +28,7 @@ from ferricstore.async_queue_runtime import (
     _close_async_resource,
 )
 from ferricstore.async_workflow_execution import apply_uniform, handle_claimed_batch
+from ferricstore.async_workflow_producer import _AsyncWorkflowProducerMixin
 from ferricstore.async_workflow_types import AsyncWorkflowWorkerResult
 from ferricstore.client_core import FlowClient
 from ferricstore.config_validation import (
@@ -76,7 +75,7 @@ from ferricstore.workflow_types import (
 )
 
 
-class AsyncWorkflow:
+class AsyncWorkflow(_AsyncWorkflowProducerMixin):
     """Simple async state-machine workflow runtime.
 
     Handlers receive compact claimed jobs by default and return one of:
@@ -113,7 +112,6 @@ class AsyncWorkflow:
         _producer_url_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
         workers = validate_positive_int(workers, name="workers")
-        _validate_auto_partition_workers(workers)
         server_shards = _validate_server_shards(server_shards)
         concurrency = validate_positive_int(concurrency, name="concurrency")
         batch_size = validate_positive_int(batch_size, name="batch_size")
@@ -296,6 +294,7 @@ class AsyncWorkflow:
         retry_policy: RetryPolicy | None = None,
         retry: RetryPolicy | None = None,
         indexed_state_meta: str | None = None,
+        max_active_ms: int | float | str | None = None,
     ) -> Any:
         if retry_policy is not None and retry is not None:
             raise ValueError("retry_policy and retry are mutually exclusive")
@@ -315,80 +314,12 @@ class AsyncWorkflow:
         kwargs: dict[str, Any] = {"retry": resolved_retry_policy, "states": state_policies}
         if indexed_state_meta is not None:
             kwargs["indexed_state_meta"] = indexed_state_meta
+        if max_active_ms is not None:
+            kwargs["max_active_ms"] = max_active_ms
         return await self._invocations.run_while_open(
             lambda: self.client.install_policy(self.type, **kwargs),
             closed_message="workflow is closed",
         )
-
-    async def enqueue(self, id: str, *, payload: Any = None, **attrs: Any) -> Any:
-        self._ensure_open()
-        partition_key = pop_workflow_partition_key(attrs, self.partition_by)
-        state = attrs.pop("state", self.initial_state)
-        return_record = attrs.pop("return_record", False)
-
-        async def send(client: AsyncFlowClient) -> Any:
-            return await client.enqueue(
-                id,
-                type=self.type,
-                state=state,
-                payload=payload,
-                partition_key=partition_key,
-                return_record=return_record,
-                **attrs,
-            )
-
-        result = await self._invocations.run_while_open(
-            lambda: self._run_producer(send),
-            closed_message="workflow is closed",
-        )
-        return result
-
-    async def start_flow(self, id: str, *, payload: Any = None, **attrs: Any) -> Any:
-        return await self.enqueue(id, payload=payload, **attrs)
-
-    async def signal(self, id: str, **kwargs: Any) -> Any:
-        self._ensure_open()
-        return await self._invocations.run_while_open(
-            lambda: self.client.signal(id, **kwargs),
-            closed_message="workflow is closed",
-        )
-
-    async def flow_signal(self, id: str, **kwargs: Any) -> Any:
-        return await self.signal(id, **kwargs)
-
-    async def enqueue_many(
-        self,
-        items: Sequence[CreateItem | tuple[str, Any] | str],
-        **attrs: Any,
-    ) -> Any:
-        self._ensure_open()
-        partition_key = pop_workflow_partition_key(attrs, self.partition_by)
-        state = attrs.pop("state", self.initial_state)
-        independent = attrs.pop("independent", True)
-        create_items = [
-            item
-            if isinstance(item, CreateItem)
-            else CreateItem(item[0], item[1])
-            if isinstance(item, tuple)
-            else CreateItem(item)
-            for item in items
-        ]
-
-        async def send(client: AsyncFlowClient) -> Any:
-            return await client.enqueue_many(
-                create_items,
-                type=self.type,
-                state=state,
-                partition_key=partition_key,
-                independent=independent,
-                **attrs,
-            )
-
-        result = await self._invocations.run_while_open(
-            lambda: self._run_producer(send),
-            closed_message="workflow is closed",
-        )
-        return result
 
     async def run_steps_many(
         self,
@@ -792,26 +723,8 @@ class AsyncWorkflow:
         return state_name
 
     def _next_claim_partition(self, worker_index: int) -> tuple[str | None, list[str] | None]:
-        keys = _owned_auto_partition_keys(
-            worker_index=worker_index,
-            workers=self.workers,
-            server_shards=self.server_shards,
-        )
-        if not keys:
-            raise RuntimeError("workflow worker owns no auto partitions")
-        count = min(self.claim_partition_batch_size, len(keys))
-        cursor = self._partition_cursors[worker_index]
-        selected = [keys[(cursor + offset) % len(keys)] for offset in range(count)]
-        self._partition_cursors[worker_index] = (cursor + count) % len(keys)
-        if len(selected) == 1:
-            return selected[0], None
-        return None, selected
-
-    async def _run_producer(self, send: Callable[[AsyncFlowClient], Awaitable[Any]]) -> Any:
-        producer_loop = self._producer_loop
-        if producer_loop is None:
-            return await send(self.client)
-        return await producer_loop.run(send)
+        del worker_index
+        return None, None
 
     @staticmethod
     def _uniform_partition_key(jobs: list[ClaimedFlow]) -> str | None:

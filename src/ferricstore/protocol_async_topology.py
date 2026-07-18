@@ -42,6 +42,7 @@ from ferricstore.protocol_common import (
     _is_retryable_route_error,
     _is_safe_control_retry,
     _protocol_connection_count,
+    _server_allows_retry,
 )
 from ferricstore.protocol_constants import (
     _ASYNC_ADAPTER_FANOUT_LIMIT,
@@ -472,7 +473,7 @@ class AsyncTopologyProtocolAdapterPool(AsyncTopologyEndpointMixin):
             with contextlib.suppress(Exception):
                 await self.refresh_topology()
                 refreshed = True
-            if refreshed and _is_safe_control_retry(args):
+            if refreshed and _is_safe_control_retry(args) and _server_allows_retry(exc):
                 result = getattr(self._control_adapter(), method)(*args)
                 return await result if inspect.isawaitable(result) else result
             raise
@@ -632,12 +633,7 @@ class AsyncTopologyProtocolAdapterPool(AsyncTopologyEndpointMixin):
     ) -> tuple[PreparedCommand, dict[str, Any]] | None:
         if not args:
             return None
-        try:
-            prepared = self._prepare_routed_command(args)
-        except PendingRequestCapacityError:
-            raise
-        except Exception:
-            return None
+        prepared = self._prepare_routed_command(args)
         route = await self._route_prepared(prepared)
         return None if route is None else (prepared, route)
 

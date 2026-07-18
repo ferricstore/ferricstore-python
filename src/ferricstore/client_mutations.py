@@ -17,6 +17,7 @@ from ferricstore.client_helpers import (
     _job_mutation_command_args,
     _now_ms,
     _retry_command_args,
+    _validate_fencing_token,
 )
 from ferricstore.client_state import _ClientMixinBase
 from ferricstore.mutation_core import JobMutation, MutationKind
@@ -377,6 +378,7 @@ class _ClientMutationsMixin(_ClientMixinBase):
         now_ms: int | None = None,
         return_record: bool = False,
     ) -> FlowRecord | bytes:
+        _validate_fencing_token(fencing_token)
         args: builtins.list[Any] = [
             "FLOW.CANCEL",
             id,

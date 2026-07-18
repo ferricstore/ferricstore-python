@@ -11,8 +11,8 @@ from ferricstore.batch_core import (
     queued_batch_fingerprint,
 )
 from ferricstore.codecs import Codec
-from ferricstore.command_core import flow_auto_partition_key
 from ferricstore.config_validation import (
+    validate_nonnegative_int,
     validate_optional_bool,
     validate_optional_flow_priority,
     validate_optional_nonnegative_int,
@@ -25,6 +25,7 @@ from ferricstore.retry_policy import RetryPolicy
 from ferricstore.types import (
     ClaimedFlow,
     CreateItem,
+    FencedItem,
     FlowRecord,
     FlowStatePolicy,
     FlowStatePolicyLike,
@@ -33,6 +34,25 @@ from ferricstore.types import (
 from ferricstore.worker_core import expand_many_result
 
 _FLOW_MANY_BATCH_LIMIT = 1_000
+
+
+def _validate_fencing_token(fencing_token: object) -> None:
+    validate_nonnegative_int(fencing_token, name="fencing_token")
+
+
+def _validate_lease_token(lease_token: object) -> None:
+    if not isinstance(lease_token, bytes) or not lease_token:
+        raise ValueError("lease_token must be non-empty bytes")
+
+
+def _validate_ownership_token(ownership_token: object) -> None:
+    if not isinstance(ownership_token, bytes) or not ownership_token:
+        raise ValueError("ownership_token must be non-empty bytes")
+
+
+def _validate_claim_guard(lease_token: object, fencing_token: object) -> None:
+    _validate_lease_token(lease_token)
+    _validate_fencing_token(fencing_token)
 
 
 def _flow_return(value: Any) -> FlowRecord | bytes:
@@ -360,6 +380,7 @@ def _step_continue_args(
     worker: str | None,
     return_job: bool,
 ) -> builtins.list[Any]:
+    _validate_claim_guard(lease_token, fencing_token)
     args: builtins.list[Any] = [
         "FLOW.STEP_CONTINUE",
         id,
@@ -442,6 +463,7 @@ def _complete_many_args(
     mixed = partition_key is None
     args.append("ITEMS")
     for item in items:
+        _validate_claim_guard(item.lease_token, item.fencing_token)
         if mixed:
             if item.partition_key is None:
                 raise ValueError("mixed FLOW.COMPLETE_MANY items require partition_key")
@@ -464,6 +486,7 @@ def _append_claimed_items_args(
     mixed = partition_key is None
     args.append("ITEMS")
     for item in items:
+        _validate_claim_guard(item.lease_token, item.fencing_token)
         if mixed:
             if item.partition_key is None:
                 raise ValueError(f"mixed {command} items require partition_key")
@@ -472,6 +495,38 @@ def _append_claimed_items_args(
             if item.partition_key is not None and item.partition_key != partition_key:
                 raise ValueError(f"{command} item partition_key does not match batch partition_key")
             args.extend([item.id, item.lease_token, item.fencing_token])
+    return args
+
+
+def _append_fenced_items_args(
+    args: builtins.list[Any],
+    partition_key: str | None,
+    items: builtins.list[FencedItem],
+    command: str,
+    *,
+    include_lease: bool = False,
+) -> builtins.list[Any]:
+    mixed = partition_key is None
+    for item in items:
+        _validate_fencing_token(item.fencing_token)
+        if include_lease:
+            try:
+                _validate_lease_token(item.lease_token)
+            except ValueError as exc:
+                raise ValueError(f"{command} item lease_token is required") from exc
+        if mixed and item.partition_key is None:
+            raise ValueError(f"mixed {command} items require partition_key")
+        if not mixed and item.partition_key is not None and item.partition_key != partition_key:
+            raise ValueError(f"{command} item partition_key does not match batch partition_key")
+
+    args.append("ITEMS")
+    for item in items:
+        if mixed:
+            args.extend([item.id, item.partition_key, item.fencing_token])
+        else:
+            args.extend([item.id, item.fencing_token])
+        if include_lease:
+            args.append(item.lease_token)
     return args
 
 
@@ -528,6 +583,7 @@ def _complete_command_args(
     ttl_ms: int | None = None,
     now_ms: int | None = None,
 ) -> builtins.list[Any]:
+    _validate_claim_guard(lease_token, fencing_token)
     args: builtins.list[Any] = [
         "FLOW.COMPLETE",
         id,
@@ -579,6 +635,7 @@ def _transition_command_args(
     now_ms: int | None = None,
     priority: int | None = None,
 ) -> builtins.list[Any]:
+    _validate_claim_guard(lease_token, fencing_token)
     now_ms = now_ms if now_ms is not None else _now_ms()
     args: builtins.list[Any] = [
         "FLOW.TRANSITION",
@@ -632,6 +689,7 @@ def _retry_command_args(
     run_at_ms: int | None = None,
     now_ms: int | None = None,
 ) -> builtins.list[Any]:
+    _validate_claim_guard(lease_token, fencing_token)
     args: builtins.list[Any] = [
         "FLOW.RETRY",
         id,
@@ -681,6 +739,7 @@ def _fail_command_args(
     ttl_ms: int | None = None,
     now_ms: int | None = None,
 ) -> builtins.list[Any]:
+    _validate_claim_guard(lease_token, fencing_token)
     args: builtins.list[Any] = [
         "FLOW.FAIL",
         id,
@@ -783,10 +842,6 @@ def _batch_named_key(
         _batch_key_value(drop_values),
         _batch_key_value(override_values),
     )
-
-
-def _auto_partition_key_for_id(id: str) -> str:
-    return flow_auto_partition_key(id)
 
 
 def _expand_many_response(value: Any, count: int) -> builtins.list[Any]:

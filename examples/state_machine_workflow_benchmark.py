@@ -3,7 +3,6 @@ import queue
 import threading
 import time
 import uuid
-import zlib
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
@@ -12,9 +11,6 @@ from ferricstore.client import FlowClient
 from ferricstore.types import CreateItem
 from ferricstore.workflow import Workflow, complete, state, transition
 
-AUTO_PARTITION_PREFIX = "__flow_auto__:"
-AUTO_PARTITION_BUCKETS = 256
-SERVER_SLOT_COUNT = 1024
 DEFAULT_STATE = "queued"
 
 
@@ -27,40 +23,6 @@ def payload_bytes(size: int) -> bytes:
     if size <= 0:
         return b""
     return b"x" * size
-
-
-def auto_partition_index_for_flow_id(id: str) -> int:
-    return zlib.crc32(id.encode()) % AUTO_PARTITION_BUCKETS
-
-
-def auto_partition_key_for_index(index: int) -> str:
-    return f"{AUTO_PARTITION_PREFIX}{index % AUTO_PARTITION_BUCKETS}"
-
-
-def auto_partition_index_from_key(partition_key: str) -> int | None:
-    if not partition_key.startswith(AUTO_PARTITION_PREFIX):
-        return None
-    try:
-        return int(partition_key[len(AUTO_PARTITION_PREFIX) :]) % AUTO_PARTITION_BUCKETS
-    except ValueError:
-        return None
-
-
-def server_shard_for_slot(slot: int, server_shards: int) -> int:
-    server_shards = max(server_shards, 1)
-    slots_per_shard = SERVER_SLOT_COUNT // server_shards
-    remainder = SERVER_SLOT_COUNT % server_shards
-    wide_slots = (slots_per_shard + 1) * remainder
-    slot = slot % SERVER_SLOT_COUNT
-    if slot < wide_slots:
-        return slot // (slots_per_shard + 1)
-    return remainder + ((slot - wide_slots) // slots_per_shard)
-
-
-def auto_partition_server_shard_for_index(index: int, server_shards: int) -> int:
-    tag = f"fa:{index % AUTO_PARTITION_BUCKETS}"
-    slot = zlib.crc32(tag.encode()) & (SERVER_SLOT_COUNT - 1)
-    return server_shard_for_slot(slot, server_shards)
 
 
 def explicit_partition_for(index: int, partitions: int, run_id: str) -> str:
@@ -134,11 +96,7 @@ def worker_partition_keys(
     run_id: str,
 ) -> list[str | None]:
     if partition_mode == "auto":
-        return [
-            auto_partition_key_for_index(idx)
-            for idx in range(AUTO_PARTITION_BUCKETS)
-            if idx % workers == worker_index
-        ]
+        return [None]
 
     return [
         explicit_partition_for(idx, partitions, run_id)
@@ -168,10 +126,8 @@ def created_partition_counts(
     counts: dict[str, int] = {}
     for index in indices:
         if partition_mode == "auto":
-            partition_index = auto_partition_index_for_flow_id(flow_id(run_id, index))
-            partition_key = auto_partition_key_for_index(partition_index)
-        else:
-            partition_key = explicit_partition_for(index, partitions, run_id)
+            continue
+        partition_key = explicit_partition_for(index, partitions, run_id)
         counts[partition_key] = counts.get(partition_key, 0) + 1
     return counts
 
@@ -202,55 +158,6 @@ def create_workflows(
 ) -> dict[str, int]:
     client = FlowClient.from_url(url)
     created = 0
-
-    if partition_mode == "auto" and create_mode == "many":
-        auto_buffers: dict[int, list[int]] = {}
-
-        def flush_auto_bucket(partition_index: int) -> None:
-            nonlocal created
-            batch = auto_buffers.get(partition_index)
-            if not batch:
-                return
-
-            items = [
-                CreateItem(
-                    flow_id(run_id, index),
-                    payload,
-                )
-                for index in batch
-            ]
-            client.enqueue_many(
-                items,
-                type=flow_type,
-                state=DEFAULT_STATE,
-                independent=independent_many,
-            )
-            created += len(items)
-            notify_ready_counts(
-                wake_coordinator,
-                flow_type=flow_type,
-                state_name=DEFAULT_STATE,
-                partition_counts=created_partition_counts(
-                    run_id=run_id,
-                    indices=batch,
-                    partitions=partitions,
-                    partition_mode=partition_mode,
-                ),
-                server_shards=server_shards,
-            )
-            auto_buffers[partition_index] = []
-
-        for index in indices:
-            partition_index = auto_partition_index_for_flow_id(flow_id(run_id, index))
-            bucket = auto_buffers.setdefault(partition_index, [])
-            bucket.append(index)
-            if len(bucket) >= max(create_batch_size, 1):
-                flush_auto_bucket(partition_index)
-
-        for partition_index in list(auto_buffers):
-            flush_auto_bucket(partition_index)
-
-        return {"created": created}
 
     if create_mode == "single":
         for index in indices:
@@ -578,13 +485,7 @@ def run_state_machine_throughput(args: argparse.Namespace) -> dict[str, float | 
     worker_mode = "blocking"
     wake_coordinator = None
 
-    if args.partition_mode == "auto" and args.create_mode == "many":
-        create_ranges = [[] for _ in range(args.producers)]
-        for index in indices:
-            owner = auto_partition_index_for_flow_id(flow_id(run_id, index)) % args.producers
-            create_ranges[owner].append(index)
-    else:
-        create_ranges = [indices[offset :: args.producers] for offset in range(args.producers)]
+    create_ranges = [indices[offset :: args.producers] for offset in range(args.producers)]
 
     started = time.perf_counter()
     create_started = started
@@ -623,9 +524,7 @@ def run_state_machine_throughput(args: argparse.Namespace) -> dict[str, float | 
                 flow_type=flow_type,
                 worker_index=worker_index,
                 workers=args.workers,
-                partitions=AUTO_PARTITION_BUCKETS
-                if args.partition_mode == "auto"
-                else args.partitions,
+                partitions=args.partitions,
                 partition_mode=args.partition_mode,
                 states=states,
                 flows=args.flows,

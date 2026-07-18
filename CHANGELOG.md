@@ -6,6 +6,30 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.5.0
+
+- Raised the minimum server version to FerricStore `0.8.0` without changing
+  native wire protocol v1, and made HELLO the authoritative source for compact
+  response codecs and aggregate response limits.
+- Added identity-safe multi-frame response assembly for compact MGET and
+  `FLOW.VALUE.MGET`, bounded aggregate chunk sizes, and authenticated large
+  requests before the unauthenticated 64 KiB limit.
+- Adopted the required fetch ownership token, canonical Flow lineage fields,
+  `max_active_ms` (including infinity), strict lease/fencing mutation guards,
+  the new signal schema, explicit effect routing, and extensible Flow records.
+- Removed TopK decay and all tokenless/reserved-auto-partition compatibility
+  APIs; added SET `exat`/`pxat`/`keepttl` validation and local same-slot
+  validation for MSET/MSETNX.
+- Required exact server-issued reservation IDs for distributed-limit release,
+  normalized compact single-slot MSET acknowledgements, and kept canonical
+  lineage queries interoperable without emitting removed lineage aliases.
+- Made retry behavior follow server `retryable`, `safe_to_retry`, and
+  `retry_after_ms` metadata, and report unknown outcomes instead of replaying
+  mutations after an ambiguous transport failure.
+- Split response negotiation/value/retry responsibilities, moved pending
+  failure ownership and autobatch dispatch behind dedicated components, and
+  retained bounded runtime classes and hot paths.
+
 ## 0.4.1
 
 - Fixed topology refresh and sync/async multi-node failover by treating

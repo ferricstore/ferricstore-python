@@ -13,7 +13,12 @@ def main() -> None:
                 print("cached report", result.value)
             else:
                 report = b"expensive report"
-                client.fetch_or_compute_result("report:42", report, ttl_ms=60_000)
+                client.fetch_or_compute_result(
+                    "report:42",
+                    result.ownership_token,
+                    report,
+                    ttl_ms=60_000,
+                )
         finally:
             client.unlock("lock:report:42", "worker-1")
 

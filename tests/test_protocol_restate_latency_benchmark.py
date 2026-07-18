@@ -182,7 +182,7 @@ def test_predicted_pipeline_wave_batch_sends_one_ordered_chain(monkeypatch):
         "FLOW.COMPLETE",
     ]
     assert commands[0][commands[0].index("PARTITION") + 1] == "p1"
-    assert commands[1][commands[1].index("PARTITION") + 1].startswith("__flow_auto__:")
+    assert "PARTITION" not in commands[1]
     assert commands[2][2] == b"worker-1:1000000:1"
     assert commands[2][commands[2].index("FENCING") + 1] == 1
     assert commands[4][2] == b"worker-1:1000001:2"
@@ -357,7 +357,7 @@ def test_restate_high_load_profile_keeps_explicit_chain_submit_mode():
     assert args.chain_submit_mode == "run-steps-many"
 
 
-def test_run_steps_many_auto_shard_local_wave_batch_groups_by_server_shard(monkeypatch):
+def test_run_steps_many_auto_shard_local_wave_batch_delegates_auto_routing(monkeypatch):
     class WaveClient:
         def __init__(self) -> None:
             self.commands = []
@@ -387,6 +387,7 @@ def test_run_steps_many_auto_shard_local_wave_batch_groups_by_server_shard(monke
 
     assert sum(sample[1] for sample in samples) == 24
     assert sum(len(items) for items, _kwargs in client.commands) == 24
+    assert len(client.commands) == 1
     for items, kwargs in client.commands:
         assert kwargs == {
             "type": "order",
@@ -397,17 +398,7 @@ def test_run_steps_many_auto_shard_local_wave_batch_groups_by_server_shard(monke
             "payload": None,
             "result": b"ok",
         }
-        shards = {
-            bench._auto_partition_server_shard(
-                bench._auto_partition_index_for_id(item["id"]),
-                4,
-            )
-            for item in items
-        }
-        assert len(shards) == 1
-        for item in items:
-            partition_index = bench._auto_partition_index_for_id(item["id"])
-            assert item["partition_key"] == bench._auto_partition_key(partition_index)
+        assert all("partition_key" not in item for item in items)
 
 
 def test_run_steps_many_auto_shard_local_wave_batch_can_trace_sub_batches(monkeypatch):

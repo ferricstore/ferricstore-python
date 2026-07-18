@@ -185,9 +185,11 @@ if result.hit:
 elif result.should_compute:
     try:
         report = build_report()
-        client.fetch_or_compute_result("report:42", report, ttl_ms=60_000)
+        client.fetch_or_compute_result(
+            "report:42", result.ownership_token, report, ttl_ms=60_000
+        )
     except Exception as exc:
-        client.fetch_or_compute_error("report:42", str(exc))
+        client.fetch_or_compute_error("report:42", result.ownership_token, str(exc))
         raise
 ```
 

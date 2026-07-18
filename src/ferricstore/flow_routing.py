@@ -12,8 +12,8 @@ from typing import Any
 from ferricstore.command_grammar import split_flow_value_mget
 from ferricstore.flow_options import FlowOptionPlan
 
-FLOW_AUTO_PARTITION_PREFIX = "__flow_auto__:"
-FLOW_AUTO_PARTITION_BUCKETS = 256
+_FLOW_AUTO_PARTITION_PREFIX = "__flow_auto__:"
+_FLOW_AUTO_PARTITION_BUCKETS = 256
 
 _AUTO_PARTITION_RE = re.compile(r"^__flow_auto__:(0|[1-9]\d{0,2})$")
 _FLOW_PARTITION_ROUTE_CACHE_SIZE = 2_048
@@ -21,7 +21,7 @@ _FLOW_PARTITION_ROUTE_CACHE_MAX_KEY_BYTES = 4_096
 _FLOW_ROUTING_TEXT_CHUNK_CHARS = 4_096
 _FLOW_GLOBAL_ROUTE_KEY = "f:{f}:route"
 _FLOW_AUTO_PARTITION_MAX_KEY_BYTES = len(
-    f"{FLOW_AUTO_PARTITION_PREFIX}{FLOW_AUTO_PARTITION_BUCKETS - 1}".encode("ascii")
+    f"{_FLOW_AUTO_PARTITION_PREFIX}{_FLOW_AUTO_PARTITION_BUCKETS - 1}".encode("ascii")
 )
 _FLOW_ROUTE_SELECTORS = frozenset({"AUTO", "ANY", "GLOBAL", "MIXED", "NONE"})
 _FLOW_ROUTE_SELECTOR_BYTES = {
@@ -154,21 +154,6 @@ _FLOW_OPTION_STARTS = {
 _FLOW_CLAIM_COMMANDS = frozenset({"FLOW.CLAIM_DUE", "FLOW.RECLAIM"})
 
 
-def flow_auto_partition_key(id: str | bytes) -> str:
-    return flow_auto_partition_key_for_index(flow_auto_partition_index(id))
-
-
-def flow_auto_partition_index(id: str | bytes) -> int:
-    checksum = _routing_crc32(id)
-    if checksum is None:
-        raise TypeError("id must be str or bytes")
-    return checksum % FLOW_AUTO_PARTITION_BUCKETS
-
-
-def flow_auto_partition_key_for_index(index: int) -> str:
-    return f"{FLOW_AUTO_PARTITION_PREFIX}{index % FLOW_AUTO_PARTITION_BUCKETS}"
-
-
 def flow_auto_id_routing_key(value: Any) -> str | None:
     checksum = _routing_crc32(value)
     if checksum is None:
@@ -201,7 +186,7 @@ def _logical_partition_routing_key(encoded: bytes) -> str:
     match = _AUTO_PARTITION_RE.fullmatch(text)
     if match is not None:
         bucket = int(match.group(1))
-        if bucket < FLOW_AUTO_PARTITION_BUCKETS:
+        if bucket < _FLOW_AUTO_PARTITION_BUCKETS:
             return f"f:{{fa:{bucket}}}:route"
 
     digest = base64.urlsafe_b64encode(hashlib.sha256(encoded).digest()).rstrip(b"=").decode()
@@ -297,7 +282,7 @@ def _partition_option_route_keys(
             mapper = _claim_partition_routing_key if claim else flow_logical_partition_routing_key
             keys = tuple(mapper(partition) for partition in partitions)
             return () if not keys or any(key is None for key in keys) else keys
-        if token in {"ITEMS", "ITEMS_EXT"}:
+        if token in {"ITEMS", "ITEMS_EXT", "ITEMS_EXT_V2"}:
             return None
         width = plan.option_width(index)
         if width is None or index + width > len(args):
@@ -377,12 +362,7 @@ def _non_negative_int(value: Any) -> int | None:
 
 
 __all__ = [
-    "FLOW_AUTO_PARTITION_BUCKETS",
-    "FLOW_AUTO_PARTITION_PREFIX",
     "flow_auto_id_routing_key",
-    "flow_auto_partition_index",
-    "flow_auto_partition_key",
-    "flow_auto_partition_key_for_index",
     "flow_command_route_keys",
     "flow_logical_partition_routing_key",
 ]

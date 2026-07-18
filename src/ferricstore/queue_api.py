@@ -47,7 +47,16 @@ class Queue:
         self.worker_config = worker_config
         self.value_config = value_config or ValueConfig()
 
-    def enqueue(self, id: str, *, payload: Any = None, **attrs: Any) -> FlowRecord | bytes:
+    def enqueue(
+        self,
+        id: str,
+        *,
+        payload: Any = None,
+        max_active_ms: int | float | str | None = None,
+        **attrs: Any,
+    ) -> FlowRecord | bytes:
+        if max_active_ms is not None:
+            attrs["max_active_ms"] = max_active_ms
         return self.client.enqueue(
             id,
             type=self.type,
@@ -56,7 +65,15 @@ class Queue:
             **attrs,
         )
 
-    def enqueue_many(self, items: list[Any], **attrs: Any) -> list[Any] | Any:
+    def enqueue_many(
+        self,
+        items: list[Any],
+        *,
+        max_active_ms: int | float | str | None = None,
+        **attrs: Any,
+    ) -> list[Any] | Any:
+        if max_active_ms is not None:
+            attrs["max_active_ms"] = max_active_ms
         return self.client.enqueue_many(
             items,
             type=self.type,
@@ -90,6 +107,7 @@ class Queue:
         retry_policy: RetryPolicy | None = None,
         retry: RetryPolicy | None = None,
         indexed_state_meta: str | None = None,
+        max_active_ms: int | float | str | None = None,
     ) -> Any:
         if retry_policy is not None and retry is not None:
             raise ValueError("retry_policy and retry are mutually exclusive")
@@ -103,6 +121,8 @@ class Queue:
         kwargs: dict[str, Any] = {"retry": resolved_retry_policy}
         if indexed_state_meta is not None:
             kwargs["indexed_state_meta"] = indexed_state_meta
+        if max_active_ms is not None:
+            kwargs["max_active_ms"] = max_active_ms
         return self.client.install_policy(self.type, **kwargs)
 
 
@@ -269,6 +289,7 @@ class QueueClient:
         retry: RetryPolicy | None = None,
         states: dict[str, FlowStatePolicyLike] | None = None,
         indexed_state_meta: str | None = None,
+        max_active_ms: int | float | str | None = None,
     ) -> Any:
         if retry_policy is not None and retry is not None:
             raise ValueError("retry_policy and retry are mutually exclusive")
@@ -282,6 +303,8 @@ class QueueClient:
         kwargs: dict[str, Any] = {"retry": resolved_retry_policy, "states": states}
         if indexed_state_meta is not None:
             kwargs["indexed_state_meta"] = indexed_state_meta
+        if max_active_ms is not None:
+            kwargs["max_active_ms"] = max_active_ms
         return self.flow.install_policy(type, **kwargs)
 
     def close(self) -> None:

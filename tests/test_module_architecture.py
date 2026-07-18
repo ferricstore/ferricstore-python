@@ -210,16 +210,22 @@ def test_workflow_mutation_planning_has_one_shared_boundary() -> None:
 
     assert (PACKAGE / "workflow_mutations.py").is_file()
     assert _module_lines("workflow_mutations") <= 250
+    assert _module_lines("workflow_producer") <= 200
+    assert _module_lines("async_workflow_producer") <= 200
     assert _module_lines("workflow_runtime") <= 900
     assert _module_lines("async_workflow_runtime") <= 850
     for module in ("workflow_runtime", "async_workflow_runtime"):
         assert "ferricstore.workflow_mutations" in _top_level_imports(module)
+    assert "ferricstore.workflow_producer" in _top_level_imports("workflow_runtime")
+    assert "ferricstore.async_workflow_producer" in _top_level_imports("async_workflow_runtime")
     _assert_acyclic_modules(
         {
             "mutation_core",
             "workflow_mutations",
             "workflow_execution",
             "async_workflow_execution",
+            "workflow_producer",
+            "async_workflow_producer",
             "workflow_runtime",
             "async_workflow_runtime",
         }
@@ -241,10 +247,17 @@ def test_sync_topology_endpoint_lifecycle_is_a_dedicated_boundary() -> None:
     """Keep endpoint ownership symmetric with the async topology implementation."""
 
     assert (PACKAGE / "protocol_sync_endpoints.py").is_file()
+    assert (PACKAGE / "protocol_sync_topology_mset.py").is_file()
     assert _module_lines("protocol_sync_topology") <= 850
     assert _module_lines("protocol_sync_endpoints") <= 250
+    assert _module_lines("protocol_sync_topology_mset") <= 120
     _assert_acyclic_modules(
-        {"protocol_sync_endpoints", "protocol_sync_routing", "protocol_sync_topology"}
+        {
+            "protocol_sync_endpoints",
+            "protocol_sync_routing",
+            "protocol_sync_topology",
+            "protocol_sync_topology_mset",
+        }
     )
 
 
@@ -258,9 +271,11 @@ def test_command_and_async_queue_modules_have_cohesive_responsibilities() -> Non
         "protocol_flow_commands": 600,
         "protocol_flow_payloads": 600,
         "protocol_command_options": 300,
+        "protocol_mset": 120,
         "protocol_compact_commands": 1_100,
         "async_queue_runtime": 1_100,
         "async_worker_completion": 250,
+        "async_queue_producer": 200,
         "async_queue_api": 850,
     }
 
@@ -588,18 +603,12 @@ def test_extracted_api_classes_have_canonical_facade_routes() -> None:
         async_worker_facade._EXPORTS["AsyncWorkflowClient"]
         == expected_root_routes["AsyncWorkflowClient"]
     )
-    for name in (
-        "AUTO_PARTITION_BUCKETS",
-        "AUTO_PARTITION_PREFIX",
-        "SERVER_SLOT_COUNT",
-        "_auto_partition_assignments",
-        "_auto_partition_index_for_id",
-        "_auto_partition_key",
-        "_auto_partition_owner",
-        "_auto_partition_server_shard",
-        "_owned_auto_partition_keys",
-    ):
-        assert async_worker_facade._EXPORTS[name] == ("ferricstore.async_partitioning", name)
+    reserved_partition_exports = {
+        name
+        for name in async_worker_facade._EXPORTS
+        if "auto_partition" in name.lower() or name == "AUTO_PARTITION_PREFIX"
+    }
+    assert not reserved_partition_exports
 
     assert "ferricstore.queue_api" not in _top_level_imports("worker")
     assert "ferricstore.workflow_client" not in _top_level_imports("workflow_runtime")
@@ -1100,7 +1109,6 @@ def test_client_and_pending_registries_use_typed_host_contracts() -> None:
 def test_facades_preserve_class_and_function_compatibility() -> None:
     from ferricstore.client_autobatch import AutobatchFlowClient, _BatchOp
     from ferricstore.client_core import FlowClient
-    from ferricstore.client_helpers import _auto_partition_key_for_id
     from ferricstore.legacy_worker import Worker
     from ferricstore.protocol_async import AsyncProtocolAdapter
     from ferricstore.protocol_async_pool import AsyncProtocolAdapterPool
@@ -1116,7 +1124,6 @@ def test_facades_preserve_class_and_function_compatibility() -> None:
         "FlowClient": FlowClient,
         "AutobatchFlowClient": AutobatchFlowClient,
         "_BatchOp": _BatchOp,
-        "_auto_partition_key_for_id": _auto_partition_key_for_id,
     }
     for name, value in expected.items():
         assert getattr(client_facade, name) is value
@@ -1207,6 +1214,7 @@ def test_flow_client_characterization_signatures_survive_decomposition() -> None
         "correlation_id: 'str | None' = None, run_at_ms: 'int | None' = None, "
         "now_ms: 'int | None' = None, priority: 'int | None' = None, "
         "idempotent: 'bool | None' = None, retention_ttl_ms: 'int | None' = None, "
+        "max_active_ms: 'int | float | str | None' = None, "
         "attributes: 'dict[str, Any] | None' = None, "
         "state_meta: 'dict[str, Any] | None' = None, values: 'dict[str, Any] | None' = None, "
         "value_refs: 'dict[str, str] | None' = None, return_record: 'bool' = False) "

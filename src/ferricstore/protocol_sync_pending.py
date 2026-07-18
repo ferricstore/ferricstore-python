@@ -23,6 +23,7 @@ from ferricstore.protocol_lifecycle import (
     PendingRequestCapacityError,
     SyncDeadlineScheduler,
 )
+from ferricstore.protocol_retry import request_outcome_error
 
 
 class SyncPendingRequestHost(Protocol):
@@ -130,10 +131,21 @@ class SyncPendingRequestRegistry:
             raise FerricStoreError(str(exc)) from exc
 
     def expire(self, request_id: int) -> None:
+        identity = _response_identity_map(self.owner).get(request_id)
         future, _trace = self.discard(request_id)
         if future is None:
             return
-        try_set_future_exception(future, FerricStoreError("protocol request timed out"))
+        timeout = TimeoutError("protocol request timed out")
+        error = (
+            FerricStoreError("protocol request timed out")
+            if identity is None
+            else request_outcome_error(
+                identity.opcode,
+                timeout,
+                message="protocol request timed out",
+            )
+        )
+        try_set_future_exception(future, error)
         self.owner._notify_idle_if_needed()
 
     def register(
@@ -237,6 +249,45 @@ class SyncPendingRequestRegistry:
             _response_identity_map(self.owner).pop(request_id, None)
             self.release_locked(request_id)
             return future, trace
+
+    def fail(
+        self,
+        exc: BaseException,
+        *,
+        transport_generation: int | None = None,
+    ) -> None:
+        pending: list[tuple[Future[ProtocolResponse], ResponseIdentity | None]] = []
+        with self.state_lock():
+            bindings = getattr(self.owner, "_pending_transport_bindings", None)
+            identities = _response_identity_map(self.owner)
+            for request_id, future in list(self.owner._pending.items()):
+                binding = None if bindings is None else bindings.get(request_id)
+                if (
+                    transport_generation is not None
+                    and binding is not None
+                    and binding[0] != transport_generation
+                ):
+                    continue
+                pending.append((future, identities.get(request_id)))
+                self.owner._pending.pop(request_id, None)
+                self.owner._pending_traces.pop(request_id, None)
+                _response_item_count_map(self.owner).pop(request_id, None)
+                identities.pop(request_id, None)
+                if bindings is not None:
+                    bindings.pop(request_id, None)
+                self.release_locked(request_id)
+        for future, identity in pending:
+            error = (
+                exc
+                if identity is None
+                else request_outcome_error(
+                    identity.opcode,
+                    exc,
+                    message="protocol connection closed",
+                )
+            )
+            try_set_future_exception(future, error)
+        self.owner._notify_idle_if_needed()
 
     def pending_socket(self, request_id: int) -> socket.socket | ssl.SSLSocket:
         with self.state_lock():

@@ -80,10 +80,7 @@ class SyncTopologyRoutingMixin:
     ) -> tuple[PreparedCommand, dict[str, Any]] | None:
         if not args:
             return None
-        try:
-            prepared = self._prepare_routed_command(args)
-        except Exception:
-            return None
+        prepared = self._prepare_routed_command(args)
         route = self._route_prepared(prepared)
         return None if route is None else (prepared, route)
 

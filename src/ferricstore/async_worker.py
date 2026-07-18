@@ -41,12 +41,6 @@ for _name in (
     "AsyncWorkflowHandler"
 ).split():
     _EXPORTS[_name] = ("ferricstore.async_queue_runtime", _name)
-for _name in (
-    "AUTO_PARTITION_BUCKETS AUTO_PARTITION_PREFIX SERVER_SLOT_COUNT "
-    "_auto_partition_assignments _auto_partition_index_for_id _auto_partition_key "
-    "_auto_partition_owner _auto_partition_server_shard _owned_auto_partition_keys"
-).split():
-    _EXPORTS[_name] = ("ferricstore.async_partitioning", _name)
 del _name
 
 __all__ = [name for name in _EXPORTS if not name.startswith("_")]

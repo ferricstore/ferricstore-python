@@ -23,7 +23,11 @@ import ferricstore.protocol as protocol_module
 import ferricstore.protocol_sync_batch as protocol_sync_batch_module
 from ferricstore.async_client import AsyncFlowClient
 from ferricstore.client import FlowClient
-from ferricstore.errors import FerricStoreError, InvalidCommandError
+from ferricstore.errors import (
+    FerricStoreError,
+    InvalidCommandError,
+    RequestOutcomeUnknownError,
+)
 from ferricstore.flow_routing import flow_command_route_keys
 from ferricstore.lifecycle_core import RetryableResourceSet
 from ferricstore.protocol import (
@@ -1415,8 +1419,12 @@ def test_sync_write_failure_retires_transport_and_fails_all_pending(
     unrelated: Future[Any] = Future()
     adapter._pending[99] = unrelated
 
-    with pytest.raises(OSError, match="partial write"):
+    with pytest.raises(FerricStoreError, match="protocol write failed") as raised:
         adapter._submit_request(0x0101, 1, {"key": "a"})
+
+    assert isinstance(raised.value.raw, OSError)
+    assert str(raised.value.raw) == "partial write"
+    assert raised.value.safe_to_retry is True
 
     assert adapter._sock is None
     assert sock.closed is True
@@ -1475,7 +1483,19 @@ def test_sync_old_transport_close_does_not_fail_replacement_requests(
     monkeypatch.setattr(protocol_module.socket, "create_connection", lambda *_a, **_k: new_socket)
     monkeypatch.setattr(adapter, "_reader_loop", lambda *_args: None)
     monkeypatch.setattr(adapter, "_request", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(adapter, "_response_value", lambda _response: None)
+    monkeypatch.setattr(
+        adapter,
+        "_response_value",
+        lambda _response: {
+            "protocol": "ferricstore-native",
+            "version": 1,
+            "auth_required": False,
+            "capabilities": {
+                "response_codecs": {"compact_response_opcodes": {}},
+                "limits": {"max_response_bytes": 64 * 1024 * 1024},
+            },
+        },
+    )
     adapter._connect_once()
     monkeypatch.setattr(adapter, "_send", lambda *_args, **_kwargs: None)
     _request_id, replacement_future = adapter._submit_request(0x0101, 1, {"key": "new"})
@@ -1564,8 +1584,14 @@ def test_sync_multiframe_write_failure_retires_transport(
     sock = FailingSocket()
     adapter._sock = sock  # type: ignore[assignment]
 
-    with pytest.raises(OSError, match="batch write failed"):
+    with pytest.raises(
+        RequestOutcomeUnknownError,
+        match="mutation outcome is unknown",
+    ) as raised:
         adapter.submit_commands([("GET", "a"), ("GET", "b")])
+
+    assert isinstance(raised.value.raw, OSError)
+    assert str(raised.value.raw) == "batch write failed"
 
     assert adapter._sock is None
     assert sock.closed is True
@@ -1606,11 +1632,12 @@ def test_sync_write_preserves_primary_error_when_timeout_restore_fails(
     sock = FailingSocket()
     adapter._sock = sock  # type: ignore[assignment]
 
-    with pytest.raises(OSError, match="partial write") as raised:
+    with pytest.raises(FerricStoreError, match="protocol write failed") as raised:
         adapter._submit_request(0x0101, 1, {"key": "a"})
 
-    assert isinstance(raised.value.__cause__, RuntimeError)
-    assert "timeout restore failed" in str(raised.value.__cause__)
+    assert isinstance(raised.value.raw, OSError)
+    assert isinstance(raised.value.raw.__cause__, RuntimeError)
+    assert "timeout restore failed" in str(raised.value.raw.__cause__)
     assert adapter._sock is None
     assert sock.closed is True
 
@@ -1876,8 +1903,12 @@ def test_async_drain_failure_retires_transport_and_fails_all_pending() -> None:
         unrelated = asyncio.get_running_loop().create_future()
         adapter._pending[99] = unrelated
 
-        with pytest.raises(OSError, match="drain failed"):
+        with pytest.raises(FerricStoreError, match="protocol write failed") as raised:
             await adapter._request_without_timeout(0x0101, 1, {"key": "a"})
+
+        assert isinstance(raised.value.raw, OSError)
+        assert str(raised.value.raw) == "drain failed"
+        assert raised.value.safe_to_retry is True
 
         assert adapter._writer is None
         assert writer.closed is True

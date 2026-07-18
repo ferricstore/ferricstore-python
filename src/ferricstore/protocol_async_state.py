@@ -37,7 +37,7 @@ from ferricstore.protocol_constants import (
     _DEFAULT_PROTOCOL_LANES,
     ProtocolResponse,
 )
-from ferricstore.protocol_framing import ResponseIdentity
+from ferricstore.protocol_framing import ResponseFrameAssembler, ResponseIdentity
 from ferricstore.protocol_lifecycle import (
     DEFAULT_MAX_BATCH_ITEMS,
     DEFAULT_MAX_INFLIGHT_REQUESTS,
@@ -45,6 +45,7 @@ from ferricstore.protocol_lifecycle import (
     PendingRequestBudget,
     PendingRequestCapacityError,
 )
+from ferricstore.protocol_negotiation import reset_hello_negotiation
 from ferricstore.protocol_tls import ProtocolTLSContextMixin
 
 _StateAdapter = TypeVar("_StateAdapter", bound="_AsyncProtocolStateMixin")
@@ -118,9 +119,13 @@ class _AsyncProtocolStateMixin(ProtocolTLSContextMixin):
         self._default_ssl_context: ssl.SSLContext | None = None
         self.heartbeat_interval = runtime_config.heartbeat_interval
         self.heartbeat_timeout = runtime_config.heartbeat_timeout
-        self.max_response_bytes = runtime_config.max_response_bytes
+        self._configured_max_response_bytes = runtime_config.max_response_bytes
+        self.max_response_bytes = self._configured_max_response_bytes
         self.max_response_chunks = runtime_config.max_response_chunks
-        self.max_decompressed_response_bytes = runtime_config.max_decompressed_response_bytes
+        self._configured_max_decompressed_response_bytes = (
+            runtime_config.max_decompressed_response_bytes
+        )
+        self.max_decompressed_response_bytes = self._configured_max_decompressed_response_bytes
         self.max_event_queue_size = runtime_config.max_event_queue_size
         self.max_decoded_collection_items = runtime_config.max_decoded_collection_items
         self.max_inflight_requests = runtime_config.max_inflight_requests
@@ -146,6 +151,14 @@ class _AsyncProtocolStateMixin(ProtocolTLSContextMixin):
         self._pending_traces: dict[int, dict[str, Any]] = {}
         self._pending_response_item_counts: dict[int, int] = {}
         self._pending_response_identities: dict[int, ResponseIdentity] = {}
+        self._response_frame_assembler = ResponseFrameAssembler(
+            max_body_bytes=self.max_response_bytes,
+            max_chunks=self.max_response_chunks,
+        )
+        self._compact_response_codecs: dict[int, str] = {}
+        self._auth_required = False
+        self._authenticated = False
+        self._negotiated_capabilities: Any = None
         self._events: deque[Any] = deque()
         self._events_cv = asyncio.Condition()
         self._event_error: BaseException | None = None
@@ -315,9 +328,9 @@ class _AsyncProtocolStateMixin(ProtocolTLSContextMixin):
             ssl_context=self.ssl_context,
             heartbeat_interval=self.heartbeat_interval,
             heartbeat_timeout=self.heartbeat_timeout,
-            max_response_bytes=self.max_response_bytes,
+            max_response_bytes=self._configured_max_response_bytes,
             max_response_chunks=self.max_response_chunks,
-            max_decompressed_response_bytes=self.max_decompressed_response_bytes,
+            max_decompressed_response_bytes=self._configured_max_decompressed_response_bytes,
             max_event_queue_size=self.max_event_queue_size,
             max_decoded_collection_items=self.max_decoded_collection_items,
             max_inflight_requests=self.max_inflight_requests,
@@ -351,6 +364,7 @@ class _AsyncProtocolStateMixin(ProtocolTLSContextMixin):
         self._reader_task = None
         self._heartbeat_task = None
         self._queued_write_bytes = 0
+        reset_hello_negotiation(self)
         retired_writers = getattr(self, "_retired_writers", None)
         if retired_writers is None:
             retired_writers = RetryableResourceSet(())

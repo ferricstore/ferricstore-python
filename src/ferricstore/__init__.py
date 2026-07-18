@@ -3,7 +3,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 _EXPORTS: dict[str, tuple[str, str]] = {
     "ApprovalResult": ("ferricstore.types", "ApprovalResult"),
@@ -73,7 +73,15 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "KeyInfo": ("ferricstore.types", "KeyInfo"),
     "LockHeldError": ("ferricstore.errors", "LockHeldError"),
     "LockNotOwnedError": ("ferricstore.errors", "LockNotOwnedError"),
+    "MINIMUM_SERVER_VERSION": (
+        "ferricstore.protocol_negotiation",
+        "MINIMUM_SERVER_VERSION",
+    ),
     "OverloadedError": ("ferricstore.errors", "OverloadedError"),
+    "RequestOutcomeUnknownError": (
+        "ferricstore.errors",
+        "RequestOutcomeUnknownError",
+    ),
     "ProtocolAdapter": ("ferricstore.protocol_sync", "ProtocolAdapter"),
     "ProtocolAdapterPool": ("ferricstore.protocol_sync_pool", "ProtocolAdapterPool"),
     "ProtocolCommand": ("ferricstore.protocol_constants", "ProtocolCommand"),
@@ -170,6 +178,7 @@ if TYPE_CHECKING:
         LockHeldError,
         LockNotOwnedError,
         OverloadedError,
+        RequestOutcomeUnknownError,
         StaleLeaseError,
     )
     from ferricstore.protocol import (
@@ -184,6 +193,7 @@ if TYPE_CHECKING:
         RoutingTopology,
         TopologyProtocolAdapterPool,
     )
+    from ferricstore.protocol_negotiation import MINIMUM_SERVER_VERSION
     from ferricstore.retry_policy import RetryPolicy
     from ferricstore.schedule_types import ScheduleResult
     from ferricstore.types import (
@@ -242,6 +252,7 @@ if TYPE_CHECKING:
 
 
 __all__ = [
+    "MINIMUM_SERVER_VERSION",
     "ApprovalResult",
     "AsyncCommandExecutor",
     "AsyncCommandPipeline",
@@ -312,6 +323,7 @@ __all__ = [
     "QueueWorkerResult",
     "RateLimitResult",
     "RawCodec",
+    "RequestOutcomeUnknownError",
     "Retry",
     "RetryPolicy",
     "RoutingTopology",

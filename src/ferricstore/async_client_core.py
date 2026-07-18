@@ -33,6 +33,7 @@ from ferricstore.client_helpers import (
     _append,
     _ok_response,
     _parse_kv_response,
+    _validate_ownership_token,
 )
 from ferricstore.client_markers import SyncFlowClientMarker
 from ferricstore.codecs import Codec, RawCodec
@@ -348,24 +349,40 @@ class _AsyncClientCoreMixin(_AsyncClientMixinBase):
         if hint is not None:
             args.append(hint)
         response = await self.executor.execute_command(*args)
-        status = response[0].decode() if isinstance(response[0], bytes) else str(response[0])
+        return FetchOrComputeResult.from_resp(response, decode=self.codec.decode)
 
-        if status == "hit":
-            return FetchOrComputeResult(status="hit", value=self.codec.decode(response[1]))
-        return FetchOrComputeResult(status="compute", compute_token=response[1])
-
-    async def fetch_or_compute_result(self, key: str, value: Any, *, ttl_ms: int) -> bool:
+    async def fetch_or_compute_result(
+        self,
+        key: str,
+        ownership_token: bytes,
+        value: Any,
+        *,
+        ttl_ms: int,
+    ) -> bool:
+        _validate_ownership_token(ownership_token)
         response = await self.executor.execute_command(
             "FETCH_OR_COMPUTE_RESULT",
             key,
+            ownership_token,
             self.codec.encode(value),
             ttl_ms,
         )
         return _ok_response(response)
 
-    async def fetch_or_compute_error(self, key: str, message: str) -> bool:
+    async def fetch_or_compute_error(
+        self,
+        key: str,
+        ownership_token: bytes,
+        message: str,
+    ) -> bool:
+        _validate_ownership_token(ownership_token)
         return _ok_response(
-            await self.executor.execute_command("FETCH_OR_COMPUTE_ERROR", key, message)
+            await self.executor.execute_command(
+                "FETCH_OR_COMPUTE_ERROR",
+                key,
+                ownership_token,
+                message,
+            )
         )
 
     async def cluster_health(self) -> Any:
