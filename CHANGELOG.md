@@ -6,7 +6,13 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
-## 0.6.1
+## 0.6.2
+
+- Stabilized live release validation for eventually projected binary Flow
+  claims and removed an SDK test dependency on server-internal LMDB migration
+  health.
+
+## 0.6.1 (unpublished)
 
 - Preserved arbitrary binary partition keys when decoding Flow effect results
   and added the canonical public `PartitionKey` type alias.

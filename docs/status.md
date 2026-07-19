@@ -5,7 +5,7 @@ FerricStore Python SDK is public alpha.
 Current version:
 
 ```text
-0.6.1
+0.6.2
 ```
 
 The SDK requires FerricStore `0.9.1` or newer and continues to use native wire
