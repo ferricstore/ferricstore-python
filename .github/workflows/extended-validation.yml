@@ -23,7 +23,7 @@ jobs:
       FERRICSTORE_NATIVE_ADVERTISE_PORT: "56400"
       FERRICSTORE_URL: ferric://127.0.0.1:56400
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
@@ -55,7 +55,7 @@ jobs:
       FERRICSTORE_TLS_URL: ferrics://127.0.0.1:56421
       FERRICSTORE_PLAIN_URL: ferric://127.0.0.1:56420
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
@@ -106,7 +106,7 @@ jobs:
       FERRICSTORE_URL: ferric://127.0.0.1:56410
       FERRICSTORE_RECOVERY_PROJECT: sdk-recovery
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
@@ -142,7 +142,7 @@ jobs:
       FERRICSTORE_CLUSTER_COMPOSE_PROJECT: sdk-cluster
       FERRICSTORE_CLUSTER_COMPOSE_FILE: docker-compose.cluster.yml
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
@@ -178,7 +178,7 @@ jobs:
       FERRICSTORE_NATIVE_ADVERTISE_PORT: "56440"
       FERRICSTORE_URL: ferric://127.0.0.1:56440
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
