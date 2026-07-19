@@ -2,12 +2,12 @@
 
 Python SDK for FerricStore and FerricFlow.
 
-Status: public alpha `0.5.1`. APIs may change before `1.0`, but the SDK is
+Status: public alpha `0.6.1`. APIs may change before `1.0`, but the SDK is
 tested against command construction, queue/workflow handlers, leases, retries,
 history, indexed attributes, named values, idempotent create, worker loops,
 async flows, and local FerricStore integration scenarios.
 
-Version `0.5.1` requires FerricStore `0.8.0` or newer. This is a breaking beta
+Version `0.6.1` requires FerricStore `0.9.1` or newer. This is a breaking beta
 contract update; the native wire protocol remains v1.
 
 FerricFlow keeps each workflow or job's state and history in one durable place. It
@@ -94,6 +94,27 @@ emails.enqueue("email-3", payload=b"welcome", partition_key="tenant-a:email")
 
 FIFO states require a `partition_key`; priority is for parallel states.
 
+Policy writes are deep patches by default and return a typed snapshot with a
+monotonic generation. Use compare-and-swap when coordinating policy writers:
+
+```python
+from ferricstore import StalePolicyGenerationError
+
+snapshot = flow.policy_get("email")
+try:
+    snapshot = flow.install_policy(
+        "email",
+        expected_generation=snapshot.generation,
+        states={"queued": FlowStatePolicy.fifo()},
+    )
+except StalePolicyGenerationError:
+    snapshot = flow.policy_get("email")
+```
+
+Workflow `install_policy()` calls default to full replacement because the
+workflow definition is the source of truth. Pass `replace=False` to request a
+patch explicitly.
+
 ### 4. Run a queue worker
 
 ```python
@@ -150,6 +171,10 @@ order.start(
 
 order.worker(states=["created", "charged"], concurrency=10, batch_size=100).run()
 ```
+
+Derived workflow partitions use collision-free `fpk:<byte-length>:<value>`
+encoding in 0.6.0. Drain flows created with the old colon-joined derived keys
+before upgrading. Explicit `partition_key` values are unchanged.
 
 ### 6. Store and fetch named values
 

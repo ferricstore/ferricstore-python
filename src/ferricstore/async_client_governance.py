@@ -17,6 +17,8 @@ from ferricstore.client_helpers import (
 )
 from ferricstore.config_validation import (
     normalize_optional_max_active_ms,
+    validate_bool,
+    validate_optional_policy_generation,
     validate_string_sequence,
 )
 from ferricstore.governance_validation import (
@@ -37,6 +39,7 @@ from ferricstore.governance_validation import (
     validate_nonempty_string,
     validate_retention_cleanup,
 )
+from ferricstore.policy_types import PolicySnapshot
 from ferricstore.retry_policy import RetryPolicy
 from ferricstore.types import (
     ApprovalResult,
@@ -54,7 +57,7 @@ class _AsyncClientGovernanceMixin(_AsyncClientMixinBase):
         parent_flow_id: str,
         children: builtins.list[ChildSpec],
         *,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         lease_token: bytes | None = None,
         fencing_token: int | None = None,
         group_id: str = "default",
@@ -140,11 +143,17 @@ class _AsyncClientGovernanceMixin(_AsyncClientMixinBase):
         states: dict[str, FlowStatePolicyLike] | None = None,
         indexed_state_meta: str | None = None,
         max_active_ms: int | float | str | None = None,
-    ) -> Any:
+        replace: bool = False,
+        expected_generation: int | None = None,
+    ) -> PolicySnapshot:
         validate_nonempty_string(type, name="type")
+        replace = validate_bool(replace, name="replace")
+        expected_generation = validate_optional_policy_generation(expected_generation)
         if indexed_state_meta is not None:
             validate_nonempty_string(indexed_state_meta, name="indexed_state_meta")
         args: builtins.list[Any] = ["FLOW.POLICY.SET", type]
+        _append(args, "EXPECTED_GENERATION", expected_generation)
+        _append_bool(args, "REPLACE", replace)
         _append(args, "MAX_ACTIVE_MS", normalize_optional_max_active_ms(max_active_ms))
         _append(args, "INDEXED_STATE_META", indexed_state_meta)
         if retry is not None:
@@ -153,19 +162,19 @@ class _AsyncClientGovernanceMixin(_AsyncClientMixinBase):
             validate_nonempty_string(state, name="state")
             args.extend(["STATE", state])
             self._append_state_policy(args, policy)
-        return await self.executor.execute_command(*args)
+        return PolicySnapshot.from_resp(await self.executor.execute_command(*args))
 
-    async def policy_get(self, type: str, *, state: str | None = None) -> dict[Any, Any]:
+    async def policy_get(self, type: str, *, state: str | None = None) -> PolicySnapshot:
         validate_nonempty_string(type, name="type")
         args: builtins.list[Any] = ["FLOW.POLICY.GET", type]
         _append(args, "STATE", state)
-        return dict(await self.executor.execute_command(*args) or {})
+        return PolicySnapshot.from_resp(await self.executor.execute_command(*args))
 
     async def governance_ledger(
         self,
         id: str,
         *,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         limit: int | None = None,
         from_ms: int | None = None,
         to_ms: int | None = None,
@@ -285,7 +294,7 @@ class _AsyncClientGovernanceMixin(_AsyncClientMixinBase):
         *,
         status: str | None = None,
         scope: str | None = None,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         flow_id: str | None = None,
         limit: int | None = None,
     ) -> builtins.list[ApprovalResult]:
@@ -312,7 +321,7 @@ class _AsyncClientGovernanceMixin(_AsyncClientMixinBase):
         self,
         *,
         scope: str | None = None,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         status: str | None = None,
         flow_id: str | None = None,
         limit: int | None = None,
@@ -498,7 +507,7 @@ class _AsyncClientGovernanceMixin(_AsyncClientMixinBase):
         self,
         *,
         scope: str | None = None,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         limit: int | None = None,
     ) -> builtins.list[BudgetResult]:
         validate_budget_list(scope=scope, partition_key=partition_key, limit=limit)
@@ -597,7 +606,7 @@ class _AsyncClientGovernanceMixin(_AsyncClientMixinBase):
         self,
         *,
         scope: str | None = None,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         limit: int | None = None,
         now_ms: int | None = None,
     ) -> builtins.list[dict[str, Any]]:

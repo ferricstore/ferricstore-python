@@ -43,6 +43,8 @@ class FakeExecutor:
 
     def execute_command(self, *args):
         self.calls.append(args)
+        if args[0] in {"FLOW.POLICY.SET", "FLOW.POLICY.GET"}:
+            return {b"type": str(args[1]).encode(), b"generation": 1}
         if args[0] in {"FLOW.EFFECT.RESERVE", "FLOW.EFFECT.CONFIRM", "FLOW.EFFECT.FAIL"}:
             status = {
                 "FLOW.EFFECT.RESERVE": b"reserved",
@@ -299,7 +301,7 @@ def test_workflow_create_uses_partition_by():
 
     workflow.create("f1", tenant_id="tenant", order_id="order", payload=b"p", now_ms=100)
 
-    assert "tenant:order" in executor.calls[0]
+    assert "fpk:6:tenant5:order" in executor.calls[0]
 
 
 def test_workflow_create_preserves_explicit_empty_partition_key():
@@ -336,7 +338,7 @@ def test_workflow_enqueue_uses_ack_only_create_with_partition_by():
 
     workflow.enqueue("f1", tenant_id="tenant", order_id="order", payload=b"p", now_ms=100)
 
-    assert "tenant:order" in executor.calls[0]
+    assert "fpk:6:tenant5:order" in executor.calls[0]
     assert len(executor.calls) == 1
 
 
@@ -1276,7 +1278,7 @@ def test_flow_workflow_constructor_registers_state_handlers_and_partition_by():
     workflow.create("f1", tenant_id="tenant-a", order_id="order-1", payload=b"p", now_ms=100)
 
     assert workflow._states["created"].on_error == "fail"
-    assert executor.calls[0][executor.calls[0].index("PARTITION") + 1] == "tenant-a:order-1"
+    assert executor.calls[0][executor.calls[0].index("PARTITION") + 1] == "fpk:8:tenant-a7:order-1"
 
 
 def test_flow_workflow_rejects_scalar_partition_by_before_owning_clients() -> None:
@@ -1312,7 +1314,7 @@ def test_workflow_client_creates_workflow_and_delegates_flow_commands():
     client.command("PING")
 
     assert executor.calls[0][0] == "FLOW.CREATE"
-    assert executor.calls[0][executor.calls[0].index("PARTITION") + 1] == "tenant-a:order-1"
+    assert executor.calls[0][executor.calls[0].index("PARTITION") + 1] == "fpk:8:tenant-a7:order-1"
     assert executor.calls[1] == ("PING",)
 
 
@@ -1332,7 +1334,7 @@ def test_workflow_start_and_claim_uses_initial_state_and_partitioning():
     assert started.id == "f1"
     assert executor.calls[0][:2] == ("FLOW.START_AND_CLAIM", "f1")
     assert executor.calls[0][executor.calls[0].index("INITIAL_STATE") + 1] == "created"
-    assert executor.calls[0][executor.calls[0].index("PARTITION") + 1] == "tenant-a:order-1"
+    assert executor.calls[0][executor.calls[0].index("PARTITION") + 1] == "fpk:8:tenant-a7:order-1"
 
 
 def test_workflow_context_step_continue_uses_current_lease_and_state():
@@ -1425,7 +1427,7 @@ def test_flow_workflow_run_steps_many_uses_partition_by_attrs():
         "NOW",
         101,
         "ITEMS",
-        [{"id": "order-flow-1", "partition_key": "tenant-a:order-1"}],
+        [{"id": "order-flow-1", "partition_key": "fpk:8:tenant-a7:order-1"}],
     )
 
 

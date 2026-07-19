@@ -24,7 +24,7 @@ class Worker:
         *,
         worker: str,
         states: list[str] | None = None,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         limit: int = 10,
         idle_sleep_s: float = 0.1,
         max_idle_sleep_s: float | None = None,

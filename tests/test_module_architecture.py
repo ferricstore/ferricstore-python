@@ -1209,7 +1209,7 @@ def test_flow_client_characterization_signatures_survive_decomposition() -> None
         "from_url": "(url: 'str', *, codec: 'Codec | None' = None, "
         "backpressure: 'BackpressurePolicy | None' = None, **kwargs: 'Any') -> 'FlowClient'",
         "create": "(self, id: 'str', *, type: 'str', state: 'str' = 'queued', "
-        "payload: 'Any' = None, partition_key: 'str | None' = None, "
+        "payload: 'Any' = None, partition_key: 'str | bytes | None' = None, "
         "parent_flow_id: 'str | None' = None, root_flow_id: 'str | None' = None, "
         "correlation_id: 'str | None' = None, run_at_ms: 'int | None' = None, "
         "now_ms: 'int | None' = None, priority: 'int | None' = None, "
@@ -1221,8 +1221,8 @@ def test_flow_client_characterization_signatures_survive_decomposition() -> None
         "-> 'FlowRecord | bytes'",
         "claim_due": "(self, type: 'str', *, state: 'str | None' = None, "
         "states: 'builtins.list[str] | None' = None, worker: 'str', "
-        "partition_key: 'str | None' = None, "
-        "partition_keys: 'builtins.list[str] | None' = None, lease_ms: 'int' = 30000, "
+        "partition_key: 'str | bytes | None' = None, "
+        "partition_keys: 'Sequence[str | bytes] | None' = None, lease_ms: 'int' = 30000, "
         "limit: 'int' = 1, priority: 'int | None' = None, now_ms: 'int | None' = None, "
         "block_ms: 'int | None' = None, reclaim_expired: 'bool | None' = None, "
         "reclaim_ratio: 'int | None' = None, include_record: 'bool | None' = None, "

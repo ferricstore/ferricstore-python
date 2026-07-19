@@ -45,6 +45,7 @@ from ferricstore.lifecycle_core import (
     raise_primary_with_cleanup,
 )
 from ferricstore.mutation_core import JobMutation
+from ferricstore.policy_types import PolicySnapshot
 from ferricstore.retry_policy import RetryPolicy
 from ferricstore.types import (
     BudgetPolicy,
@@ -295,7 +296,9 @@ class AsyncWorkflow(_AsyncWorkflowProducerMixin):
         retry: RetryPolicy | None = None,
         indexed_state_meta: str | None = None,
         max_active_ms: int | float | str | None = None,
-    ) -> Any:
+        replace: bool = True,
+        expected_generation: int | None = None,
+    ) -> PolicySnapshot:
         if retry_policy is not None and retry is not None:
             raise ValueError("retry_policy and retry are mutually exclusive")
         resolved_retry_policy = (
@@ -311,7 +314,12 @@ class AsyncWorkflow(_AsyncWorkflowProducerMixin):
                 mode=self.state_modes.get(state_name),
                 retry=self.retry_policies.get(state_name),
             )
-        kwargs: dict[str, Any] = {"retry": resolved_retry_policy, "states": state_policies}
+        kwargs: dict[str, Any] = {
+            "retry": resolved_retry_policy,
+            "states": state_policies,
+            "replace": replace,
+            "expected_generation": expected_generation,
+        }
         if indexed_state_meta is not None:
             kwargs["indexed_state_meta"] = indexed_state_meta
         if max_active_ms is not None:
@@ -722,12 +730,14 @@ class AsyncWorkflow(_AsyncWorkflowProducerMixin):
         self._state_cursors[worker_index] += 1
         return state_name
 
-    def _next_claim_partition(self, worker_index: int) -> tuple[str | None, list[str] | None]:
+    def _next_claim_partition(
+        self, worker_index: int
+    ) -> tuple[str | bytes | None, list[str | bytes] | None]:
         del worker_index
         return None, None
 
     @staticmethod
-    def _uniform_partition_key(jobs: list[ClaimedFlow]) -> str | None:
+    def _uniform_partition_key(jobs: list[ClaimedFlow]) -> str | bytes | None:
         first = jobs[0].partition_key
         if first is not None and all(job.partition_key == first for job in jobs):
             return first

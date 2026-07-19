@@ -649,13 +649,14 @@ effect["status"]
 approval.get("reason")
 ```
 
-The public result classes are `ScheduleResult`, `EffectResult`,
+The public result classes are `ScheduleResult`, `EffectResult`, `PolicySnapshot`,
 `ApprovalResult`, `CircuitBreakerStatus`, `BudgetResult`, and
 `GovernanceOverview`.
 
 ## `install_policy`
 
-Installs retry policy globally or per state. State mode policy is also
+Installs retry policy globally or per state. Direct client calls are deep
+patches by default (`replace=False`). State mode policy is also
 supported; FIFO is opt-in per state and requires explicit `partition_key` when
 records enter that state.
 
@@ -671,6 +672,24 @@ client.install_policy(
     },
 )
 ```
+
+Every successful read or write returns a typed, mapping-compatible
+`PolicySnapshot`. Use its monotonic generation for compare-and-swap updates:
+
+```python
+snapshot = client.policy_get("order")
+updated = client.install_policy(
+    "order",
+    expected_generation=snapshot.generation,
+    states={"dispatch": FlowStatePolicy.parallel()},
+)
+```
+
+Generations must be integers in `0..9_007_199_254_740_991`. A mismatch raises
+`StalePolicyGenerationError` and is never retried automatically. Set
+`replace=True` for a full replacement that resets omitted fields. Declarative
+workflow `install_policy()` calls default to replacement; pass `replace=False`
+to patch instead.
 
 ## Enterprise invocation helpers
 
@@ -700,6 +719,7 @@ client.invocation_partition_list("send-email", scope="tenant:acme")
 
 ```python
 policy = client.policy_get("order", state="charge")
+print(policy.generation, policy.mode)
 ```
 
 ## `retention_cleanup`

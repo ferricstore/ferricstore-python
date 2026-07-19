@@ -522,6 +522,7 @@ _BOOL_FIELDS = {
     "override",
     "overwrite",
     "reclaim_expired",
+    "replace",
     "rev",
     "terminal_only",
     "terminal_local_only",
@@ -556,8 +557,10 @@ _COMPACT_COLLECTION_MIN_ITEM_BYTES = {
 
 
 _FLOW_POLICY_FIELD_NAMES = {
+    "EXPECTED_GENERATION": "expected_generation",
     "INDEXED_ATTRIBUTES": "indexed_attributes",
     "MODE": "mode",
+    "REPLACE": "replace",
 }
 
 

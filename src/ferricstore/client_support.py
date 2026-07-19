@@ -30,7 +30,7 @@ class _ClientSupportMixin(_ClientMixinBase):
     def _append_claimed_items(
         self,
         args: builtins.list[Any],
-        partition_key: str | None,
+        partition_key: str | bytes | None,
         items: builtins.list[ClaimedFlow],
         command: str,
     ) -> builtins.list[Any]:
@@ -39,7 +39,7 @@ class _ClientSupportMixin(_ClientMixinBase):
     def _append_fenced_items(
         self,
         args: builtins.list[Any],
-        partition_key: str | None,
+        partition_key: str | bytes | None,
         items: builtins.list[FencedItem],
         command: str,
         *,
@@ -93,7 +93,7 @@ class _ClientSupportMixin(_ClientMixinBase):
         self,
         value: Any,
         id: str,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
     ) -> FlowRecord:
         if isinstance(value, dict):
             return self._record(value)

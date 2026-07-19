@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.14"]
-        server-version: ["0.8.0"]
+        server-version: ["0.9.1"]
     env:
       FERRICSTORE_IMAGE: ghcr.io/ferricstore/ferricstore:${{ matrix.server-version }}
       FERRICSTORE_PORT: "56400"
@@ -49,7 +49,7 @@ jobs:
     name: TLS and ACL authentication
     runs-on: ubuntu-latest
     env:
-      FERRICSTORE_IMAGE: ghcr.io/ferricstore/ferricstore:0.8.0
+      FERRICSTORE_IMAGE: ghcr.io/ferricstore/ferricstore:0.9.1
       FERRICSTORE_SECURITY_PLAIN_PORT: "56420"
       FERRICSTORE_SECURITY_TLS_PORT: "56421"
       FERRICSTORE_TLS_URL: ferrics://127.0.0.1:56421
@@ -100,7 +100,7 @@ jobs:
     name: Prolonged outage and restart recovery
     runs-on: ubuntu-latest
     env:
-      FERRICSTORE_IMAGE: ghcr.io/ferricstore/ferricstore:0.8.0
+      FERRICSTORE_IMAGE: ghcr.io/ferricstore/ferricstore:0.9.1
       FERRICSTORE_PORT: "56410"
       FERRICSTORE_NATIVE_ADVERTISE_PORT: "56410"
       FERRICSTORE_URL: ferric://127.0.0.1:56410
@@ -133,7 +133,7 @@ jobs:
     name: Three-node leader failover
     runs-on: ubuntu-latest
     env:
-      FERRICSTORE_IMAGE: ghcr.io/ferricstore/ferricstore:0.8.0
+      FERRICSTORE_IMAGE: ghcr.io/ferricstore/ferricstore:0.9.1
       FERRICSTORE_CLUSTER_PORT_0: "56430"
       FERRICSTORE_CLUSTER_PORT_1: "56431"
       FERRICSTORE_CLUSTER_PORT_2: "56432"
@@ -173,7 +173,7 @@ jobs:
     name: Sync and async soak
     runs-on: ubuntu-latest
     env:
-      FERRICSTORE_IMAGE: ghcr.io/ferricstore/ferricstore:0.8.0
+      FERRICSTORE_IMAGE: ghcr.io/ferricstore/ferricstore:0.9.1
       FERRICSTORE_PORT: "56440"
       FERRICSTORE_NATIVE_ADVERTISE_PORT: "56440"
       FERRICSTORE_URL: ferric://127.0.0.1:56440

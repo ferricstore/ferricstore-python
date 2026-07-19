@@ -14,6 +14,7 @@ from ferricstore.config_validation import (
     validate_optional_flow_priority,
     validate_optional_nonnegative_int,
     validate_optional_positive_int,
+    validate_partition_key_sequence,
     validate_positive_int,
     validate_string_sequence,
 )
@@ -49,8 +50,8 @@ class WorkflowWorker:
         priority: int | None = 0,
         reclaim_expired: bool | None = None,
         reclaim_ratio: int | None = None,
-        partition_key: str | None = None,
-        partition_keys: Sequence[str] | None = None,
+        partition_key: str | bytes | None = None,
+        partition_keys: Sequence[str | bytes] | None = None,
         claim_partition_batch_size: int | None = None,
         block_ms: int | None = None,
         idle_sleep_s: float = 0.1,
@@ -67,13 +68,7 @@ class WorkflowWorker:
             else None
         )
         resolved_partition_keys = (
-            list(
-                validate_string_sequence(
-                    partition_keys,
-                    name="partition_keys",
-                    allow_empty=False,
-                )
-            )
+            list(validate_partition_key_sequence(partition_keys, allow_empty=False))
             if partition_keys is not None
             else None
         )
@@ -448,7 +443,9 @@ class WorkflowWorker:
         self._state_cursor = (self._state_cursor + 1) % len(self.states)
         return state_name
 
-    def _next_claim_target(self) -> tuple[str, str | None, builtins.list[str] | None]:
+    def _next_claim_target(
+        self,
+    ) -> tuple[str, str | bytes | None, builtins.list[str | bytes] | None]:
         if self.partition_key is not None:
             return self._next_state(), self.partition_key, None
         if not self.partition_keys:
@@ -468,7 +465,9 @@ class WorkflowWorker:
             return state_name, keys[0], None
         return state_name, None, keys
 
-    def _next_claim_partition(self) -> tuple[str | None, builtins.list[str] | None]:
+    def _next_claim_partition(
+        self,
+    ) -> tuple[str | bytes | None, builtins.list[str | bytes] | None]:
         if self.partition_key is not None:
             return self.partition_key, None
         if not self.partition_keys:

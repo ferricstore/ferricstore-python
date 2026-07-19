@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from numbers import Real
 
 MAX_FLOW_ACTIVE_MS = 31_536_000_000
+MAX_POLICY_GENERATION = 9_007_199_254_740_991
 
 
 def validate_positive_int(value: object, *, name: str) -> int:
@@ -36,6 +37,17 @@ def validate_optional_nonnegative_int(value: object | None, *, name: str) -> int
     if value is None:
         return None
     return validate_nonnegative_int(value, name=name)
+
+
+def validate_optional_policy_generation(value: object | None) -> int | None:
+    """Validate the cross-SDK safe-integer range used by policy CAS."""
+    if value is None:
+        return None
+    return validate_bounded_nonnegative_int(
+        value,
+        name="expected_generation",
+        maximum=MAX_POLICY_GENERATION,
+    )
 
 
 def normalize_optional_max_active_ms(value: object | None) -> int | str | None:
@@ -115,6 +127,35 @@ def validate_string_sequence(
     if any(not isinstance(item, str) or not item for item in items):
         raise ValueError(f"{name} must contain only non-empty strings")
     return items
+
+
+def validate_partition_key_sequence(
+    value: object,
+    *,
+    name: str = "partition_keys",
+    allow_empty: bool = True,
+) -> tuple[str | bytes, ...]:
+    """Validate partition identifiers without corrupting arbitrary binary keys."""
+    if isinstance(value, (str, bytes, bytearray, memoryview)) or not isinstance(value, Sequence):
+        raise ValueError(f"{name} must be a sequence of strings or bytes")
+    items = tuple(value)
+    if not allow_empty and not items:
+        raise ValueError(f"{name} must be non-empty")
+
+    normalized: list[str | bytes] = []
+    for item in items:
+        if isinstance(item, str):
+            if not item:
+                raise ValueError(f"{name} must contain only non-empty strings or bytes")
+            normalized.append(item)
+        elif isinstance(item, (bytes, bytearray, memoryview)):
+            binary = bytes(item)
+            if not binary:
+                raise ValueError(f"{name} must contain only non-empty strings or bytes")
+            normalized.append(binary)
+        else:
+            raise ValueError(f"{name} must contain only non-empty strings or bytes")
+    return tuple(normalized)
 
 
 def validate_host(value: object) -> str:

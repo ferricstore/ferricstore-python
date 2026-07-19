@@ -12,6 +12,7 @@ from ferricstore.config_validation import (
     validate_optional_flow_priority,
     validate_optional_nonnegative_int,
     validate_optional_positive_int,
+    validate_partition_key_sequence,
     validate_positive_int,
     validate_string_sequence,
 )
@@ -24,7 +25,7 @@ class QueueWorkerRuntimeConfig:
     """Validated configuration shared by sync and async queue workers."""
 
     states: list[str] | None
-    partition_keys: list[str] | None
+    partition_keys: list[str | bytes] | None
     concurrency: int
     batch_size: int
     workers: int
@@ -54,8 +55,8 @@ class QueueWorkerRuntimeConfig:
         *,
         state: str | None,
         states: Sequence[str] | None,
-        partition_key: str | None,
-        partition_keys: Sequence[str] | None,
+        partition_key: str | bytes | None,
+        partition_keys: Sequence[str | bytes] | None,
         concurrency: int,
         batch_size: int,
         workers: int,
@@ -90,13 +91,7 @@ class QueueWorkerRuntimeConfig:
             else None
         )
         resolved_partition_keys = (
-            list(
-                validate_string_sequence(
-                    partition_keys,
-                    name="partition_keys",
-                    allow_empty=False,
-                )
-            )
+            list(validate_partition_key_sequence(partition_keys, allow_empty=False))
             if partition_keys is not None
             else None
         )

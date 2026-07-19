@@ -16,6 +16,7 @@ from ferricstore.lifecycle_core import (
     raise_primary_with_cleanup,
 )
 from ferricstore.mutation_core import JobMutation
+from ferricstore.policy_types import PolicySnapshot
 from ferricstore.retry_policy import RetryPolicy
 from ferricstore.types import (
     BudgetPolicy,
@@ -140,7 +141,9 @@ class Workflow(_WorkflowProducerMixin):
         retry: RetryPolicy | None = None,
         indexed_state_meta: str | None = None,
         max_active_ms: int | float | str | None = None,
-    ) -> Any:
+        replace: bool = True,
+        expected_generation: int | None = None,
+    ) -> PolicySnapshot:
         if retry_policy is not None and retry is not None:
             raise ValueError("retry_policy and retry are mutually exclusive")
         resolved_retry_policy = (
@@ -157,14 +160,19 @@ class Workflow(_WorkflowProducerMixin):
                     mode=config.mode,
                     retry=config.retry,
                 )
-        kwargs: dict[str, Any] = {"retry": resolved_retry_policy, "states": state_policies}
+        kwargs: dict[str, Any] = {
+            "retry": resolved_retry_policy,
+            "states": state_policies,
+            "replace": replace,
+            "expected_generation": expected_generation,
+        }
         if indexed_state_meta is not None:
             kwargs["indexed_state_meta"] = indexed_state_meta
         if max_active_ms is not None:
             kwargs["max_active_ms"] = max_active_ms
         return self.client.install_policy(self.type, **kwargs)
 
-    def policy_get(self, *, state: str | None = None) -> dict[Any, Any]:
+    def policy_get(self, *, state: str | None = None) -> PolicySnapshot:
         return self.client.policy_get(self.type, state=state)
 
     def signal(self, id: str, **kwargs: Any) -> Any:
@@ -189,8 +197,8 @@ class Workflow(_WorkflowProducerMixin):
         state_name: str,
         *,
         worker: str,
-        partition_key: str | None = None,
-        partition_keys: builtins.list[str] | None = None,
+        partition_key: str | bytes | None = None,
+        partition_keys: Sequence[str | bytes] | None = None,
         limit: int = 1,
         priority: int | None = None,
         reclaim_expired: bool | None = None,
@@ -242,7 +250,7 @@ class Workflow(_WorkflowProducerMixin):
         self,
         *,
         worker: str,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         lease_ms: int = 30_000,
         limit: int = 1,
     ) -> builtins.list[FlowRecord]:
@@ -262,8 +270,8 @@ class Workflow(_WorkflowProducerMixin):
         state_name: str,
         *,
         worker: str,
-        partition_key: str | None = None,
-        partition_keys: builtins.list[str] | None = None,
+        partition_key: str | bytes | None = None,
+        partition_keys: Sequence[str | bytes] | None = None,
         limit: int = 1,
         priority: int | None = None,
         reclaim_expired: bool | None = None,
@@ -286,8 +294,8 @@ class Workflow(_WorkflowProducerMixin):
         state_name: str,
         *,
         worker: str,
-        partition_key: str | None = None,
-        partition_keys: builtins.list[str] | None = None,
+        partition_key: str | bytes | None = None,
+        partition_keys: Sequence[str | bytes] | None = None,
         limit: int = 1,
         priority: int | None = None,
         reclaim_expired: bool | None = None,
@@ -322,7 +330,7 @@ class Workflow(_WorkflowProducerMixin):
     ) -> int:
         return cast(int, self._handle_known_state_batch(state_name, jobs, materialize=False))
 
-    def get(self, id: str, *, partition_key: str | None = None) -> FlowRecord | None:
+    def get(self, id: str, *, partition_key: str | bytes | None = None) -> FlowRecord | None:
         return self.client.get(id, partition_key=partition_key)
 
     def history(self, id: str, **kwargs: Any) -> builtins.list[Any]:
@@ -378,7 +386,7 @@ class Workflow(_WorkflowProducerMixin):
         id: str,
         *,
         payload: Any = None,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
     ) -> ChildSpec:
@@ -587,7 +595,9 @@ class Workflow(_WorkflowProducerMixin):
         return job.run_state or job.state
 
     @staticmethod
-    def _uniform_partition_key(jobs: Sequence[FlowRecord | ClaimedFlow]) -> str | None:
+    def _uniform_partition_key(
+        jobs: Sequence[FlowRecord | ClaimedFlow],
+    ) -> str | bytes | None:
         first = jobs[0].partition_key
         if first is not None and all(job.partition_key == first for job in jobs):
             return first

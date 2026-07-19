@@ -275,9 +275,9 @@ def _shared_create_many_state_meta(
 
 def _run_steps_many_items(
     items: builtins.list[str | dict[str, Any] | CreateItem],
-    partition_key: str | None,
-) -> builtins.list[dict[str, str]]:
-    normalized: builtins.list[dict[str, str]] = []
+    partition_key: str | bytes | None,
+) -> builtins.list[dict[str, str | bytes]]:
+    normalized: builtins.list[dict[str, str | bytes]] = []
     for item in items:
         if isinstance(item, CreateItem):
             id = item.id
@@ -288,8 +288,8 @@ def _run_steps_many_items(
                 raise ValueError("run_steps_many item id must be a non-empty string")
             id = raw_id
             raw_partition = item.get("partition_key", partition_key)
-            if raw_partition is not None and not isinstance(raw_partition, str):
-                raise ValueError("run_steps_many item partition_key must be a string")
+            if raw_partition is not None and not isinstance(raw_partition, (str, bytes)):
+                raise ValueError("run_steps_many item partition_key must be string or bytes")
             item_partition = raw_partition
         else:
             if not isinstance(item, str) or not item:
@@ -297,7 +297,7 @@ def _run_steps_many_items(
             id = item
             item_partition = partition_key
 
-        normalized_item = {"id": id}
+        normalized_item: dict[str, str | bytes] = {"id": id}
         if item_partition is not None:
             normalized_item["partition_key"] = item_partition
         normalized.append(normalized_item)
@@ -316,7 +316,7 @@ def _run_steps_many_args(
     now_ms: int | None,
     payload: Any,
     result: Any,
-    partition_key: str | None,
+    partition_key: str | bytes | None,
     retention_ttl_ms: int | None,
 ) -> builtins.list[Any]:
     if (states is None) == (steps is None):
@@ -367,7 +367,7 @@ def _step_continue_args(
     to_state: str,
     fencing_token: int,
     lease_ms: int,
-    partition_key: str | None,
+    partition_key: str | bytes | None,
     payload: Any,
     values: dict[str, Any] | None,
     value_refs: dict[str, str] | None,
@@ -418,7 +418,7 @@ def _step_continue_args(
 
 def _complete_many_args(
     codec: Codec,
-    partition_key: str | None,
+    partition_key: str | bytes | None,
     items: builtins.list[ClaimedFlow],
     *,
     result: Any,
@@ -479,7 +479,7 @@ def _complete_many_args(
 
 def _append_claimed_items_args(
     args: builtins.list[Any],
-    partition_key: str | None,
+    partition_key: str | bytes | None,
     items: builtins.list[ClaimedFlow],
     command: str,
 ) -> builtins.list[Any]:
@@ -500,7 +500,7 @@ def _append_claimed_items_args(
 
 def _append_fenced_items_args(
     args: builtins.list[Any],
-    partition_key: str | None,
+    partition_key: str | bytes | None,
     items: builtins.list[FencedItem],
     command: str,
     *,
@@ -570,7 +570,7 @@ def _complete_command_args(
     *,
     lease_token: bytes,
     fencing_token: int,
-    partition_key: str | None = None,
+    partition_key: str | bytes | None = None,
     result: Any = None,
     payload: Any = None,
     values: dict[str, Any] | None = None,
@@ -622,7 +622,7 @@ def _transition_command_args(
     to_state: str,
     lease_token: bytes,
     fencing_token: int,
-    partition_key: str | None = None,
+    partition_key: str | bytes | None = None,
     payload: Any = None,
     values: dict[str, Any] | None = None,
     value_refs: dict[str, str] | None = None,
@@ -676,7 +676,7 @@ def _retry_command_args(
     *,
     lease_token: bytes,
     fencing_token: int,
-    partition_key: str | None = None,
+    partition_key: str | bytes | None = None,
     error: Any = None,
     payload: Any = None,
     values: dict[str, Any] | None = None,
@@ -726,7 +726,7 @@ def _fail_command_args(
     *,
     lease_token: bytes,
     fencing_token: int,
-    partition_key: str | None = None,
+    partition_key: str | bytes | None = None,
     error: Any = None,
     payload: Any = None,
     values: dict[str, Any] | None = None,
@@ -851,7 +851,7 @@ def _expand_many_response(value: Any, count: int) -> builtins.list[Any]:
 def _append_read_options(
     args: builtins.list[Any],
     *,
-    partition_key: str | None = None,
+    partition_key: str | bytes | None = None,
     count: int | None = None,
     from_ms: int | None = None,
     to_ms: int | None = None,

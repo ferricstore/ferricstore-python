@@ -78,6 +78,8 @@ class RecordingExecutor:
 
     def execute_command(self, *args: Any) -> Any:
         self.calls.append(args)
+        if args[0] in {"FLOW.POLICY.SET", "FLOW.POLICY.GET"}:
+            return {b"type": str(args[1]).encode(), b"generation": 1}
         return self.responses.get(str(args[0]), b"OK")
 
 
@@ -112,13 +114,14 @@ def _hello(*, max_response_bytes: int = 4096) -> dict[str, Any]:
                     "unknown_future_codec_v1": [0x7FFE],
                 }
             },
+            "schemas": {"FLOW.POLICY.SET": {"fields": ["type", "expected_generation", "replace"]}},
         },
     }
 
 
-def test_v080_declares_minimum_server_without_changing_wire_v1() -> None:
-    assert ferricstore.MINIMUM_SERVER_VERSION == "0.8.0"
-    assert MINIMUM_SERVER_VERSION == "0.8.0"
+def test_v091_declares_minimum_server_without_changing_wire_v1() -> None:
+    assert ferricstore.MINIMUM_SERVER_VERSION == "0.9.1"
+    assert MINIMUM_SERVER_VERSION == "0.9.1"
     assert _MAGIC == b"FSNP"
     assert _REQUEST_VERSION == 0x01
     assert _RESPONSE_VERSION == 0x81
@@ -149,8 +152,8 @@ def test_hello_drives_compact_codecs_and_response_limit() -> None:
     assert adapter._authenticated is False
 
 
-def test_pre_080_hello_contract_is_rejected() -> None:
-    with pytest.raises(FerricStoreError, match=r"0\.8\.0"):
+def test_pre_091_hello_contract_is_rejected() -> None:
+    with pytest.raises(FerricStoreError, match=r"0\.9\.1"):
         parse_hello_capabilities({"protocol": "ferricstore-native", "version": 1})
 
 

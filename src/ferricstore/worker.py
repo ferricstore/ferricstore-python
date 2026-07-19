@@ -13,8 +13,8 @@ from ferricstore.client_core import FlowClient
 from ferricstore.client_ownership import resolve_sync_client_pair
 from ferricstore.config_validation import (
     validate_nonnegative_int,
+    validate_partition_key_sequence,
     validate_positive_int,
-    validate_string_sequence,
 )
 from ferricstore.legacy_worker import Worker as Worker
 from ferricstore.lifecycle_core import (
@@ -129,8 +129,8 @@ class QueueFlowWorker(SyncWorkerClaimMixin, SyncWorkerCompletionMixin):
         exception_policy: ErrorMode | None = None,
         on_error: ErrorMode | None = None,
         complete_independent: bool = True,
-        partition_key: str | None = None,
-        partition_keys: Sequence[str] | None = None,
+        partition_key: str | bytes | None = None,
+        partition_keys: Sequence[str | bytes] | None = None,
         claim_partition_batch_size: int | None = None,
         claim_drain_batches: int = 1,
         claim_prefetch: int = 0,
@@ -295,7 +295,7 @@ class QueueFlowWorker(SyncWorkerClaimMixin, SyncWorkerCompletionMixin):
         self._pending_completions: deque[Future[QueueFlowWorkerResult]] = deque()
         self._pending_claims: list[_PendingClaim] = []
         self._partition_cursor = 0
-        self._claim_cooldown_until: dict[str, float] = {}
+        self._claim_cooldown_until: dict[str | bytes, float] = {}
         default_claim_cooldown_s = min(self.idle_sleep_s, 0.001)
         self.empty_claim_cooldown_s = (
             default_claim_cooldown_s
@@ -554,19 +554,14 @@ class QueueFlowWorker(SyncWorkerClaimMixin, SyncWorkerCompletionMixin):
     def run_batch_once_for_partition_keys(
         self,
         handler: FlowBatchHandler,
-        partition_keys: Sequence[str],
+        partition_keys: Sequence[str | bytes],
         *,
         claim_credit: int | None = None,
         block_ms: int | None = None,
     ) -> QueueFlowWorkerResult:
         self._invocations.begin("queue worker is closing")
         try:
-            keys = list(
-                validate_string_sequence(
-                    partition_keys,
-                    name="partition_keys",
-                )
-            )
+            keys = list(validate_partition_key_sequence(partition_keys))
             if not keys:
                 return self._drain_pending_completions(block=False)
 
@@ -710,8 +705,8 @@ class QueueFlowWorker(SyncWorkerClaimMixin, SyncWorkerCompletionMixin):
         self,
         handler: FlowHandler | FlowBatchHandler,
         result: QueueFlowWorkerResult,
-        claim_partition_key: str | None,
-        claim_partition_keys: list[str] | None,
+        claim_partition_key: str | bytes | None,
+        claim_partition_keys: list[str | bytes] | None,
         claim_credit: int,
         *,
         block_ms: int | None,
@@ -774,8 +769,8 @@ class QueueFlowWorker(SyncWorkerClaimMixin, SyncWorkerCompletionMixin):
         self,
         handled: _HandledBatch,
         *,
-        claim_partition_key: str | None,
-        claim_partition_keys: list[str] | None,
+        claim_partition_key: str | bytes | None,
+        claim_partition_keys: list[str | bytes] | None,
         limit: int,
         block_ms: int | None,
     ) -> Future[list[FlowJob]] | None:
@@ -820,8 +815,8 @@ class QueueFlowWorker(SyncWorkerClaimMixin, SyncWorkerCompletionMixin):
         self,
         handled: _HandledBatch,
         *,
-        claim_partition_key: str | None,
-        claim_partition_keys: list[str] | None,
+        claim_partition_key: str | bytes | None,
+        claim_partition_keys: list[str | bytes] | None,
         limit: int,
         block_ms: int | None,
     ) -> list[FlowJob]:

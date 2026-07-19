@@ -41,6 +41,8 @@ class FakeExecutor:
 
     async def execute_command(self, *args):
         self.calls.append(args)
+        if args[0] in {"FLOW.POLICY.SET", "FLOW.POLICY.GET"}:
+            return {b"type": str(args[1]).encode(), b"generation": 1}
         if args[0] in {"FLOW.EFFECT.RESERVE", "FLOW.EFFECT.CONFIRM", "FLOW.EFFECT.FAIL"}:
             status = {
                 "FLOW.EFFECT.RESERVE": b"reserved",
@@ -2375,9 +2377,9 @@ def test_async_workflow_partition_by_applies_to_single_and_batch_producers():
         )
 
         assert [call[2]["partition_key"] for call in client.calls] == [
-            "tenant-a:7",
-            "tenant-a:7",
-            "tenant-a:7",
+            "fpk:8:tenant-a1:7",
+            "fpk:8:tenant-a1:7",
+            "fpk:8:tenant-a1:7",
         ]
         assert all(
             "tenant_id" not in call[2] and "order_id" not in call[2] for call in client.calls

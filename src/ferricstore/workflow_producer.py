@@ -82,7 +82,7 @@ class _WorkflowProducerMixin:
 
     def create_many(
         self,
-        partition_key: str | None,
+        partition_key: str | bytes | None,
         items: builtins.list[CreateItem],
         *,
         max_active_ms: int | float | str | None = None,
@@ -98,10 +98,10 @@ class _WorkflowProducerMixin:
             **attrs,
         )
 
-    def partition_key(self, attrs: dict[str, Any]) -> str | None:
+    def partition_key(self, attrs: dict[str, Any]) -> str | bytes | None:
         return workflow_partition_key(attrs, self.partition_by)
 
-    def _resolve_partition_key(self, attrs: dict[str, Any]) -> str | None:
+    def _resolve_partition_key(self, attrs: dict[str, Any]) -> str | bytes | None:
         return pop_workflow_partition_key(
             attrs,
             self.partition_by,

@@ -44,6 +44,20 @@ class StaleLeaseError(FerricStoreError):
     code = "stale_lease"
 
 
+class StalePolicyGenerationError(FerricStoreError):
+    """A policy compare-and-swap used an obsolete generation."""
+
+    code = "stale_policy_generation"
+
+    def __init__(self, message: str, *, raw: Any = None) -> None:
+        super().__init__(
+            message,
+            raw=raw,
+            retryable=False,
+            safe_to_retry=False,
+        )
+
+
 class FlowAlreadyExistsError(FerricStoreError):
     code = "flow_already_exists"
 
@@ -142,6 +156,8 @@ def classify_server_error(
         return FlowAlreadyExistsError(message, raw=raw, **metadata)
     if "wrong state" in lower:
         return FlowWrongStateError(message, raw=raw, **metadata)
+    if "stale flow policy generation" in lower or "stale policy generation" in lower:
+        return StalePolicyGenerationError(message, raw=raw)
     if "stale flow lease" in lower or "stale lease" in lower or "stale token" in lower:
         return StaleLeaseError(message, raw=raw, **metadata)
     if "not found" in lower or "does not exist" in lower:

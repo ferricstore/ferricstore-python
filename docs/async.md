@@ -141,8 +141,10 @@ silently replacing the first handler.
 
 `partition_by` has the same routing behavior in sync and async workflows. An
 explicit `partition_key=...` takes precedence; otherwise the configured values
-are joined in order and removed from the command options. The same rule applies
-to `enqueue_many()` and `run_steps_many()`.
+are encoded in order as collision-free `fpk:<byte-length>:<value>` components
+and removed from the command options. The same rule applies to `enqueue_many()`
+and `run_steps_many()`. Drain flows using the old colon-joined derived keys
+before upgrading; explicit keys do not change.
 
 `AsyncWorkflow.close()` is terminal and cancellation-safe. It waits for worker
 tasks before owned transports, retains failed resource ownership for a retry,

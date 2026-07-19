@@ -11,11 +11,13 @@ from ferricstore.protocol_command_options import (
     _option_map,
 )
 from ferricstore.protocol_common import (
+    _coerce_bool,
     _command_token,
     _require_arg,
     _text,
 )
 from ferricstore.protocol_constants import (
+    _BOOL_FIELDS,
     _COMPACT_FLOW_COMPLETE_MANY_OK_REQUEST,
     _COMPACT_FLOW_COMPLETE_MANY_REQUEST,
     _COMPACT_FLOW_RETRY_MANY_OK_REQUEST,
@@ -479,7 +481,8 @@ def _flow_policy_option_map(args: tuple[Any, ...]) -> dict[str, Any]:
             raise InvalidCommandError(
                 f"FerricStore protocol transport does not support option {token}"
             )
-        payload[mapped_field] = _require_arg(args, idx + 1, token)
+        value = _require_arg(args, idx + 1, token)
+        payload[mapped_field] = _coerce_bool(value) if mapped_field in _BOOL_FIELDS else value
         idx += 2
     return payload
 

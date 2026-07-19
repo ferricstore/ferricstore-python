@@ -90,8 +90,8 @@ class QueueWorkerClaimPlanHost(Protocol):
     def _claim_flows(
         self,
         *,
-        claim_partition_key: str | None,
-        claim_partition_keys: list[str] | None,
+        claim_partition_key: str | bytes | None,
+        claim_partition_keys: list[str | bytes] | None,
         limit: int,
         block_ms: int | None,
     ) -> list[FlowJob]: ...
@@ -100,8 +100,8 @@ class QueueWorkerClaimPlanHost(Protocol):
         self,
         handled: _HandledBatch,
         *,
-        claim_partition_key: str | None,
-        claim_partition_keys: list[str] | None,
+        claim_partition_key: str | bytes | None,
+        claim_partition_keys: list[str | bytes] | None,
         limit: int,
         block_ms: int | None,
     ) -> list[FlowJob]: ...
@@ -120,8 +120,8 @@ class QueueWorkerClaimPlanHost(Protocol):
 
     def _cool_claim_keys(
         self,
-        partition_key: str | None,
-        partition_keys: list[str] | None,
+        partition_key: str | bytes | None,
+        partition_keys: list[str | bytes] | None,
         cooldown_s: float,
     ) -> None: ...
 
@@ -149,8 +149,8 @@ class QueueWorkerClaimPlanHost(Protocol):
         self,
         handled: _HandledBatch,
         *,
-        claim_partition_key: str | None,
-        claim_partition_keys: list[str] | None,
+        claim_partition_key: str | bytes | None,
+        claim_partition_keys: list[str | bytes] | None,
         limit: int,
         block_ms: int | None,
     ) -> Future[list[FlowJob]] | None: ...
@@ -250,8 +250,8 @@ def drain_claim_plan(
     self: QueueWorkerClaimPlanHost,
     handler: FlowHandler | FlowBatchHandler,
     result: QueueFlowWorkerResult,
-    claim_partition_key: str | None,
-    claim_partition_keys: list[str] | None,
+    claim_partition_key: str | bytes | None,
+    claim_partition_keys: list[str | bytes] | None,
     claim_credit: int,
     *,
     block_ms: int | None,

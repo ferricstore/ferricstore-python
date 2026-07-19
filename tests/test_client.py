@@ -77,6 +77,8 @@ class FakeExecutor:
             record[b"value_refs"] = {b"order": {b"ref": b"ref-order"}}
         if command == "FLOW.VALUE.MGET":
             return list(args[1:])
+        if command in {"FLOW.POLICY.SET", "FLOW.POLICY.GET"}:
+            return {b"type": str(args[1]).encode(), b"generation": 1}
         if command == "FLOW.ATTRIBUTES":
             return [{b"name": b"tenant", b"count": 3}]
         if command == "FLOW.ATTRIBUTE_VALUES":
@@ -4290,7 +4292,7 @@ def test_query_policy_and_cleanup_commands():
     assert client.info("order") == {b"ok": 1}
     assert client.stuck("order", older_than_ms=100, now_ms=200)[0].id == "f1"
     assert client.history("f1", count=10, from_version=2, values=True)
-    assert client.policy_get("order", state="queued") == {b"ok": 1}
+    assert client.policy_get("order", state="queued").generation == 1
     assert client.retention_cleanup(limit=100, now_ms=123) == {b"ok": 1}
 
 
@@ -4524,7 +4526,10 @@ def test_install_policy_still_builds_state_policy():
         },
     )
 
-    assert executor.calls[-1][:4] == ("FLOW.POLICY.SET", "order", "STATE", "queued")
+    call = executor.calls[-1]
+    assert call[:4] == ("FLOW.POLICY.SET", "order", "REPLACE", "false")
+    state_index = call.index("STATE")
+    assert call[state_index : state_index + 2] == ("STATE", "queued")
 
 
 def test_install_policy_can_set_indexed_state_meta():
@@ -4539,8 +4544,11 @@ def test_install_policy_can_set_indexed_state_meta():
     )
 
     call = executor.calls[-1]
-    assert call[:4] == ("FLOW.POLICY.SET", "order", "INDEXED_STATE_META", "version")
-    assert call[4:6] == ("MAX_RETRIES", 2)
+    assert call[:4] == ("FLOW.POLICY.SET", "order", "REPLACE", "false")
+    indexed_index = call.index("INDEXED_STATE_META")
+    assert call[indexed_index : indexed_index + 2] == ("INDEXED_STATE_META", "version")
+    retry_index = call.index("MAX_RETRIES")
+    assert call[retry_index : retry_index + 2] == ("MAX_RETRIES", 2)
     state_index = call.index("STATE")
     assert call[state_index : state_index + 4] == ("STATE", "queued", "MAX_RETRIES", 5)
 

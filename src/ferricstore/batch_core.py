@@ -136,7 +136,7 @@ def ordered_batch_executor(executor: Any) -> Callable[..., Any] | None:
 class CreateManyGroup:
     """One shard-routable group in an ordered create-many plan."""
 
-    partition_key: str | None
+    partition_key: str | bytes | None
     indexed_items: tuple[tuple[int, CreateItem], ...]
 
     @property
@@ -160,7 +160,7 @@ class CreateManyPlan:
         now_ms: int | None,
         clock: Callable[[], int],
     ) -> CreateManyPlan:
-        grouped: dict[str | None, list[tuple[int, CreateItem]]] = {}
+        grouped: dict[str | bytes | None, list[tuple[int, CreateItem]]] = {}
         for index, item in enumerate(items):
             grouped.setdefault(item.partition_key, []).append((index, item))
         groups = tuple(

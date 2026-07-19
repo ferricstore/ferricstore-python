@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+from collections.abc import Sequence
 from typing import Any, cast
 
 from ferricstore.async_client_state import _AsyncClientMixinBase
@@ -30,8 +31,8 @@ class _AsyncClientClaimsMixin(_AsyncClientMixinBase):
         state: str | None = None,
         states: builtins.list[str] | None = None,
         worker: str,
-        partition_key: str | None = None,
-        partition_keys: builtins.list[str] | None = None,
+        partition_key: str | bytes | None = None,
+        partition_keys: Sequence[str | bytes] | None = None,
         lease_ms: int = 30_000,
         limit: int = 1,
         priority: int | None = None,
@@ -92,8 +93,8 @@ class _AsyncClientClaimsMixin(_AsyncClientMixinBase):
         state: str | None = None,
         states: builtins.list[str] | None = None,
         worker: str,
-        partition_key: str | None = None,
-        partition_keys: builtins.list[str] | None = None,
+        partition_key: str | bytes | None = None,
+        partition_keys: Sequence[str | bytes] | None = None,
         lease_ms: int = 30_000,
         limit: int = 100,
         priority: int | None = 0,
@@ -136,8 +137,8 @@ class _AsyncClientClaimsMixin(_AsyncClientMixinBase):
         *,
         state: str | None = None,
         worker: str,
-        partition_key: str | None = None,
-        partition_keys: builtins.list[str] | None = None,
+        partition_key: str | bytes | None = None,
+        partition_keys: Sequence[str | bytes] | None = None,
         lease_ms: int = 30_000,
         limit: int = 1,
         priority: int | None = None,
@@ -182,7 +183,7 @@ class _AsyncClientClaimsMixin(_AsyncClientMixinBase):
         *,
         fencing_token: int,
         lease_ms: int,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         now_ms: int | None = None,
     ) -> FlowRecord:
         args: builtins.list[Any] = [

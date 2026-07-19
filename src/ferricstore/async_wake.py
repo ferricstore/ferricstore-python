@@ -7,7 +7,10 @@ from asyncio import TimeoutError as AsyncioTimeoutError
 from collections.abc import Sequence
 from typing import Any
 
-from ferricstore.config_validation import validate_string_sequence
+from ferricstore.config_validation import (
+    validate_partition_key_sequence,
+    validate_string_sequence,
+)
 
 
 class AsyncFlowWakeCoordinator:
@@ -23,8 +26,8 @@ class AsyncFlowWakeCoordinator:
         type: str,
         state: str | None,
         states: Sequence[str] | None,
-        partition_key: str | None,
-        partition_keys: Sequence[str] | None,
+        partition_key: str | bytes | None,
+        partition_keys: Sequence[str | bytes] | None,
         priority: int | None,
         limit: int,
         enabled: bool,
@@ -42,11 +45,7 @@ class AsyncFlowWakeCoordinator:
         )
         self._partition_key = partition_key
         self._partition_keys = (
-            validate_string_sequence(
-                partition_keys,
-                name="partition_keys",
-                allow_empty=False,
-            )
+            validate_partition_key_sequence(partition_keys, allow_empty=False)
             if partition_keys is not None
             else None
         )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from ferricstore.protocol_common import _flow_wake_payload
@@ -38,8 +39,8 @@ class SyncProtocolSubscriptionMixin:
         *,
         state: str | None = None,
         states: list[str] | None = None,
-        partition_key: str | None = None,
-        partition_keys: list[str] | None = None,
+        partition_key: str | bytes | None = None,
+        partition_keys: Sequence[str | bytes] | None = None,
         priority: int | None = 0,
         limit: int | None = None,
     ) -> Any:
@@ -75,8 +76,8 @@ class SyncProtocolSubscriptionMixin:
         *,
         state: str | None = None,
         states: list[str] | None = None,
-        partition_key: str | None = None,
-        partition_keys: list[str] | None = None,
+        partition_key: str | bytes | None = None,
+        partition_keys: Sequence[str | bytes] | None = None,
         priority: int | None = 0,
         limit: int | None = None,
     ) -> None:
@@ -119,8 +120,8 @@ class AsyncProtocolSubscriptionMixin:
         *,
         state: str | None = None,
         states: list[str] | None = None,
-        partition_key: str | None = None,
-        partition_keys: list[str] | None = None,
+        partition_key: str | bytes | None = None,
+        partition_keys: Sequence[str | bytes] | None = None,
         priority: int | None = 0,
         limit: int | None = None,
     ) -> Any:
@@ -156,8 +157,8 @@ class AsyncProtocolSubscriptionMixin:
         *,
         state: str | None = None,
         states: list[str] | None = None,
-        partition_key: str | None = None,
-        partition_keys: list[str] | None = None,
+        partition_key: str | bytes | None = None,
+        partition_keys: Sequence[str | bytes] | None = None,
         priority: int | None = 0,
         limit: int | None = None,
     ) -> None:

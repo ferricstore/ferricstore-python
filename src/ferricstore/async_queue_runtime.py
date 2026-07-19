@@ -171,8 +171,8 @@ class AsyncQueueFlowWorker(AsyncWorkerCompletionMixin):
         exception_policy: AsyncErrorMode | None = None,
         on_error: AsyncErrorMode | None = None,
         complete_independent: bool = True,
-        partition_key: str | None = None,
-        partition_keys: Sequence[str] | None = None,
+        partition_key: str | bytes | None = None,
+        partition_keys: Sequence[str | bytes] | None = None,
         auto_partitions: bool = False,
         worker_index: int = 0,
         workers: int = 1,
@@ -624,8 +624,8 @@ class AsyncQueueFlowWorker(AsyncWorkerCompletionMixin):
     async def _claim_flows(
         self,
         *,
-        partition_key: str | None,
-        partition_keys: list[str] | None,
+        partition_key: str | bytes | None,
+        partition_keys: list[str | bytes] | None,
         limit: int,
     ) -> list[AsyncFlowJob]:
         if self.claim_values:
@@ -745,7 +745,7 @@ class AsyncQueueFlowWorker(AsyncWorkerCompletionMixin):
             failures=failures,
         )
 
-    def _next_claim_partition(self) -> tuple[str | None, list[str] | None]:
+    def _next_claim_partition(self) -> tuple[str | bytes | None, list[str | bytes] | None]:
         if self.partition_key is not None:
             return self.partition_key, None
         if self.partition_keys is None:

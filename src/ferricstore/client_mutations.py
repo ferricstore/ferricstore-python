@@ -43,7 +43,7 @@ class _ClientMutationsMixin(_ClientMixinBase):
         *,
         lease_token: bytes,
         fencing_token: int,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         result: Any = None,
         payload: Any = None,
         values: dict[str, Any] | None = None,
@@ -127,7 +127,7 @@ class _ClientMutationsMixin(_ClientMixinBase):
 
     def transition_many(
         self,
-        partition_key: str | None,
+        partition_key: str | bytes | None,
         *,
         from_state: str,
         to_state: str,
@@ -185,7 +185,7 @@ class _ClientMutationsMixin(_ClientMixinBase):
         *,
         lease_token: bytes,
         fencing_token: int,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         error: Any = None,
         payload: Any = None,
         values: dict[str, Any] | None = None,
@@ -224,7 +224,7 @@ class _ClientMutationsMixin(_ClientMixinBase):
 
     def retry_many(
         self,
-        partition_key: str | None,
+        partition_key: str | bytes | None,
         items: builtins.list[ClaimedFlow],
         *,
         error: Any = None,
@@ -275,7 +275,7 @@ class _ClientMutationsMixin(_ClientMixinBase):
         *,
         lease_token: bytes,
         fencing_token: int,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         error: Any = None,
         payload: Any = None,
         values: dict[str, Any] | None = None,
@@ -314,7 +314,7 @@ class _ClientMutationsMixin(_ClientMixinBase):
 
     def fail_many(
         self,
-        partition_key: str | None,
+        partition_key: str | bytes | None,
         items: builtins.list[ClaimedFlow],
         *,
         error: Any = None,
@@ -365,7 +365,7 @@ class _ClientMutationsMixin(_ClientMixinBase):
         *,
         fencing_token: int,
         lease_token: bytes | None = None,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         reason: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
@@ -412,7 +412,7 @@ class _ClientMutationsMixin(_ClientMixinBase):
 
     def cancel_many(
         self,
-        partition_key: str | None,
+        partition_key: str | bytes | None,
         items: builtins.list[FencedItem],
         *,
         reason: Any = None,
@@ -453,7 +453,7 @@ class _ClientMutationsMixin(_ClientMixinBase):
         id: str,
         *,
         to_event: str,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         expect_state: str | None = None,
         run_at_ms: int | None = None,
         reason_ref: str | None = None,

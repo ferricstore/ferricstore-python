@@ -4,7 +4,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-SERVER_VERSION = "0.8.0"
+SERVER_VERSION = "0.9.1"
 
 
 def _load_wait_module():

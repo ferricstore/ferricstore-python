@@ -274,8 +274,8 @@ class _AsyncClientCoreMixin(_AsyncClientMixinBase):
         *,
         state: str | None = None,
         states: builtins.list[str] | None = None,
-        partition_key: str | None = None,
-        partition_keys: builtins.list[str] | None = None,
+        partition_key: str | bytes | None = None,
+        partition_keys: Sequence[str | bytes] | None = None,
         priority: int | None = 0,
         limit: int | None = None,
     ) -> Any:

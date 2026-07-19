@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 from ferricstore.config_validation import (
     normalize_optional_max_active_ms,
@@ -19,12 +19,16 @@ from ferricstore.model_core import (
     _normalize_ref_meta,
     _optional_int,
     _optional_str,
+    _optional_str_or_bytes,
     _optional_str_or_int,
     _raw_map,
     _str,
     _str_key_map,
+    _str_or_bytes,
 )
 from ferricstore.schedule_types import ScheduleResult as ScheduleResult
+
+PartitionKey: TypeAlias = str | bytes
 
 if TYPE_CHECKING:
     from ferricstore.retry_policy import RetryPolicy as RetryPolicy
@@ -298,7 +302,7 @@ class EffectResult(_MappingResult):
 
     id: str = ""
     flow_id: str = ""
-    partition_key: str | None = None
+    partition_key: PartitionKey | None = None
     flow_type: str | None = None
     state: str | None = None
     effect_key: str = ""
@@ -335,7 +339,7 @@ class EffectResult(_MappingResult):
         return cls(
             id=_str(raw.get("id")),
             flow_id=_str(raw.get("flow_id")),
-            partition_key=_optional_str(raw.get("partition_key")),
+            partition_key=_optional_str_or_bytes(raw.get("partition_key")),
             flow_type=_optional_str(raw.get("type")),
             state=_optional_str(raw.get("state")),
             effect_key=_str(raw.get("effect_key")),
@@ -529,7 +533,7 @@ class ChildSpec:
     id: str
     type: str
     payload: Any = None
-    partition_key: str | None = None
+    partition_key: PartitionKey | None = None
     values: dict[str, Any] | None = None
     value_refs: dict[str, str] | None = None
     attributes: dict[str, Any] | None = None
@@ -543,7 +547,7 @@ class ChildSpec:
 class CreateItem:
     id: str
     payload: Any = None
-    partition_key: str | None = None
+    partition_key: PartitionKey | None = None
     values: dict[str, Any] | None = None
     value_refs: dict[str, str] | None = None
     attributes: dict[str, Any] | None = None
@@ -559,7 +563,7 @@ class ClaimedFlow:
     id: str
     lease_token: bytes
     fencing_token: int
-    partition_key: str | None = None
+    partition_key: PartitionKey | None = None
     type: str = ""
     state: str = "running"
     run_state: str | None = None
@@ -580,12 +584,7 @@ class ClaimedFlow:
             else:
                 id_value = str(raw_id)
 
-            if raw_partition is None or raw_partition == b"" or raw_partition == "":
-                partition_key = None
-            elif isinstance(raw_partition, bytes):
-                partition_key = raw_partition.decode()
-            else:
-                partition_key = str(raw_partition)
+            partition_key = _optional_str_or_bytes(raw_partition)
 
             if isinstance(raw_lease, bytes):
                 lease_token = raw_lease
@@ -621,7 +620,7 @@ class ClaimedFlow:
             id=_str(_get(value, "id")),
             lease_token=_bytes(_get(value, "lease_token")),
             fencing_token=_int(_get(value, "fencing_token")),
-            partition_key=_optional_str(_get(value, "partition_key")),
+            partition_key=_optional_str_or_bytes(_get(value, "partition_key")),
             type=_str(_get(value, "type")),
             state=_optional_str(_get(value, "state")) or "running",
             run_state=_optional_str(_get(value, "run_state")),
@@ -651,12 +650,7 @@ class ClaimedFlow:
             else:
                 id_value = str(raw_id)
 
-            if raw_partition is None or raw_partition == b"" or raw_partition == "":
-                partition_key = None
-            elif isinstance(raw_partition, bytes):
-                partition_key = raw_partition.decode()
-            else:
-                partition_key = str(raw_partition)
+            partition_key = _optional_str_or_bytes(raw_partition)
 
             if isinstance(raw_lease, bytes):
                 lease_token = raw_lease
@@ -697,7 +691,7 @@ class FencedItem:
     id: str
     fencing_token: int
     lease_token: bytes | None = None
-    partition_key: str | None = None
+    partition_key: PartitionKey | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -793,7 +787,7 @@ class FlowRecord:
     id: str
     type: str
     state: str
-    partition_key: str
+    partition_key: PartitionKey
     run_state: str | None = None
     payload: Any = None
     lease_token: bytes = b""
@@ -832,7 +826,7 @@ class FlowRecord:
             id=_str(_get(value, "id")),
             type=_str(_get(value, "type")),
             state=_str(_get(value, "state")),
-            partition_key=_str(_get(value, "partition_key")),
+            partition_key=_str_or_bytes(_get(value, "partition_key")),
             run_state=_optional_str(_get(value, "run_state")),
             payload=payload,
             lease_token=_bytes(_get(value, "lease_token")),

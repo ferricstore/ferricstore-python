@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -21,8 +21,8 @@ FlowBatchHandler = Callable[[list[FlowJob]], Any]
 @dataclass
 class _PendingClaim:
     future: Future[list[FlowJob]]
-    partition_key: str | None
-    partition_keys: list[str] | None
+    partition_key: str | bytes | None
+    partition_keys: list[str | bytes] | None
     handler: FlowHandler | FlowBatchHandler
     batch_handler: bool
 
@@ -42,8 +42,8 @@ class SyncWorkerClaimMixin:
         client: FlowClient
         concurrency: int
         lease_ms: int
-        partition_key: str | None
-        partition_keys: list[str] | None
+        partition_key: str | bytes | None
+        partition_keys: list[str | bytes] | None
         priority: int | None
         reclaim_expired: bool | None
         reclaim_ratio: int | None
@@ -53,7 +53,7 @@ class SyncWorkerClaimMixin:
         type: str
         value_max_bytes: int | None
         worker: str
-        _claim_cooldown_until: dict[str, float]
+        _claim_cooldown_until: dict[str | bytes, float]
         _complete_async_depth: int
         _completion_executor: ThreadPoolExecutor | None
         _executor: ThreadPoolExecutor | None
@@ -152,8 +152,8 @@ class SyncWorkerClaimMixin:
     def _claim_flows_future(
         self,
         *,
-        claim_partition_key: str | None,
-        claim_partition_keys: list[str] | None,
+        claim_partition_key: str | bytes | None,
+        claim_partition_keys: list[str | bytes] | None,
         limit: int,
         block_ms: int | None,
     ) -> Future[list[FlowJob]]:
@@ -239,8 +239,8 @@ class SyncWorkerClaimMixin:
     def _claim_flows(
         self,
         *,
-        claim_partition_key: str | None,
-        claim_partition_keys: list[str] | None,
+        claim_partition_key: str | bytes | None,
+        claim_partition_keys: list[str | bytes] | None,
         limit: int,
         block_ms: int | None,
     ) -> list[FlowJob]:
@@ -314,7 +314,9 @@ class SyncWorkerClaimMixin:
             // self.claim_partition_batch_size,
         )
 
-    def _owned_partition_block_claim(self) -> tuple[str | None, list[str] | None]:
+    def _owned_partition_block_claim(
+        self,
+    ) -> tuple[str | bytes | None, list[str | bytes] | None]:
         if not self.partition_keys:
             return None, None
         if len(self.partition_keys) == 1:
@@ -402,7 +404,7 @@ class SyncWorkerClaimMixin:
 
         return _HandledBatch(jobs=jobs, first_result=result)
 
-    def _next_claim_partition(self) -> tuple[str | None, list[str] | None]:
+    def _next_claim_partition(self) -> tuple[str | bytes | None, list[str | bytes] | None]:
         if self.partition_key is not None:
             return self.partition_key, None
         if not self.partition_keys:
@@ -431,13 +433,13 @@ class SyncWorkerClaimMixin:
 
     def _cool_claim_keys(
         self,
-        partition_key: str | None,
-        partition_keys: list[str] | None,
+        partition_key: str | bytes | None,
+        partition_keys: list[str | bytes] | None,
         cooldown_s: float,
     ) -> None:
         if cooldown_s <= 0:
             return
-        keys: list[str]
+        keys: Sequence[str | bytes]
         if partition_key is not None:
             keys = [partition_key]
         elif partition_keys:

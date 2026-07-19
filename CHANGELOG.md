@@ -6,6 +6,30 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.6.1
+
+- Preserved arbitrary binary partition keys when decoding Flow effect results
+  and added the canonical public `PartitionKey` type alias.
+- Made sync and async workflow-context policy installation default to full
+  replacement, matching the other declarative workflow APIs.
+- Restored complete mapping compatibility for typed policy snapshots and
+  removed a redundant recursive normalization pass from policy responses.
+
+## 0.6.0
+
+- Raised the minimum server version to FerricStore `0.9.1` while retaining
+  native protocol v1, and now validate HELLO support for policy replacement and
+  generation compare-and-swap.
+- Added sync/async `replace` and `expected_generation` policy options, typed
+  `PolicySnapshot` responses, safe-integer generation validation, and a
+  non-retryable `StalePolicyGenerationError`.
+- Made direct policy writes deep patches and declarative workflow installation
+  full replacement by default, with live coverage for patch, replacement,
+  successful CAS, atomic stale-CAS rejection, and FIFO concurrency.
+- Replaced collision-prone colon-joined workflow partitions with binary-safe,
+  byte-length-prefixed `fpk:` encoding and preserved arbitrary binary partition
+  identifiers throughout Flow records and APIs.
+
 ## 0.5.1
 
 - Stabilized FerricStore 0.8 release validation by requiring continuous native

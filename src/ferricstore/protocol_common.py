@@ -19,6 +19,7 @@ from ferricstore.command_core import normalize_command_name
 from ferricstore.config_validation import (
     validate_bool,
     validate_optional_flow_priority,
+    validate_partition_key_sequence,
     validate_string_sequence,
 )
 from ferricstore.config_validation import (
@@ -369,8 +370,8 @@ def _flow_wake_payload(
     *,
     state: str | None = None,
     states: list[str] | None = None,
-    partition_key: str | None = None,
-    partition_keys: list[str] | None = None,
+    partition_key: str | bytes | None = None,
+    partition_keys: Sequence[str | bytes] | None = None,
     priority: int | None = 0,
     limit: int | None = None,
 ) -> dict[str, Any]:
@@ -388,11 +389,7 @@ def _flow_wake_payload(
         flow_wake["state"] = state
     if partition_keys is not None:
         flow_wake["partition_keys"] = list(
-            validate_string_sequence(
-                partition_keys,
-                name="partition_keys",
-                allow_empty=False,
-            )
+            validate_partition_key_sequence(partition_keys, allow_empty=False)
         )
     elif partition_key is not None:
         flow_wake["partition_key"] = partition_key
@@ -759,7 +756,7 @@ def _is_retryable_route_error(exc: BaseException) -> bool:
 
 
 def _server_allows_retry(exc: BaseException) -> bool:
-    """Require both v0.8 retry flags before replaying a server response error."""
+    """Require both server retry flags before replaying a response error."""
     if isinstance(exc, FerricStoreError):
         return exc.retryable is True and exc.safe_to_retry is True
     return isinstance(exc, (OSError, TimeoutError, FutureTimeoutError))

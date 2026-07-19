@@ -24,7 +24,7 @@ class _AsyncClientMixinBase:
             self,
             value: Any,
             id: str,
-            partition_key: str | None = None,
+            partition_key: str | bytes | None = None,
         ) -> FlowRecord: ...
 
         async def _index_query(

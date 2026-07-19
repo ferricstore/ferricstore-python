@@ -24,7 +24,7 @@ from ferricstore.types import CreateItem
 
 def _create_many_args(
     codec: Codec,
-    partition_key: str | None,
+    partition_key: str | bytes | None,
     items: builtins.list[CreateItem],
     *,
     type: str,

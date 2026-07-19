@@ -310,6 +310,21 @@ def test_flow_worker_drains_same_partition_group_while_batches_are_full():
     ]
 
 
+def test_flow_worker_preserves_binary_derived_partition_keys():
+    partition = b"fpk:2:\x00\xff"
+    worker = QueueFlowWorker(
+        FakeFlowClient([]),
+        type="email",
+        partition_keys=[partition],
+        priority=None,
+    )
+
+    try:
+        assert worker.partition_keys == [partition]
+    finally:
+        worker.close()
+
+
 def test_flow_worker_stop_before_thread_loop_starts_is_not_overwritten():
     entered = threading.Event()
     release = threading.Event()
@@ -1328,8 +1343,19 @@ def test_queue_client_retry_policy_is_inherited_and_can_be_overridden():
     queue.install_policy()
     queue_client.install_policy("sms")
 
-    assert client.policies[0] == ("email", {"retry": queue_policy})
-    assert client.policies[1] == ("sms", {"retry": default_policy, "states": None})
+    assert client.policies[0] == (
+        "email",
+        {"retry": queue_policy, "replace": False, "expected_generation": None},
+    )
+    assert client.policies[1] == (
+        "sms",
+        {
+            "retry": default_policy,
+            "states": None,
+            "replace": False,
+            "expected_generation": None,
+        },
+    )
 
 
 def test_queue_client_worker_and_value_config_are_inherited_and_overridable():

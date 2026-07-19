@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 
@@ -55,6 +55,24 @@ def _optional_str_or_int(value: Any) -> str | int | None:
     return _str(value)
 
 
+def _str_or_bytes(value: Any, default: str = "") -> str | bytes:
+    """Decode UTF-8 protocol text while preserving arbitrary binary identifiers."""
+    if value is None:
+        return default
+    if isinstance(value, bytes):
+        try:
+            return value.decode()
+        except UnicodeDecodeError:
+            return value
+    return str(value)
+
+
+def _optional_str_or_bytes(value: Any) -> str | bytes | None:
+    if value is None or value == b"" or value == "":
+        return None
+    return _str_or_bytes(value)
+
+
 def _normalize_ref_meta(value: Any) -> Any:
     if isinstance(value, dict):
         return {_str(key): _normalize_ref_meta(item) for key, item in value.items()}
@@ -80,20 +98,22 @@ def _raw_map(value: dict[Any, Any]) -> dict[str, Any]:
     return {_str(key): _normalize_ref_meta(item) for key, item in value.items()}
 
 
-class _MappingResult:
+class _MappingResult(Mapping[str, Any]):
     raw: dict[str, Any] | None
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.raw or {})
 
     def __getitem__(self, key: str) -> Any:
-        return self.to_dict()[key]
+        if self.raw is None:
+            raise KeyError(key)
+        return self.raw[key]
 
-    def get(self, key: str, default: Any = None) -> Any:
-        return self.to_dict().get(key, default)
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.raw or {})
 
-    def items(self) -> Iterator[tuple[str, Any]]:
-        return iter(self.to_dict().items())
+    def __len__(self) -> int:
+        return len(self.raw or {})
 
 
 __all__ = [
@@ -104,8 +124,10 @@ __all__ = [
     "_normalize_ref_meta",
     "_optional_int",
     "_optional_str",
+    "_optional_str_or_bytes",
     "_optional_str_or_int",
     "_raw_map",
     "_str",
     "_str_key_map",
+    "_str_or_bytes",
 ]

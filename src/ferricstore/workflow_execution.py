@@ -83,7 +83,7 @@ class WorkflowExecutionHost(Protocol):
     def _uniform_partition_key(
         self,
         jobs: Sequence[FlowRecord | ClaimedFlow],
-    ) -> str | None: ...
+    ) -> str | bytes | None: ...
 
     def _uniform_current_state(
         self,

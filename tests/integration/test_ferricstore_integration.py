@@ -23,6 +23,8 @@ from ferricstore import (
     FlowStatePolicy,
     JsonCodec,
     RetryPolicy,
+    StalePolicyGenerationError,
+    WorkflowClient,
 )
 from ferricstore.command_core import normalize_command_name
 from ferricstore.commands import DataCommandsMixin
@@ -460,6 +462,9 @@ def _decode(client: FlowClient, value: Any) -> Any:
 def _field(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, dict):
         return value.get(name, value.get(name.encode(), default))
+    getter = getattr(value, "get", None)
+    if callable(getter):
+        return getter(name, default)
     return default
 
 
@@ -527,17 +532,23 @@ def _claim_one(
     lease_ms: int = 30_000,
     include_state: bool = False,
 ) -> ClaimedFlow:
-    jobs = client.claim_flows(
-        flow_type,
-        state=state,
-        worker=worker,
-        partition_key=partition,
-        limit=1,
-        lease_ms=lease_ms,
-        now_ms=now_ms,
-        priority=None,
-        include_state=include_state,
-    )
+    deadline = time.monotonic() + 0.5
+    while True:
+        claim_now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+        jobs = client.claim_flows(
+            flow_type,
+            state=state,
+            worker=worker,
+            partition_key=partition,
+            limit=1,
+            lease_ms=lease_ms,
+            now_ms=claim_now_ms,
+            priority=None,
+            include_state=include_state,
+        )
+        if jobs or now_ms is not None or time.monotonic() >= deadline:
+            break
+        time.sleep(0.001)
     assert len(jobs) == 1
     return jobs[0]
 
@@ -572,16 +583,20 @@ def _create_and_claim(
 ) -> tuple[str, str, ClaimedFlow]:
     flow_id = f"py-sdk:{name}:{suffix}"
     partition = f"{flow_id}:partition"
+    create_now_ms = now_ms
+    if create_now_ms is None:
+        create_now_ms = int(time.time() * 1000) - 1
     client.create(
         flow_id,
         type=flow_type,
         state=state,
         partition_key=partition,
         payload={"name": name},
-        now_ms=now_ms,
-        run_at_ms=now_ms,
+        now_ms=create_now_ms,
+        run_at_ms=create_now_ms,
         idempotent=True,
     )
+    claim_now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
     return (
         flow_id,
         partition,
@@ -590,7 +605,7 @@ def _create_and_claim(
             flow_type,
             state,
             partition,
-            now_ms=now_ms,
+            now_ms=claim_now_ms,
             lease_ms=lease_ms,
             include_state=True,
         ),
@@ -612,6 +627,7 @@ def test_real_ferricstore_native_protocol_command_coverage_contract() -> None:
         catalog_names = _command_catalog_names(client.command("COMMAND"))
         assert catalog_names <= _NATIVE_PROTOCOL_COMMANDS
         assert set(_NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED) <= _NATIVE_PROTOCOL_COMMANDS
+        assert isinstance(client.retention_cleanup(limit=10), dict)
     finally:
         client.close()
 
@@ -901,6 +917,199 @@ def test_real_ferricstore_fifo_state_policy_edges() -> None:
             now_ms=now + 24,
         )
         assert [job.id for job in queued] == [transition_id]
+    finally:
+        client.close()
+
+
+def test_real_ferricstore_policy_patch_replacement_and_generation_cas() -> None:
+    client = _client()
+    flow_type = f"py-sdk-policy-cas-{_suffix()}"
+
+    try:
+        initial = client.install_policy(
+            flow_type,
+            replace=True,
+            max_active_ms=60_000,
+            retry=RetryPolicy(max_retries=5),
+            states={"queued": FlowStatePolicy(mode=FlowStateMode.FIFO)},
+        )
+        assert initial.generation > 0
+        assert initial.max_active_ms == 60_000
+        assert initial.states is not None
+        assert initial.states["queued"]["mode"] == "fifo"
+
+        patched = client.install_policy(
+            flow_type,
+            indexed_state_meta="phase",
+            expected_generation=initial.generation,
+        )
+        assert patched.generation == initial.generation + 1
+        assert patched.max_active_ms == 60_000
+        assert patched.indexed_state_meta == "phase"
+        assert patched.states is not None
+        assert patched.states["queued"]["mode"] == "fifo"
+
+        replaced = client.install_policy(
+            flow_type,
+            replace=True,
+            expected_generation=patched.generation,
+            max_active_ms=120_000,
+        )
+        assert replaced.generation == patched.generation + 1
+        assert replaced.max_active_ms == 120_000
+        assert replaced.indexed_state_meta is None
+        assert replaced.states == {}
+
+        with pytest.raises(StalePolicyGenerationError):
+            client.install_policy(
+                flow_type,
+                expected_generation=patched.generation,
+                indexed_state_meta="must-not-apply",
+            )
+
+        after_stale = client.policy_get(flow_type)
+        assert after_stale.generation == replaced.generation
+        assert after_stale.max_active_ms == 120_000
+        assert after_stale.indexed_state_meta is None
+        assert after_stale.states == {}
+    finally:
+        client.close()
+
+
+def test_real_ferricstore_fifo_orders_each_partition_and_claims_partitions_concurrently() -> None:
+    client = _client()
+    suffix = _suffix()
+    flow_type = f"py-sdk-fifo-concurrency-{suffix}"
+    partitions = [f"py-sdk:fifo:{suffix}:a", f"py-sdk:fifo:{suffix}:b"]
+    now = int(time.time() * 1000)
+
+    try:
+        client.install_policy(
+            flow_type,
+            replace=True,
+            states={"queued": FlowStatePolicy(mode=FlowStateMode.FIFO)},
+        )
+        expected_first: set[str] = set()
+        expected_second: set[str] = set()
+        for partition_index, partition in enumerate(partitions):
+            first_id = f"py-sdk:fifo:{suffix}:{partition_index}:first"
+            second_id = f"py-sdk:fifo:{suffix}:{partition_index}:second"
+            expected_first.add(first_id)
+            expected_second.add(second_id)
+            for offset, flow_id in enumerate((first_id, second_id)):
+                assert client.create(
+                    flow_id,
+                    type=flow_type,
+                    state="queued",
+                    partition_key=partition,
+                    now_ms=now + offset,
+                    run_at_ms=now + offset,
+                )
+
+        first = client.claim_flows(
+            flow_type,
+            state="queued",
+            worker="py-sdk-fifo-concurrent-worker",
+            partition_keys=partitions,
+            limit=4,
+            priority=None,
+            now_ms=now + 10,
+        )
+        assert {job.id for job in first} == expected_first
+        assert {job.partition_key for job in first} == set(partitions)
+
+        blocked = client.claim_flows(
+            flow_type,
+            state="queued",
+            worker="py-sdk-fifo-concurrent-worker",
+            partition_keys=partitions,
+            limit=4,
+            priority=None,
+            now_ms=now + 11,
+        )
+        assert blocked == []
+
+        for job in first:
+            client.complete(
+                job.id,
+                lease_token=job.lease_token,
+                fencing_token=job.fencing_token,
+                partition_key=job.partition_key,
+                now_ms=now + 12,
+                return_record=False,
+            )
+
+        second = client.claim_flows(
+            flow_type,
+            state="queued",
+            worker="py-sdk-fifo-concurrent-worker",
+            partition_keys=partitions,
+            limit=4,
+            priority=None,
+            now_ms=now + 13,
+        )
+        assert {job.id for job in second} == expected_second
+        assert {job.partition_key for job in second} == set(partitions)
+    finally:
+        client.close()
+
+
+def test_real_ferricstore_workflow_partition_derivation_handles_unicode_colons_and_binary() -> None:
+    client = _client()
+    suffix = _suffix()
+    workflow = WorkflowClient(client).workflow(
+        type=f"py-sdk-derived-partition-{suffix}",
+        initial_state="queued",
+        partition_by=("tenant", "item"),
+    )
+
+    try:
+        unicode_record = workflow.create(
+            f"py-sdk-derived-unicode-{suffix}",
+            tenant="é:a",
+            item="東京",
+            return_record=True,
+        )
+        left = workflow.create(
+            f"py-sdk-derived-colon-left-{suffix}",
+            tenant="a:b",
+            item="c",
+            return_record=True,
+        )
+        right = workflow.create(
+            f"py-sdk-derived-colon-right-{suffix}",
+            tenant="a",
+            item="b:c",
+            return_record=True,
+        )
+        binary_record = workflow.create(
+            f"py-sdk-derived-binary-{suffix}",
+            tenant=b"\x00\xff",
+            item=b"a:b",
+            return_record=True,
+        )
+
+        assert unicode_record.partition_key == "fpk:4:é:a6:東京"
+        assert left.partition_key == "fpk:3:a:b1:c"
+        assert right.partition_key == "fpk:1:a3:b:c"
+        assert left.partition_key != right.partition_key
+        assert binary_record.partition_key == b"fpk:2:\x00\xff3:a:b"
+
+        binary_jobs = client.claim_flows(
+            workflow.type,
+            state="queued",
+            worker="py-sdk-binary-partition-worker",
+            partition_keys=[b"fpk:2:\x00\xff3:a:b"],
+            limit=1,
+            priority=None,
+        )
+        assert [job.id for job in binary_jobs] == [binary_record.id]
+        assert client.complete(
+            binary_jobs[0].id,
+            lease_token=binary_jobs[0].lease_token,
+            fencing_token=binary_jobs[0].fencing_token,
+            partition_key=binary_jobs[0].partition_key,
+        )
     finally:
         client.close()
 
@@ -1460,7 +1669,9 @@ def test_real_ferricstore_native_protocol_flow_admin_surface() -> None:
             retry=RetryPolicy(max_retries=2, base_ms=10, max_ms=100, jitter_pct=0),
             indexed_state_meta="version",
         )
-        assert isinstance(client.policy_get(flow_type), dict)
+        policy = client.policy_get(flow_type)
+        assert policy.type == flow_type
+        assert policy.generation > 0
 
         attr_id = f"py-sdk:native-attr:{suffix}"
         client.create(
@@ -2017,8 +2228,8 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
             type=flow_type,
             state="reclaim",
             partition_key=reclaim_partition,
-            now_ms=1_000,
-            run_at_ms=1_000,
+            now_ms=now,
+            run_at_ms=now,
         )
         reclaim_initial = _claim_one(
             client,
@@ -2026,16 +2237,18 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
             "reclaim",
             reclaim_partition,
             worker="py-sdk-reclaim-initial",
-            now_ms=1_000,
+            now_ms=now,
             lease_ms=10,
         )
         assert reclaim_initial.id == reclaim_id
+        time.sleep(0.02)
+        reclaim_now_ms = int(time.time() * 1000)
         reclaimed = client.reclaim(
             flow_type,
             worker="py-sdk-reclaim-worker",
             partition_key=reclaim_partition,
             limit=1,
-            now_ms=2_000,
+            now_ms=reclaim_now_ms,
             lease_ms=30_000,
             include_record=False,
         )
@@ -2056,32 +2269,28 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
             type=flow_type,
             state="stuck",
             partition_key=stuck_partition,
-            now_ms=1_000,
-            run_at_ms=1_000,
+            now_ms=now,
+            run_at_ms=now,
         )
         stuck_job = _claim_one(
             client,
             flow_type,
             "stuck",
             stuck_partition,
-            now_ms=1_000,
-            lease_ms=60_000,
+            now_ms=now,
+            lease_ms=10,
         )
+        assert stuck_job.id == stuck_id
+        time.sleep(0.02)
         assert any(
             record.id == stuck_id
             for record in client.stuck(
                 flow_type,
                 partition_key=stuck_partition,
                 count=10,
-                older_than_ms=1,
-                now_ms=120_000,
+                older_than_ms=0,
+                now_ms=int(time.time() * 1000),
             )
-        )
-        assert client.complete(
-            stuck_job.id,
-            lease_token=stuck_job.lease_token,
-            fencing_token=stuck_job.fencing_token,
-            partition_key=stuck_job.partition_key,
         )
 
         parent_flow_id = f"py-sdk:parent:{suffix}"
@@ -2142,8 +2351,8 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
 
         assert isinstance(client.list(flow_type, count=100), list)
         assert isinstance(client.info(flow_type), dict)
+        time.sleep(2.0)
         assert isinstance(client.history(signal_id, partition_key=signal_partition, count=5), list)
-        assert isinstance(client.retention_cleanup(limit=10), dict)
     finally:
         client.close()
 

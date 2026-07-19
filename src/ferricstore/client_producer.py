@@ -49,7 +49,7 @@ class _ClientProducerMixin(_ClientMixinBase):
         type: str,
         state: str = "queued",
         payload: Any = None,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         parent_flow_id: str | None = None,
         root_flow_id: str | None = None,
         correlation_id: str | None = None,
@@ -92,7 +92,7 @@ class _ClientProducerMixin(_ClientMixinBase):
         type: str,
         payload: Any = None,
         state: str = "queued",
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         priority: int | None = 0,
@@ -134,7 +134,7 @@ class _ClientProducerMixin(_ClientMixinBase):
         worker: str,
         lease_ms: int = 30_000,
         payload: Any = None,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         parent_flow_id: str | None = None,
         root_flow_id: str | None = None,
         correlation_id: str | None = None,
@@ -188,7 +188,7 @@ class _ClientProducerMixin(_ClientMixinBase):
         now_ms: int | None = None,
         payload: Any = None,
         result: Any = None,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         retention_ttl_ms: int | None = None,
     ) -> bytes:
         """Run deterministic workflow step chains in one durable Flow command.
@@ -219,8 +219,8 @@ class _ClientProducerMixin(_ClientMixinBase):
     @staticmethod
     def _run_steps_many_items(
         items: builtins.list[str | dict[str, Any] | CreateItem],
-        partition_key: str | None,
-    ) -> builtins.list[dict[str, str]]:
+        partition_key: str | bytes | None,
+    ) -> builtins.list[dict[str, str | bytes]]:
         return _run_steps_many_items(items, partition_key)
 
     def enqueue_many(
@@ -229,7 +229,7 @@ class _ClientProducerMixin(_ClientMixinBase):
         *,
         type: str,
         state: str = "queued",
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         run_at_ms: int | None = None,
         now_ms: int | None = None,
         priority: int | None = 0,
@@ -306,7 +306,7 @@ class _ClientProducerMixin(_ClientMixinBase):
 
     def create_many(
         self,
-        partition_key: str | None,
+        partition_key: str | bytes | None,
         items: builtins.list[CreateItem],
         *,
         type: str,
@@ -350,7 +350,7 @@ class _ClientProducerMixin(_ClientMixinBase):
 
     def submit_create_many(
         self,
-        partition_key: str | None,
+        partition_key: str | bytes | None,
         items: builtins.list[CreateItem],
         *,
         type: str,

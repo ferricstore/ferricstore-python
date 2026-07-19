@@ -6,7 +6,7 @@ from typing import Any
 from ferricstore.errors import FerricStoreError
 from ferricstore.protocol_common import _map_get
 
-MINIMUM_SERVER_VERSION = "0.8.0"
+MINIMUM_SERVER_VERSION = "0.9.1"
 UNAUTHENTICATED_MAX_FRAME_BYTES = 64 * 1024
 
 
@@ -15,10 +15,11 @@ class NegotiatedProtocolCapabilities:
     max_response_bytes: int
     compact_response_codecs: dict[int, str]
     auth_required: bool
+    flow_policy_set_fields: frozenset[str]
 
 
 def parse_hello_capabilities(value: Any) -> NegotiatedProtocolCapabilities:
-    """Validate and normalize the FerricStore 0.8 HELLO capability contract."""
+    """Validate and normalize the FerricStore 0.9.1 HELLO capability contract."""
     if not isinstance(value, dict):
         raise _incompatible_server("HELLO response is not a map")
     if _text(_map_get(value, "protocol")) != "ferricstore-native":
@@ -34,6 +35,13 @@ def parse_hello_capabilities(value: Any) -> NegotiatedProtocolCapabilities:
     )
     response_codecs = _required_map(capabilities, "response_codecs")
     compact_opcodes = _required_map(response_codecs, "compact_response_opcodes")
+    schemas = _required_map(capabilities, "schemas")
+    policy_set_schema = _required_map(schemas, "FLOW.POLICY.SET")
+    policy_set_fields = _required_text_set(policy_set_schema, "fields")
+    missing_policy_fields = {"expected_generation", "replace"} - policy_set_fields
+    if missing_policy_fields:
+        missing = ", ".join(sorted(missing_policy_fields))
+        raise _incompatible_server(f"FLOW.POLICY.SET schema is missing required fields: {missing}")
 
     by_opcode: dict[int, str] = {}
     for raw_name, raw_opcodes in compact_opcodes.items():
@@ -55,6 +63,7 @@ def parse_hello_capabilities(value: Any) -> NegotiatedProtocolCapabilities:
         max_response_bytes=max_response_bytes,
         compact_response_codecs=by_opcode,
         auth_required=auth_required,
+        flow_policy_set_fields=frozenset(policy_set_fields),
     )
 
 
@@ -130,6 +139,16 @@ def _required_map(value: dict[Any, Any], field: str) -> dict[Any, Any]:
     return nested
 
 
+def _required_text_set(value: dict[Any, Any], field: str) -> set[str]:
+    nested = _map_get(value, field)
+    if not isinstance(nested, (list, tuple)):
+        raise _incompatible_server(f"HELLO is missing {field}")
+    result = {_text(item) for item in nested}
+    if "" in result:
+        raise _incompatible_server(f"HELLO {field} contains an invalid value")
+    return result
+
+
 def _minimum_limit(configured: int | None, negotiated: int) -> int:
     return negotiated if configured is None else min(configured, negotiated)
 
@@ -156,7 +175,7 @@ def _text(value: Any) -> str:
 
 def _incompatible_server(detail: str) -> FerricStoreError:
     return FerricStoreError(
-        f"FerricStore server does not satisfy the minimum 0.8.0 HELLO contract: {detail}"
+        f"FerricStore server does not satisfy the minimum 0.9.1 HELLO contract: {detail}"
     )
 
 

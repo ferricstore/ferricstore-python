@@ -60,6 +60,8 @@ class FakeAsyncExecutor:
             if "RETURN" in args and str(args[args.index("RETURN") + 1]).endswith("_ATTRS"):
                 return [[b"f1", b"tenant:1", b"lease", 7, {b"tenant": b"acme"}]]
             return [[b"f1", b"tenant:1", b"lease", 7]]
+        if command in {"FLOW.POLICY.SET", "FLOW.POLICY.GET"}:
+            return {b"type": str(args[1]).encode(), b"generation": 1}
         if command in {
             "FLOW.LIST",
             "FLOW.TERMINALS",
@@ -71,7 +73,7 @@ class FakeAsyncExecutor:
             "FLOW.SEARCH",
         }:
             return [record]
-        if command in {"FLOW.INFO", "FLOW.POLICY.GET", "FLOW.RETENTION_CLEANUP"}:
+        if command in {"FLOW.INFO", "FLOW.RETENTION_CLEANUP"}:
             return {b"ok": 1}
         if command == "FLOW.HISTORY":
             return [[b"event-1", {b"event": b"created"}]]
@@ -2192,7 +2194,7 @@ def test_async_query_policy_and_cleanup_commands():
         assert await client.info("order") == {b"ok": 1}
         assert (await client.stuck("order", older_than_ms=100, now_ms=200))[0].id == "f1"
         assert await client.history("f1", count=10, from_version=2, values=True)
-        assert await client.policy_get("order", state="queued") == {b"ok": 1}
+        assert (await client.policy_get("order", state="queued")).generation == 1
         assert await client.retention_cleanup(limit=100, now_ms=123) == {b"ok": 1}
 
     run(main())
@@ -2216,8 +2218,11 @@ def test_async_install_policy_can_set_indexed_state_meta():
         )
 
         call = executor.calls[-1]
-        assert call[:4] == ("FLOW.POLICY.SET", "order", "INDEXED_STATE_META", "version")
-        assert call[4:6] == ("MAX_RETRIES", 2)
+        assert call[:4] == ("FLOW.POLICY.SET", "order", "REPLACE", "false")
+        indexed_index = call.index("INDEXED_STATE_META")
+        assert call[indexed_index : indexed_index + 2] == ("INDEXED_STATE_META", "version")
+        retry_index = call.index("MAX_RETRIES")
+        assert call[retry_index : retry_index + 2] == ("MAX_RETRIES", 2)
         state_index = call.index("STATE")
         assert call[state_index : state_index + 4] == ("STATE", "queued", "MAX_RETRIES", 5)
 

@@ -48,7 +48,7 @@ class _AsyncClientMutationsMixin(_AsyncClientMixinBase):
         to_state: str,
         lease_token: bytes,
         fencing_token: int,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         payload: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
@@ -96,7 +96,7 @@ class _AsyncClientMutationsMixin(_AsyncClientMixinBase):
         to_state: str,
         fencing_token: int,
         lease_ms: int = 30_000,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         payload: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
@@ -137,7 +137,7 @@ class _AsyncClientMutationsMixin(_AsyncClientMixinBase):
 
     async def complete_many(
         self,
-        partition_key: str | None,
+        partition_key: str | bytes | None,
         items: builtins.list[ClaimedFlow],
         *,
         result: Any = None,
@@ -222,8 +222,8 @@ class _AsyncClientMutationsMixin(_AsyncClientMixinBase):
         state: str | None = None,
         states: builtins.list[str] | None = None,
         worker: str,
-        partition_key: str | None = None,
-        partition_keys: builtins.list[str] | None = None,
+        partition_key: str | bytes | None = None,
+        partition_keys: Sequence[str | bytes] | None = None,
         lease_ms: int = 30_000,
         limit: int = 100,
         priority: int | None = 0,
@@ -332,7 +332,7 @@ class _AsyncClientMutationsMixin(_AsyncClientMixinBase):
         *,
         lease_token: bytes,
         fencing_token: int,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         result: Any = None,
         payload: Any = None,
         values: dict[str, Any] | None = None,
@@ -416,7 +416,7 @@ class _AsyncClientMutationsMixin(_AsyncClientMixinBase):
 
     async def transition_many(
         self,
-        partition_key: str | None,
+        partition_key: str | bytes | None,
         *,
         from_state: str,
         to_state: str,
@@ -474,7 +474,7 @@ class _AsyncClientMutationsMixin(_AsyncClientMixinBase):
         *,
         lease_token: bytes,
         fencing_token: int,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         error: Any = None,
         payload: Any = None,
         values: dict[str, Any] | None = None,
@@ -513,7 +513,7 @@ class _AsyncClientMutationsMixin(_AsyncClientMixinBase):
 
     async def retry_many(
         self,
-        partition_key: str | None,
+        partition_key: str | bytes | None,
         items: builtins.list[ClaimedFlow],
         *,
         error: Any = None,
@@ -564,7 +564,7 @@ class _AsyncClientMutationsMixin(_AsyncClientMixinBase):
         *,
         lease_token: bytes,
         fencing_token: int,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         error: Any = None,
         payload: Any = None,
         values: dict[str, Any] | None = None,
@@ -603,7 +603,7 @@ class _AsyncClientMutationsMixin(_AsyncClientMixinBase):
 
     async def fail_many(
         self,
-        partition_key: str | None,
+        partition_key: str | bytes | None,
         items: builtins.list[ClaimedFlow],
         *,
         error: Any = None,
@@ -654,7 +654,7 @@ class _AsyncClientMutationsMixin(_AsyncClientMixinBase):
         *,
         fencing_token: int,
         lease_token: bytes | None = None,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         reason: Any = None,
         values: dict[str, Any] | None = None,
         value_refs: dict[str, str] | None = None,
@@ -701,7 +701,7 @@ class _AsyncClientMutationsMixin(_AsyncClientMixinBase):
 
     async def cancel_many(
         self,
-        partition_key: str | None,
+        partition_key: str | bytes | None,
         items: builtins.list[FencedItem],
         *,
         reason: Any = None,
@@ -742,7 +742,7 @@ class _AsyncClientMutationsMixin(_AsyncClientMixinBase):
         id: str,
         *,
         to_event: str,
-        partition_key: str | None = None,
+        partition_key: str | bytes | None = None,
         expect_state: str | None = None,
         run_at_ms: int | None = None,
         reason_ref: str | None = None,

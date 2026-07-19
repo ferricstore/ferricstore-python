@@ -1,6 +1,6 @@
 services:
   ferricstore-security:
-    image: ${FERRICSTORE_IMAGE:-ghcr.io/ferricstore/ferricstore:0.8.0}
+    image: ${FERRICSTORE_IMAGE:-ghcr.io/ferricstore/ferricstore:0.9.1}
     environment:
       FERRICSTORE_PROTECTED_MODE: "false"
       FERRICSTORE_SHARD_COUNT: "${FERRICSTORE_SHARD_COUNT:-4}"

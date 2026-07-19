@@ -1493,6 +1493,9 @@ def test_sync_old_transport_close_does_not_fail_replacement_requests(
             "capabilities": {
                 "response_codecs": {"compact_response_opcodes": {}},
                 "limits": {"max_response_bytes": 64 * 1024 * 1024},
+                "schemas": {
+                    "FLOW.POLICY.SET": {"fields": ["type", "expected_generation", "replace"]}
+                },
             },
         },
     )

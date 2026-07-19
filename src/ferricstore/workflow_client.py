@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from ferricstore.client_core import FlowClient
 from ferricstore.lifecycle_core import SyncCloseCoordinator, close_resources_sync
+from ferricstore.policy_types import PolicySnapshot
 from ferricstore.retry_policy import RetryPolicy
 from ferricstore.types import (
     FlowStatePolicyLike,
@@ -189,7 +190,9 @@ class WorkflowClient:
         states: dict[str, FlowStatePolicyLike] | None = None,
         indexed_state_meta: str | None = None,
         max_active_ms: int | float | str | None = None,
-    ) -> Any:
+        replace: bool = True,
+        expected_generation: int | None = None,
+    ) -> PolicySnapshot:
         if retry_policy is not None and retry is not None:
             raise ValueError("retry_policy and retry are mutually exclusive")
         resolved_retry_policy = (
@@ -199,7 +202,12 @@ class WorkflowClient:
             if retry is not None
             else self.retry_policy
         )
-        kwargs: dict[str, Any] = {"retry": resolved_retry_policy, "states": states}
+        kwargs: dict[str, Any] = {
+            "retry": resolved_retry_policy,
+            "states": states,
+            "replace": replace,
+            "expected_generation": expected_generation,
+        }
         if indexed_state_meta is not None:
             kwargs["indexed_state_meta"] = indexed_state_meta
         if max_active_ms is not None:

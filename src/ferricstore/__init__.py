@@ -3,7 +3,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.5.1"
+__version__ = "0.6.1"
 
 _EXPORTS: dict[str, tuple[str, str]] = {
     "ApprovalResult": ("ferricstore.types", "ApprovalResult"),
@@ -78,6 +78,8 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "MINIMUM_SERVER_VERSION",
     ),
     "OverloadedError": ("ferricstore.errors", "OverloadedError"),
+    "PartitionKey": ("ferricstore.types", "PartitionKey"),
+    "PolicySnapshot": ("ferricstore.policy_types", "PolicySnapshot"),
     "RequestOutcomeUnknownError": (
         "ferricstore.errors",
         "RequestOutcomeUnknownError",
@@ -101,6 +103,10 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "RoutingTopology": ("ferricstore.protocol_common", "RoutingTopology"),
     "ScheduleResult": ("ferricstore.schedule_types", "ScheduleResult"),
     "StaleLeaseError": ("ferricstore.errors", "StaleLeaseError"),
+    "StalePolicyGenerationError": (
+        "ferricstore.errors",
+        "StalePolicyGenerationError",
+    ),
     "TopologyProtocolAdapterPool": (
         "ferricstore.protocol_sync_topology",
         "TopologyProtocolAdapterPool",
@@ -180,7 +186,9 @@ if TYPE_CHECKING:
         OverloadedError,
         RequestOutcomeUnknownError,
         StaleLeaseError,
+        StalePolicyGenerationError,
     )
+    from ferricstore.policy_types import PolicySnapshot
     from ferricstore.protocol import (
         AsyncProtocolAdapter,
         AsyncProtocolAdapterPool,
@@ -213,6 +221,7 @@ if TYPE_CHECKING:
         FlowStatePolicy,
         GovernanceOverview,
         KeyInfo,
+        PartitionKey,
         PubSubMessage,
         RateLimitResult,
     )
@@ -309,6 +318,8 @@ __all__ = [
     "LockHeldError",
     "LockNotOwnedError",
     "OverloadedError",
+    "PartitionKey",
+    "PolicySnapshot",
     "ProtocolAdapter",
     "ProtocolAdapterPool",
     "ProtocolCommand",
@@ -329,6 +340,7 @@ __all__ = [
     "RoutingTopology",
     "ScheduleResult",
     "StaleLeaseError",
+    "StalePolicyGenerationError",
     "TopologyProtocolAdapterPool",
     "TransactionSession",
     "Transition",

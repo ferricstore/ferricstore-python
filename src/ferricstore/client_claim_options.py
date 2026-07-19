@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+from collections.abc import Sequence
 from typing import Any
 
 from ferricstore.client_helpers import (
@@ -16,6 +17,7 @@ from ferricstore.config_validation import (
     validate_bounded_nonnegative_int,
     validate_optional_bool,
     validate_optional_nonnegative_int,
+    validate_partition_key_sequence,
     validate_positive_int,
     validate_string_sequence,
 )
@@ -28,8 +30,8 @@ def _claim_due_command_args(
     state: str | None = None,
     states: builtins.list[str] | None = None,
     worker: str,
-    partition_key: str | None = None,
-    partition_keys: builtins.list[str] | None = None,
+    partition_key: str | bytes | None = None,
+    partition_keys: Sequence[str | bytes] | None = None,
     lease_ms: int = 30_000,
     limit: int = 1,
     priority: int | None = None,
@@ -65,7 +67,7 @@ def _claim_due_command_args(
         else None
     )
     resolved_partition_keys = (
-        validate_string_sequence(partition_keys, name="partition_keys", allow_empty=False)
+        validate_partition_key_sequence(partition_keys, allow_empty=False)
         if partition_keys is not None
         else None
     )
@@ -108,8 +110,8 @@ def _reclaim_command_args(
     type: str,
     *,
     worker: str,
-    partition_key: str | None,
-    partition_keys: builtins.list[str] | None,
+    partition_key: str | bytes | None,
+    partition_keys: Sequence[str | bytes] | None,
     lease_ms: int,
     limit: int,
     priority: int | None,
@@ -127,7 +129,7 @@ def _reclaim_command_args(
     include_record = validate_bool(include_record, name="include_record")
     include_attributes = validate_bool(include_attributes, name="include_attributes")
     resolved_partition_keys = (
-        validate_string_sequence(partition_keys, name="partition_keys", allow_empty=False)
+        validate_partition_key_sequence(partition_keys, allow_empty=False)
         if partition_keys is not None
         else None
     )
