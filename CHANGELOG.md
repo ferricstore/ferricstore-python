@@ -17,7 +17,7 @@ The project is currently public alpha. APIs may change before `1.0`.
   remove the superseded collection opcodes from the native command surface.
 - Add live pagination, count, explain/analyze, index-status, eventual
   projection, convenience, and scoped query ACL integration coverage.
-- Pin live server integration to the immutable FerricStore 0.10.1 release
+- Pin live server integration to the immutable FerricStore 0.10.2 release
   while retaining FerricStore 0.10.0 as the minimum negotiated contract.
 - Reject incompatible index-status contracts during HELLO and preserve the
   server's UTF-8 and metadata-normalization rules before query transport.

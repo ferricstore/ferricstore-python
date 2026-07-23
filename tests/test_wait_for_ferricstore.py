@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
-INTEGRATION_SERVER_VERSION = "0.10.1"
+INTEGRATION_SERVER_VERSION = "0.10.2"
+INTEGRATION_IMAGE_PATTERN = re.compile(
+    rf"ghcr\.io/ferricstore/ferricstore:{INTEGRATION_SERVER_VERSION}"
+    r"@sha256:[0-9a-f]{64}"
+)
 
 
 def _load_wait_module():
@@ -73,7 +78,12 @@ def test_main_waits_for_continuous_configured_readiness(monkeypatch):
 
 def test_compose_fixtures_target_current_ferricstore_server_version():
     root = Path(__file__).resolve().parents[1]
-    for name in ("docker-compose.yml", "docker-compose.cluster.yml", ".env.example"):
+    for name in (
+        "docker-compose.yml",
+        "docker-compose.cluster.yml",
+        "docker-compose.security.yml",
+        ".env.example",
+    ):
         text = (root / name).read_text()
         assert f"ghcr.io/ferricstore/ferricstore:{INTEGRATION_SERVER_VERSION}" in text
         assert "ghcr.io/ferricstore/ferricstore:0.7.2" not in text
@@ -90,3 +100,32 @@ def test_ci_fixtures_target_current_ferricstore_server_version():
         text = (root / name).read_text()
         assert f"ghcr.io/ferricstore/ferricstore:{INTEGRATION_SERVER_VERSION}" in text
         assert "ghcr.io/ferricstore/ferricstore:0.9.1" not in text
+
+
+def test_integration_fixtures_share_one_immutable_server_image():
+    root = Path(__file__).resolve().parents[1]
+    names = (
+        "docker-compose.yml",
+        "docker-compose.cluster.yml",
+        "docker-compose.security.yml",
+        ".env.example",
+        ".github/workflows/ci.yml",
+        ".github/workflows/extended-validation.yml",
+        ".github/workflows/publish.yml",
+    )
+    images = set()
+
+    for name in names:
+        matches = INTEGRATION_IMAGE_PATTERN.findall((root / name).read_text())
+        assert matches, f"{name} does not pin an immutable integration image"
+        images.update(matches)
+
+    assert len(images) == 1
+
+
+def test_security_integration_grants_native_bootstrap_and_query_permissions():
+    root = Path(__file__).resolve().parents[1]
+    fixture = (root / "tests/integration/test_security_integration.py").read_text()
+
+    for command in ("shards", "subscribe_events", "flow.query", "flow.query.explain"):
+        assert f'"+{command}"' in fixture

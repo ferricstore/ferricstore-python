@@ -74,6 +74,8 @@ def test_tls_acl_authentication_and_authorization_for_sync_and_async_clients() -
                 "-@all",
                 "+ping",
                 "+get",
+                "+shards",
+                "+subscribe_events",
                 "+flow.query",
                 "+flow.query.explain",
             ],
