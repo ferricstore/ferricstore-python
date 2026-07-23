@@ -2,12 +2,12 @@
 
 Python SDK for FerricStore and FerricFlow.
 
-Status: public alpha `0.6.2`. APIs may change before `1.0`, but the SDK is
+Status: public alpha `0.7.0`. APIs may change before `1.0`, but the SDK is
 tested against command construction, queue/workflow handlers, leases, retries,
 history, indexed attributes, named values, idempotent create, worker loops,
 async flows, and local FerricStore integration scenarios.
 
-Version `0.6.2` requires FerricStore `0.9.1` or newer. This is a breaking beta
+Version `0.7.0` requires FerricStore `0.10.0` or newer. This is a breaking beta
 contract update; the native wire protocol remains v1.
 
 FerricFlow keeps each workflow or job's state and history in one durable place. It
@@ -55,7 +55,30 @@ server command. The SDK examples assume:
 ferric://127.0.0.1:6388
 ```
 
-### 3. Create a durable queue item
+### 3. Query durable runs
+
+Use parameterized FQL for bounded, partition-scoped reads. Cursors are opaque
+and must be reused with the same query and parameters.
+
+```python
+from ferricstore import FlowClient
+
+client = FlowClient.from_url("ferric://127.0.0.1:6388")
+query = """
+FROM runs
+WHERE partition_key = @partition AND type = @type AND state = @state
+ORDER BY updated_at_ms ASC
+LIMIT 25
+RETURN RECORDS
+"""
+params = {"partition": "partition-a", "type": "invoice", "state": "queued"}
+
+result = client.query(query, params)
+plan = client.explain(query, params)
+indexes = client.query_indexes()
+```
+
+### 4. Create a durable queue item
 
 ```python
 from ferricstore import FlowClient, QueueClient
@@ -72,13 +95,13 @@ Use `attributes` for small indexed metadata you want to filter/count later:
 emails.enqueue(
     "email-2",
     payload=b"welcome:user-2",
-    attributes={"tenant": "acme", "campaign": "summer"},
+    attributes={"account": "acme", "campaign": "summer"},
     idempotent=True,
 )
 
 flow = FlowClient.from_url("ferric://127.0.0.1:6388")
-records = flow.list("email", attributes={"tenant": "acme"})
-stats = flow.stats("email", attributes={"tenant": "acme"})
+records = flow.list("email", attributes={"account": "acme"})
+stats = flow.stats("email", attributes={"account": "acme"})
 ```
 
 Attributes are not payload bytes. Use named values/value refs for large data.
@@ -89,7 +112,7 @@ FIFO Flow state policy is opt-in per state:
 from ferricstore import FlowStatePolicy
 
 flow.install_policy("email", states={"queued": FlowStatePolicy.fifo()})
-emails.enqueue("email-3", payload=b"welcome", partition_key="tenant-a:email")
+emails.enqueue("email-3", payload=b"welcome", partition_key="account-a:email")
 ```
 
 FIFO states require a `partition_key`; priority is for parallel states.
@@ -145,7 +168,7 @@ client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 order = client.workflow(
     type="order",
     initial_state="created",
-    partition_by=("tenant_id", "order_id"),
+    partition_by=("account_id", "order_id"),
 )
 
 
@@ -163,7 +186,7 @@ def charged(job):
 
 order.start(
     "order-1",
-    tenant_id="tenant-a",
+    account_id="account-a",
     order_id="order-1",
     payload=b"order payload",
     idempotent=True,

@@ -550,11 +550,25 @@ def flow_history_payload_batch(
     return b"".join(parts)
 
 
-def flow_list_command(flow_type: str, count: int, *, return_meta: bool = False) -> tuple[Any, ...]:
-    command: list[Any] = ["FLOW.LIST", flow_type, "STATE", FLOW_STATE, "COUNT", count]
-    if return_meta:
-        command.extend(("RETURN", "META"))
-    return tuple(command)
+def flow_list_command(flow_type: str, count: int, *, partition: str) -> tuple[Any, ...]:
+    if count < 1 or count > 100:
+        raise ValueError("FLOW.QUERY benchmark count must be between 1 and 100")
+    query = (
+        "FROM runs WHERE partition_key = @partition_key "
+        "AND type = @type AND state = @state "
+        f"ORDER BY updated_at_ms ASC LIMIT {count} RETURN RECORDS"
+    )
+    return (
+        "FLOW.QUERY",
+        "FQL1",
+        query,
+        "partition_key",
+        partition,
+        "state",
+        FLOW_STATE,
+        "type",
+        flow_type,
+    )
 
 
 def warm_flow_history_projection(
@@ -915,8 +929,9 @@ def run_flow_list_reads(
     *,
     clock: Callable[[], float] | None = None,
 ) -> tuple[int, int, list[float]]:
-    def build(_start: int, count: int) -> tuple[Any, ...]:
-        return flow_list_command(flow_type, count, return_meta=args.operation == "flow-list-meta")
+    def build(start: int, count: int) -> tuple[Any, ...]:
+        partition = partition_key(start // max(args.batch_size, 1), args.partitions)
+        return flow_list_command(flow_type, count, partition=partition)
 
     if args.read_duration > 0:
         return run_submit_command_batches_for_duration(
@@ -2270,14 +2285,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "flow-get": 250,
             "flow-get-meta": 250,
             "flow-history": 250,
-            "flow-list": 250,
-            "flow-list-meta": 250,
+            "flow-list": 100,
+            "flow-list-meta": 100,
             "value-put": 100,
             "value-put-ok": 500,
             "value-put-owned": 100,
         }.get(args.operation, 500)
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
+    if args.operation in {"flow-list", "flow-list-meta"} and args.batch_size > 100:
+        parser.error("FLOW.QUERY --batch-size must not exceed 100")
     if args.setup_batch_size is not None and args.setup_batch_size <= 0:
         parser.error("--setup-batch-size must be positive")
     if args.inflight_batches <= 0:

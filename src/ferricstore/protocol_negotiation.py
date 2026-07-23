@@ -6,8 +6,45 @@ from typing import Any
 from ferricstore.errors import FerricStoreError
 from ferricstore.protocol_common import _map_get
 
-MINIMUM_SERVER_VERSION = "0.9.1"
+MINIMUM_SERVER_VERSION = "0.10.0"
 UNAUTHENTICATED_MAX_FRAME_BYTES = 64 * 1024
+
+_FLOW_QUERY_CAPABILITIES = frozenset(
+    {
+        "flow_query_v1",
+        "flow_explain_v1",
+        "flow_explain_analyze_v1",
+        "flow_composite_index_v1",
+        "flow_query_index_status_v1",
+    }
+)
+_FLOW_QUERY_SHAPES = frozenset(
+    {
+        "runs_by_run_id_record",
+        "runs_by_partition_and_run_id_record",
+        "runs_by_partition_predicates_ordered_records",
+        "runs_by_partition_type_state_ordered_records",
+        "runs_by_partition_type_terminals_ordered_records",
+        "runs_by_partition_metadata_ordered_records",
+        "runs_by_partition_type_running_lease_deadline_ordered_records",
+        "runs_by_partition_parent_ordered_records",
+        "runs_by_partition_root_ordered_records",
+        "runs_by_partition_correlation_ordered_records",
+        "runs_by_partition_predicates_count",
+        "events_by_run_id_ordered_records",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class FlowQueryCapabilities:
+    request_contract: str
+    result_contract: str
+    explain_contract: str
+    index_status_contract: str
+    capabilities: frozenset[str]
+    language_versions: frozenset[str]
+    shapes: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,10 +53,11 @@ class NegotiatedProtocolCapabilities:
     compact_response_codecs: dict[int, str]
     auth_required: bool
     flow_policy_set_fields: frozenset[str]
+    flow_query: FlowQueryCapabilities
 
 
 def parse_hello_capabilities(value: Any) -> NegotiatedProtocolCapabilities:
-    """Validate and normalize the FerricStore 0.9.1 HELLO capability contract."""
+    """Validate and normalize the FerricStore 0.10.0 HELLO capability contract."""
     if not isinstance(value, dict):
         raise _incompatible_server("HELLO response is not a map")
     if _text(_map_get(value, "protocol")) != "ferricstore-native":
@@ -42,6 +80,7 @@ def parse_hello_capabilities(value: Any) -> NegotiatedProtocolCapabilities:
     if missing_policy_fields:
         missing = ", ".join(sorted(missing_policy_fields))
         raise _incompatible_server(f"FLOW.POLICY.SET schema is missing required fields: {missing}")
+    flow_query = _parse_flow_query_capabilities(capabilities, schemas)
 
     by_opcode: dict[int, str] = {}
     for raw_name, raw_opcodes in compact_opcodes.items():
@@ -64,6 +103,7 @@ def parse_hello_capabilities(value: Any) -> NegotiatedProtocolCapabilities:
         compact_response_codecs=by_opcode,
         auth_required=auth_required,
         flow_policy_set_fields=frozenset(policy_set_fields),
+        flow_query=flow_query,
     )
 
 
@@ -149,6 +189,83 @@ def _required_text_set(value: dict[Any, Any], field: str) -> set[str]:
     return result
 
 
+def _parse_flow_query_capabilities(
+    capabilities: dict[Any, Any], schemas: dict[Any, Any]
+) -> FlowQueryCapabilities:
+    manifest = _required_map(capabilities, "flow_query")
+    request_contract = _required_text(manifest, "request_contract")
+    result_contract = _required_text(manifest, "result_contract")
+    explain_contract = _required_text(manifest, "explain_contract")
+    index_status_contract = _required_text(manifest, "index_status_contract")
+    expected_contracts = {
+        "request_contract": (request_contract, "ferric.flow.query.request/v1"),
+        "result_contract": (result_contract, "ferric.flow.query.result/v1"),
+        "explain_contract": (explain_contract, "ferric.flow.explain/v1"),
+        "index_status_contract": (
+            index_status_contract,
+            "ferric.flow.query.indexes/v1",
+        ),
+    }
+    for field, (actual, expected) in expected_contracts.items():
+        if actual != expected:
+            raise _incompatible_server(f"flow_query {field} must be {expected!r}")
+
+    query_capabilities = _bounded_text_set(manifest, "capabilities", maximum=64)
+    language_versions = _bounded_text_set(manifest, "language_versions", maximum=16)
+    shapes = _bounded_text_set(manifest, "shapes", maximum=128)
+    _require_members(query_capabilities, _FLOW_QUERY_CAPABILITIES, "flow_query capability")
+    _require_members(language_versions, frozenset({"FQL1"}), "flow_query language")
+    _require_members(shapes, _FLOW_QUERY_SHAPES, "flow_query shape")
+
+    query_schema = _required_map(schemas, "FLOW.QUERY")
+    fields = _bounded_text_set(query_schema, "fields", maximum=64)
+    _require_members(
+        fields,
+        frozenset({"version", "query", "params", "deadline_ms"}),
+        "FLOW.QUERY schema field",
+    )
+    required = _bounded_text_set(query_schema, "required", maximum=16)
+    if required != {"version", "query"}:
+        raise _incompatible_server("FLOW.QUERY schema must require exactly version and query")
+    return FlowQueryCapabilities(
+        request_contract=request_contract,
+        result_contract=result_contract,
+        explain_contract=explain_contract,
+        index_status_contract=index_status_contract,
+        capabilities=frozenset(query_capabilities),
+        language_versions=frozenset(language_versions),
+        shapes=frozenset(shapes),
+    )
+
+
+def _required_text(value: dict[Any, Any], field: str) -> str:
+    text = _text(_map_get(value, field))
+    if not text or len(text.encode("utf-8")) > 256:
+        raise _incompatible_server(f"HELLO flow_query {field} must be bounded non-empty text")
+    return text
+
+
+def _bounded_text_set(value: dict[Any, Any], field: str, *, maximum: int) -> set[str]:
+    raw_items = _map_get(value, field)
+    if not isinstance(raw_items, (list, tuple)) or not 1 <= len(raw_items) <= maximum:
+        raise _incompatible_server(f"HELLO {field} must contain 1..{maximum} entries")
+    result: set[str] = set()
+    for raw_item in raw_items:
+        item = _text(raw_item)
+        if not item or len(item.encode("utf-8")) > 256:
+            raise _incompatible_server(f"HELLO {field} contains invalid text")
+        if item in result:
+            raise _incompatible_server(f"HELLO {field} contains duplicate {item!r}")
+        result.add(item)
+    return result
+
+
+def _require_members(actual: set[str], required: frozenset[str], context: str) -> None:
+    missing = required - actual
+    if missing:
+        raise _incompatible_server(f"missing {context} {sorted(missing)[0]!r}")
+
+
 def _minimum_limit(configured: int | None, negotiated: int) -> int:
     return negotiated if configured is None else min(configured, negotiated)
 
@@ -175,13 +292,15 @@ def _text(value: Any) -> str:
 
 def _incompatible_server(detail: str) -> FerricStoreError:
     return FerricStoreError(
-        f"FerricStore server does not satisfy the minimum 0.9.1 HELLO contract: {detail}"
+        f"FerricStore server does not satisfy the minimum {MINIMUM_SERVER_VERSION} "
+        f"HELLO contract: {detail}"
     )
 
 
 __all__ = [
     "MINIMUM_SERVER_VERSION",
     "UNAUTHENTICATED_MAX_FRAME_BYTES",
+    "FlowQueryCapabilities",
     "NegotiatedProtocolCapabilities",
     "apply_hello_negotiation",
     "mark_authenticated",

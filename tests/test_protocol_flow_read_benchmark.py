@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 _BENCH_PATH = Path(__file__).resolve().parents[1] / "examples" / "protocol_flow_read_benchmark.py"
 _SPEC = importlib.util.spec_from_file_location("protocol_flow_read_benchmark", _BENCH_PATH)
 assert _SPEC is not None
@@ -99,6 +101,31 @@ def test_protocol_flow_read_builds_value_commands():
     )
 
 
+def test_protocol_flow_read_builds_bounded_partition_query():
+    assert bench.flow_query_command("email", partition_key="tenant-a", count=25) == (
+        "FLOW.QUERY",
+        "FQL1",
+        "FROM runs WHERE partition_key = @partition_key AND type = @type "
+        "AND state = @state ORDER BY updated_at_ms ASC LIMIT 25 RETURN RECORDS",
+        "partition_key",
+        "tenant-a",
+        "state",
+        "queued",
+        "type",
+        "email",
+    )
+
+    with pytest.raises(ValueError, match="between 1 and 100"):
+        bench.flow_query_command("email", partition_key="tenant-a", count=101)
+
+
+def test_protocol_flow_read_query_mode_requires_partition(capsys):
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--mode", "flow-query"])
+
+    assert "requires --partition-key" in capsys.readouterr().err
+
+
 def test_protocol_flow_read_extracts_value_refs_from_put_results():
     assert bench.value_refs_from_results(
         [
@@ -110,10 +137,21 @@ def test_protocol_flow_read_extracts_value_refs_from_put_results():
 
 
 def test_protocol_flow_read_result_reports_item_rate():
-    args = bench.parse_args(["--mode", "flow-list-meta", "--test-time", "2", "--list-count", "50"])
+    args = bench.parse_args(
+        [
+            "--mode",
+            "flow-query",
+            "--partition-key",
+            "tenant-a",
+            "--test-time",
+            "2",
+            "--query-count",
+            "50",
+        ]
+    )
     result = bench.benchmark_result(args, requests=4, items=200, latencies_ms=[1.0, 2.0, 3.0])
 
     assert result["requests_per_sec"] == 2.0
     assert result["items_per_sec"] == 100.0
-    assert result["list_count"] == 50
+    assert result["query_count"] == 50
     assert result["batch_latency_p50_ms"] == 2.0

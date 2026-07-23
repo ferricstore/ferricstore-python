@@ -3,7 +3,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.6.2"
+__version__ = "0.7.0"
 
 _EXPORTS: dict[str, tuple[str, str]] = {
     "ApprovalResult": ("ferricstore.types", "ApprovalResult"),
@@ -61,7 +61,26 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "FetchOrComputeResult": ("ferricstore.types", "FetchOrComputeResult"),
     "FlowAlreadyExistsError": ("ferricstore.errors", "FlowAlreadyExistsError"),
     "FlowClient": ("ferricstore.client_core", "FlowClient"),
+    "FlowExplainResult": ("ferricstore.flow_query_types", "FlowExplainResult"),
     "FlowNotFoundError": ("ferricstore.errors", "FlowNotFoundError"),
+    "FlowQueryError": ("ferricstore.flow_query_types", "FlowQueryError"),
+    "FlowQueryErrorPosition": (
+        "ferricstore.flow_query_types",
+        "FlowQueryErrorPosition",
+    ),
+    "FlowQueryIndex": ("ferricstore.flow_query_types", "FlowQueryIndex"),
+    "FlowQueryIndexRegistry": (
+        "ferricstore.flow_query_types",
+        "FlowQueryIndexRegistry",
+    ),
+    "FlowQueryIndexStatus": (
+        "ferricstore.flow_query_types",
+        "FlowQueryIndexStatus",
+    ),
+    "FlowQueryPage": ("ferricstore.flow_query_types", "FlowQueryPage"),
+    "FlowQueryQuality": ("ferricstore.flow_query_types", "FlowQueryQuality"),
+    "FlowQueryResult": ("ferricstore.flow_query_types", "FlowQueryResult"),
+    "FlowQueryUsage": ("ferricstore.flow_query_types", "FlowQueryUsage"),
     "FlowRecord": ("ferricstore.types", "FlowRecord"),
     "FlowStateMode": ("ferricstore.types", "FlowStateMode"),
     "FlowStatePolicy": ("ferricstore.types", "FlowStatePolicy"),
@@ -188,6 +207,18 @@ if TYPE_CHECKING:
         StaleLeaseError,
         StalePolicyGenerationError,
     )
+    from ferricstore.flow_query_types import (
+        FlowExplainResult,
+        FlowQueryError,
+        FlowQueryErrorPosition,
+        FlowQueryIndex,
+        FlowQueryIndexRegistry,
+        FlowQueryIndexStatus,
+        FlowQueryPage,
+        FlowQueryQuality,
+        FlowQueryResult,
+        FlowQueryUsage,
+    )
     from ferricstore.policy_types import PolicySnapshot
     from ferricstore.protocol import (
         AsyncProtocolAdapter,
@@ -305,7 +336,17 @@ __all__ = [
     "FetchOrComputeResult",
     "FlowAlreadyExistsError",
     "FlowClient",
+    "FlowExplainResult",
     "FlowNotFoundError",
+    "FlowQueryError",
+    "FlowQueryErrorPosition",
+    "FlowQueryIndex",
+    "FlowQueryIndexRegistry",
+    "FlowQueryIndexStatus",
+    "FlowQueryPage",
+    "FlowQueryQuality",
+    "FlowQueryResult",
+    "FlowQueryUsage",
     "FlowRecord",
     "FlowStateMode",
     "FlowStatePolicy",

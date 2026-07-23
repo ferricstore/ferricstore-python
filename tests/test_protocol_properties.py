@@ -16,7 +16,7 @@ from ferricstore.protocol_responses import _decode_protocol_response
 _WIRE_SCALARS = st.one_of(
     st.none(),
     st.booleans(),
-    st.integers(min_value=-(2**63), max_value=2**63 - 1),
+    st.integers(min_value=-(2**63), max_value=2**64 - 1),
     st.floats(allow_nan=False, allow_infinity=False),
     st.binary(max_size=32),
     st.text(max_size=32),

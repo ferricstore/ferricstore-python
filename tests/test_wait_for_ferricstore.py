@@ -4,7 +4,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-SERVER_VERSION = "0.9.1"
+INTEGRATION_SERVER_VERSION = "0.10.1"
 
 
 def _load_wait_module():
@@ -75,6 +75,18 @@ def test_compose_fixtures_target_current_ferricstore_server_version():
     root = Path(__file__).resolve().parents[1]
     for name in ("docker-compose.yml", "docker-compose.cluster.yml", ".env.example"):
         text = (root / name).read_text()
-        assert f"ghcr.io/ferricstore/ferricstore:{SERVER_VERSION}" in text
+        assert f"ghcr.io/ferricstore/ferricstore:{INTEGRATION_SERVER_VERSION}" in text
         assert "ghcr.io/ferricstore/ferricstore:0.7.2" not in text
         assert "ferricstore/ferricstore:latest" not in text
+
+
+def test_ci_fixtures_target_current_ferricstore_server_version():
+    root = Path(__file__).resolve().parents[1]
+    for name in (
+        ".github/workflows/ci.yml",
+        ".github/workflows/extended-validation.yml",
+        ".github/workflows/publish.yml",
+    ):
+        text = (root / name).read_text()
+        assert f"ghcr.io/ferricstore/ferricstore:{INTEGRATION_SERVER_VERSION}" in text
+        assert "ghcr.io/ferricstore/ferricstore:0.9.1" not in text

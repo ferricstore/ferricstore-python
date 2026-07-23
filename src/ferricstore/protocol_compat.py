@@ -67,7 +67,7 @@ _GROUPS = (
             "_compact_binary _compact_bool_marker _compact_create_many_return_mode "
             "_compact_flow_cancel_many_payload _compact_flow_claim_due_payload "
             "_compact_flow_claimed_many_payload _compact_flow_complete_many_payload "
-            "_compact_flow_create_many_payload _compact_flow_list_payload "
+            "_compact_flow_create_many_payload "
             "_compact_flow_transition_many_payload _compact_flow_value_mget_payload "
             "_compact_flow_value_put_payload _compact_optional_binary "
             "_compact_i64 "

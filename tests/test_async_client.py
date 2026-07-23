@@ -62,17 +62,31 @@ class FakeAsyncExecutor:
             return [[b"f1", b"tenant:1", b"lease", 7]]
         if command in {"FLOW.POLICY.SET", "FLOW.POLICY.GET"}:
             return {b"type": str(args[1]).encode(), b"generation": 1}
-        if command in {
-            "FLOW.LIST",
-            "FLOW.TERMINALS",
-            "FLOW.FAILURES",
-            "FLOW.BY_PARENT",
-            "FLOW.BY_ROOT",
-            "FLOW.BY_CORRELATION",
-            "FLOW.STUCK",
-            "FLOW.SEARCH",
-        }:
-            return [record]
+        if command == "FLOW.QUERY":
+            return {
+                "version": "ferric.flow.query.result/v1",
+                "records": [record],
+                "page": {"has_more": False},
+                "quality": {
+                    "exactness": "projected_exact",
+                    "freshness": "projection_watermark",
+                    "coverage": "complete",
+                    "pagination": "live_seek",
+                },
+                "usage": {
+                    "range_seeks": 1,
+                    "range_pages": 1,
+                    "scanned_entries": 1,
+                    "scanned_bytes": 1,
+                    "hydrated_records": 1,
+                    "residual_checks": 0,
+                    "duplicate_entries": 0,
+                    "result_records": 1,
+                    "response_bytes": 1,
+                    "memory_high_water_bytes": 1,
+                    "wall_time_us": 1,
+                },
+            }
         if command in {"FLOW.INFO", "FLOW.RETENTION_CLEANUP"}:
             return {b"ok": 1}
         if command == "FLOW.HISTORY":
@@ -2157,42 +2171,38 @@ def test_async_query_policy_and_cleanup_commands():
         executor = FakeAsyncExecutor()
         client = AsyncFlowClient(executor)
 
-        assert (await client.list("order", state="queued", count=10))[0].id == "f1"
-        assert executor.calls[-1] == ("FLOW.LIST", "order", "STATE", "queued", "COUNT", 10)
+        assert (await client.list("order", partition_key="tenant:1", state="queued", count=10))[
+            0
+        ].id == "f1"
+        assert executor.calls[-1][0] == "FLOW.QUERY"
 
-        assert (await client.terminals("order", state="completed", rev=True, count=5))[0].id == "f1"
-        assert executor.calls[-1] == (
-            "FLOW.TERMINALS",
-            "order",
-            "COUNT",
-            5,
-            "REV",
-            "true",
-            "STATE",
-            "completed",
-        )
+        assert (
+            await client.terminals(
+                "order", partition_key="tenant:1", state="completed", rev=True, count=5
+            )
+        )[0].id == "f1"
+        assert executor.calls[-1][0] == "FLOW.QUERY"
 
-        assert (await client.failures("order", from_ms=10, to_ms=20))[0].id == "f1"
-        assert executor.calls[-1] == ("FLOW.FAILURES", "order", "FROM_MS", 10, "TO_MS", 20)
+        assert (await client.failures("order", partition_key="tenant:1", from_ms=10, to_ms=20))[
+            0
+        ].id == "f1"
+        assert executor.calls[-1][0] == "FLOW.QUERY"
 
-        assert (await client.by_parent("p", count=1, terminal_only=True))[0].id == "f1"
-        assert executor.calls[-1] == (
-            "FLOW.BY_PARENT",
-            "p",
-            "COUNT",
-            1,
-            "TERMINAL_ONLY",
-            "true",
-        )
+        assert (await client.by_parent("p", partition_key="tenant:1", count=1))[0].id == "f1"
+        assert executor.calls[-1][0] == "FLOW.QUERY"
 
-        assert (await client.by_root("root", count=1))[0].id == "f1"
-        assert executor.calls[-1] == ("FLOW.BY_ROOT", "root", "COUNT", 1)
+        assert (await client.by_root("root", partition_key="tenant:1", count=1))[0].id == "f1"
+        assert executor.calls[-1][0] == "FLOW.QUERY"
 
-        assert (await client.by_correlation("checkout-1", include_cold=True))[0].id == "f1"
-        assert executor.calls[-1] == ("FLOW.BY_CORRELATION", "checkout-1", "INCLUDE_COLD", "true")
+        assert (await client.by_correlation("checkout-1", partition_key="tenant:1", count=1))[
+            0
+        ].id == "f1"
+        assert executor.calls[-1][0] == "FLOW.QUERY"
 
         assert await client.info("order") == {b"ok": 1}
-        assert (await client.stuck("order", older_than_ms=100, now_ms=200))[0].id == "f1"
+        assert (
+            await client.stuck("order", partition_key="tenant:1", older_than_ms=100, now_ms=200)
+        )[0].id == "f1"
         assert await client.history("f1", count=10, from_version=2, values=True)
         assert (await client.policy_get("order", state="queued")).generation == 1
         assert await client.retention_cleanup(limit=100, now_ms=123) == {b"ok": 1}
@@ -2339,6 +2349,26 @@ def test_async_management_wrappers_build_control_plane_commands_and_normalize_re
     run(main())
 
 
+def test_async_metrics_helpers_parse_real_prometheus_text_without_losing_the_exposition():
+    async def main():
+        scrape = (
+            "# HELP ferric_reads_total Reads\n"
+            'ferric_reads_total{node="host:6379",kind="cold read"} 12.5 1700000000\n'
+            "ferric_queue_depth 3\n"
+        )
+        executor = FakeAsyncExecutor()
+        executor.responses.extend([scrape.encode(), scrape.encode()])
+        client = AsyncFlowClient(executor)
+
+        assert await client.ferricstore_metrics() == {
+            'ferric_reads_total{node="host:6379",kind="cold read"}': 12.5,
+            "ferric_queue_depth": 3,
+        }
+        assert await client.ferricstore_metrics_text() == scrape
+
+    run(main())
+
+
 def test_async_invocation_helpers_build_narrow_commands_and_request_context():
     async def main():
         executor = FakeAsyncExecutor()
@@ -2411,31 +2441,15 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         search_results = await client.search(
             "order",
             state="queued",
+            partition_key="tenant:1",
             count=10,
             attributes={"tenant": "acme"},
             state_meta={"version": 1},
-            terminal_only=True,
-            consistent_projection=True,
         )
         assert search_results[0].id == "f1"
-        assert executor.calls[-1] == (
-            "FLOW.SEARCH",
-            "order",
-            "COUNT",
-            10,
-            "STATE",
-            "queued",
-            "TERMINAL_ONLY",
-            "true",
-            "CONSISTENT_PROJECTION",
-            "true",
-            "ATTRIBUTE",
-            "tenant",
-            "acme",
-            "STATE_META",
-            "queued",
-            {"version": 1},
-        )
+        assert executor.calls[-1][0] == "FLOW.QUERY"
+        assert "attribute['tenant'] = @attribute_0" in executor.calls[-1][2]
+        assert "state_meta['queued']['version'] = @state_meta_0" in executor.calls[-1][2]
 
         assert await client.attributes("order", state="queued", count=10) == [
             {"name": "tenant", "count": 3}

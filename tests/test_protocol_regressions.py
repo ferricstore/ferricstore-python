@@ -41,10 +41,11 @@ from ferricstore.protocol import (
     TopologyProtocolAdapterPool,
     build_protocol_command,
 )
-from ferricstore.protocol_codec import encode_value
+from ferricstore.protocol_codec import decode_value, encode_value
 from ferricstore.protocol_common import _endpoint_adapter_is_idle, _endpoint_from_url
 from ferricstore.protocol_framing import decompress_response, send_frames
 from ferricstore.topology_lifecycle import EndpointAdapterLifecycle, SyncSingleFlight
+from tests.flow_query_contract import with_flow_query_contract
 
 
 def _single_shard_topology(
@@ -301,9 +302,12 @@ def test_flow_option_routing_tokenization_is_linear(monkeypatch: Any) -> None:
         return original_token(value)
 
     monkeypatch.setattr(flow_options_module, "_token", counted_token)
-    args = ("state",) + (b"PAYLOAD",) * 512
+    args = ("FQL1", "FROM runs WHERE partition_key = @partition RETURN COUNT") + (
+        b"parameter",
+        b"value",
+    ) * 64
 
-    assert flow_command_route_keys("FLOW.SEARCH", args) == ()
+    assert flow_command_route_keys("FLOW.QUERY", args) == ()
     assert token_calls <= len(args) * 4
 
 
@@ -516,9 +520,17 @@ def test_generic_map_encoding_rejects_duplicate_wire_keys(value: dict[Any, bytes
         encode_value(value)
 
 
-@pytest.mark.parametrize("value", [-(2**63) - 1, 2**63])
+def test_generic_encoding_round_trips_unsigned_64_bit_integers() -> None:
+    maximum = 2**64 - 1
+    encoded = encode_value(maximum)
+
+    assert encoded == b"\x08" + maximum.to_bytes(8, "big")
+    assert decode_value(encoded) == (maximum, b"")
+
+
+@pytest.mark.parametrize("value", [-(2**63) - 1, 2**64])
 def test_generic_encoding_normalizes_out_of_range_integers(value: int) -> None:
-    with pytest.raises(FerricStoreError, match="signed 64-bit"):
+    with pytest.raises(FerricStoreError, match="signed or unsigned 64-bit"):
         encode_value(value)
 
 
@@ -1490,13 +1502,15 @@ def test_sync_old_transport_close_does_not_fail_replacement_requests(
             "protocol": "ferricstore-native",
             "version": 1,
             "auth_required": False,
-            "capabilities": {
-                "response_codecs": {"compact_response_opcodes": {}},
-                "limits": {"max_response_bytes": 64 * 1024 * 1024},
-                "schemas": {
-                    "FLOW.POLICY.SET": {"fields": ["type", "expected_generation", "replace"]}
-                },
-            },
+            "capabilities": with_flow_query_contract(
+                {
+                    "response_codecs": {"compact_response_opcodes": {}},
+                    "limits": {"max_response_bytes": 64 * 1024 * 1024},
+                    "schemas": {
+                        "FLOW.POLICY.SET": {"fields": ["type", "expected_generation", "replace"]}
+                    },
+                }
+            ),
         },
     )
     adapter._connect_once()

@@ -43,7 +43,6 @@ from ferricstore.protocol_constants import (
     _FLAG_MORE_CHUNKS,
     _HEADER,
     _MAGIC,
-    _OP_COMMAND_EXEC,
     _OP_MSET,
     _OPCODES,
     _REQUEST_VERSION,
@@ -69,6 +68,7 @@ from ferricstore.types import ChildSpec, CreateItem, FencedItem, FlowRecord
 from ferricstore.workflow_client import WorkflowClient
 from ferricstore.workflow_models import WorkflowFlowCommands
 from ferricstore.workflow_runtime import FlowWorkflow, Workflow
+from tests.flow_query_contract import with_flow_query_contract
 
 
 class RecordingExecutor:
@@ -105,23 +105,27 @@ def _hello(*, max_response_bytes: int = 4096) -> dict[str, Any]:
         "protocol": "ferricstore-native",
         "version": 1,
         "auth_required": True,
-        "capabilities": {
-            "limits": {"max_response_bytes": max_response_bytes},
-            "response_codecs": {
-                "compact_response_opcodes": {
-                    "kv_mget_v1": [0x0104, 0x020C],
-                    "flow_record_v1": [0x0202],
-                    "unknown_future_codec_v1": [0x7FFE],
-                }
-            },
-            "schemas": {"FLOW.POLICY.SET": {"fields": ["type", "expected_generation", "replace"]}},
-        },
+        "capabilities": with_flow_query_contract(
+            {
+                "limits": {"max_response_bytes": max_response_bytes},
+                "response_codecs": {
+                    "compact_response_opcodes": {
+                        "kv_mget_v1": [0x0104, 0x020C],
+                        "flow_record_v1": [0x0202],
+                        "unknown_future_codec_v1": [0x7FFE],
+                    }
+                },
+                "schemas": {
+                    "FLOW.POLICY.SET": {"fields": ["type", "expected_generation", "replace"]}
+                },
+            }
+        ),
     }
 
 
-def test_v091_declares_minimum_server_without_changing_wire_v1() -> None:
-    assert ferricstore.MINIMUM_SERVER_VERSION == "0.9.1"
-    assert MINIMUM_SERVER_VERSION == "0.9.1"
+def test_v010_declares_minimum_server_without_changing_wire_v1() -> None:
+    assert ferricstore.MINIMUM_SERVER_VERSION == "0.10.0"
+    assert MINIMUM_SERVER_VERSION == "0.10.0"
     assert _MAGIC == b"FSNP"
     assert _REQUEST_VERSION == 0x01
     assert _RESPONSE_VERSION == 0x81
@@ -152,8 +156,8 @@ def test_hello_drives_compact_codecs_and_response_limit() -> None:
     assert adapter._authenticated is False
 
 
-def test_pre_091_hello_contract_is_rejected() -> None:
-    with pytest.raises(FerricStoreError, match=r"0\.9\.1"):
+def test_pre_010_hello_contract_is_rejected() -> None:
+    with pytest.raises(FerricStoreError, match=r"0\.10\.0"):
         parse_hello_capabilities({"protocol": "ferricstore-native", "version": 1})
 
 
@@ -581,12 +585,28 @@ def test_lineage_payloads_use_only_canonical_names() -> None:
     assert command.payload["root_flow_id"] == "root"
     assert "parent_id" not in command.payload
     assert "root_id" not in command.payload
-    parent_query = build_protocol_command("FLOW.BY_PARENT", "parent")
-    root_query = build_protocol_command("FLOW.BY_ROOT", "root")
-    assert parent_query.opcode == _OP_COMMAND_EXEC
-    assert parent_query.payload == {"command": "FLOW.BY_PARENT", "args": ["parent"]}
-    assert root_query.opcode == _OP_COMMAND_EXEC
-    assert root_query.payload == {"command": "FLOW.BY_ROOT", "args": ["root"]}
+    parent_query = build_protocol_command(
+        "FLOW.QUERY",
+        "FQL1",
+        "FROM runs WHERE partition_key = @partition AND parent_flow_id = @parent RETURN COUNT",
+        "partition",
+        "tenant-a",
+        "parent",
+        "parent",
+    )
+    root_query = build_protocol_command(
+        "FLOW.QUERY",
+        "FQL1",
+        "FROM runs WHERE partition_key = @partition AND root_flow_id = @root RETURN COUNT",
+        "partition",
+        "tenant-a",
+        "root",
+        "root",
+    )
+    assert parent_query.opcode == 0x0231
+    assert parent_query.payload["params"]["parent"] == "parent"
+    assert root_query.opcode == 0x0231
+    assert root_query.payload["params"]["root"] == "root"
     assert "parent_id" not in str(parent_query.payload)
     assert "root_id" not in str(root_query.payload)
     with pytest.raises(InvalidCommandError):

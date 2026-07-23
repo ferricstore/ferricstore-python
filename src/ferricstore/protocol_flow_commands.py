@@ -6,6 +6,7 @@ from typing import Any
 from ferricstore.errors import (
     InvalidCommandError,
 )
+from ferricstore.flow_query_request import build_flow_query_payload
 from ferricstore.protocol_command_options import (
     _command_exec_protocol_command,
     _option_map,
@@ -33,7 +34,6 @@ from ferricstore.protocol_flow_codec import (
     _compact_flow_claim_due_payload,
     _compact_flow_claimed_many_payload,
     _compact_flow_create_many_payload,
-    _compact_flow_list_payload,
     _compact_flow_transition_many_payload,
     _compact_flow_value_mget_payload,
 )
@@ -55,16 +55,9 @@ from ferricstore.protocol_flow_payloads import (
 
 
 def _build_flow_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolCommand:
-    # The v0.8 native query opcode handlers still name these positional inputs
-    # with removed lineage aliases. COMMAND_EXEC preserves the canonical public
-    # contract without constructing either legacy field on the wire.
-    if name in {"FLOW.BY_PARENT", "FLOW.BY_ROOT"}:
-        return _command_exec_protocol_command(name, args)
     command = _build_native_flow_protocol_command(name, args)
     payload = command.payload
-    if isinstance(payload, dict) and (
-        "indexed_state_meta" in payload or (name != "FLOW.SEARCH" and "state_meta" in payload)
-    ):
+    if isinstance(payload, dict) and ("indexed_state_meta" in payload or "state_meta" in payload):
         return _command_exec_protocol_command(name, args)
     return command
 
@@ -197,9 +190,6 @@ _FLOW_ID_QUERY_ARGUMENTS = {
     "FLOW.GET": "id",
     "FLOW.HISTORY": "id",
     "FLOW.REWIND": "id",
-    "FLOW.BY_PARENT": "parent_flow_id",
-    "FLOW.BY_ROOT": "root_flow_id",
-    "FLOW.BY_CORRELATION": "correlation_id",
     "FLOW.SIGNAL": "id",
 }
 
@@ -207,25 +197,22 @@ _FLOW_ID_QUERY_ARGUMENTS = {
 def _build_flow_query_protocol_command(
     name: str, args: tuple[Any, ...], opcode: int
 ) -> ProtocolCommand:
+    if name == "FLOW.QUERY":
+        try:
+            return ProtocolCommand(opcode, build_flow_query_payload(args))
+        except (TypeError, ValueError) as exc:
+            raise InvalidCommandError(str(exc)) from exc
     key = _FLOW_ID_QUERY_ARGUMENTS.get(name)
     if key is not None:
         payload = {key: _require_arg(args, 0, name)}
         payload.update(_option_map(args[1:]))
         return ProtocolCommand(opcode, payload)
     if name in {
-        "FLOW.LIST",
         "FLOW.STATS",
-        "FLOW.TERMINALS",
-        "FLOW.FAILURES",
         "FLOW.INFO",
-        "FLOW.STUCK",
     }:
         payload = {"type": _require_arg(args, 0, name)}
         payload.update(_option_map(args[1:]))
-        if name == "FLOW.LIST":
-            compact = _compact_flow_list_payload(payload)
-            if compact is not None:
-                return ProtocolCommand(opcode, compact, flags=_FLAG_CUSTOM_PAYLOAD)
         return ProtocolCommand(opcode, payload)
     if name == "FLOW.ATTRIBUTES":
         payload = {"type": _require_arg(args, 0, name)}
@@ -238,12 +225,6 @@ def _build_flow_query_protocol_command(
         }
         payload.update(_option_map(args[2:]))
         return ProtocolCommand(opcode, payload)
-    if name == "FLOW.SEARCH":
-        payload = {"type": _require_arg(args, 0, name)}
-        payload.update(_option_map(args[1:]))
-        _normalize_flow_search_state_meta_payload(payload)
-        return ProtocolCommand(opcode, payload)
-
     raise InvalidCommandError(f"unsupported flow query command {name}")
 
 
@@ -379,15 +360,11 @@ _FLOW_COMMAND_FAMILIES: tuple[tuple[frozenset[str], _FlowCommandBuilder], ...] =
         frozenset(
             {
                 *_FLOW_ID_QUERY_ARGUMENTS,
-                "FLOW.LIST",
                 "FLOW.STATS",
-                "FLOW.TERMINALS",
-                "FLOW.FAILURES",
                 "FLOW.INFO",
-                "FLOW.STUCK",
                 "FLOW.ATTRIBUTES",
                 "FLOW.ATTRIBUTE_VALUES",
-                "FLOW.SEARCH",
+                "FLOW.QUERY",
             }
         ),
         _build_flow_query_protocol_command,
@@ -423,21 +400,6 @@ def _build_native_flow_protocol_command(name: str, args: tuple[Any, ...]) -> Pro
     if builder is not None:
         return builder(name, args, _OPCODES[name])
     raise InvalidCommandError(f"FerricStore protocol transport does not support command {name}")
-
-
-def _normalize_flow_search_state_meta_payload(payload: dict[str, Any]) -> None:
-    state_meta = payload.get("state_meta")
-    if not isinstance(state_meta, dict) or not state_meta:
-        return
-    if all(isinstance(value, dict) for value in state_meta.values()):
-        return
-
-    state = payload.get("state")
-    if state is None:
-        raise InvalidCommandError(
-            "FLOW.SEARCH STATE_META filters require STATE or nested state metadata"
-        )
-    payload["state_meta"] = {_text(state): state_meta}
 
 
 def _flow_policy_set_option_map(args: tuple[Any, ...]) -> dict[str, Any]:
@@ -497,7 +459,6 @@ __all__ = [
     "_flow_policy_option_map",
     "_flow_policy_set_option_map",
     "_flow_spawn_children_payload",
-    "_normalize_flow_search_state_meta_payload",
     "_parse_claimed_items",
     "_parse_create_items",
     "_parse_create_items_ext",

@@ -681,7 +681,6 @@ def test_direct_compact_commands_keep_fast_path_when_admitted(
             None,
         ),
         ("FLOW.VALUE.MGET", "ref-a", "réf-b", "MAX_BYTES", 100),
-        ("FLOW.LIST", "jobs", "COUNT", 10, "RETURN", "META"),
     ],
     ids=[
         "mget",
@@ -694,7 +693,6 @@ def test_direct_compact_commands_keep_fast_path_when_admitted(
         "flow-cancel-many",
         "flow-transition-many",
         "flow-value-mget",
-        "flow-list",
     ],
 )
 def test_compact_command_budget_matches_exact_wire_size(args: tuple[object, ...]) -> None:

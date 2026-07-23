@@ -18,7 +18,6 @@ from ferricstore.protocol_constants import (
     _COMPACT_FLOW_CREATE_MANY_MIXED_REQUEST,
     _COMPACT_FLOW_CREATE_MANY_PARTITION_REQUEST,
     _COMPACT_FLOW_CREATE_MANY_REQUEST,
-    _COMPACT_FLOW_LIST_REQUEST,
     _COMPACT_FLOW_TRANSITION_MANY_OK_REQUEST,
     _COMPACT_FLOW_TRANSITION_MANY_REQUEST,
     _COMPACT_FLOW_VALUE_MGET_REQUEST,
@@ -478,37 +477,6 @@ def _compact_flow_value_mget_payload(payload: dict[str, Any]) -> bytes | None:
     return b"".join(parts)
 
 
-def _compact_flow_list_payload(payload: dict[str, Any]) -> bytes | None:
-    if not set(payload).issubset({"type", "state", "count", "return"}):
-        return None
-
-    budget = _new_compact_budget(1 + struct.calcsize(">qB"))
-    if budget is None:
-        return None
-    flow_type = _bounded_maybe_bytes(payload.get("type"), budget=budget)
-    state = _bounded_optional_bytes(payload.get("state"), budget=budget)
-    if state is None:
-        budget.reserve(4)
-    count = _compact_i64(_raw_int(payload.get("count")))
-    if flow_type is None or state is False or count is None:
-        return None
-
-    return_value = payload.get("return")
-    if return_value is None:
-        return_mode = 0
-    elif _maybe_bytes(return_value) == b"META" or _maybe_bytes(return_value) == b"meta":
-        return_mode = 1
-    else:
-        return None
-
-    return (
-        bytes([_COMPACT_FLOW_LIST_REQUEST])
-        + _compact_binary(flow_type)
-        + _compact_optional_binary(cast(bytes | None, state))
-        + struct.pack(">qB", count, return_mode)
-    )
-
-
 def _raw_int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, (int, str, bytes)):
         return None
@@ -678,7 +646,6 @@ __all__ = [
     "_compact_flow_claimed_many_payload",
     "_compact_flow_complete_many_payload",
     "_compact_flow_create_many_payload",
-    "_compact_flow_list_payload",
     "_compact_flow_transition_many_payload",
     "_compact_flow_value_mget_payload",
     "_compact_flow_value_put_payload",

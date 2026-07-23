@@ -6,10 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from ferricstore import FerricStoreError, FlowClient
+from ferricstore import FlowClient
 from ferricstore.async_workflow_context import AsyncWorkflowEffect
 from ferricstore.batch_core import batch_fingerprint, queued_batch_fingerprint
-from ferricstore.protocol_commands import build_protocol_command, encode_frame
+from ferricstore.errors import InvalidCommandError
+from ferricstore.protocol_commands import build_protocol_command
 from ferricstore.protocol_compact_commands import _compact_pipeline_payload_from_raw
 from ferricstore.protocol_framing import decompress_response
 from ferricstore.protocol_pipeline_codec import _compact_pipeline_payload
@@ -87,12 +88,15 @@ def test_batch_fingerprints_preserve_unordered_value_multiplicity() -> None:
     assert queued_batch_fingerprint(one_nan) != queued_batch_fingerprint(two_nans)
 
 
-def test_compact_flow_integer_overflow_falls_back_to_generic_protocol_error() -> None:
-    command = build_protocol_command("FLOW.LIST", "jobs", "COUNT", 2**63)
-
-    assert isinstance(command.payload, dict)
-    with pytest.raises(FerricStoreError, match="signed 64-bit"):
-        encode_frame(command.opcode, command.lane_id, 1, command.payload, command.flags)
+def test_flow_query_integer_overflow_is_rejected_before_encoding() -> None:
+    with pytest.raises(InvalidCommandError, match="signed 64-bit"):
+        build_protocol_command(
+            "FLOW.QUERY",
+            "FQL1",
+            "FROM runs WHERE partition_key = @partition RETURN COUNT",
+            "partition",
+            2**63,
+        )
 
 
 def test_compact_range_integer_overflow_falls_back_to_generic_encoding() -> None:

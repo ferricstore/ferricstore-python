@@ -169,13 +169,17 @@ def test_protocol_flow_read_query_commands_use_partitioned_shape():
         "INCLUDE_COLD",
         False,
     )
-    assert bench.flow_list_command("email", 25) == (
-        "FLOW.LIST",
-        "email",
-        "STATE",
+    assert bench.flow_list_command("email", 25, partition="protocol-flow-benchmark:3") == (
+        "FLOW.QUERY",
+        "FQL1",
+        "FROM runs WHERE partition_key = @partition_key AND type = @type "
+        "AND state = @state ORDER BY updated_at_ms ASC LIMIT 25 RETURN RECORDS",
+        "partition_key",
+        "protocol-flow-benchmark:3",
+        "state",
         "queued",
-        "COUNT",
-        25,
+        "type",
+        "email",
     )
 
 
@@ -499,7 +503,7 @@ def test_protocol_flow_read_queries_use_throughput_tuned_default_batch_size():
     assert bench.parse_args(["--operation", "flow-get"]).batch_size == 250
     assert bench.parse_args(["--operation", "flow-get-meta"]).batch_size == 250
     assert bench.parse_args(["--operation", "flow-history"]).batch_size == 250
-    assert bench.parse_args(["--operation", "flow-list"]).batch_size == 250
+    assert bench.parse_args(["--operation", "flow-list"]).batch_size == 100
 
 
 def test_protocol_flow_setup_batch_defaults_to_fast_partition_shape():
@@ -739,6 +743,7 @@ def test_protocol_flow_list_duration_reuses_list_command_until_deadline():
         batch_size = 2
         inflight_batches = 2
         read_duration = 0.008
+        partitions = 16
 
     class FakeClock:
         def __init__(self):
@@ -755,7 +760,7 @@ def test_protocol_flow_list_duration_reuses_list_command_until_deadline():
         def submit_command(self, *args):
             self.commands.append(args)
             future = Future()
-            future.set_result([b"ok"] * args[-3])
+            future.set_result({})
             return future
 
     adapter = FakeAdapter()
@@ -767,8 +772,8 @@ def test_protocol_flow_list_duration_reuses_list_command_until_deadline():
     assert errors == 0
     assert len(latencies) == 2
     assert adapter.commands == [
-        ("FLOW.LIST", "email", "STATE", "queued", "COUNT", 2, "RETURN", "META"),
-        ("FLOW.LIST", "email", "STATE", "queued", "COUNT", 2, "RETURN", "META"),
+        bench.flow_list_command("email", 2, partition="protocol-flow-benchmark:0"),
+        bench.flow_list_command("email", 2, partition="protocol-flow-benchmark:1"),
     ]
 
 

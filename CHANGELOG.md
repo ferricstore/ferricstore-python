@@ -6,6 +6,29 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.7.0
+
+- Require FerricStore 0.10.0 and negotiate the complete OSS FQL1 request,
+  result, explain, index-status, capability, and schema contracts during HELLO.
+- Add typed synchronous and asynchronous `query`, `explain`,
+  `explain_analyze`, and `query_indexes` APIs with bounded parameters, opaque
+  cursors, actionable diagnostics, and exact unsigned 64-bit index metadata.
+- Compile collection convenience methods to bounded, partition-scoped FQL and
+  remove the superseded collection opcodes from the native command surface.
+- Add live pagination, count, explain/analyze, index-status, eventual
+  projection, convenience, and scoped query ACL integration coverage.
+- Pin live server integration to the immutable FerricStore 0.10.1 release
+  while retaining FerricStore 0.10.0 as the minimum negotiated contract.
+- Reject incompatible index-status contracts during HELLO and preserve the
+  server's UTF-8 and metadata-normalization rules before query transport.
+- Reject collection shapes without a bounded server index and explicit empty
+  index identifiers before sync or async transport.
+- Reject malformed Unicode query response text and quality labels over 64
+  bytes before exposing server metadata to callers.
+- Parse `FERRICSTORE.METRICS` Prometheus samples instead of treating them as
+  INFO sections, and add lossless sync and async `ferricstore_metrics_text`
+  helpers for labels, comments, duplicate series, and timestamps.
+
 ## 0.6.2
 
 - Stabilized live release validation for eventually projected binary Flow

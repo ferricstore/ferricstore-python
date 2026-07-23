@@ -11,10 +11,12 @@ from ferricstore.errors import FerricStoreError
 MAX_VALUE_NESTING: Final = 128
 _U32 = struct.Struct(">I")
 _I64 = struct.Struct(">q")
+_U64 = struct.Struct(">Q")
 _F64 = struct.Struct(">d")
 _U32_MAX: Final = 2**32 - 1
 _I64_MIN: Final = -(2**63)
 _I64_MAX: Final = 2**63 - 1
+_U64_MAX: Final = 2**64 - 1
 
 
 class DecodedCollectionLimitError(FerricStoreError):
@@ -148,11 +150,15 @@ def _write_value(stream: _ValueWriter, value: Any, *, depth: int) -> None:
         stream.write(b"\x02")
         return
     if isinstance(value, int):
-        if value < _I64_MIN or value > _I64_MAX:
-            raise FerricStoreError("protocol integer must fit in a signed 64-bit value")
-        stream.write(b"\x03")
-        stream.write(_I64.pack(value))
-        return
+        if _I64_MIN <= value <= _I64_MAX:
+            stream.write(b"\x03")
+            stream.write(_I64.pack(value))
+            return
+        if _I64_MAX < value <= _U64_MAX:
+            stream.write(b"\x08")
+            stream.write(_U64.pack(value))
+            return
+        raise FerricStoreError("protocol integer must fit in a signed or unsigned 64-bit value")
     if isinstance(value, str):
         remaining = stream.remaining_capacity
         if remaining is not None:
@@ -302,6 +308,9 @@ def _decode_value_at(
     if tag == 7:
         _require_available(data, offset, _F64.size)
         return _F64.unpack_from(data, offset)[0], offset + _F64.size
+    if tag == 8:
+        _require_available(data, offset, _U64.size)
+        return _U64.unpack_from(data, offset)[0], offset + _U64.size
     raise FerricStoreError("protocol value has unknown tag")
 
 

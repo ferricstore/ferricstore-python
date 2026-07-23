@@ -29,7 +29,7 @@ docker run --name ferricstore-dev \
   -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore-dev-data:/data \
-  ghcr.io/ferricstore/ferricstore:0.9.1
+  ghcr.io/ferricstore/ferricstore:0.10.1
 ```
 
 This starts one local FerricStore server on:

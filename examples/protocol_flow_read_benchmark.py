@@ -246,9 +246,34 @@ def run_flow_value_mget(
     return benchmark_result(args, requests, values, latencies_ms)
 
 
-def run_flow_list_meta(
+def flow_query_command(flow_type: str, *, partition_key: str, count: int) -> tuple[Any, ...]:
+    if not partition_key:
+        raise ValueError("FLOW.QUERY benchmark requires a partition key")
+    if count < 1 or count > 100:
+        raise ValueError("FLOW.QUERY benchmark count must be between 1 and 100")
+    query = (
+        "FROM runs WHERE partition_key = @partition_key "
+        "AND type = @type AND state = @state "
+        f"ORDER BY updated_at_ms ASC LIMIT {count} RETURN RECORDS"
+    )
+    return (
+        "FLOW.QUERY",
+        "FQL1",
+        query,
+        "partition_key",
+        partition_key,
+        "state",
+        "queued",
+        "type",
+        flow_type,
+    )
+
+
+def run_flow_query(
     adapter: ProtocolAdapter, args: argparse.Namespace, flow_type: str
 ) -> dict[str, Any]:
+    if args.partition_key is None:
+        raise ValueError("flow-query mode requires --partition-key")
     deadline = time.perf_counter() + args.test_time
     requests = 0
     records = 0
@@ -258,25 +283,24 @@ def run_flow_list_meta(
     while time.perf_counter() < deadline or pending:
         while time.perf_counter() < deadline and len(pending) < args.inflight_batches:
             future = adapter.submit_command(
-                "FLOW.LIST",
-                flow_type,
-                "STATE",
-                "queued",
-                "COUNT",
-                args.list_count,
-                *(("PARTITION", args.partition_key) if args.partition_key is not None else ()),
-                "RETURN",
-                "META",
+                *flow_query_command(
+                    flow_type,
+                    partition_key=args.partition_key,
+                    count=args.query_count,
+                )
             )
             pending.append((time.perf_counter_ns(), future, 1))
 
         started_ns, future, _expected_items = pending.pop(0)
         result = future.result()
-        if not isinstance(result, list):
-            raise RuntimeError(f"expected FLOW.LIST result list, got {type(result)!r}")
+        if not isinstance(result, dict):
+            raise RuntimeError(f"expected FLOW.QUERY result map, got {type(result)!r}")
+        query_records = result.get("records", result.get(b"records"))
+        if not isinstance(query_records, list):
+            raise RuntimeError("expected FLOW.QUERY result records list")
 
         requests += 1
-        records += len(result)
+        records += len(query_records)
         latencies_ms.append((time.perf_counter_ns() - started_ns) / 1_000_000)
 
     return benchmark_result(args, requests, records, latencies_ms)
@@ -297,7 +321,7 @@ def benchmark_result(
         "items_per_sec": items / args.test_time if args.test_time > 0 else 0.0,
         "create_batch_size": args.create_batch_size,
         "read_batch_size": args.read_batch_size,
-        "list_count": args.list_count if args.mode == "flow-list-meta" else None,
+        "query_count": args.query_count if args.mode == "flow-query" else None,
         "inflight_batches": args.inflight_batches,
         "value_bytes": args.value_bytes,
         "partition_key": args.partition_key,
@@ -320,8 +344,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
         if args.mode in {"flow-get", "flow-get-meta"}:
             result = run_batched_flow_get(adapter, args, flow_type)
-        elif args.mode == "flow-list-meta":
-            result = run_flow_list_meta(adapter, args, flow_type)
+        elif args.mode == "flow-query":
+            result = run_flow_query(adapter, args, flow_type)
         elif args.mode == "flow-value-mget":
             value_seconds, refs = warmup_value_refs(adapter, args, flow_type, payload)
             result = run_flow_value_mget(adapter, args, refs)
@@ -340,7 +364,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FerricStore native protocol Flow read benchmark")
     parser.add_argument(
         "--mode",
-        choices=("flow-get", "flow-get-meta", "flow-list-meta", "flow-value-mget"),
+        choices=("flow-get", "flow-get-meta", "flow-query", "flow-value-mget"),
         default="flow-get-meta",
     )
     parser.add_argument("--url", default="ferric://127.0.0.1:6388")
@@ -350,7 +374,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--test-time", type=float, default=30.0)
     parser.add_argument("--create-batch-size", type=int, default=500)
     parser.add_argument("--read-batch-size", type=int, default=500)
-    parser.add_argument("--list-count", type=int, default=100)
+    parser.add_argument("--query-count", type=int, default=100)
     parser.add_argument("--inflight-batches", type=int, default=64)
     parser.add_argument("--value-bytes", type=int, default=32)
     parser.add_argument("--value-max-bytes", type=int, default=64 * 1024)
@@ -367,8 +391,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--create-batch-size must be positive")
     if args.read_batch_size <= 0:
         parser.error("--read-batch-size must be positive")
-    if args.list_count <= 0:
-        parser.error("--list-count must be positive")
+    if args.query_count <= 0 or args.query_count > 100:
+        parser.error("--query-count must be between 1 and 100")
+    if args.mode == "flow-query" and not args.partition_key:
+        parser.error("flow-query mode requires --partition-key")
     if args.inflight_batches <= 0:
         parser.error("--inflight-batches must be positive")
     if args.value_bytes < 0:

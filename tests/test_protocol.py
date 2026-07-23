@@ -34,7 +34,6 @@ from ferricstore.errors import (
 )
 from ferricstore.protocol import (
     _COMPACT_BINARY_LIST_LIST,
-    _COMPACT_FLOW_LIST_REQUEST,
     _COMPACT_FLOW_RECORD,
     _COMPACT_FLOW_RECORD_LIST,
     _COMPACT_INTEGER_LIST,
@@ -62,6 +61,7 @@ from ferricstore.protocol_pipeline_codec import (
     _expected_payload_collection_items,
 )
 from ferricstore.types import ChildSpec, ClaimedFlow, CreateItem
+from tests.flow_query_contract import with_flow_query_contract
 
 
 def _flow_partition_route_key(value: str | bytes) -> str:
@@ -80,11 +80,15 @@ def _v091_hello(*, auth_required: bool = False) -> dict[str, Any]:
         "protocol": "ferricstore-native",
         "version": 1,
         "auth_required": auth_required,
-        "capabilities": {
-            "response_codecs": {"compact_response_opcodes": {}},
-            "limits": {"max_response_bytes": 64 * 1024 * 1024},
-            "schemas": {"FLOW.POLICY.SET": {"fields": ["type", "expected_generation", "replace"]}},
-        },
+        "capabilities": with_flow_query_contract(
+            {
+                "response_codecs": {"compact_response_opcodes": {}},
+                "limits": {"max_response_bytes": 64 * 1024 * 1024},
+                "schemas": {
+                    "FLOW.POLICY.SET": {"fields": ["type", "expected_generation", "replace"]}
+                },
+            }
+        ),
     }
 
 
@@ -4812,36 +4816,44 @@ def test_protocol_execute_batch_compacts_flow_get_meta_without_partition(monkeyp
     )
 
 
-def test_protocol_builds_flow_list_return_meta_payload():
+def test_protocol_builds_flow_query_payload():
     command = build_protocol_command(
-        "FLOW.LIST", "email", "STATE", "queued", "COUNT", 10, "RETURN", "META"
+        "FLOW.QUERY",
+        "FQL1",
+        "FROM runs WHERE partition_key = @tenant AND type = @type RETURN COUNT",
+        "tenant",
+        "tenant-a",
+        "type",
+        "email",
     )
 
-    assert command.opcode == 0x020E
-    assert command.flags == _FLAG_CUSTOM_PAYLOAD
-    assert command.payload == (
-        bytes([_COMPACT_FLOW_LIST_REQUEST])
-        + struct.pack(">I", 5)
-        + b"email"
-        + struct.pack(">I", 6)
-        + b"queued"
-        + struct.pack(">qB", 10, 1)
-    )
-
-
-def test_protocol_keeps_generic_flow_list_payload_for_unsupported_filters():
-    command = build_protocol_command(
-        "FLOW.LIST", "email", "STATE", "queued", "COUNT", 10, "REV", True
-    )
-
-    assert command.opcode == 0x020E
+    assert command.opcode == 0x0231
     assert command.flags == 0
     assert command.payload == {
-        "type": "email",
-        "state": "queued",
-        "count": 10,
-        "rev": True,
+        "version": "FQL1",
+        "query": "FROM runs WHERE partition_key = @tenant AND type = @type RETURN COUNT",
+        "params": {"tenant": "tenant-a", "type": "email"},
     }
+
+
+@pytest.mark.parametrize(
+    "removed",
+    [
+        "FLOW.LIST",
+        "FLOW.SEARCH",
+        "FLOW.TERMINALS",
+        "FLOW.FAILURES",
+        "FLOW.BY_PARENT",
+        "FLOW.BY_ROOT",
+        "FLOW.BY_CORRELATION",
+        "FLOW.STUCK",
+    ],
+)
+def test_removed_collection_commands_have_no_specialized_opcode(removed: str):
+    command = build_protocol_command(removed, "ignored")
+
+    assert removed not in protocol_module._OPCODES
+    assert command.opcode == _OP_COMMAND_EXEC
 
 
 def test_protocol_builds_control_opcode_payloads():
@@ -4892,46 +4904,9 @@ def test_protocol_builds_flow_stats_with_attributes():
     }
 
 
-def test_protocol_builds_flow_search_with_attributes_and_state_meta():
-    command = build_protocol_command(
-        "FLOW.SEARCH",
-        "email",
-        "STATE",
-        "queued",
-        "ATTRIBUTE",
-        "tenant",
-        "acme",
-        "STATE_META",
-        "queued",
-        {"version": 3},
-        "TERMINAL_ONLY",
-        "true",
-    )
-
-    assert command.opcode == 0x0230
-    assert command.flags == 0
-    assert command.payload == {
-        "type": "email",
-        "state": "queued",
-        "attributes": {"tenant": "acme"},
-        "state_meta": {"queued": {"version": 3}},
-        "terminal_only": True,
-    }
-
-    flat_meta = build_protocol_command(
-        "FLOW.SEARCH",
-        "email",
-        "STATE",
-        "queued",
-        "STATE_META",
-        "version",
-        3,
-    )
-    assert flat_meta.payload == {
-        "type": "email",
-        "state": "queued",
-        "state_meta": {"queued": {"version": 3}},
-    }
+def test_protocol_rejects_malformed_flow_query_parameters():
+    with pytest.raises(InvalidCommandError, match="name/value pairs"):
+        build_protocol_command("FLOW.QUERY", "FQL1", "FROM runs RETURN COUNT", "name")
 
 
 def test_protocol_builds_flow_state_meta_and_indexed_policy_payloads():

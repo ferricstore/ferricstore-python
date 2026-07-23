@@ -28,6 +28,7 @@ from ferricstore.types import ClaimedFlow, EffectResult, FlowRecord
 from ferricstore.workflow_client import WorkflowClient
 from ferricstore.workflow_core import workflow_partition_key
 from ferricstore.workflow_models import WorkflowFlowCommands
+from tests.flow_query_contract import with_flow_query_contract
 
 
 def _policy_response(*, generation: int = 8) -> dict[bytes, Any]:
@@ -53,18 +54,20 @@ def _hello(*, policy_fields: list[str] | None = None) -> dict[str, Any]:
         "protocol": "ferricstore-native",
         "version": 1,
         "auth_required": False,
-        "capabilities": {
-            "limits": {"max_response_bytes": 4096},
-            "response_codecs": {"compact_response_opcodes": {}},
-            "schemas": {
-                "FLOW.POLICY.SET": {
-                    "required": ["type"],
-                    "fields": policy_fields
-                    if policy_fields is not None
-                    else ["type", "replace", "expected_generation", "states"],
-                }
-            },
-        },
+        "capabilities": with_flow_query_contract(
+            {
+                "limits": {"max_response_bytes": 4096},
+                "response_codecs": {"compact_response_opcodes": {}},
+                "schemas": {
+                    "FLOW.POLICY.SET": {
+                        "required": ["type"],
+                        "fields": policy_fields
+                        if policy_fields is not None
+                        else ["type", "replace", "expected_generation", "states"],
+                    }
+                },
+            }
+        ),
     }
 
 
@@ -83,9 +86,9 @@ class AsyncRecordingExecutor(RecordingExecutor):
         return super().execute_command(*args)
 
 
-def test_v091_declares_minimum_server_without_changing_native_protocol_v1() -> None:
-    assert ferricstore.__version__ == "0.6.2"
-    assert ferricstore.MINIMUM_SERVER_VERSION == "0.9.1"
+def test_v010_declares_minimum_server_without_changing_native_protocol_v1() -> None:
+    assert ferricstore.__version__ == "0.7.0"
+    assert ferricstore.MINIMUM_SERVER_VERSION == "0.10.0"
     assert _MAGIC == b"FSNP"
     assert _REQUEST_VERSION == 0x01
     assert _RESPONSE_VERSION == 0x81
@@ -110,7 +113,7 @@ def test_hello_requires_and_records_policy_cas_fields() -> None:
     ],
 )
 def test_hello_rejects_server_without_policy_cas_fields(policy_fields: list[str]) -> None:
-    with pytest.raises(ferricstore.FerricStoreError, match=r"0\.9\.1.*FLOW\.POLICY\.SET"):
+    with pytest.raises(ferricstore.FerricStoreError, match=r"0\.10\.0.*FLOW\.POLICY\.SET"):
         parse_hello_capabilities(_hello(policy_fields=policy_fields))
 
 

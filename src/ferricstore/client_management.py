@@ -17,6 +17,7 @@ from ferricstore.client_helpers import (
     _validate_ownership_token,
 )
 from ferricstore.client_state import _ClientMixinBase
+from ferricstore.metrics_response import metrics_text_response, parse_metrics_response
 from ferricstore.types import FetchOrComputeResult, KeyInfo, RateLimitResult
 
 
@@ -142,7 +143,10 @@ class _ClientManagementMixin(_ClientMixinBase):
         return _parse_kv_response(self.executor.execute_command("FERRICSTORE.HOTNESS", *args))
 
     def ferricstore_metrics(self, *args: Any) -> Any:
-        return _parse_kv_response(self.executor.execute_command("FERRICSTORE.METRICS", *args))
+        return parse_metrics_response(self.executor.execute_command("FERRICSTORE.METRICS", *args))
+
+    def ferricstore_metrics_text(self, *args: Any) -> str:
+        return metrics_text_response(self.executor.execute_command("FERRICSTORE.METRICS", *args))
 
     def ferricstore_blobgc(self, *args: Any) -> Any:
         return self.executor.execute_command("FERRICSTORE.BLOBGC", *args)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import ssl
+import time
 import uuid
 
 import pytest
@@ -66,9 +67,29 @@ def test_tls_acl_authentication_and_authorization_for_sync_and_async_clients() -
         admin.acl_set_user(username, ["on", f">{secret}", "~*", "+@all"])
         admin.acl_set_user(
             readonly,
-            ["on", f">{secret}", "~*", "-@all", "+ping", "+get"],
+            [
+                "on",
+                f">{secret}",
+                f"~{key}*",
+                "-@all",
+                "+ping",
+                "+get",
+                "+flow.query",
+                "+flow.query.explain",
+            ],
         )
         admin.set(key, b"secured")
+        query_id = f"{key}:query:flow"
+        query_partition = f"{key}:query:partition"
+        query_type = f"python-sdk-security-query-{suffix}"
+        admin.create(
+            query_id,
+            type=query_type,
+            state="ready",
+            partition_key=query_partition,
+            now_ms=int(time.time() * 1000),
+            idempotent=True,
+        )
 
         authenticated = FlowClient.from_url(
             _tls_url(),
@@ -96,6 +117,34 @@ def test_tls_acl_authentication_and_authorization_for_sync_and_async_clients() -
             assert denied.command("GET", key) == b"secured"
             with pytest.raises(FerricStoreError):
                 denied.command("SET", key, b"denied")
+
+            query = (
+                "FROM runs WHERE partition_key = @partition AND type = @type "
+                "AND state = @state ORDER BY updated_at_ms ASC LIMIT 10 RETURN RECORDS"
+            )
+            params = {"partition": query_partition, "type": query_type, "state": "ready"}
+            deadline = time.monotonic() + 10.0
+            result = denied.query(query, params)
+            while (result.records is None or len(result.records) != 1) and (
+                time.monotonic() < deadline
+            ):
+                time.sleep(0.05)
+                result = denied.query(query, params)
+            assert result.records is not None
+            assert len(result.records) == 1
+            assert denied.explain(query, params).status == "planned"
+
+            denied_params = {
+                "partition": f"sdk-security-denied:{suffix}:partition",
+                "type": query_type,
+                "state": "ready",
+            }
+            with pytest.raises(FerricStoreError):
+                denied.query(query, denied_params)
+            with pytest.raises(FerricStoreError):
+                denied.explain(query, denied_params)
+            with pytest.raises(FerricStoreError):
+                denied.query_indexes()
         finally:
             denied.close()
 

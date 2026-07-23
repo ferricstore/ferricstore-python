@@ -1,6 +1,6 @@
 services:
   fs0:
-    image: ${FERRICSTORE_IMAGE:-ghcr.io/ferricstore/ferricstore:0.9.1}
+    image: ${FERRICSTORE_IMAGE:-ghcr.io/ferricstore/ferricstore:0.10.1@sha256:198cffba8e2df2f5f66db9e6bbef83131f4841d4b90c65ee8091ac463ec6715d}
     restart: on-failure:3
     hostname: fs0
     environment:
@@ -24,7 +24,7 @@ services:
       - ferricstore-cluster-fs0:/data
 
   fs1:
-    image: ${FERRICSTORE_IMAGE:-ghcr.io/ferricstore/ferricstore:0.9.1}
+    image: ${FERRICSTORE_IMAGE:-ghcr.io/ferricstore/ferricstore:0.10.1@sha256:198cffba8e2df2f5f66db9e6bbef83131f4841d4b90c65ee8091ac463ec6715d}
     restart: on-failure:3
     hostname: fs1
     environment:
@@ -48,7 +48,7 @@ services:
       - ferricstore-cluster-fs1:/data
 
   fs2:
-    image: ${FERRICSTORE_IMAGE:-ghcr.io/ferricstore/ferricstore:0.9.1}
+    image: ${FERRICSTORE_IMAGE:-ghcr.io/ferricstore/ferricstore:0.10.1@sha256:198cffba8e2df2f5f66db9e6bbef83131f4841d4b90c65ee8091ac463ec6715d}
     restart: on-failure:3
     hostname: fs2
     environment:

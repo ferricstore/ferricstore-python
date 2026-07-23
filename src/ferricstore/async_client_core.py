@@ -40,6 +40,7 @@ from ferricstore.codecs import Codec, RawCodec
 from ferricstore.command_core import normalize_command_name
 from ferricstore.config_validation import validate_string_sequence
 from ferricstore.errors import InvalidCommandError
+from ferricstore.metrics_response import metrics_text_response, parse_metrics_response
 from ferricstore.types import (
     FetchOrComputeResult,
     KeyInfo,
@@ -430,7 +431,14 @@ class _AsyncClientCoreMixin(_AsyncClientMixinBase):
         return _parse_kv_response(await self.executor.execute_command("FERRICSTORE.HOTNESS", *args))
 
     async def ferricstore_metrics(self, *args: Any) -> Any:
-        return _parse_kv_response(await self.executor.execute_command("FERRICSTORE.METRICS", *args))
+        return parse_metrics_response(
+            await self.executor.execute_command("FERRICSTORE.METRICS", *args)
+        )
+
+    async def ferricstore_metrics_text(self, *args: Any) -> str:
+        return metrics_text_response(
+            await self.executor.execute_command("FERRICSTORE.METRICS", *args)
+        )
 
     async def ferricstore_blobgc(self, *args: Any) -> Any:
         return await self.executor.execute_command("FERRICSTORE.BLOBGC", *args)

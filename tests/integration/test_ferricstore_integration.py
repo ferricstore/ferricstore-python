@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,8 @@ from ferricstore import (
     FencedItem,
     FerricStoreError,
     FlowClient,
+    FlowQueryError,
+    FlowQueryResult,
     FlowStateMode,
     FlowStatePolicy,
     JsonCodec,
@@ -50,19 +53,18 @@ _NATIVE_PROTOCOL_COMMANDS: set[str] = set(
     FLOW.APPROVAL.APPROVE FLOW.APPROVAL.GET FLOW.APPROVAL.LIST FLOW.APPROVAL.REJECT
     FLOW.APPROVAL.REQUEST FLOW.ATTRIBUTES FLOW.ATTRIBUTE_VALUES FLOW.BUDGET.COMMIT
     FLOW.BUDGET.GET FLOW.BUDGET.LIST FLOW.BUDGET.RELEASE FLOW.BUDGET.RESERVE
-    FLOW.BY_CORRELATION FLOW.BY_PARENT FLOW.BY_ROOT FLOW.CANCEL FLOW.CANCEL_MANY
-    FLOW.CIRCUIT.CLOSE FLOW.CIRCUIT.GET FLOW.CIRCUIT.OPEN FLOW.CLAIM_DUE
-    FLOW.COMPLETE FLOW.COMPLETE_MANY FLOW.CREATE FLOW.CREATE_MANY
+    FLOW.CANCEL FLOW.CANCEL_MANY FLOW.CIRCUIT.CLOSE FLOW.CIRCUIT.GET FLOW.CIRCUIT.OPEN
+    FLOW.CLAIM_DUE FLOW.COMPLETE FLOW.COMPLETE_MANY FLOW.CREATE FLOW.CREATE_MANY
     FLOW.EFFECT.COMPENSATE FLOW.EFFECT.CONFIRM FLOW.EFFECT.FAIL FLOW.EFFECT.GET
-    FLOW.EFFECT.RESERVE FLOW.EXTEND_LEASE FLOW.FAIL FLOW.FAILURES FLOW.FAIL_MANY
+    FLOW.EFFECT.RESERVE FLOW.EXTEND_LEASE FLOW.FAIL FLOW.FAIL_MANY
     FLOW.GET FLOW.GOVERNANCE.LEDGER FLOW.GOVERNANCE.OVERVIEW FLOW.HISTORY
     FLOW.INFO FLOW.LIMIT.GET FLOW.LIMIT.LEASE FLOW.LIMIT.LIST FLOW.LIMIT.RELEASE
-    FLOW.LIMIT.SPEND FLOW.LIST FLOW.POLICY.GET FLOW.POLICY.SET FLOW.RECLAIM
+    FLOW.LIMIT.SPEND FLOW.POLICY.GET FLOW.POLICY.SET FLOW.QUERY FLOW.QUERY.INDEXES FLOW.RECLAIM
     FLOW.RETENTION_CLEANUP FLOW.RETRY FLOW.RETRY_MANY FLOW.REWIND
-    FLOW.RUN_STEPS_MANY FLOW.SCHEDULE.CREATE FLOW.SCHEDULE.DELETE FLOW.SEARCH
+    FLOW.RUN_STEPS_MANY FLOW.SCHEDULE.CREATE FLOW.SCHEDULE.DELETE
     FLOW.SCHEDULE.FIRE FLOW.SCHEDULE.FIRE_DUE FLOW.SCHEDULE.GET FLOW.SCHEDULE.LIST
     FLOW.SCHEDULE.PAUSE FLOW.SCHEDULE.RESUME FLOW.SIGNAL FLOW.SPAWN_CHILDREN
-    FLOW.START_AND_CLAIM FLOW.STATS FLOW.STEP_CONTINUE FLOW.STUCK FLOW.TERMINALS
+    FLOW.START_AND_CLAIM FLOW.STATS FLOW.STEP_CONTINUE
     FLOW.TRANSITION FLOW.TRANSITION_MANY FLOW.VALUE.PUT FLUSHALL FLUSHDB GEOADD
     GEODIST GEOHASH GEOPOS GEOSEARCH GEOSEARCHSTORE GET GETBIT GETDEL GETEX
     GETRANGE GETSET HDEL HELLO HEXISTS HEXPIRE HEXPIRETIME HGET HGETALL HGETDEL
@@ -571,6 +573,49 @@ def _wait_flow_state(
     raise AssertionError(f"flow {flow_id} did not reach state {state!r}; last={record!r}")
 
 
+def _wait_flow_query(
+    client: FlowClient,
+    query: str,
+    params: dict[str, Any],
+    ready: Callable[[FlowQueryResult], bool],
+    *,
+    timeout: float = 30.0,
+) -> FlowQueryResult:
+    deadline = time.monotonic() + timeout
+    last_result: FlowQueryResult | None = None
+    last_error: FerricStoreError | None = None
+    while time.monotonic() < deadline:
+        try:
+            last_result = client.query(query, params)
+            last_error = None
+            if ready(last_result):
+                return last_result
+        except FerricStoreError as exc:
+            last_error = exc
+        time.sleep(0.05)
+    raise AssertionError(
+        f"FLOW.QUERY projection did not become ready; last={last_result!r}, error={last_error!r}"
+    )
+
+
+def _wait_flow_records(
+    fetch: Callable[[], list[Any]],
+    expected_id: str,
+    *,
+    timeout: float = 30.0,
+) -> list[Any]:
+    deadline = time.monotonic() + timeout
+    last_records: list[Any] = []
+    while time.monotonic() < deadline:
+        last_records = fetch()
+        if any(record.id == expected_id for record in last_records):
+            return last_records
+        time.sleep(0.05)
+    raise AssertionError(
+        f"FLOW.QUERY projection did not expose flow {expected_id!r}; last={last_records!r}"
+    )
+
+
 def _create_and_claim(
     client: FlowClient,
     flow_type: str,
@@ -682,6 +727,112 @@ def test_real_ferricstore_command_and_flow_cycle() -> None:
     finally:
         with suppress(Exception):
             client.command("DEL", key)
+        client.close()
+
+
+def test_real_ferricstore_flow_query_planner_v010() -> None:
+    _require_protocol_transport()
+
+    client = _client()
+    suffix = _suffix()
+    partition = f"py-sdk:query:{suffix}:partition"
+    flow_type = f"py-sdk-query-{suffix}"
+    state = "query-ready"
+    now = int(time.time() * 1000)
+    ids = [f"py-sdk:query:{suffix}:{index}" for index in range(3)]
+    params = {"partition": partition, "type": flow_type, "state": state}
+    base_query = (
+        "FROM runs WHERE partition_key = @partition AND type = @type AND state = @state "
+        "ORDER BY updated_at_ms ASC LIMIT 2 RETURN RECORDS"
+    )
+
+    try:
+        for index, flow_id in enumerate(ids):
+            client.create(
+                flow_id,
+                type=flow_type,
+                state=state,
+                partition_key=partition,
+                payload={"secret": f"payload-{index}"},
+                run_at_ms=now + index,
+                now_ms=now + index,
+                idempotent=True,
+            )
+
+        first = _wait_flow_query(
+            client,
+            base_query,
+            params,
+            lambda result: (
+                result.records is not None
+                and len(result.records) == 2
+                and result.page is not None
+                and result.page.has_more
+            ),
+        )
+        assert first.page is not None
+        assert first.page.cursor
+        assert first.usage.result_records == 2
+        assert first.quality.pagination
+
+        second_params = {**params, "cursor": first.page.cursor}
+        second = client.query(
+            "FROM runs WHERE partition_key = @partition AND type = @type AND state = @state "
+            "ORDER BY updated_at_ms ASC LIMIT 2 CURSOR @cursor RETURN RECORDS",
+            second_params,
+        )
+        assert second.records is not None
+        assert len(second.records) == 1
+        assert second.page is not None
+        assert not second.page.has_more
+        paged_ids = [_text(_field(record, "id")) for record in (*first.records, *second.records)]
+        assert len(set(paged_ids)) == len(paged_ids)
+        assert set(paged_ids) == set(ids)
+
+        count = _wait_flow_query(
+            client,
+            "FROM runs WHERE partition_key = @partition AND type = @type AND state = @state "
+            "RETURN COUNT",
+            params,
+            lambda result: result.count == len(ids),
+        )
+        assert count.page is None
+        assert count.usage.result_records == 1
+
+        explained = client.explain(base_query, params)
+        assert explained.status == "planned"
+        assert explained.actual is None
+        assert _field(explained.plan, "path") is not None
+
+        analyzed = client.explain_analyze(base_query, params)
+        assert analyzed.status == "executed"
+        assert analyzed.actual is not None
+        assert analyzed.actual.result_records == 2
+
+        indexes = client.query_indexes()
+        assert indexes.registry.catalog_version > 0
+        assert indexes.indexes
+
+        with pytest.raises(FlowQueryError) as error:
+            client.query(
+                "FROM runs WHERE partition_key = @partition AND unsupported = 1 "
+                "ORDER BY updated_at_ms ASC LIMIT 2 RETURN RECORDS",
+                {"partition": partition},
+            )
+        assert error.value.code == "unsupported_field"
+        assert error.value.position is not None
+        assert error.value.hint
+
+        listed = _wait_flow_query(
+            client,
+            base_query.replace("LIMIT 2", "LIMIT 3"),
+            params,
+            lambda result: result.records is not None and len(result.records) == len(ids),
+        )
+        assert len(client.list(flow_type, partition_key=partition, state=state, count=3)) == len(
+            listed.records or ()
+        )
+    finally:
         client.close()
 
 
@@ -1252,7 +1403,10 @@ def test_real_ferricstore_protocol_helpers_and_diagnostics() -> None:
         assert isinstance(client.cluster_status(), dict)
         assert client.cluster_role() is not None
         assert client.ferricstore_config("GET", "*") is not None
-        assert isinstance(client.ferricstore_metrics(), dict)
+        metrics = client.ferricstore_metrics()
+        assert metrics
+        assert any(name.startswith("ferricstore_") for name in metrics)
+        assert "ferricstore_" in client.ferricstore_metrics_text()
         assert isinstance(client.ferricstore_hotness(), dict)
         assert isinstance(client.command("FERRICSTORE.CAPABILITIES"), dict)
         assert isinstance(client.command("FERRICSTORE.TELEMETRY", "CLUSTER_INFO"), dict)
@@ -1655,7 +1809,10 @@ def test_real_ferricstore_native_protocol_store_and_admin_surface() -> None:
         assert isinstance(client.cluster_status(), dict)
         assert client.cluster_role() is not None
         assert client.ferricstore_config("GET", "*") is not None
-        assert isinstance(client.ferricstore_metrics(), dict)
+        metrics = client.ferricstore_metrics()
+        assert metrics
+        assert any(name.startswith("ferricstore_") for name in metrics)
+        assert "ferricstore_" in client.ferricstore_metrics_text()
         assert isinstance(client.ferricstore_hotness(), dict)
         assert client.ferricstore_blobgc() is not None
     finally:
@@ -1696,19 +1853,20 @@ def test_real_ferricstore_native_protocol_flow_admin_surface() -> None:
             run_at_ms=now,
             idempotent=True,
         )
-        assert client.list(
-            flow_type,
-            state="attr",
-            partition_key=partition,
-            attributes={"tenant": "acme"},
-            consistent_projection=True,
+        assert _wait_flow_records(
+            lambda: client.list(
+                flow_type,
+                state="attr",
+                partition_key=partition,
+                attributes={"tenant": "acme"},
+            ),
+            attr_id,
         )
         search_matches = client.search(
             flow_type,
             state="attr",
             partition_key=partition,
             state_meta={"version": "1"},
-            consistent_projection=True,
         )
         assert any(record.id == attr_id for record in search_matches)
         assert isinstance(
@@ -2113,7 +2271,7 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
         failed = client.get(fail_id, partition_key=fail_partition)
         assert failed is not None
         assert failed.state == "failed"
-        assert client.failures(flow_type, count=20) is not None
+        assert client.failures(flow_type, partition_key=fail_partition, count=20) is not None
 
         cancel_id, cancel_partition, cancel_job = _create_and_claim(
             client, flow_type, suffix, "cancel"
@@ -2128,7 +2286,7 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
         cancelled = client.get(cancel_id, partition_key=cancel_partition)
         assert cancelled is not None
         assert cancelled.state == "cancelled"
-        assert client.terminals(flow_type, count=50) is not None
+        assert client.terminals(flow_type, partition_key=cancel_partition, count=50) is not None
 
         many_partition = f"py-sdk:many:{suffix}:partition"
         many_items = [
@@ -2292,16 +2450,15 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
             lease_ms=10,
         )
         assert stuck_job.id == stuck_id
-        time.sleep(0.02)
-        assert any(
-            record.id == stuck_id
-            for record in client.stuck(
+        assert _wait_flow_records(
+            lambda: client.stuck(
                 flow_type,
                 partition_key=stuck_partition,
                 count=10,
                 older_than_ms=0,
                 now_ms=int(time.time() * 1000),
-            )
+            ),
+            stuck_id,
         )
 
         parent_flow_id = f"py-sdk:parent:{suffix}"
@@ -2333,9 +2490,11 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
             success="children_done",
             failure="children_failed",
         )
-        assert isinstance(client.by_parent(parent_flow_id), list)
-        assert isinstance(client.by_root(f"root:{suffix}"), list)
-        assert isinstance(client.by_correlation(f"corr:{suffix}"), list)
+        assert isinstance(client.by_parent(parent_flow_id, partition_key=parent_partition), list)
+        assert isinstance(client.by_root(f"root:{suffix}", partition_key=parent_partition), list)
+        assert isinstance(
+            client.by_correlation(f"corr:{suffix}", partition_key=parent_partition), list
+        )
 
         rewind_id, rewind_partition, rewind_job = _create_and_claim(
             client, flow_type, suffix, "rewind"
@@ -2360,7 +2519,7 @@ def test_real_ferricstore_flow_state_machine_and_repair_surface() -> None:
         assert rewound is not None
         assert rewound.state == "queued"
 
-        assert isinstance(client.list(flow_type, count=100), list)
+        assert isinstance(client.list(flow_type, partition_key=parent_partition, count=100), list)
         assert isinstance(client.info(flow_type), dict)
     finally:
         client.close()

@@ -154,6 +154,31 @@ class FakeExecutor:
             "FLOW.LIMIT.GET",
         }:
             return {b"id": b"item-1", b"scope": b"tenant-a", b"status": b"active"}
+        if command == "FLOW.QUERY":
+            return {
+                "version": "ferric.flow.query.result/v1",
+                "records": [record],
+                "page": {"has_more": False},
+                "quality": {
+                    "exactness": "projected_exact",
+                    "freshness": "projection_watermark",
+                    "coverage": "complete",
+                    "pagination": "live_seek",
+                },
+                "usage": {
+                    "range_seeks": 1,
+                    "range_pages": 1,
+                    "scanned_entries": 1,
+                    "scanned_bytes": 1,
+                    "hydrated_records": 1,
+                    "residual_checks": 0,
+                    "duplicate_entries": 0,
+                    "result_records": 1,
+                    "response_bytes": 1,
+                    "memory_high_water_bytes": 1,
+                    "wall_time_us": 1,
+                },
+            }
         if command in {
             "FLOW.CLAIM_DUE",
             "FLOW.RECLAIM",
@@ -163,14 +188,6 @@ class FakeExecutor:
             "FLOW.RETRY_MANY",
             "FLOW.FAIL_MANY",
             "FLOW.CANCEL_MANY",
-            "FLOW.LIST",
-            "FLOW.TERMINALS",
-            "FLOW.FAILURES",
-            "FLOW.BY_PARENT",
-            "FLOW.BY_ROOT",
-            "FLOW.BY_CORRELATION",
-            "FLOW.STUCK",
-            "FLOW.SEARCH",
         }:
             return [
                 {
@@ -4250,23 +4267,26 @@ def test_query_policy_and_cleanup_commands():
     executor = FakeExecutor()
     client = FlowClient(executor)
 
-    assert client.list("order", state="queued", count=10)[0].id == "f1"
-    assert executor.calls[-1] == ("FLOW.LIST", "order", "STATE", "queued", "COUNT", 10)
-
-    assert client.terminals("order", state="completed", rev=True, count=5)[0].id == "f1"
-    assert executor.calls[-1] == (
-        "FLOW.TERMINALS",
-        "order",
-        "COUNT",
-        5,
-        "REV",
-        "true",
-        "STATE",
-        "completed",
+    assert client.list("order", partition_key="tenant:1", state="queued", count=10)[0].id == "f1"
+    assert executor.calls[-1][:3] == (
+        "FLOW.QUERY",
+        "FQL1",
+        "FROM runs WHERE partition_key = @partition_key AND type = @type "
+        "AND state = @state ORDER BY updated_at_ms ASC LIMIT 10 RETURN RECORDS",
     )
 
-    assert client.failures("order", from_ms=10, to_ms=20)[0].id == "f1"
-    assert executor.calls[-1] == ("FLOW.FAILURES", "order", "FROM_MS", 10, "TO_MS", 20)
+    assert (
+        client.terminals("order", partition_key="tenant:1", state="completed", rev=True, count=5)[
+            0
+        ].id
+        == "f1"
+    )
+    assert executor.calls[-1][0] == "FLOW.QUERY"
+    assert "ORDER BY updated_at_ms DESC LIMIT 5" in executor.calls[-1][2]
+
+    assert client.failures("order", partition_key="tenant:1", from_ms=10, to_ms=20)[0].id == "f1"
+    assert executor.calls[-1][0] == "FLOW.QUERY"
+    assert "updated_at_ms BETWEEN @from_ms AND @to_ms" in executor.calls[-1][2]
 
     assert client.stats("order", state="queued", attributes={"tenant": "acme"})["count"] == 1
     assert executor.calls[-1] == (
@@ -4279,18 +4299,14 @@ def test_query_policy_and_cleanup_commands():
         "acme",
     )
 
-    assert client.by_parent("p", count=1, terminal_only=True)[0].id == "f1"
-    assert executor.calls[-1] == (
-        "FLOW.BY_PARENT",
-        "p",
-        "COUNT",
-        1,
-        "TERMINAL_ONLY",
-        "true",
-    )
+    assert client.by_parent("p", partition_key="tenant:1", count=1)[0].id == "f1"
+    assert executor.calls[-1][0] == "FLOW.QUERY"
+    assert "parent_flow_id = @lineage_id" in executor.calls[-1][2]
 
     assert client.info("order") == {b"ok": 1}
-    assert client.stuck("order", older_than_ms=100, now_ms=200)[0].id == "f1"
+    assert (
+        client.stuck("order", partition_key="tenant:1", older_than_ms=100, now_ms=200)[0].id == "f1"
+    )
     assert client.history("f1", count=10, from_version=2, values=True)
     assert client.policy_get("order", state="queued").generation == 1
     assert client.retention_cleanup(limit=100, now_ms=123) == {b"ok": 1}
@@ -4393,6 +4409,56 @@ def test_protocol_ferricstore_commands_are_first_class():
     client.ferricstore_config("GET", "max_memory")
     assert executor.calls[-1] == ("FERRICSTORE.CONFIG", "GET", "max_memory")
     assert client.ferricstore_metrics()["ops"] == b"10"
+
+
+def test_metrics_helpers_parse_real_prometheus_text_without_losing_the_exposition():
+    scrape = (
+        "# HELP ferric_reads_total Reads\n"
+        'ferric_reads_total{node="host:6379",kind="cold read"} 12.5 1700000000\n'
+        "ferric_queue_depth 3\n"
+    )
+
+    class MetricsExecutor(FakeExecutor):
+        def execute_command(self, *args):
+            self.calls.append(args)
+            return scrape.encode()
+
+    client = FlowClient(MetricsExecutor())
+
+    assert client.ferricstore_metrics() == {
+        'ferric_reads_total{node="host:6379",kind="cold read"}': 12.5,
+        "ferric_queue_depth": 3,
+    }
+    assert client.ferricstore_metrics_text() == scrape
+
+
+@pytest.mark.parametrize(
+    "scrape",
+    [
+        "metric_without_value\n",
+        'metric{label="unterminated} 1\n',
+        "metric value trailing unexpected fields\n",
+        "metric 1 invalid-timestamp\n",
+    ],
+)
+def test_metrics_helpers_reject_malformed_prometheus_text(scrape):
+    class MetricsExecutor(FakeExecutor):
+        def execute_command(self, *args):
+            self.calls.append(args)
+            return scrape
+
+    with pytest.raises(ValueError, match="Prometheus"):
+        FlowClient(MetricsExecutor()).ferricstore_metrics()
+
+
+def test_metrics_text_helper_rejects_non_text_responses():
+    class MetricsExecutor(FakeExecutor):
+        def execute_command(self, *args):
+            self.calls.append(args)
+            return {"metric": 1}
+
+    with pytest.raises(TypeError, match="Prometheus metrics text"):
+        FlowClient(MetricsExecutor()).ferricstore_metrics_text()
 
 
 def test_command_passes_through_data_structure_commands():
@@ -4754,31 +4820,15 @@ def test_admin_flow_wrappers_build_readable_commands_and_normalize_responses():
     search_results = client.search(
         "order",
         state="queued",
+        partition_key="tenant:1",
         count=10,
         attributes={"tenant": "acme"},
         state_meta={"version": 1},
-        terminal_only=True,
-        consistent_projection=True,
     )
     assert search_results[0].id == "f1"
-    assert executor.calls[-1] == (
-        "FLOW.SEARCH",
-        "order",
-        "COUNT",
-        10,
-        "STATE",
-        "queued",
-        "TERMINAL_ONLY",
-        "true",
-        "CONSISTENT_PROJECTION",
-        "true",
-        "ATTRIBUTE",
-        "tenant",
-        "acme",
-        "STATE_META",
-        "queued",
-        {"version": 1},
-    )
+    assert executor.calls[-1][0] == "FLOW.QUERY"
+    assert "attribute['tenant'] = @attribute_0" in executor.calls[-1][2]
+    assert "state_meta['queued']['version'] = @state_meta_0" in executor.calls[-1][2]
 
     assert client.attributes("order", state="queued", count=10) == [{"name": "tenant", "count": 3}]
     assert executor.calls[-1] == ("FLOW.ATTRIBUTES", "order", "STATE", "queued", "COUNT", 10)
