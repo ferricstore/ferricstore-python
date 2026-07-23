@@ -92,6 +92,7 @@ order_saga = client.workflow(
     partition_by=("tenant_id", "order_id"),
 )
 
+
 @order_saga.state("reserve_inventory", claim_values=["order"])
 def reserve_inventory(job):
     order = decode_order(job.value("order"))
@@ -101,6 +102,7 @@ def reserve_inventory(job):
         "charge_payment",
         values={"reservation": reservation_id.encode()},
     )
+
 
 @order_saga.state("charge_payment", claim_values=["order", "reservation"])
 def charge_payment(job):
@@ -112,6 +114,7 @@ def charge_payment(job):
         values={"charge": charge_id.encode()},
     )
 
+
 @order_saga.state("ship_order", claim_values=["order", "reservation", "charge"])
 def ship_order(job):
     order = decode_order(job.value("order"))
@@ -119,12 +122,14 @@ def ship_order(job):
 
     return complete(result=shipment_id.encode(), ttl_ms=30 * 86_400_000)
 
+
 @order_saga.state("compensate_payment", claim_values=["charge"])
 def compensate_payment(job):
     charge_id = job.value("charge")
     if charge_id:
         payments.refund(charge_id.decode(), idempotency_key=f"{job.id}:refund")
     return transition("compensate_inventory")
+
 
 @order_saga.state("compensate_inventory", claim_values=["reservation"])
 def compensate_inventory(job):
@@ -173,6 +178,7 @@ rollout = client.workflow(
     partition_by=("tenant_id", "rollout_id"),
 )
 
+
 @rollout.state("fanout", claim_values=["manifest"])
 def fanout(job):
     manifest = job.value("manifest")
@@ -201,6 +207,7 @@ def fanout(job):
 
     return transition("waiting_devices")
 
+
 @rollout.state("completed")
 def completed(job):
     return complete(result=b"rollout complete")
@@ -210,6 +217,7 @@ Device-command workflow:
 
 ```python
 device_command = client.workflow(type="device_command", initial_state="send")
+
 
 @device_command.state("send", claim_values=["manifest"])
 def send(job):
@@ -224,6 +232,7 @@ def send(job):
     )
 
     return transition("waiting_ack", run_at_ms=now_ms() + 60_000)
+
 
 @device_command.state("waiting_ack")
 def waiting_ack(job):
@@ -267,6 +276,7 @@ ai_run = client.workflow(
     partition_by=("tenant_id", "run_id"),
 )
 
+
 @ai_run.state("plan", claim_values=["input"])
 def plan(job):
     user_input = job.value("input")
@@ -276,6 +286,7 @@ def plan(job):
         "run_tools",
         values={"plan": plan},
     )
+
 
 @ai_run.state("run_tools", claim_values=["plan"])
 def run_tools(job):
@@ -298,6 +309,7 @@ def run_tools(job):
         value_refs={"tool_outputs": tool_ref["ref"]},
     )
 
+
 @ai_run.state("draft_answer", claim_values=["input", "plan", "tool_outputs"])
 def draft_answer(job):
     draft = llm.answer(
@@ -309,9 +321,11 @@ def draft_answer(job):
 
     return transition("human_review", values={"draft": draft})
 
+
 @ai_run.state("human_review")
 def human_review(job):
     return retry(error=b"waiting for human review", run_at_ms=now_ms() + 300_000)
+
 
 @ai_run.state("approved", claim_values=["draft"])
 def approved(job):
@@ -351,6 +365,7 @@ from ferricstore import ChildSpec, WorkflowClient, complete, transition
 client = WorkflowClient.from_url(url)
 document_batch = client.workflow(type="document_batch", initial_state="split")
 
+
 @document_batch.state("split", claim_values=["archive"])
 def split(job):
     archive = job.value("archive")
@@ -377,6 +392,7 @@ def split(job):
     job.flow.spawn_children(children, wait="all", wait_state="waiting", success="merge")
     return transition("waiting")
 
+
 @document_batch.state("merge")
 def merge(job):
     return complete(result=b"batch done")
@@ -397,14 +413,17 @@ from ferricstore import WorkflowClient, complete, fail, retry
 client = WorkflowClient.from_url(url)
 approval = client.workflow(type="approval", initial_state="waiting")
 
+
 @approval.state("waiting")
 def waiting(job):
     notify_approver(job.id)
     return retry(error=b"waiting approval", run_at_ms=now_ms() + 86_400_000)
 
+
 @approval.state("approved")
 def approved(job):
     return complete(result=b"approved")
+
 
 @approval.state("rejected")
 def rejected(job):
@@ -439,6 +458,7 @@ Use flow ids as idempotency keys:
 from ferricstore import QueueClient
 
 queue_client = QueueClient.from_url(url)
+
 
 def handle_webhook(event):
     flow_id = f"webhook:{event.provider}:{event.id}"

@@ -28,8 +28,10 @@ emails = client.queue(type="email")
 
 emails.enqueue("email-1", payload=b"welcome")
 
+
 def handle_email(job):
     send_email(job.id)
+
 
 emails.worker(concurrency=100, batch_size=1000, lease_ms=30_000).run(handle_email)
 ```
@@ -92,10 +94,12 @@ payment = client.workflow(
     partition_by=("tenant_id", "payment_id"),
 )
 
+
 @payment.state("created", lease_ms=30_000)
 def created(job):
     charge_card(job.payload)
     return transition("charged", payload=b"charge result")
+
 
 @payment.state("charged", lease_ms=30_000, claim_values=["receipt"])
 def charged(job):
@@ -128,6 +132,7 @@ from ferricstore import BudgetPolicy, WorkflowClient, complete
 
 client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 workflow = client.workflow(type="agent", initial_state="call_model")
+
 
 @workflow.state(
     "call_model",

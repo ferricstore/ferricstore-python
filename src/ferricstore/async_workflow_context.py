@@ -51,7 +51,7 @@ class AsyncWorkflowFlowCommands:
     def __getattr__(self, name: str) -> Any:
         return getattr(self.client, name)
 
-    def _partition(self, partition_key: str | bytes | None | object) -> str | bytes | None:
+    def _partition(self, partition_key: str | bytes | object | None) -> str | bytes | None:
         if partition_key is _CURRENT_PARTITION:
             return self._ctx.partition_key
         return cast(str | bytes | None, partition_key)
@@ -70,7 +70,7 @@ class AsyncWorkflowFlowCommands:
         self,
         id: str | None = None,
         *,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         **kwargs: Any,
     ) -> Any:
         return await self.client.get(
@@ -83,7 +83,7 @@ class AsyncWorkflowFlowCommands:
         self,
         id: str | None = None,
         *,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         **kwargs: Any,
     ) -> Any:
         return await self.client.history(
@@ -99,7 +99,7 @@ class AsyncWorkflowFlowCommands:
         type: str | None = None,
         state: str | None = None,
         payload: Any = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         return_record: bool = False,
         max_active_ms: int | float | str | None = None,
         **kwargs: Any,
@@ -123,7 +123,7 @@ class AsyncWorkflowFlowCommands:
         type: str | None = None,
         state: str | None = None,
         payload: Any = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         return_record: bool = False,
         max_active_ms: int | float | str | None = None,
         **kwargs: Any,
@@ -148,7 +148,7 @@ class AsyncWorkflowFlowCommands:
         initial_state: str | None = None,
         worker: str,
         payload: Any = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         max_active_ms: int | float | str | None = None,
         **kwargs: Any,
     ) -> FlowRecord:
@@ -170,7 +170,7 @@ class AsyncWorkflowFlowCommands:
         *,
         type: str | None = None,
         state: str | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         max_active_ms: int | float | str | None = None,
         **kwargs: Any,
     ) -> builtins.list[FlowRecord] | Any:
@@ -190,7 +190,7 @@ class AsyncWorkflowFlowCommands:
         *,
         type: str | None = None,
         state: str | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         max_active_ms: int | float | str | None = None,
         **kwargs: Any,
     ) -> builtins.list[Any] | Any:
@@ -214,7 +214,7 @@ class AsyncWorkflowFlowCommands:
         worker: str,
         payload: Any = None,
         result: Any = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         **kwargs: Any,
     ) -> bytes:
         return await self.client.run_steps_many(
@@ -268,7 +268,7 @@ class AsyncWorkflowFlowCommands:
         lease_token: bytes | None = None,
         *,
         fencing_token: int | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         **kwargs: Any,
     ) -> FlowRecord:
         return await self.client.extend_lease(
@@ -287,7 +287,7 @@ class AsyncWorkflowFlowCommands:
         from_state: str | None = None,
         lease_token: bytes | None = None,
         fencing_token: int | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         return_record: bool = False,
         **kwargs: Any,
     ) -> Any:
@@ -310,7 +310,7 @@ class AsyncWorkflowFlowCommands:
         from_state: str | None = None,
         lease_token: bytes | None = None,
         fencing_token: int | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         **kwargs: Any,
     ) -> FlowRecord | ClaimedFlow:
         return await self.client.step_continue(
@@ -329,7 +329,7 @@ class AsyncWorkflowFlowCommands:
         *,
         lease_token: bytes | None = None,
         fencing_token: int | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         return_record: bool = False,
         **kwargs: Any,
     ) -> Any:
@@ -348,7 +348,7 @@ class AsyncWorkflowFlowCommands:
         *,
         lease_token: bytes | None = None,
         fencing_token: int | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         return_record: bool = False,
         **kwargs: Any,
     ) -> Any:
@@ -367,7 +367,7 @@ class AsyncWorkflowFlowCommands:
         *,
         lease_token: bytes | None = None,
         fencing_token: int | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         return_record: bool = False,
         **kwargs: Any,
     ) -> Any:
@@ -386,7 +386,7 @@ class AsyncWorkflowFlowCommands:
         *,
         fencing_token: int | None = None,
         lease_token: bytes | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         return_record: bool = False,
         **kwargs: Any,
     ) -> Any:
@@ -403,7 +403,7 @@ class AsyncWorkflowFlowCommands:
         self,
         id: str | None = None,
         *,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         return_record: bool = False,
         **kwargs: Any,
     ) -> Any:
@@ -482,7 +482,7 @@ class AsyncWorkflowFlowCommands:
         children: builtins.list[ChildSpec],
         *,
         parent_flow_id: str | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         lease_token: bytes | None = None,
         fencing_token: int | None = None,
         max_active_ms: int | float | str | None = None,

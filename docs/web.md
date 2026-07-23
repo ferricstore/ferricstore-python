@@ -18,7 +18,14 @@ Put shared SDK configuration in one module.
 `flow_config.py`:
 
 ```python
-from ferricstore import ExceptionPolicy, JsonCodec, QueueClient, RetryPolicy, ValueConfig, WorkerConfig
+from ferricstore import (
+    ExceptionPolicy,
+    JsonCodec,
+    QueueClient,
+    RetryPolicy,
+    ValueConfig,
+    WorkerConfig,
+)
 
 
 def queue_client() -> QueueClient:
@@ -130,7 +137,9 @@ from ferricstore import JsonCodec, WorkflowClient, complete, transition
 
 
 client = WorkflowClient.from_url("ferric://ferricstore.service:6388", codec=JsonCodec())
-orders = client.workflow(type="order", initial_state="created", partition_by=("tenant_id", "order_id"))
+orders = client.workflow(
+    type="order", initial_state="created", partition_by=("tenant_id", "order_id")
+)
 
 
 def register_handlers():

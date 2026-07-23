@@ -96,7 +96,7 @@ class WorkflowFlowCommands:
         self,
         id: str | None = None,
         *,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
     ) -> FlowRecord | None:
         return self.client.get(
             self._ctx.id if id is None else id,
@@ -107,7 +107,7 @@ class WorkflowFlowCommands:
         self,
         id: str | None = None,
         *,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         **kwargs: Any,
     ) -> builtins.list[Any]:
         return self.client.history(
@@ -123,7 +123,7 @@ class WorkflowFlowCommands:
         type: str | None = None,
         state: str | None = None,
         payload: Any = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         return_record: bool = False,
         max_active_ms: int | float | str | None = None,
         **kwargs: Any,
@@ -147,7 +147,7 @@ class WorkflowFlowCommands:
         type: str | None = None,
         state: str | None = None,
         payload: Any = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         return_record: bool = False,
         max_active_ms: int | float | str | None = None,
         **kwargs: Any,
@@ -172,7 +172,7 @@ class WorkflowFlowCommands:
         initial_state: str | None = None,
         worker: str,
         payload: Any = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         max_active_ms: int | float | str | None = None,
         **kwargs: Any,
     ) -> FlowRecord:
@@ -194,7 +194,7 @@ class WorkflowFlowCommands:
         *,
         type: str | None = None,
         state: str | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         max_active_ms: int | float | str | None = None,
         **kwargs: Any,
     ) -> builtins.list[FlowRecord] | Any:
@@ -214,7 +214,7 @@ class WorkflowFlowCommands:
         *,
         type: str | None = None,
         state: str | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         max_active_ms: int | float | str | None = None,
         **kwargs: Any,
     ) -> builtins.list[Any] | Any:
@@ -238,7 +238,7 @@ class WorkflowFlowCommands:
         worker: str,
         payload: Any = None,
         result: Any = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         **kwargs: Any,
     ) -> bytes:
         return self.client.run_steps_many(
@@ -281,7 +281,7 @@ class WorkflowFlowCommands:
         lease_token: bytes | None = None,
         *,
         fencing_token: int | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         **kwargs: Any,
     ) -> FlowRecord:
         return self.client.extend_lease(
@@ -300,7 +300,7 @@ class WorkflowFlowCommands:
         from_state: str | None = None,
         lease_token: bytes | None = None,
         fencing_token: int | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         return_record: bool = False,
         **kwargs: Any,
     ) -> FlowRecord | bytes:
@@ -323,7 +323,7 @@ class WorkflowFlowCommands:
         from_state: str | None = None,
         lease_token: bytes | None = None,
         fencing_token: int | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         **kwargs: Any,
     ) -> FlowRecord | ClaimedFlow:
         return self.client.step_continue(
@@ -342,7 +342,7 @@ class WorkflowFlowCommands:
         *,
         lease_token: bytes | None = None,
         fencing_token: int | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         return_record: bool = False,
         **kwargs: Any,
     ) -> FlowRecord | bytes:
@@ -361,7 +361,7 @@ class WorkflowFlowCommands:
         *,
         lease_token: bytes | None = None,
         fencing_token: int | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         return_record: bool = False,
         **kwargs: Any,
     ) -> FlowRecord | bytes:
@@ -380,7 +380,7 @@ class WorkflowFlowCommands:
         *,
         lease_token: bytes | None = None,
         fencing_token: int | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         return_record: bool = False,
         **kwargs: Any,
     ) -> FlowRecord | bytes:
@@ -399,7 +399,7 @@ class WorkflowFlowCommands:
         *,
         fencing_token: int | None = None,
         lease_token: bytes | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         return_record: bool = False,
         **kwargs: Any,
     ) -> FlowRecord | bytes:
@@ -416,7 +416,7 @@ class WorkflowFlowCommands:
         self,
         id: str | None = None,
         *,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         return_record: bool = False,
         **kwargs: Any,
     ) -> FlowRecord | bytes:
@@ -491,7 +491,7 @@ class WorkflowFlowCommands:
         children: builtins.list[ChildSpec],
         *,
         parent_flow_id: str | None = None,
-        partition_key: str | bytes | None | object = _CURRENT_PARTITION,
+        partition_key: str | bytes | object | None = _CURRENT_PARTITION,
         lease_token: bytes | None = None,
         fencing_token: int | None = None,
         max_active_ms: int | float | str | None = None,

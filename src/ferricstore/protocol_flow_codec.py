@@ -569,7 +569,7 @@ def _maybe_bytes(value: Any) -> bytes | None:
     return _bounded_maybe_bytes(value)
 
 
-def _optional_bytes(value: Any) -> bytes | None | bool:
+def _optional_bytes(value: Any) -> bytes | bool | None:
     if value is None:
         return None
     encoded = _maybe_bytes(value)

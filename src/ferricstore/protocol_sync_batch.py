@@ -131,7 +131,7 @@ class SyncProtocolBatchHost(Protocol):
         payload: dict[str, Any] | bytes,
         flags: int = 0,
         *,
-        timeout: float | None | object = ...,
+        timeout: float | object | None = ...,
         exact_lane: bool = False,
         expected_collection_items: int | None = None,
     ) -> ProtocolResponse: ...
@@ -143,7 +143,7 @@ class SyncProtocolBatchHost(Protocol):
         payload: dict[str, Any] | bytes,
         flags: int = 0,
         *,
-        timeout: float | None | object = ...,
+        timeout: float | object | None = ...,
         expected_collection_items: int | None = None,
     ) -> ProtocolResponse: ...
 

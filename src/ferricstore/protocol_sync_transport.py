@@ -358,7 +358,7 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
         payload: dict[str, Any] | bytes,
         flags: int = 0,
         *,
-        timeout: float | None | object = _USE_ADAPTER_TIMEOUT,
+        timeout: float | object | None = _USE_ADAPTER_TIMEOUT,
         exact_lane: bool = False,
         expected_collection_items: int | None = None,
     ) -> ProtocolResponse:
@@ -414,7 +414,7 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
         payload: dict[str, Any] | bytes,
         flags: int = 0,
         *,
-        timeout: float | None | object = _USE_ADAPTER_TIMEOUT,
+        timeout: float | object | None = _USE_ADAPTER_TIMEOUT,
         expected_collection_items: int | None = None,
     ) -> ProtocolResponse:
         return self._request(

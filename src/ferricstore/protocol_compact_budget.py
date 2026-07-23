@@ -205,7 +205,7 @@ def _bounded_optional_bytes(
     pending_limit: int | None = None,
     *,
     budget: _CompactPayloadBudget | None = None,
-) -> bytes | None | bool:
+) -> bytes | bool | None:
     if value is None:
         return None
     encoded = _bounded_maybe_bytes(

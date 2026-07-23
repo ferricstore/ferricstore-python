@@ -74,14 +74,17 @@ order = client.workflow(
     partition_by=("tenant_id", "order_id"),
 )
 
+
 @order.state("created")
 def created(job):
     charge(job.payload)
     return transition("charged")
 
+
 @order.state("charged")
 def charged(job):
     return complete(result=b"ok")
+
 
 order.start("order-1", tenant_id="tenant-a", order_id="order-1", payload=b"...")
 ```

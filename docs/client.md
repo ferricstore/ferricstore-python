@@ -667,7 +667,9 @@ client.install_policy(
     "order",
     retry=RetryPolicy(max_retries=3, backoff="fixed", base_ms=100, max_ms=1_000),
     states={
-        "charge": RetryPolicy(max_retries=10, backoff="exponential", base_ms=1_000, max_ms=86_400_000),
+        "charge": RetryPolicy(
+            max_retries=10, backoff="exponential", base_ms=1_000, max_ms=86_400_000
+        ),
         "dispatch": FlowStatePolicy.fifo(),
     },
 )
@@ -760,9 +762,7 @@ if result.hit:
 elif result.should_compute:
     try:
         report = build_report()
-        client.fetch_or_compute_result(
-            "report:42", result.ownership_token, report, ttl_ms=60_000
-        )
+        client.fetch_or_compute_result("report:42", result.ownership_token, report, ttl_ms=60_000)
     except Exception as exc:
         client.fetch_or_compute_error("report:42", result.ownership_token, str(exc))
         raise

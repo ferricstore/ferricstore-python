@@ -52,9 +52,11 @@ deterministic replay.
 ```python
 orders = client.workflow(type="order", initial_state="created")
 
+
 @orders.state("created")
 def created(job):
     return transition("charged")
+
 
 @orders.state("charged")
 def charged(job):
@@ -79,9 +81,11 @@ mutate through durable commands:
 ```python
 workflow = client.workflow(type="order", initial_state="reserve")
 
+
 @workflow.state("reserve")
 def reserve(job):
     return transition("charge")
+
 
 @workflow.state("charge")
 def charge(job):

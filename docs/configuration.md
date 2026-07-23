@@ -96,9 +96,9 @@ order = client.workflow(
     retry_policy=RetryPolicy(max_retries=5),
 )
 
+
 @order.state("charge", retry_policy=RetryPolicy(max_retries=3))
-def charge(job):
-    ...
+def charge(job): ...
 ```
 
 ## BackpressurePolicy

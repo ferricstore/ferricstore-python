@@ -185,9 +185,7 @@ if result.hit:
 elif result.should_compute:
     try:
         report = build_report()
-        client.fetch_or_compute_result(
-            "report:42", result.ownership_token, report, ttl_ms=60_000
-        )
+        client.fetch_or_compute_result("report:42", result.ownership_token, report, ttl_ms=60_000)
     except Exception as exc:
         client.fetch_or_compute_error("report:42", result.ownership_token, str(exc))
         raise
@@ -611,8 +609,10 @@ emails = client.queue(type="email")
 
 emails.enqueue("email-1", payload=b"welcome:user-1")
 
+
 def send_email(job):
     deliver(job.id)
+
 
 emails.worker(concurrency=500, batch_size=1000).run(send_email)
 ```
@@ -633,15 +633,18 @@ order = client.workflow(
     partition_by=("tenant_id", "order_id"),
 )
 
+
 @order.state("created", lease_ms=30_000, claim_payload=True)
 def created(job):
     charge_card(job.payload)
     return transition("charged", payload=b"charge result")
 
+
 @order.state("charged", lease_ms=30_000, claim_values=["invoice"])
 def charged(job):
     send_receipt(job.values.get("invoice"))
     return complete(result=b"ok")
+
 
 order.start(
     "order-1",
@@ -792,13 +795,16 @@ from ferricstore import WorkflowClient, complete, transition
 client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 signup = client.workflow(type="signup", initial_state="created")
 
+
 @signup.state("created")
 def created(job):
     return transition("email_sent")
 
+
 @signup.state("email_sent")
 def email_sent(job):
     return complete(result=b"ok")
+
 
 signup.start("signup-1", payload=b"user")
 ```

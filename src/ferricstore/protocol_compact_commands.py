@@ -662,7 +662,7 @@ def _parse_compact_flow_step_continue_raw(
     lease_token = _maybe_bytes(command[2])
     from_state = _maybe_bytes(command[3])
     to_state = _maybe_bytes(command[4])
-    partition_key: bytes | None | bool = None
+    partition_key: bytes | bool | None = None
     fencing_token: int | None = None
     lease_ms: int | None = None
     now_ms: int | None = None
@@ -797,8 +797,8 @@ def _parse_compact_flow_start_and_claim_raw(
 
     flow_id = _maybe_bytes(command[1])
     flow_type = initial_state = worker = None
-    partition_key: bytes | None | bool = None
-    item_payload: bytes | None | bool = None
+    partition_key: bytes | bool | None = None
+    item_payload: bytes | bool | None = None
     lease_ms: int | None = None
     now_ms: int | None = None
     jobs_compact = False
@@ -901,7 +901,7 @@ def _parse_compact_flow_value_put_raw(
     value = _maybe_bytes(command[1])
     owner_flow_id: bytes | None = None
     name_value: bytes | None = None
-    partition_key: bytes | None | bool = None
+    partition_key: bytes | bool | None = None
     now_ms: int | None = None
     return_mode: Any = None
 

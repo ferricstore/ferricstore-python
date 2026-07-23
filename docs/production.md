@@ -98,7 +98,14 @@ Compose service, or Cloud Run service with enough minimum instances.
 `flow_config.py`:
 
 ```python
-from ferricstore import ExceptionPolicy, JsonCodec, QueueClient, RetryPolicy, ValueConfig, WorkerConfig
+from ferricstore import (
+    ExceptionPolicy,
+    JsonCodec,
+    QueueClient,
+    RetryPolicy,
+    ValueConfig,
+    WorkerConfig,
+)
 
 
 def queue_client() -> QueueClient:
