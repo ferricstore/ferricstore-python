@@ -20,7 +20,7 @@ def _url() -> str:
 
 def test_sync_sdk_compatibility_smoke() -> None:
     suffix = uuid.uuid4().hex
-    keys = [f"py-sdk-compat:{suffix}:{index}" for index in range(3)]
+    keys = [f"py-sdk-compat:{{{suffix}}}:{index}" for index in range(3)]
     flow_id = f"py-sdk-compat-flow:{suffix}"
     client = FlowClient.from_url(
         _url(),
