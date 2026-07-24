@@ -44,6 +44,55 @@ class MyExecutor:
 client = FlowClient(MyExecutor())
 ```
 
+This minimal executor receives only actual FerricStore command arguments.
+Typed query routing hints are local SDK metadata and are not serialized or
+passed to `execute_command`.
+
+To support `deadline_ms` on `query`, `explain`, and `explain_analyze`, a custom
+executor must also implement the optional query capability:
+
+```python
+class MyExecutor:
+    def execute_command(self, *args):
+        return my_transport.send_command(*args)
+
+    def execute_flow_query_command(
+        self, *args, deadline_ms=None, routing_key=None
+    ):
+        return my_transport.send_flow_query(
+            *args,
+            deadline_ms=deadline_ms,
+            routing_key=routing_key,
+        )
+```
+
+The capability must encode `deadline_ms` into the native FLOW.QUERY payload.
+`routing_key` is only an endpoint-selection hint and must never be placed in the
+wire payload. Without this capability, queries still execute through
+`execute_command`; requesting a deadline raises `TypeError` instead of silently
+dropping it.
+
+Async clients use the corresponding awaitable capability:
+
+```python
+class MyAsyncExecutor:
+    async def execute_command(self, *args):
+        return await my_transport.send_command(*args)
+
+    async def execute_flow_query_command(
+        self, *args, deadline_ms=None, routing_key=None
+    ):
+        return await my_transport.send_flow_query(
+            *args,
+            deadline_ms=deadline_ms,
+            routing_key=routing_key,
+        )
+```
+
+Both async executor methods must return an awaitable. The same deadline and
+routing rules apply; a synchronous return is rejected instead of being accepted
+as an already-completed query.
+
 ## Test executor
 
 Unit tests should use fake executors:

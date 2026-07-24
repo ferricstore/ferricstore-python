@@ -41,6 +41,7 @@ class ProtocolAdapterPool:
     client: ProtocolAdapterPool
     requires_explicit_session = True
     supports_concurrent_fanout = True
+    _supports_native_flow_query_options = True
 
     def __init__(self, adapters: list[ProtocolAdapter]) -> None:
         if not adapters:

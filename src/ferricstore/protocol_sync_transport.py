@@ -48,8 +48,13 @@ from ferricstore.protocol_negotiation import (
 from ferricstore.protocol_pipeline_codec import (
     _expected_payload_collection_items,
 )
-from ferricstore.protocol_responses import _decode_protocol_response
-from ferricstore.protocol_retry import request_outcome_error
+from ferricstore.protocol_responses import (
+    _decode_protocol_response,
+)
+from ferricstore.protocol_responses import (
+    _supported_compact_response_codec_names as _startup_codecs,
+)
+from ferricstore.protocol_retry import request_may_mutate, request_outcome_error
 from ferricstore.protocol_sync_state import _SyncProtocolStateMixin
 
 
@@ -200,11 +205,12 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
         if self.client_name is not None:
             hello["client_name"] = self.client_name
         hello_value = self._response_value(self._request(_OPCODES["HELLO"], 0, hello))
-        apply_hello_negotiation(self, hello_value)
+        negotiated = apply_hello_negotiation(self, hello_value)
 
         startup: dict[str, Any] = {
             "compression": self.compression,
             "compact_flow_responses": True,
+            "compact_response_codecs": _startup_codecs(negotiated.compact_response_codecs),
         }
         if self.client_name is not None:
             startup["client_name"] = self.client_name
@@ -327,6 +333,7 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
             outcome_error = request_outcome_error(
                 opcode,
                 write_error,
+                payload=payload,
                 message="protocol write failed",
             )
             try:
@@ -404,6 +411,7 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
             raise request_outcome_error(
                 opcode,
                 exc,
+                payload=payload,
                 message="protocol request timed out",
             ) from exc
 
@@ -490,6 +498,7 @@ class SyncProtocolTransportMixin(_SyncProtocolStateMixin):
                     lane_id=lane_id,
                     opcode=opcode,
                     request_id=request_id,
+                    may_mutate=request_may_mutate(opcode, payload),
                 ),
             )
             try:

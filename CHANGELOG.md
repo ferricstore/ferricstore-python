@@ -6,6 +6,28 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.7.1 - 2026-07-24
+
+- Require FerricStore 0.10.3 for result projections and the negotiated compact
+  FQL1 result codec while retaining native wire protocol v1.
+- Validate the compact FQL1 decoder against the byte-for-byte shared server and
+  SDK golden corpus.
+
+- Add an immutable, composable `FlowQuery`/`FlowFields` FQL1 builder with
+  parameter binding, source-aware run/event projections, safe metadata and
+  event-field selectors, point/count/event shapes, deterministic compilation,
+  and cursor pages that retain the original query bindings; sync and async
+  query/explain APIs accept either raw FQL or this DSL.
+- Expose absolute `deadline_ms` on sync and async query/explain calls without
+  reserving or colliding with FQL parameter names, and classify the generic
+  `FLOW.QUERY.INDEXES` transport as a retry-safe read after ambiguous I/O.
+- Add fully typed query-index status sections, bounded malformed-response and
+  property coverage, live async/TLS/failover query scenarios, executable query
+  documentation, and eager predicate-budget rejection for large metadata maps.
+- Rename the legacy management telemetry helper to `telemetry_flow_query`;
+  retain `flow_query` as a deprecated compatibility alias so it cannot be
+  mistaken for the FQL execution API.
+
 ## 0.7.0
 
 - Require FerricStore 0.10.0 and negotiate the complete OSS FQL1 request,

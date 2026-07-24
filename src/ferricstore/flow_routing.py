@@ -11,6 +11,7 @@ from typing import Any
 
 from ferricstore.command_grammar import split_flow_value_mget
 from ferricstore.flow_options import FlowOptionPlan
+from ferricstore.flow_query_request import flow_query_command_routing_key
 
 _FLOW_AUTO_PARTITION_PREFIX = "__flow_auto__:"
 _FLOW_AUTO_PARTITION_BUCKETS = 256
@@ -205,6 +206,9 @@ def flow_command_route_keys(name: str, args: Sequence[Any]) -> tuple[Any, ...]:
         return ()
     if name in _FLOW_GLOBAL_COMMANDS:
         return (_FLOW_GLOBAL_ROUTE_KEY,)
+    if name == "FLOW.QUERY":
+        routing_key = flow_query_command_routing_key(values)
+        return () if routing_key is None else (routing_key,)
     if name == "FLOW.VALUE.MGET":
         return _value_mget_route_keys(values)
     if name in _FLOW_APPROVAL_ID_COMMANDS:

@@ -103,9 +103,10 @@ def charge(job): ...
 
 ## BackpressurePolicy
 
-`BackpressurePolicy` controls client-side retries for server-declared overloads on
-safe producer writes. It does not retry timeouts or disconnects because their
-commit outcome can be unknown.
+`BackpressurePolicy` controls server-declared safe retries and coordinates shared
+pressure before safe producer writes and Flow query reads. The SDK retries only
+when the server sets both `retryable` and `safe_to_retry`. It does not replay a
+mutation after a timeout or disconnect because its commit outcome can be unknown.
 
 ```python
 from ferricstore import BackpressurePolicy, QueueClient
@@ -124,7 +125,10 @@ client = QueueClient.from_url(
 The default elapsed retry budget is 30 seconds. Shared pressure is coordinated
 only within the same transport endpoint or pool, so an overloaded cluster does
 not delay clients connected to an unrelated cluster. Set `shared=False` only
-when a producer needs an independent retry window.
+when a client needs an independent retry window. If both retry limits are
+explicitly disabled, the query reader still inserts a one-millisecond
+cooperative delay when neither the server nor the overload policy supplies one;
+this prevents an intentionally unbounded retry loop from consuming a CPU core.
 
 Timing values must be numeric, finite, and non-negative. Durations that reach a
 threading wait (`base_delay_ms`, `max_delay_ms`, worker idle timing, autobatch

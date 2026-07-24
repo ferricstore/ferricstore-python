@@ -17,6 +17,7 @@ _GROUPS = (
             "_read_custom_flow_record_list _read_custom_flow_value_ref "
             "_read_tagged_binary _read_tagged_i64 _read_u32 _require_available "
             "_require_compact_collection_count _response_value _status_text "
+            "_supported_compact_response_codec_names "
             "_try_decode_binary_list _try_decode_claim_jobs_compact "
             "_try_decode_custom_binary_list_list _try_decode_custom_binary_map_list "
             "_try_decode_custom_claim_jobs _try_decode_custom_claim_jobs_width "

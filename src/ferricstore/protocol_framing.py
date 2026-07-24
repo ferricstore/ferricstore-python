@@ -8,7 +8,7 @@ import sys
 import time
 import zlib
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 from ferricstore.config_validation import (
@@ -30,6 +30,7 @@ class ResponseIdentity:
     lane_id: int
     opcode: int
     request_id: int
+    may_mutate: bool | None = field(default=None, compare=False, repr=False)
 
 
 def validate_response_identity(

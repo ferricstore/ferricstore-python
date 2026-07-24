@@ -240,7 +240,7 @@ client.acl_set_user("platform_worker", ["on", "+PING", "+@read", "~tenant:acme:*
 client.ensure_namespace("tenant:acme:", {"owner": "platform"})
 client.set_quota("tenant:acme:", {"keys": 100_000, "bytes": 1_000_000_000})
 usage = client.namespace_usage("tenant:acme:")
-flows = client.flow_query({"type": "order", "state": "failed"})
+flows = client.telemetry_flow_query({"type": "order", "state": "failed"})
 ```
 
 ## FlowClient basics
@@ -472,18 +472,88 @@ expired = client.reclaim("order", worker="reaper-1", limit=100)
 
 ### Queries
 
+Use parameterized FQL for custom reads. Query values are encoded separately
+from the query text, and collection reads must be scoped to one partition:
+
+```python
+import time
+
+query = """
+FROM runs
+WHERE partition_key = @partition AND type = @type AND state = @state
+ORDER BY updated_at_ms DESC
+LIMIT 100
+RETURN RECORDS
+"""
+params = {"partition": "tenant-a", "type": "order", "state": "queued"}
+deadline_ms = int(time.time() * 1000) + 5_000
+
+result = client.query(query, params, deadline_ms=deadline_ms)
+plan = client.explain(query, params, deadline_ms=deadline_ms)
+indexes = client.query_indexes()
+```
+
+`deadline_ms` is optional and is always an absolute Unix timestamp in
+milliseconds, not a relative timeout.
+
+Use the immutable query builder when queries need to be composed or reused:
+
+```python
+from ferricstore import FlowFields, FlowQuery, flow_param
+
+active_orders = (
+    FlowQuery.runs()
+    .where(
+        FlowFields.partition_key.eq(flow_param("partition")),
+        FlowFields.type.eq("order"),
+        FlowFields.state.in_("queued", "running"),
+    )
+    .order_by(FlowFields.updated_at_ms.desc())
+    .limit(25)
+    .return_records(FlowFields.run_id, FlowFields.state, FlowFields.updated_at_ms)
+    .bind(partition="tenant-a")
+)
+
+result = client.query(active_orders, deadline_ms=deadline_ms)
+```
+
+`FlowQuery.events()` builds event queries. Predicates support `eq`, `in_`,
+`between`, `from_to`, `is_null`, and `is_missing`, plus safe dynamic selectors
+through `FlowFields.attribute(name)` and `FlowFields.state_meta(state, name)`.
+Passing fields to `return_record(...)` or `return_records(...)` creates a
+source-checked server projection. Event projections use `FlowFields.event_id`,
+`FlowFields.fields`, or `FlowFields.event_field(name)`; omit the arguments for
+the complete record. Run projections may select whole metadata maps with
+`FlowFields.attributes` and `FlowFields.state_metadata`. Call `compile()` when the generated FQL text and bound
+parameters are needed. Bind placeholders with `bind()`; a separate `params`
+mapping cannot be combined with a `FlowQuery`. `AsyncFlowClient` accepts the
+same query objects.
+
+The collection convenience methods compile to FQL and also require an explicit
+`partition_key`:
+
 ```python
 record = client.get("order-1", partition_key="tenant-a:order-1")
 history = client.history("order-1", partition_key="tenant-a:order-1", count=100)
-queued = client.list("order", state="queued", count=100)
-completed = client.terminals("order", state="completed", count=100)
-failed = client.failures("order", count=100)
-children = client.by_parent("parent-flow-id", count=100)
-root = client.by_root("root-flow-id", count=100)
-correlated = client.by_correlation("checkout-123", count=100)
+queued = client.list("order", partition_key="tenant-a", state="queued", count=100)
+completed = client.terminals(
+    "order", partition_key="tenant-a", state="completed", count=100
+)
+failed = client.failures("order", partition_key="tenant-a", count=100)
+children = client.by_parent("parent-flow-id", partition_key="tenant-a", count=100)
+root = client.by_root("root-flow-id", partition_key="tenant-a", count=100)
+correlated = client.by_correlation(
+    "checkout-123", partition_key="tenant-a", count=100
+)
 info = client.info("order")
-stuck = client.stuck("order", older_than_ms=300_000, count=100)
+stuck = client.stuck(
+    "order", partition_key="tenant-a", older_than_ms=300_000, count=100
+)
 ```
+
+FQL collection helpers do not support `include_cold` or
+`consistent_projection`. Lineage helpers support `state`, `from_ms`, `to_ms`,
+and `rev`, but not `terminal_only` or attribute filters.
 
 ### Policy and cleanup
 
@@ -510,6 +580,7 @@ payload or named values:
 client.create(
     "order-1",
     type="order",
+    partition_key="tenant-a",
     payload=b"small routing bytes",
     attributes={"tenant": "acme", "region": "us"},
 )
@@ -523,8 +594,16 @@ client.transition(
     attributes_merge={"phase": "charge"},
 )
 
-records = client.list("order", attributes={"tenant": "acme"})
-stats = client.stats("order", attributes={"tenant": "acme"})
+records = client.list(
+    "order",
+    partition_key="tenant-a",
+    attributes={"tenant": "acme"},
+)
+stats = client.stats(
+    "order",
+    partition_key="tenant-a",
+    attributes={"tenant": "acme"},
+)
 ```
 
 Keep attributes small and stable: tenant, region, campaign, device group, model,

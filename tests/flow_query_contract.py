@@ -12,6 +12,7 @@ def with_flow_query_contract(capabilities: dict[str, Any]) -> dict[str, Any]:
         "language_versions": ["FQL1"],
         "capabilities": [
             "flow_query_v1",
+            "flow_query_result_projection_v1",
             "flow_explain_v1",
             "flow_explain_analyze_v1",
             "flow_composite_index_v1",

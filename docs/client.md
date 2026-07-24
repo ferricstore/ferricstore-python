@@ -23,11 +23,11 @@ The SDK only opens FerricStore native protocol connections from URLs. Use `ferri
 | Claim/lease | `claim_due`, `reclaim`, `extend_lease` |
 | Mutate | `transition`, `transition_many`, `complete`, `complete_many`, `retry`, `retry_many`, `fail`, `fail_many`, `cancel`, `cancel_many`, `rewind` |
 | Children | `spawn_children` |
-| Query | `get`, `history`, `list`, `search`, `terminals`, `failures`, `by_parent`, `by_root`, `by_correlation`, `info`, `stuck` |
+| Query | `get`, `history`, `list`, `search`, `terminals`, `failures`, `by_parent`, `by_root`, `by_correlation`, `info`, `stuck`, `query`, `explain`, `explain_analyze`, `query_indexes` |
 | Attribute discovery | `attributes`, `attribute_values` |
 | Schedules | `schedule_create`, `schedule_get`, `schedule_fire`, `schedule_pause`, `schedule_resume`, `schedule_delete`, `schedule_fire_due`, `schedule_list` |
 | Governance | `effect_reserve`, `effect_confirm`, `effect_fail`, `effect_compensate`, `effect_get`, `governance_ledger`, `approval_request`, `approval_approve`, `approval_reject`, `approval_get`, `approval_list`, `governance_overview`, `circuit_open`, `circuit_close`, `circuit_get`, `budget_reserve`, `budget_commit`, `budget_release`, `budget_get`, `budget_list`, `limit_lease`, `limit_spend`, `limit_release`, `limit_get`, `limit_list` |
-| Management reads/writes | `capabilities`, `acl_*`, `ensure_namespace`, `get_namespace`, `list_namespaces`, `delete_namespace`, `set_quota`, `get_quota`, `quota_usage`, `cluster_info`, `namespace_usage`, `flow_query`, `flow_history`, `invocation_*` |
+| Management reads/writes | `capabilities`, `acl_*`, `ensure_namespace`, `get_namespace`, `list_namespaces`, `delete_namespace`, `set_quota`, `get_quota`, `quota_usage`, `cluster_info`, `namespace_usage`, `telemetry_flow_query`, `flow_history`, `invocation_*` |
 | Policy/cleanup | `install_policy`, `policy_get`, `retention_cleanup` |
 
 `from_url` uses the native FerricStore protocol adapter.
@@ -433,27 +433,127 @@ events = client.history(
 
 ## Query Commands
 
+Use parameterized FQL for custom reads. Values belong in `params`, not in the
+query text. Every collection query must select one explicit partition.
+
 ```python
-client.list("order", state="queued", count=100)
+import time
+
+query = """
+FROM runs
+WHERE partition_key = @partition AND type = @type AND state = @state
+ORDER BY updated_at_ms DESC
+LIMIT 100
+RETURN RECORDS
+"""
+params = {"partition": "tenant-a", "type": "order", "state": "queued"}
+deadline_ms = int(time.time() * 1000) + 5_000
+
+result = client.query(query, params, deadline_ms=deadline_ms)
+plan = client.explain(query, params, deadline_ms=deadline_ms)
+indexes = client.query_indexes()
+```
+
+`deadline_ms` is optional and is always an absolute Unix timestamp in
+milliseconds, not a relative timeout.
+
+`explain()` and `explain_analyze()` return a typed `FlowExplainResult`. A full
+explain response exposes planner statistics, quality, pressure, the decision,
+alternatives, and status-dependent `actual` or `diagnostic` data. A specialized
+planned explain instead exposes a `capabilities` map with `requested`,
+`available`, and `missing` lists and intentionally omits those extended fields;
+the typed result represents them as `None` (and `alternatives` as an empty
+tuple). Native compact response negotiation is transparent and does not change
+either public result type.
+
+### Composable queries
+
+`FlowQuery` is an immutable query object for building reusable FQL without
+assembling strings. Values are always compiled as parameters, including literal
+values supplied to predicates:
+
+```python
+from ferricstore import FlowFields, FlowQuery, flow_param
+
+active_orders = (
+    FlowQuery.runs()
+    .where(
+        FlowFields.partition_key.eq(flow_param("partition")),
+        FlowFields.type.eq("order"),
+        FlowFields.state.in_("queued", "running"),
+        FlowFields.attribute("tenant").eq("acme"),
+    )
+    .order_by(FlowFields.updated_at_ms.desc())
+    .limit(25)
+    .return_records(
+        FlowFields.run_id,
+        FlowFields.state,
+        FlowFields.updated_at_ms,
+        FlowFields.attribute("tenant"),
+    )
+    .bind(partition="tenant-a")
+)
+
+result = client.query(active_orders, deadline_ms=deadline_ms)
+plan = client.explain(active_orders, deadline_ms=deadline_ms)
+
+if result.page is not None and result.page.cursor is not None:
+    next_result = client.query(active_orders.cursor(result.page.cursor))
+
+fql, bound_params = active_orders.compile()
+```
+
+Use `FlowQuery.events()` for event history and `return_record()`,
+`return_records()`, or `return_count()` to choose the result shape. Passing
+fields to `return_record(...)` or `return_records(...)` requests a server-side
+projection; an empty argument list returns the complete record. Run projections
+accept built-in run fields, whole maps through `FlowFields.attributes` and
+`FlowFields.state_metadata`, plus `attribute(...)` and `state_meta(...)`. Event
+projections accept `FlowFields.event_id`, `FlowFields.fields`, and
+`FlowFields.event_field(name)`. The builder validates the source, rejects
+duplicates, and enforces the server's 32-field projection limit.
+
+Field predicates support `eq`, `in_`, `between`, `from_to`, `is_null`, and
+`is_missing`; use `FlowFields.state_meta(state, name)` for indexed state
+metadata. `compile()` is useful for interoperability and deliberate inspection,
+but normal SDK calls can accept the query object directly. For logs, record only
+the returned FQL text (or a fingerprint) after deliberate redaction; the
+returned parameter mapping can contain secrets and user data. Bind placeholders
+with `bind()`; passing a separate `params` mapping together with a `FlowQuery`
+is rejected.
+`AsyncFlowClient` accepts the same objects through `await client.query(...)` and
+the async explain methods.
+
+The convenience methods below compile to parameterized FQL and require
+`partition_key`. `include_cold` and `consistent_projection` are not supported by
+these FQL collection queries.
+
+```python
+client.list("order", partition_key="tenant-a", state="queued", count=100)
 client.search(
     "order",
+    partition_key="tenant-a",
     state="completed",
     attributes={"tenant": "acme"},
     state_meta={"version": 3},
     terminal_only=True,
     count=100,
 )
-client.terminals("order", state="completed", rev=True, count=100)
-client.failures("order", from_ms=0, to_ms=now_ms)
-client.by_parent("parent-flow-id", terminal_only=True)
-client.by_root("root-flow-id", state="failed")
-client.by_correlation("checkout-123", include_cold=True)
+client.terminals(
+    "order", partition_key="tenant-a", state="completed", rev=True, count=100
+)
+client.failures("order", partition_key="tenant-a", from_ms=0, to_ms=now_ms)
+client.by_parent("parent-flow-id", partition_key="tenant-a")
+client.by_root("root-flow-id", partition_key="tenant-a", state="failed")
+client.by_correlation("checkout-123", partition_key="tenant-a")
 client.info("order", include_cold=True)
-client.stuck("order", older_than_ms=60_000)
+client.stuck("order", partition_key="tenant-a", older_than_ms=60_000)
 ```
 
 Broad `search(...)` filters use server-side policy indexes. Attribute filters
 require `indexed_attributes`; state metadata filters require `indexed_state_meta`.
+Lineage queries support `state` and time-window filters, but not `terminal_only`
+or attribute predicates.
 
 ## Attribute Discovery
 

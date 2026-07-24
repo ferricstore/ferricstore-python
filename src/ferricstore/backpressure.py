@@ -20,11 +20,11 @@ from ferricstore.config_validation import (
 
 @dataclass(frozen=True, slots=True)
 class BackpressurePolicy:
-    """Client-side overload retry policy for safe producer writes.
+    """Client-side policy for server-declared safe retries and shared pressure.
 
-    This policy is intentionally used only for server-declared overload
-    responses. Timeouts and disconnects can have unknown commit outcome and are
-    not retried by this helper.
+    It governs safe producer retries and idempotent Flow query reads. Timeouts
+    and disconnects after a mutation can have unknown commit outcome and are
+    never retried by this helper.
     """
 
     enabled: bool = True
@@ -79,18 +79,30 @@ class BackpressureController:
                 cls._shared_states[key] = state
             return state
 
-    def before_request(self, *, elapsed_s: float | None = None) -> bool:
+    def before_request(
+        self,
+        *,
+        elapsed_s: float | None = None,
+        remaining_s: float | None = None,
+    ) -> bool:
         started = time.monotonic()
         while True:
             delay = self._wait_delay()
             if delay <= 0:
                 return True
-            current_elapsed = self._elapsed_after_wait(elapsed_s, started)
-            if not self._retry_wait_fits_budget(delay, current_elapsed):
+            current_elapsed, current_remaining = self._budgets_after_wait(
+                elapsed_s, remaining_s, started
+            )
+            if not self._retry_wait_fits_budget(delay, current_elapsed, current_remaining):
                 return False
             time.sleep(delay)
 
-    async def before_request_async(self, *, elapsed_s: float | None = None) -> bool:
+    async def before_request_async(
+        self,
+        *,
+        elapsed_s: float | None = None,
+        remaining_s: float | None = None,
+    ) -> bool:
         import asyncio
 
         started = time.monotonic()
@@ -98,8 +110,10 @@ class BackpressureController:
             delay = self._wait_delay()
             if delay <= 0:
                 return True
-            current_elapsed = self._elapsed_after_wait(elapsed_s, started)
-            if not self._retry_wait_fits_budget(delay, current_elapsed):
+            current_elapsed, current_remaining = self._budgets_after_wait(
+                elapsed_s, remaining_s, started
+            )
+            if not self._retry_wait_fits_budget(delay, current_elapsed, current_remaining):
                 return False
             await asyncio.sleep(delay)
 
@@ -123,8 +137,14 @@ class BackpressureController:
         retry_after_ms: int | None = None,
         *,
         elapsed_s: float | None = None,
+        remaining_s: float | None = None,
     ) -> bool:
-        delay = self._reserve_overload_delay(attempt, retry_after_ms, elapsed_s=elapsed_s)
+        delay = self._reserve_overload_delay(
+            attempt,
+            retry_after_ms,
+            elapsed_s=elapsed_s,
+            remaining_s=remaining_s,
+        )
         if delay is None:
             return False
         if delay > 0:
@@ -137,10 +157,16 @@ class BackpressureController:
         retry_after_ms: int | None = None,
         *,
         elapsed_s: float | None = None,
+        remaining_s: float | None = None,
     ) -> bool:
         import asyncio
 
-        delay = self._reserve_overload_delay(attempt, retry_after_ms, elapsed_s=elapsed_s)
+        delay = self._reserve_overload_delay(
+            attempt,
+            retry_after_ms,
+            elapsed_s=elapsed_s,
+            remaining_s=remaining_s,
+        )
         if delay is None:
             return False
         if delay > 0:
@@ -152,10 +178,11 @@ class BackpressureController:
         retry_after_ms: int | None,
         *,
         elapsed_s: float | None = None,
+        remaining_s: float | None = None,
     ) -> bool:
         """Honor a non-overload server retry hint without changing pressure state."""
         delay = self._retry_after_delay(retry_after_ms)
-        if not self._retry_wait_fits_budget(delay, elapsed_s):
+        if not self._retry_wait_fits_budget(delay, elapsed_s, remaining_s):
             return False
         if delay > 0:
             time.sleep(delay)
@@ -166,11 +193,12 @@ class BackpressureController:
         retry_after_ms: int | None,
         *,
         elapsed_s: float | None = None,
+        remaining_s: float | None = None,
     ) -> bool:
         import asyncio
 
         delay = self._retry_after_delay(retry_after_ms)
-        if not self._retry_wait_fits_budget(delay, elapsed_s):
+        if not self._retry_wait_fits_budget(delay, elapsed_s, remaining_s):
             return False
         if delay > 0:
             await asyncio.sleep(delay)
@@ -192,7 +220,14 @@ class BackpressureController:
         with state.lock:
             return max(state.blocked_until - now, 0.0)
 
-    def _retry_wait_fits_budget(self, delay_s: float, elapsed_s: float | None) -> bool:
+    def _retry_wait_fits_budget(
+        self,
+        delay_s: float,
+        elapsed_s: float | None,
+        remaining_s: float | None = None,
+    ) -> bool:
+        if remaining_s is not None and max(delay_s, 0.0) >= max(remaining_s, 0.0):
+            return False
         max_elapsed_ms = self.policy.max_elapsed_ms
         if elapsed_s is None or max_elapsed_ms is None:
             return True
@@ -200,10 +235,15 @@ class BackpressureController:
         return max(elapsed_s, 0.0) + max(delay_s, 0.0) < budget_s
 
     @staticmethod
-    def _elapsed_after_wait(elapsed_s: float | None, started: float) -> float | None:
-        if elapsed_s is None:
-            return None
-        return max(elapsed_s, 0.0) + max(time.monotonic() - started, 0.0)
+    def _budgets_after_wait(
+        elapsed_s: float | None,
+        remaining_s: float | None,
+        started: float,
+    ) -> tuple[float | None, float | None]:
+        spent_s = max(time.monotonic() - started, 0.0)
+        current_elapsed = None if elapsed_s is None else max(elapsed_s, 0.0) + spent_s
+        current_remaining = None if remaining_s is None else remaining_s - spent_s
+        return current_elapsed, current_remaining
 
     def _record_overload_delay(self, attempt: int, retry_after_ms: int | None = None) -> float:
         if not self.policy.enabled:
@@ -226,6 +266,7 @@ class BackpressureController:
         retry_after_ms: int | None,
         *,
         elapsed_s: float | None,
+        remaining_s: float | None = None,
     ) -> float | None:
         if not self.policy.enabled:
             return 0.0
@@ -240,7 +281,7 @@ class BackpressureController:
                 self._retry_after_delay(retry_after_ms),
             )
             wait_delay = max(state.blocked_until - now, requested_delay, 0.0)
-            if not self._retry_wait_fits_budget(wait_delay, elapsed_s):
+            if not self._retry_wait_fits_budget(wait_delay, elapsed_s, remaining_s):
                 return None
             state.consecutive_overloads = next_overloads
             state.blocked_until = max(state.blocked_until, now + requested_delay)

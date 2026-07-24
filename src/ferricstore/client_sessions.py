@@ -11,6 +11,7 @@ from ferricstore.batch_core import (
 )
 from ferricstore.config_validation import validate_string_sequence
 from ferricstore.errors import map_exception
+from ferricstore.flow_query_request import _with_flow_query_command_options
 from ferricstore.lifecycle_core import (
     raise_primary_with_cleanup,
 )
@@ -29,6 +30,39 @@ class _ErrorMappingExecutor:
     def execute_command(self, *args: Any) -> Any:
         try:
             return self._executor.execute_command(*args)
+        except Exception as exc:
+            mapped = map_exception(exc)
+            if mapped is exc:
+                raise
+            raise mapped from exc
+
+    def execute_flow_query_command(
+        self,
+        *args: Any,
+        deadline_ms: int | None = None,
+        routing_key: str | bytes | None = None,
+    ) -> Any:
+        execute = getattr(self._executor, "execute_flow_query_command", None)
+        if not callable(execute):
+            if getattr(self._executor, "_supports_native_flow_query_options", False):
+                command = _with_flow_query_command_options(
+                    args,
+                    deadline_ms=deadline_ms,
+                    routing_key=routing_key,
+                )
+                return self.execute_command(*command)
+            if deadline_ms is not None:
+                raise TypeError(
+                    "custom executors must implement execute_flow_query_command() "
+                    "to support FLOW.QUERY deadline_ms"
+                )
+            return self.execute_command(*args)
+        try:
+            return execute(
+                *args,
+                deadline_ms=deadline_ms,
+                routing_key=routing_key,
+            )
         except Exception as exc:
             mapped = map_exception(exc)
             if mapped is exc:

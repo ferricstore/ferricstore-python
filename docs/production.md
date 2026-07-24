@@ -421,11 +421,11 @@ Backpressure should happen before FerricStore becomes the bottleneck:
 - use rate-limit commands for tenant/request limits
 - avoid unbounded local queues around `enqueue_many`
 
-Safe producer writes retry server-declared overloads with exponential backoff.
-The default `BackpressurePolicy` limits an overload retry chain to 30 seconds,
-and shared pressure is scoped to one endpoint or pool. Timeouts and disconnects
-are not retried automatically because the server may already have committed the
-write.
+Safe producer writes and idempotent Flow query reads follow server-declared safe
+retry metadata. The default `BackpressurePolicy` limits a retry chain to 30
+seconds, and shared pressure is scoped to one endpoint or pool. Mutations are
+not replayed after timeouts or disconnects because the server may already have
+committed the write.
 
 For async apps, avoid spawning unlimited tasks that all call the SDK. Use bounded
 producer/consumer queues or semaphores.

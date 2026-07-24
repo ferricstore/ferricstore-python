@@ -72,6 +72,7 @@ class ProtocolAdapter(
     client: ProtocolAdapter
     requires_explicit_session = True
     supports_concurrent_fanout = True
+    _supports_native_flow_query_options = True
 
     def _build_protocol_command(self, *args: Any) -> ProtocolCommand:
         return build_adapter_protocol_command(self, args)

@@ -53,7 +53,7 @@ def query_response() -> dict[str, Any]:
     return {
         "version": "ferric.flow.query.result/v1",
         "records": [record("one"), record("two")],
-        "page": {"has_more": True, "cursor": "fqc1_next"},
+        "page": {"has_more": True, "cursor": "fqc1_next-page-token"},
         "quality": deepcopy(QUALITY),
         "usage": deepcopy(USAGE),
     }
@@ -77,7 +77,14 @@ def explain_response(status: str, *, actual: dict[str, Any] | None = None) -> di
         "status": status,
         "plan": {"path": "ordered_range"},
         "estimate": {"scanned_entries": 2},
+        "stats": {"source": "fresh"},
+        "quality": deepcopy(QUALITY),
         "bounds": {"scanned_entries": 50_000},
+        "pressure": {"resources": []},
+        "decision": {"reason": "only_bounded_candidate"},
+        "alternatives": [],
+        "actual": None,
+        "diagnostic": None,
     }
     if actual is not None:
         response["actual"] = actual
@@ -104,14 +111,66 @@ def index_response() -> dict[str, Any]:
         "observed_at_ms": 100,
         "statistics_max_age_ms": 30_000,
         "registry": {"epoch": 2, "catalog_version": 3},
-        "services": {"backfill": {"status": "idle"}},
+        "services": {
+            "registry": "ready",
+            "lifecycle_worker": "ready",
+            "statistics_store": "ready",
+            "statistics_worker": "ready",
+        },
         "indexes": [
             {
                 "id": "flow_runs_tenant_updated",
                 "version": 1,
                 "build_id": "build-1",
+                "source": "runs",
                 "state": "active",
                 "queryable": True,
+                "fields": [
+                    {"name": "partition_key", "direction": "asc", "encoding": "hashed"},
+                    {"name": "updated_at_ms", "direction": "desc", "encoding": "ordered"},
+                ],
+                "workloads": ["tenant_updated"],
+                "count_prefixes": [1],
+                "coverage": {
+                    "complete_shards": 1,
+                    "total_shards": 1,
+                    "validation": "passed",
+                },
+                "build": {
+                    "scope": "catalog_build",
+                    "phase_counts": {"done": 1},
+                    "current_phases": ["done"],
+                    "completed_shards": 1,
+                    "total_shards": 1,
+                    "scanned_records": 1,
+                    "written_entries": 1,
+                    "written_bytes": 100,
+                },
+                "validation": {
+                    "scope": "catalog_build",
+                    "status": "passed",
+                    "phase_counts": {"done": 1},
+                    "current_phases": ["done"],
+                    "completed_shards": 1,
+                    "total_shards": 1,
+                    "checked_records": 1,
+                    "checked_entries": 1,
+                    "mismatches": 0,
+                    "failure_reason": None,
+                    "validated_at_ms": 100,
+                },
+                "retirement": {"status": "not_applicable"},
+                "statistics": {
+                    "status": "missing",
+                    "samples": 0,
+                    "fresh_samples": 0,
+                    "stale_samples": 0,
+                    "future_samples": 0,
+                    "oldest_collected_at_ms": None,
+                    "newest_collected_at_ms": None,
+                    "oldest_age_ms": None,
+                    "newest_age_ms": None,
+                },
             }
         ],
     }
@@ -171,6 +230,7 @@ def hello() -> dict[str, Any]:
                 "language_versions": ["FQL1"],
                 "capabilities": [
                     "flow_query_v1",
+                    "flow_query_result_projection_v1",
                     "flow_explain_v1",
                     "flow_explain_analyze_v1",
                     "flow_composite_index_v1",
@@ -231,7 +291,7 @@ def test_sync_query_decodes_page_and_sorts_bounded_parameters() -> None:
     assert isinstance(result, FlowQueryResult)
     assert [item[b"id"] for item in result.records or ()] == [b"one", b"two"]
     assert result.count is None
-    assert result.page is not None and result.page.cursor == "fqc1_next"
+    assert result.page is not None and result.page.cursor == "fqc1_next-page-token"
     assert result.usage.result_records == 2
     assert executor.calls == [
         ("FLOW.QUERY", "FQL1", QUERY, "tenant", "tenant-a", "type", "invoice")
@@ -421,7 +481,7 @@ def test_query_rejects_unencodable_text_parameters_before_io() -> None:
     assert executor.calls == []
 
 
-def test_query_conveniences_preserve_server_metadata_normalization() -> None:
+def test_query_conveniences_preserve_exact_metadata_identity() -> None:
     executor = RecordingExecutor(query_response(), query_response())
     client = FlowClient(executor)
 
@@ -436,14 +496,13 @@ def test_query_conveniences_preserve_server_metadata_normalization() -> None:
         state_meta={" queued ": {" risk ": 3}},
     )
 
-    assert "attribute['customer'] = @attribute_0" in executor.calls[0][2]
-    assert "state_meta['queued']['risk'] = @state_meta_0" in executor.calls[1][2]
+    assert "attribute[' customer '] = @attribute_0" in executor.calls[0][2]
+    assert "state_meta[' queued '][' risk '] = @state_meta_0" in executor.calls[1][2]
 
 
 @pytest.mark.parametrize(
     "attributes",
     [
-        {"tenant": "one", " tenant ": "two"},
         {"__internal": "one"},
         {"x" * 65: "one"},
     ],
@@ -463,17 +522,29 @@ def test_query_conveniences_reject_invalid_metadata_before_io(
     assert executor.calls == []
 
 
-def test_query_conveniences_reject_duplicate_normalized_state_names_before_io() -> None:
-    executor = RecordingExecutor(query_response())
+def test_query_conveniences_keep_space_distinct_metadata_names() -> None:
+    executor = RecordingExecutor(query_response(), query_response())
+    client = FlowClient(executor)
 
-    with pytest.raises(ValueError, match="state"):
-        FlowClient(executor).search(
-            "invoice",
-            partition_key="tenant-a",
-            state_meta={"queued": {"risk": 1}, " queued ": {"risk": 2}},
-        )
+    client.search(
+        "invoice",
+        partition_key="tenant-a",
+        attributes={"x": 1, " x ": 2, " ": 3, "customer's.区域": 4},
+    )
+    client.search(
+        "invoice",
+        partition_key="tenant-a",
+        state_meta={"queued": {"risk": 1}, " queued ": {" risk ": 2}},
+    )
 
-    assert executor.calls == []
+    attribute_query = executor.calls[0][2]
+    assert "attribute['x']" in attribute_query
+    assert "attribute[' x ']" in attribute_query
+    assert "attribute[' ']" in attribute_query
+    assert "attribute['customer''s.区域']" in attribute_query
+    state_query = executor.calls[1][2]
+    assert "state_meta['queued']['risk']" in state_query
+    assert "state_meta[' queued '][' risk ']" in state_query
 
 
 def test_query_conveniences_reject_empty_non_mapping_state_meta_before_io() -> None:
@@ -520,6 +591,13 @@ def test_async_query_uses_the_same_contract() -> None:
 def test_hello_requires_the_complete_query_manifest_and_schema() -> None:
     negotiated = parse_hello_capabilities(hello())
     assert negotiated.flow_query.language_versions == frozenset({"FQL1"})
+
+    missing_projection = hello()
+    missing_projection["capabilities"]["flow_query"]["capabilities"].remove(
+        "flow_query_result_projection_v1"
+    )
+    with pytest.raises(FerricStoreError, match="flow_query_result_projection_v1"):
+        parse_hello_capabilities(missing_projection)
 
     missing_shape = hello()
     missing_shape["capabilities"]["flow_query"]["shapes"].pop()

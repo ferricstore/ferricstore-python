@@ -13,8 +13,14 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10 CI
     import tomli as tomllib
 
 from ferricstore import __version__
+from ferricstore.protocol_negotiation import MINIMUM_SERVER_VERSION
 
 REPOSITORY = Path(__file__).resolve().parents[1]
+
+
+def test_projection_release_versions_are_current() -> None:
+    assert __version__ == "0.7.1"
+    assert MINIMUM_SERVER_VERSION == "0.10.3"
 
 
 def test_package_version_has_one_build_metadata_source() -> None:
@@ -130,3 +136,15 @@ def test_ci_and_publish_enforce_critical_module_coverage() -> None:
         workflow = (REPOSITORY / ".github" / "workflows" / workflow_name).read_text()
         assert "--cov-report=json:coverage.json" in workflow
         assert "scripts/check_critical_coverage.py coverage.json" in workflow
+
+
+def test_every_query_contract_module_has_a_critical_coverage_floor() -> None:
+    config = tomllib.loads((REPOSITORY / "pyproject.toml").read_text())
+    thresholds = config["tool"]["ferricstore"]["critical_coverage"]
+    query_modules = {
+        str(path.relative_to(REPOSITORY))
+        for path in (REPOSITORY / "src" / "ferricstore").glob("flow_query_*.py")
+    }
+    query_modules.add("src/ferricstore/protocol_flow_query_result.py")
+
+    assert query_modules <= thresholds.keys()

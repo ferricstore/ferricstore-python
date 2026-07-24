@@ -13,6 +13,7 @@ from ferricstore.batch_core import (
 )
 from ferricstore.config_validation import validate_string_sequence
 from ferricstore.errors import map_exception
+from ferricstore.flow_query_request import _with_flow_query_command_options
 from ferricstore.lifecycle_core import await_cancellation_safe, raise_primary_with_cleanup
 from ferricstore.types import (
     PubSubMessage,
@@ -31,6 +32,44 @@ class _AsyncErrorMappingExecutor:
             result = self._executor.execute_command(*args)
             if not inspect.isawaitable(result):
                 raise TypeError("async executor execute_command() must return an awaitable")
+            return await result
+        except Exception as exc:
+            mapped = map_exception(exc)
+            if mapped is exc:
+                raise
+            raise mapped from exc
+
+    async def execute_flow_query_command(
+        self,
+        *args: Any,
+        deadline_ms: int | None = None,
+        routing_key: str | bytes | None = None,
+    ) -> Any:
+        execute = getattr(self._executor, "execute_flow_query_command", None)
+        if not callable(execute):
+            if getattr(self._executor, "_supports_native_flow_query_options", False):
+                command = _with_flow_query_command_options(
+                    args,
+                    deadline_ms=deadline_ms,
+                    routing_key=routing_key,
+                )
+                return await self.execute_command(*command)
+            if deadline_ms is not None:
+                raise TypeError(
+                    "custom executors must implement execute_flow_query_command() "
+                    "to support FLOW.QUERY deadline_ms"
+                )
+            return await self.execute_command(*args)
+        try:
+            result = execute(
+                *args,
+                deadline_ms=deadline_ms,
+                routing_key=routing_key,
+            )
+            if not inspect.isawaitable(result):
+                raise TypeError(
+                    "async executor execute_flow_query_command() must return an awaitable"
+                )
             return await result
         except Exception as exc:
             mapped = map_exception(exc)

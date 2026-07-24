@@ -247,16 +247,41 @@ def test_sync_topology_endpoint_lifecycle_is_a_dedicated_boundary() -> None:
     """Keep endpoint ownership symmetric with the async topology implementation."""
 
     assert (PACKAGE / "protocol_sync_endpoints.py").is_file()
+    assert (PACKAGE / "protocol_sync_topology_retry.py").is_file()
     assert (PACKAGE / "protocol_sync_topology_mset.py").is_file()
     assert _module_lines("protocol_sync_topology") <= 850
     assert _module_lines("protocol_sync_endpoints") <= 250
+    assert _module_lines("protocol_sync_topology_retry") <= 150
     assert _module_lines("protocol_sync_topology_mset") <= 120
     _assert_acyclic_modules(
         {
             "protocol_sync_endpoints",
             "protocol_sync_routing",
             "protocol_sync_topology",
+            "protocol_sync_topology_retry",
             "protocol_sync_topology_mset",
+        }
+    )
+
+
+def test_async_protocol_response_handling_is_a_dedicated_boundary() -> None:
+    assert (PACKAGE / "protocol_async_responses.py").is_file()
+    assert _module_lines("protocol_async_responses") <= 250
+    assert "ferricstore.protocol_async_responses" in _top_level_imports("protocol_async")
+    _assert_acyclic_modules({"protocol_async", "protocol_async_responses", "protocol_async_state"})
+
+
+def test_async_topology_retry_is_a_dedicated_boundary() -> None:
+    assert (PACKAGE / "protocol_async_topology_retry.py").is_file()
+    assert _module_lines("protocol_async_topology_retry") <= 150
+    assert "ferricstore.protocol_async_topology_retry" in _top_level_imports(
+        "protocol_async_topology"
+    )
+    _assert_acyclic_modules(
+        {
+            "protocol_async_endpoints",
+            "protocol_async_topology",
+            "protocol_async_topology_retry",
         }
     )
 
@@ -649,7 +674,10 @@ def test_extracted_mixins_have_explicit_host_contracts() -> None:
         ("protocol_sync_transport", "SyncProtocolTransportMixin"),
         ("protocol_sync_batch", "SyncProtocolBatchMixin"),
         ("protocol_async_batch", "AsyncProtocolBatchMixin"),
+        ("protocol_async_responses", "AsyncProtocolResponseMixin"),
+        ("protocol_async_topology_retry", "AsyncTopologyRetryMixin"),
         ("protocol_async_state", "_AsyncProtocolStateMixin"),
+        ("protocol_sync_topology_retry", "SyncTopologyRetryMixin"),
         ("protocol_sync_routing", "SyncTopologyRoutingMixin"),
         ("protocol_sync_endpoints", "SyncTopologyEndpointMixin"),
         ("protocol_subscriptions", "SyncProtocolSubscriptionMixin"),
@@ -731,12 +759,15 @@ def test_large_sdk_facades_are_thin_and_implementations_are_bounded() -> None:
         "protocol_sync_pool",
         "protocol_sync_endpoints",
         "protocol_sync_topology",
+        "protocol_sync_topology_retry",
         "protocol_async",
         "protocol_async_batch",
+        "protocol_async_responses",
         "protocol_async_state",
         "protocol_async_pool",
         "protocol_async_endpoints",
         "protocol_async_topology",
+        "protocol_async_topology_retry",
     }
     async_client_components = {
         "async_client_sessions",
@@ -805,6 +836,17 @@ def test_handwritten_production_modules_stay_below_one_thousand_lines() -> None:
     }
 
     assert not oversized
+
+
+def test_flow_query_components_remain_small_and_acyclic() -> None:
+    modules = {
+        *(path.stem for path in PACKAGE.glob("flow_query_*.py")),
+        "protocol_flow_query_result",
+    }
+
+    oversized = {module: _module_lines(module) for module in modules if _module_lines(module) > 500}
+    assert not oversized
+    _assert_acyclic_modules(modules)
 
 
 def test_protocol_dependency_direction_keeps_wire_code_transport_free() -> None:
@@ -1014,12 +1056,15 @@ def test_extracted_component_import_graphs_are_acyclic() -> None:
             "protocol_subscriptions",
             "protocol_sync_pool",
             "protocol_sync_topology",
+            "protocol_sync_topology_retry",
             "protocol_async",
             "protocol_async_batch",
+            "protocol_async_responses",
             "protocol_async_state",
             "protocol_async_pool",
             "protocol_async_endpoints",
             "protocol_async_topology",
+            "protocol_async_topology_retry",
             "flow_options",
             "flow_routing",
             "topology_security",
@@ -1079,8 +1124,11 @@ def test_compatibility_facades_resolve_only_requested_components(
 
 def test_client_and_pending_registries_use_typed_host_contracts() -> None:
     expected_executors = {
-        "client_state": ("_ClientMixinBase", "CommandExecutor"),
-        "async_client_state": ("_AsyncClientMixinBase", "AsyncCommandExecutor"),
+        "client_state": ("_ClientMixinBase", "FlowQueryCommandExecutor"),
+        "async_client_state": (
+            "_AsyncClientMixinBase",
+            "AsyncFlowQueryCommandExecutor",
+        ),
     }
     for module, (class_name, expected) in expected_executors.items():
         fields = {

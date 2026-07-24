@@ -142,6 +142,7 @@ class SyncPendingRequestRegistry:
             else request_outcome_error(
                 identity.opcode,
                 timeout,
+                may_mutate=identity.may_mutate,
                 message="protocol request timed out",
             )
         )
@@ -283,6 +284,7 @@ class SyncPendingRequestRegistry:
                 else request_outcome_error(
                     identity.opcode,
                     exc,
+                    may_mutate=identity.may_mutate,
                     message="protocol connection closed",
                 )
             )

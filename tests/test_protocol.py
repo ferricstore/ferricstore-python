@@ -75,14 +75,18 @@ def _flow_id_route_key(value: str | bytes) -> str:
     return f"f:{{fa:{zlib.crc32(encoded) % 256}}}:route"
 
 
-def _v091_hello(*, auth_required: bool = False) -> dict[str, Any]:
+def _v091_hello(
+    *,
+    auth_required: bool = False,
+    compact_response_opcodes: dict[str, list[int]] | None = None,
+) -> dict[str, Any]:
     return {
         "protocol": "ferricstore-native",
         "version": 1,
         "auth_required": auth_required,
         "capabilities": with_flow_query_contract(
             {
-                "response_codecs": {"compact_response_opcodes": {}},
+                "response_codecs": {"compact_response_opcodes": compact_response_opcodes or {}},
                 "limits": {"max_response_bytes": 64 * 1024 * 1024},
                 "schemas": {
                     "FLOW.POLICY.SET": {"fields": ["type", "expected_generation", "replace"]}
@@ -98,6 +102,7 @@ def _serve_v091_handshake(
     response: Any,
     *,
     auth_required: bool = False,
+    compact_response_opcodes: dict[str, list[int]] | None = None,
 ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
     frames = []
     for _ in range(2):
@@ -108,7 +113,10 @@ def _serve_v091_handshake(
                 frame[0],
                 frame[1],
                 frame[2],
-                _v091_hello(auth_required=auth_required),
+                _v091_hello(
+                    auth_required=auth_required,
+                    compact_response_opcodes=compact_response_opcodes,
+                ),
             )
         )
     return cast(tuple[tuple[Any, ...], tuple[Any, ...]], tuple(frames))
@@ -5520,7 +5528,17 @@ def test_ferrics_url_enables_protocol_tls(monkeypatch):
     }
 
 
-def test_protocol_adapter_uses_real_tcp_frames():
+@pytest.mark.parametrize(
+    ("advertised_codecs", "expected_codecs"),
+    [
+        ({}, []),
+        ({"flow_query_result_v1": [0x0231]}, [b"flow_query_result_v1"]),
+        ({"future_codec_v2": [0x0231]}, []),
+    ],
+)
+def test_protocol_adapter_uses_real_tcp_frames(
+    advertised_codecs: dict[str, list[int]], expected_codecs: list[bytes]
+):
     header = struct.Struct(">4sBBIHQI")
     status = struct.Struct(">H")
     received: list[tuple[int, int, Any]] = []
@@ -5556,7 +5574,12 @@ def test_protocol_adapter_uses_real_tcp_frames():
         with listener:
             conn, _addr = listener.accept()
             with conn:
-                _hello, startup = _serve_v091_handshake(conn, recv_frame, response)
+                _hello, startup = _serve_v091_handshake(
+                    conn,
+                    recv_frame,
+                    response,
+                    compact_response_opcodes=advertised_codecs,
+                )
                 startup_opcode, startup_lane, _startup_id, startup_payload = startup
                 received.append((startup_opcode, startup_lane, startup_payload))
 
@@ -5577,6 +5600,7 @@ def test_protocol_adapter_uses_real_tcp_frames():
     assert received[0][0] == 0x000C
     assert received[0][1] == 0
     assert received[0][2][b"compact_flow_responses"] is True
+    assert received[0][2][b"compact_response_codecs"] == expected_codecs
     assert received[1][0] == 0x0101
     assert received[1][1] == 1
 
@@ -6993,6 +7017,7 @@ def test_async_protocol_adapter_allows_multiple_inflight_requests():
     header = struct.Struct(">4sBBIHQI")
     status = struct.Struct(">H")
     received: list[tuple[int, int]] = []
+    startup_codecs: list[Any] = []
 
     async def recv_frame(
         reader: asyncio.StreamReader,
@@ -7015,7 +7040,10 @@ def test_async_protocol_adapter_allows_multiple_inflight_requests():
             writer: asyncio.StreamWriter,
         ) -> None:
             try:
-                await _serve_async_v091_handshake(reader, writer, recv_frame, response)
+                _hello, startup = await _serve_async_v091_handshake(
+                    reader, writer, recv_frame, response
+                )
+                startup_codecs.extend(startup[3][b"compact_response_codecs"])
 
                 first_opcode, first_lane, first_id, _first_payload = await recv_frame(reader)
                 second_opcode, second_lane, second_id, _second_payload = await recv_frame(reader)
@@ -7048,6 +7076,7 @@ def test_async_protocol_adapter_allows_multiple_inflight_requests():
     asyncio.run(run())
 
     assert received == [(0x0101, 1), (0x0101, 2)]
+    assert startup_codecs == []
 
 
 def test_async_protocol_adapter_waits_for_authenticated_handshake_before_commands():

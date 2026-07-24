@@ -178,6 +178,16 @@ def test_tls_acl_authentication_and_authorization_for_sync_and_async_clients() -
                 assert await client.command("GET", key) == b"secured"
                 assert await client.command("SET", large_key, large_value) in {b"OK", "OK"}
                 assert await client.command("GET", large_key) == large_value
+                query_result = await client.query(
+                    query,
+                    params,
+                    deadline_ms=int(time.time() * 1000) + 10_000,
+                )
+                assert query_result.records is not None
+                assert len(query_result.records) == 1
+                assert (await client.explain(query, params)).status == "planned"
+                assert (await client.explain_analyze(query, params)).status == "executed"
+                assert (await client.query_indexes()).indexes
             finally:
                 await client.close()
 

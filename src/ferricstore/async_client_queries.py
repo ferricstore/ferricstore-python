@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+from collections.abc import Mapping
 from typing import Any, cast
 
 from ferricstore.async_client_state import _AsyncClientMixinBase
@@ -13,7 +14,13 @@ from ferricstore.client_helpers import (
     _parse_kv_response,
 )
 from ferricstore.errors import FerricStoreError
+from ferricstore.flow_query_api import (
+    FlowQueryInput,
+    resolve_flow_explain_input,
+    resolve_flow_query_input,
+)
 from ferricstore.flow_query_builder import (
+    _lineage_query_options,
     build_flow_failure_query,
     build_flow_lineage_query,
     build_flow_list_query,
@@ -24,6 +31,7 @@ from ferricstore.flow_query_builder import (
 from ferricstore.flow_query_request import (
     build_flow_query_args,
     has_explain_prefix,
+    normalize_flow_query_deadline,
     validate_flow_query_index_id,
     validate_flow_query_text,
 )
@@ -33,11 +41,13 @@ from ferricstore.flow_query_response import (
     decode_flow_query_index_status,
     decode_flow_query_result,
 )
+from ferricstore.flow_query_retry import execute_flow_query_read_with_retry_async
 from ferricstore.flow_query_types import (
     FlowExplainResult,
     FlowQueryIndexStatus,
     FlowQueryResult,
 )
+from ferricstore.flow_routing import flow_logical_partition_routing_key
 from ferricstore.types import (
     FlowRecord,
 )
@@ -60,18 +70,43 @@ class _AsyncClientQueriesMixin(_AsyncClientMixinBase):
             return None
         return self._record(value)
 
-    async def query(self, query: str, params: dict[str, Any] | None = None) -> FlowQueryResult:
-        if isinstance(query, str) and has_explain_prefix(query):
+    async def query(
+        self,
+        query: FlowQueryInput,
+        params: Mapping[str, Any] | None = None,
+        *,
+        deadline_ms: int | None = None,
+    ) -> FlowQueryResult:
+        query_text, resolved_params, routing_key = resolve_flow_query_input(query, params)
+        validate_flow_query_text(query_text)
+        if has_explain_prefix(query_text):
             raise ValueError("query does not accept EXPLAIN; use explain or explain_analyze")
-        return decode_flow_query_result(await self._execute_flow_query(query, params))
+        return decode_flow_query_result(
+            await self._execute_flow_query(
+                query_text,
+                resolved_params,
+                deadline_ms=deadline_ms,
+                routing_key=routing_key,
+            )
+        )
 
-    async def explain(self, query: str, params: dict[str, Any] | None = None) -> FlowExplainResult:
-        return await self._explain_query("EXPLAIN ", query, params)
+    async def explain(
+        self,
+        query: FlowQueryInput,
+        params: Mapping[str, Any] | None = None,
+        *,
+        deadline_ms: int | None = None,
+    ) -> FlowExplainResult:
+        return await self._explain_query("EXPLAIN ", query, params, deadline_ms=deadline_ms)
 
     async def explain_analyze(
-        self, query: str, params: dict[str, Any] | None = None
+        self,
+        query: FlowQueryInput,
+        params: Mapping[str, Any] | None = None,
+        *,
+        deadline_ms: int | None = None,
     ) -> FlowExplainResult:
-        return await self._explain_query("EXPLAIN ANALYZE ", query, params)
+        return await self._explain_query("EXPLAIN ANALYZE ", query, params, deadline_ms=deadline_ms)
 
     async def query_indexes(self, index_id: str | None = None) -> FlowQueryIndexStatus:
         args: list[Any] = ["FLOW.QUERY.INDEXES"]
@@ -79,10 +114,17 @@ class _AsyncClientQueriesMixin(_AsyncClientMixinBase):
             validate_flow_query_index_id(index_id)
             args.append(index_id)
         try:
-            value = await self.executor.execute_command(*args)
+
+            async def execute() -> Any:
+                return await self.executor.execute_command(*args)
+
+            value = await execute_flow_query_read_with_retry_async(
+                execute,
+                self.backpressure,
+            )
         except FerricStoreError as exc:
             self._raise_flow_query_error(exc)
-        return decode_flow_query_index_status(value)
+        return decode_flow_query_index_status(value, expected_id=index_id)
 
     async def list(
         self,
@@ -251,16 +293,64 @@ class _AsyncClientQueriesMixin(_AsyncClientMixinBase):
         )
         return await self._execute_flow_record_query(query, params)
 
-    async def by_parent(self, parent_flow_id: str, **kwargs: Any) -> builtins.list[FlowRecord]:
-        query, params = build_flow_lineage_query("parent_flow_id", parent_flow_id, **kwargs)
+    async def by_parent(
+        self,
+        parent_flow_id: str,
+        *,
+        partition_key: str | bytes | None,
+        state: str | None = None,
+        count: int | None = None,
+        from_ms: int | None = None,
+        to_ms: int | None = None,
+        rev: bool | None = None,
+        attributes: Mapping[str, Any] | None = None,
+        terminal_only: bool | None = None,
+        include_cold: bool | None = None,
+        consistent_projection: bool | None = None,
+    ) -> builtins.list[FlowRecord]:
+        query, params = build_flow_lineage_query(
+            "parent_flow_id", parent_flow_id, **_lineage_query_options(locals())
+        )
         return await self._execute_flow_record_query(query, params)
 
-    async def by_root(self, root_flow_id: str, **kwargs: Any) -> builtins.list[FlowRecord]:
-        query, params = build_flow_lineage_query("root_flow_id", root_flow_id, **kwargs)
+    async def by_root(
+        self,
+        root_flow_id: str,
+        *,
+        partition_key: str | bytes | None,
+        state: str | None = None,
+        count: int | None = None,
+        from_ms: int | None = None,
+        to_ms: int | None = None,
+        rev: bool | None = None,
+        attributes: Mapping[str, Any] | None = None,
+        terminal_only: bool | None = None,
+        include_cold: bool | None = None,
+        consistent_projection: bool | None = None,
+    ) -> builtins.list[FlowRecord]:
+        query, params = build_flow_lineage_query(
+            "root_flow_id", root_flow_id, **_lineage_query_options(locals())
+        )
         return await self._execute_flow_record_query(query, params)
 
-    async def by_correlation(self, correlation_id: str, **kwargs: Any) -> builtins.list[FlowRecord]:
-        query, params = build_flow_lineage_query("correlation_id", correlation_id, **kwargs)
+    async def by_correlation(
+        self,
+        correlation_id: str,
+        *,
+        partition_key: str | bytes | None,
+        state: str | None = None,
+        count: int | None = None,
+        from_ms: int | None = None,
+        to_ms: int | None = None,
+        rev: bool | None = None,
+        attributes: Mapping[str, Any] | None = None,
+        terminal_only: bool | None = None,
+        include_cold: bool | None = None,
+        consistent_projection: bool | None = None,
+    ) -> builtins.list[FlowRecord]:
+        query, params = build_flow_lineage_query(
+            "correlation_id", correlation_id, **_lineage_query_options(locals())
+        )
         return await self._execute_flow_record_query(query, params)
 
     async def info(
@@ -295,28 +385,63 @@ class _AsyncClientQueriesMixin(_AsyncClientMixinBase):
         )
         return await self._execute_flow_record_query(query, params)
 
-    async def _execute_flow_query(self, query: str, params: dict[str, Any] | None) -> Any:
+    async def _execute_flow_query(
+        self,
+        query: str,
+        params: Mapping[str, Any] | None,
+        *,
+        deadline_ms: int | None = None,
+        routing_key: str | bytes | None = None,
+    ) -> Any:
         args = build_flow_query_args(query, params)
+        deadline = None if deadline_ms is None else normalize_flow_query_deadline(deadline_ms)
         try:
-            return await self.executor.execute_command(*args)
+
+            async def execute() -> Any:
+                return await self.executor.execute_flow_query_command(
+                    *args,
+                    deadline_ms=deadline,
+                    routing_key=routing_key,
+                )
+
+            return await execute_flow_query_read_with_retry_async(
+                execute,
+                self.backpressure,
+                deadline_ms=deadline,
+            )
         except FerricStoreError as exc:
             self._raise_flow_query_error(exc)
 
     async def _execute_flow_record_query(
         self, query: str, params: dict[str, Any]
     ) -> builtins.list[FlowRecord]:
-        result = await self.query(query, params)
+        partition_key = params.get("partition_key")
+        routing_key = flow_logical_partition_routing_key(partition_key)
+        result = decode_flow_query_result(
+            await self._execute_flow_query(query, params, routing_key=routing_key)
+        )
         if result.records is None:
             raise FerricStoreError("FLOW record convenience query returned a count result")
         return self._records(list(result.records))
 
     async def _explain_query(
-        self, prefix: str, query: str, params: dict[str, Any] | None
+        self,
+        prefix: str,
+        query: FlowQueryInput,
+        params: Mapping[str, Any] | None,
+        *,
+        deadline_ms: int | None = None,
     ) -> FlowExplainResult:
-        validate_flow_query_text(query)
-        if has_explain_prefix(query):
+        query_text, resolved_params, routing_key = resolve_flow_explain_input(query, params)
+        validate_flow_query_text(query_text)
+        if has_explain_prefix(query_text):
             raise ValueError("query already contains an EXPLAIN prefix")
-        value = await self._execute_flow_query(prefix + query.strip(), params)
+        value = await self._execute_flow_query(
+            prefix + query_text,
+            resolved_params,
+            deadline_ms=deadline_ms,
+            routing_key=routing_key,
+        )
         return decode_flow_explain_result(value)
 
     @staticmethod

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import warnings
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
@@ -245,7 +246,7 @@ class _ClientManagementMixin(_ClientMixinBase):
             ),
         )
 
-    def flow_query(
+    def telemetry_flow_query(
         self,
         attrs: Mapping[str, Any] | None = None,
         **kwargs: Any,
@@ -260,6 +261,18 @@ class _ClientManagementMixin(_ClientMixinBase):
                 )
             ),
         )
+
+    def flow_query(
+        self,
+        attrs: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> builtins.list[Any]:
+        warnings.warn(
+            "flow_query() is telemetry, not FQL; use telemetry_flow_query()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.telemetry_flow_query(attrs, **kwargs)
 
     def flow_history(
         self,

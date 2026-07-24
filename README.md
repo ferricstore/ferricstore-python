@@ -2,12 +2,12 @@
 
 Python SDK for FerricStore and FerricFlow.
 
-Status: public alpha `0.7.0`. APIs may change before `1.0`, but the SDK is
+Status: public alpha `0.7.1`. APIs may change before `1.0`, but the SDK is
 tested against command construction, queue/workflow handlers, leases, retries,
 history, indexed attributes, named values, idempotent create, worker loops,
 async flows, and local FerricStore integration scenarios.
 
-Version `0.7.0` requires FerricStore `0.10.0` or newer. This is a breaking beta
+Version `0.7.1` requires FerricStore `0.10.3` or newer. This is a breaking beta
 contract update; the native wire protocol remains v1.
 
 FerricFlow keeps each workflow or job's state and history in one durable place. It
@@ -78,6 +78,32 @@ plan = client.explain(query, params)
 indexes = client.query_indexes()
 ```
 
+For bounded request execution, pass `deadline_ms` as an absolute Unix timestamp
+in milliseconds to `query`, `explain`, or `explain_analyze`.
+
+For reusable, composable queries, use the immutable query builder. It compiles
+to the same parameterized FQL1 and can be passed directly to `query` or
+`explain`:
+
+```python
+from ferricstore import FlowFields, FlowQuery, flow_param
+
+queued_invoices = (
+    FlowQuery.runs()
+    .where(
+        FlowFields.partition_key.eq(flow_param("partition")),
+        FlowFields.type.eq("invoice"),
+        FlowFields.state.eq("queued"),
+    )
+    .order_by(FlowFields.updated_at_ms.desc())
+    .limit(25)
+    .return_records(FlowFields.run_id, FlowFields.state, FlowFields.updated_at_ms)
+    .bind(partition="partition-a")
+)
+
+result = client.query(queued_invoices)
+```
+
 ### 4. Create a durable queue item
 
 ```python
@@ -95,13 +121,22 @@ Use `attributes` for small indexed metadata you want to filter/count later:
 emails.enqueue(
     "email-2",
     payload=b"welcome:user-2",
+    partition_key="account-a",
     attributes={"account": "acme", "campaign": "summer"},
     idempotent=True,
 )
 
 flow = FlowClient.from_url("ferric://127.0.0.1:6388")
-records = flow.list("email", attributes={"account": "acme"})
-stats = flow.stats("email", attributes={"account": "acme"})
+records = flow.list(
+    "email",
+    partition_key="account-a",
+    attributes={"account": "acme"},
+)
+stats = flow.stats(
+    "email",
+    partition_key="account-a",
+    attributes={"account": "acme"},
+)
 ```
 
 Attributes are not payload bytes. Use named values/value refs for large data.
@@ -252,7 +287,7 @@ requested values, not history replay.
 | `FlowNotFoundError` | The flow does not exist or was retained/expired. | Check id, partition inputs, and retention policy. |
 | `FlowWrongStateError` | The command expected a different current state. | Check worker state filters and handler transitions. |
 | `StaleLeaseError` | A worker tried to complete with an old lease. | Keep handlers under `lease_ms` or renew/retry safely. |
-| `OverloadedError` | Server backpressure rejected the write. | Let the SDK retry/back off; reduce producer rate under sustained pressure. |
+| `OverloadedError` | Server backpressure rejected a safe operation. | Let the SDK retry/back off; reduce request rate under sustained pressure. |
 
 ## What you use
 

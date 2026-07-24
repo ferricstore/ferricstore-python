@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from ferricstore.adapters import AsyncCommandExecutor
+from ferricstore.adapters import AsyncFlowQueryCommandExecutor
 from ferricstore.backpressure import BackpressureController
 from ferricstore.codecs import Codec
 from ferricstore.types import FlowRecord
 
 
 class _AsyncClientMixinBase:
-    executor: AsyncCommandExecutor
+    executor: AsyncFlowQueryCommandExecutor
     codec: Codec
     backpressure: BackpressureController
     _transaction_mode: bool

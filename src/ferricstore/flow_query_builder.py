@@ -5,16 +5,53 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from ferricstore.flow_query_limits import (
+    FLOW_QUERY_MAX_FIELD_VALUE_BYTES,
+)
+from ferricstore.flow_query_limits import (
+    FLOW_QUERY_MAX_METADATA_NAME_BYTES as MAX_FLOW_QUERY_METADATA_KEY_BYTES,
+)
+from ferricstore.flow_query_limits import (
+    FLOW_QUERY_MAX_PARTITION_BYTES as MAX_FLOW_QUERY_PARTITION_BYTES,
+)
+from ferricstore.flow_query_limits import (
+    FLOW_QUERY_MAX_PREDICATES as MAX_FLOW_QUERY_PREDICATES,
+)
+from ferricstore.flow_query_limits import (
+    FLOW_QUERY_MAX_RESULTS as MAX_FLOW_QUERY_RESULTS,
+)
+from ferricstore.flow_query_limits import (
+    FLOW_QUERY_MAX_STATE_NAME_BYTES as MAX_FLOW_QUERY_STATE_BYTES,
+)
 from ferricstore.flow_query_request import (
     normalize_flow_query_parameter,
     validate_flow_query_text,
 )
+from ferricstore.flow_query_selectors import (
+    flow_metadata_selector,
+    normalize_flow_selector_segment,
+)
 
-MAX_FLOW_QUERY_RESULTS = 100
-MAX_FLOW_QUERY_PARTITION_BYTES = 65_535
 MAX_FLOW_QUERY_TIME = 9_007_199_254_740_991
-MAX_FLOW_QUERY_METADATA_KEY_BYTES = 64
-MAX_FLOW_QUERY_STATE_BYTES = 64
+_LINEAGE_SELECTORS = frozenset({"parent_flow_id", "root_flow_id", "correlation_id"})
+_LINEAGE_OPTION_NAMES = (
+    "partition_key",
+    "state",
+    "count",
+    "from_ms",
+    "to_ms",
+    "rev",
+    "attributes",
+    "terminal_only",
+    "include_cold",
+    "consistent_projection",
+)
+
+
+def _lineage_query_options(local_values: Mapping[str, Any]) -> dict[str, Any]:
+    """Select the explicitly typed public lineage options for internal forwarding."""
+
+    return {name: local_values[name] for name in _LINEAGE_OPTION_NAMES}
 
 
 @dataclass(slots=True)
@@ -30,12 +67,26 @@ class _FlowCollectionQuery:
         self.params["partition_key"] = self.partition_key
 
     def equality(self, selector: str, parameter: str, value: Any) -> None:
-        self.params[parameter] = normalize_flow_query_parameter(value, name=parameter)
+        self.ensure_predicate_capacity(1)
+        if isinstance(value, (str, bytes)) and len(value) > FLOW_QUERY_MAX_FIELD_VALUE_BYTES:
+            raise ValueError(
+                f"FLOW.QUERY field values must not exceed {FLOW_QUERY_MAX_FIELD_VALUE_BYTES} bytes"
+            )
+        normalized = normalize_flow_query_parameter(value, name=parameter)
+        if isinstance(normalized, (str, bytes)):
+            encoded = normalized if isinstance(normalized, bytes) else normalized.encode("utf-8")
+            if len(encoded) > FLOW_QUERY_MAX_FIELD_VALUE_BYTES:
+                raise ValueError(
+                    f"FLOW.QUERY field values must not exceed "
+                    f"{FLOW_QUERY_MAX_FIELD_VALUE_BYTES} bytes"
+                )
+        self.params[parameter] = normalized
         self.predicates.append(f"{selector} = @{parameter}")
 
     def window(self, from_ms: int | None, to_ms: int | None) -> None:
         if from_ms is None and to_ms is None:
             return
+        self.ensure_predicate_capacity(1)
         lower = 0 if from_ms is None else _bounded_time(from_ms, "from_ms")
         upper = MAX_FLOW_QUERY_TIME if to_ms is None else _bounded_time(to_ms, "to_ms")
         if lower > upper:
@@ -44,8 +95,10 @@ class _FlowCollectionQuery:
         self.params.update(from_ms=lower, to_ms=upper)
 
     def metadata(self, root: str, values: Mapping[str, Any]) -> None:
-        for index, (name, value) in enumerate(_metadata_entries(values, root)):
-            self.equality(_metadata_selector(root, name), f"{root}_{index}", value)
+        for index, (name, value) in enumerate(
+            _metadata_entries(values, root, maximum=self.remaining_predicates)
+        ):
+            self.equality(flow_metadata_selector(root, name), f"{root}_{index}", value)
 
     def state_metadata(self, values: Mapping[str, Mapping[str, Any]]) -> None:
         entries: list[tuple[str, str, Any]] = []
@@ -57,19 +110,24 @@ class _FlowCollectionQuery:
             states.add(state)
             if not isinstance(metadata, Mapping):
                 raise TypeError("state_meta must map states to metadata mappings")
+            remaining = self.remaining_predicates - len(entries)
             entries.extend(
-                (state, name, value) for name, value in _metadata_entries(metadata, "state_meta")
+                (state, name, value)
+                for name, value in _metadata_entries(
+                    metadata,
+                    "state_meta",
+                    maximum=remaining,
+                )
             )
         for index, (state, name, value) in enumerate(
             sorted(entries, key=lambda entry: (entry[0], entry[1]))
         ):
             self.equality(
-                _metadata_selector("state_meta", state, name), f"state_meta_{index}", value
+                flow_metadata_selector("state_meta", state, name), f"state_meta_{index}", value
             )
 
     def build(self) -> tuple[str, dict[str, Any]]:
-        if len(self.predicates) > 12:
-            raise ValueError("FLOW.QUERY accepts at most 12 predicates")
+        self.ensure_predicate_capacity(0)
         direction = "DESC" if self.reverse else "ASC"
         query = (
             f"FROM runs WHERE {' AND '.join(self.predicates)} "
@@ -77,6 +135,14 @@ class _FlowCollectionQuery:
         )
         validate_flow_query_text(query)
         return query, self.params
+
+    @property
+    def remaining_predicates(self) -> int:
+        return MAX_FLOW_QUERY_PREDICATES - len(self.predicates)
+
+    def ensure_predicate_capacity(self, additional: int) -> None:
+        if additional > self.remaining_predicates:
+            raise ValueError(f"FLOW.QUERY accepts at most {MAX_FLOW_QUERY_PREDICATES} predicates")
 
 
 def build_flow_list_query(
@@ -191,6 +257,8 @@ def build_flow_lineage_query(
     include_cold: bool | None = None,
     consistent_projection: bool | None = None,
 ) -> tuple[str, dict[str, Any]]:
+    if selector not in _LINEAGE_SELECTORS:
+        raise ValueError("lineage selector must be parent_flow_id, root_flow_id, or correlation_id")
     if terminal_only not in {None, False}:
         raise ValueError("terminal_only cannot be combined with a lineage query")
     if attributes:
@@ -298,22 +366,46 @@ def _normalize_state_meta(
         raise TypeError("state_meta must be a mapping")
     if not state_meta:
         return {}
-    nested = [isinstance(value, Mapping) for value in state_meta.values()]
-    if all(nested):
-        return state_meta
-    if any(nested):
-        raise TypeError("state_meta cannot mix nested and flat values")
+    if len(state_meta) > MAX_FLOW_QUERY_PREDICATES:
+        raise ValueError(f"FLOW.QUERY accepts at most {MAX_FLOW_QUERY_PREDICATES} predicates")
+
+    nested: bool | None = None
+    filtered: dict[str, Any] = {}
+    for index, (key, value) in enumerate(state_meta.items()):
+        if index >= MAX_FLOW_QUERY_PREDICATES:
+            raise ValueError(f"FLOW.QUERY accepts at most {MAX_FLOW_QUERY_PREDICATES} predicates")
+        value_is_nested = isinstance(value, Mapping)
+        if nested is None:
+            nested = value_is_nested
+        elif nested != value_is_nested:
+            raise TypeError("state_meta cannot mix nested and flat values")
+        if not value_is_nested or value:
+            filtered[key] = value
+
+    if nested:
+        if not filtered:
+            raise ValueError("state_meta must contain at least one metadata predicate")
+        return filtered
     if state in {None, "", "any"}:
         raise ValueError("flat state_meta requires a concrete state")
-    return {_required_text(state, "state"): state_meta}
+    return {_required_text(state, "state"): filtered}
 
 
-def _metadata_entries(values: Mapping[str, Any], context: str) -> list[tuple[str, Any]]:
+def _metadata_entries(
+    values: Mapping[str, Any],
+    context: str,
+    *,
+    maximum: int,
+) -> list[tuple[str, Any]]:
     if not isinstance(values, Mapping):
         raise TypeError("metadata filters must be a mapping")
+    if len(values) > maximum:
+        raise ValueError(f"FLOW.QUERY accepts at most {MAX_FLOW_QUERY_PREDICATES} predicates")
     entries: list[tuple[str, Any]] = []
     names: set[str] = set()
-    for raw_name, value in values.items():
+    for index, (raw_name, value) in enumerate(values.items()):
+        if index >= maximum:
+            raise ValueError(f"FLOW.QUERY accepts at most {MAX_FLOW_QUERY_PREDICATES} predicates")
         name = _normalized_metadata_name(raw_name, context)
         if name in names:
             raise ValueError(f"{context} key is duplicated after normalization")
@@ -323,39 +415,28 @@ def _metadata_entries(values: Mapping[str, Any], context: str) -> list[tuple[str
 
 
 def _normalized_metadata_name(value: Any, context: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError(f"{context} metadata keys must be strings")
-    name = value.strip()
-    try:
-        size = len(name.encode("utf-8"))
-    except UnicodeEncodeError as exc:
-        raise ValueError(f"{context} metadata key must be valid UTF-8") from exc
-    if not 1 <= size <= MAX_FLOW_QUERY_METADATA_KEY_BYTES or name.startswith("__"):
-        raise ValueError(f"{context} metadata key is invalid or reserved")
-    return name
+    return normalize_flow_selector_segment(
+        value,
+        f"{context} metadata key",
+        maximum_bytes=MAX_FLOW_QUERY_METADATA_KEY_BYTES,
+        reject_reserved=True,
+    )
 
 
 def _normalized_state_name(value: Any) -> str:
-    if not isinstance(value, str):
-        raise ValueError("state_meta state names must be strings")
-    state = value.strip()
-    try:
-        size = len(state.encode("utf-8"))
-    except UnicodeEncodeError as exc:
-        raise ValueError("state_meta state name must be valid UTF-8") from exc
-    if not 1 <= size <= MAX_FLOW_QUERY_STATE_BYTES:
-        raise ValueError("state_meta state name must be 1..64 bytes")
-    return state
-
-
-def _metadata_selector(root: str, *names: str) -> str:
-    suffix = "".join("['" + name.replace("'", "''") + "']" for name in names)
-    return root + suffix
+    return normalize_flow_selector_segment(
+        value,
+        "state_meta state name",
+        maximum_bytes=MAX_FLOW_QUERY_STATE_BYTES,
+        reject_reserved=False,
+    )
 
 
 def _required_partition(value: str | bytes | None) -> str | bytes:
     if not isinstance(value, (str, bytes)):
         raise ValueError("FLOW.QUERY convenience methods require partition_key")
+    if len(value) > MAX_FLOW_QUERY_PARTITION_BYTES:
+        raise ValueError(f"partition_key must be 1..{MAX_FLOW_QUERY_PARTITION_BYTES} bytes")
     try:
         size = len(value if isinstance(value, bytes) else value.encode("utf-8"))
     except UnicodeEncodeError as exc:

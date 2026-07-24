@@ -4720,7 +4720,9 @@ def test_management_wrappers_build_control_plane_commands_and_normalize_response
     assert client.quota_usage("tenant:") == {"keys": 2, "bytes": 256}
     assert client.cluster_info() == {"cluster": "ok"}
     assert client.namespace_usage("tenant:") == {"keys": 2}
-    assert client.flow_query({"type": "order"}, state="queued") == [{"id": "f1", "type": "order"}]
+    assert client.telemetry_flow_query({"type": "order"}, state="queued") == [
+        {"id": "f1", "type": "order"}
+    ]
     assert client.flow_history("f1", {"include": "metadata"}) == [{"event": "created"}]
 
     assert executor.calls == [

@@ -51,6 +51,7 @@ from ferricstore.protocol_responses import (
     _ok_scalar,
     _pipeline_pair_list,
 )
+from ferricstore.protocol_retry import request_may_mutate
 
 
 class SyncProtocolBatchHost(Protocol):
@@ -837,6 +838,7 @@ def _submit_commands_on_host(
                         lane_id=lane_id,
                         opcode=command.opcode,
                         request_id=request_id,
+                        may_mutate=request_may_mutate(command.opcode, command.payload),
                     ),
                 )
                 pending.append((request_id, response_future))

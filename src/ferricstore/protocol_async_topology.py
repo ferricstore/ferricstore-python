@@ -29,6 +29,7 @@ from ferricstore.protocol_async import (
     AsyncProtocolPipeline,
 )
 from ferricstore.protocol_async_endpoints import AsyncTopologyEndpointMixin
+from ferricstore.protocol_async_topology_retry import AsyncTopologyRetryMixin
 from ferricstore.protocol_commands import (
     build_protocol_command,  # noqa: F401 - historical monkeypatch seam
 )
@@ -40,9 +41,7 @@ from ferricstore.protocol_common import (
     _connection_endpoint_key,
     _endpoint_adapter_is_idle,
     _is_retryable_route_error,
-    _is_safe_control_retry,
     _protocol_connection_count,
-    _server_allows_retry,
 )
 from ferricstore.protocol_constants import (
     _ASYNC_ADAPTER_FANOUT_LIMIT,
@@ -79,12 +78,16 @@ from ferricstore.topology_security import (
 )
 
 
-class AsyncTopologyProtocolAdapterPool(AsyncTopologyEndpointMixin):
+class AsyncTopologyProtocolAdapterPool(
+    AsyncTopologyRetryMixin,
+    AsyncTopologyEndpointMixin,
+):
     """Async topology-aware native pool backed by the server SHARDS slot table."""
 
     client: AsyncTopologyProtocolAdapterPool
     requires_explicit_session = True
     supports_concurrent_fanout = True
+    _supports_native_flow_query_options = True
 
     def __init__(
         self,
@@ -386,26 +389,6 @@ class AsyncTopologyProtocolAdapterPool(AsyncTopologyEndpointMixin):
         self._validate_endpoint(route["endpoint"])
         return route
 
-    async def execute_command(self, *args: Any) -> Any:
-        route_data = await self._route_data(args)
-        if route_data is None:
-            return await self._execute_control_method("execute_command", args)
-
-        prepared, route = route_data
-        lease: EndpointAdapterLease[tuple[str, int]] | None = None
-        try:
-            lease = self._leased_adapter_for_endpoint(route["endpoint"])
-            adapter = lease.adapter
-            return await self._execute_protocol_command(adapter, prepared, route["lane_id"])
-        except Exception as exc:
-            if _is_retryable_route_error(exc):
-                with contextlib.suppress(Exception):
-                    await self.refresh_topology()
-            raise
-        finally:
-            if lease is not None:
-                self._release_adapter_lease(lease)
-
     async def execute_command_with_trace(self, *args: Any) -> dict[str, Any]:
         route_data = await self._route_data(args)
         if route_data is None:
@@ -460,23 +443,6 @@ class AsyncTopologyProtocolAdapterPool(AsyncTopologyEndpointMixin):
         finally:
             if lease is not None:
                 self._release_adapter_lease(lease)
-
-    async def _execute_control_method(self, method: str, args: tuple[Any, ...]) -> Any:
-        adapter = self._control_adapter()
-        try:
-            result = getattr(adapter, method)(*args)
-            return await result if inspect.isawaitable(result) else result
-        except Exception as exc:
-            if not _is_retryable_route_error(exc):
-                raise
-            refreshed = False
-            with contextlib.suppress(Exception):
-                await self.refresh_topology()
-                refreshed = True
-            if refreshed and _is_safe_control_retry(args) and _server_allows_retry(exc):
-                result = getattr(self._control_adapter(), method)(*args)
-                return await result if inspect.isawaitable(result) else result
-            raise
 
     async def execute_batch(self, commands: list[tuple[Any, ...]]) -> list[Any]:
         return await self._execute_batch(commands, ordered=False)

@@ -3,13 +3,14 @@ from __future__ import annotations
 from typing import Any
 
 from ferricstore.errors import FerricStoreError
+from ferricstore.flow_query_index_response import (
+    FLOW_QUERY_INDEXES_CONTRACT,
+    decode_flow_query_index_status,
+)
 from ferricstore.flow_query_types import (
     FlowExplainResult,
     FlowQueryError,
     FlowQueryErrorPosition,
-    FlowQueryIndex,
-    FlowQueryIndexRegistry,
-    FlowQueryIndexStatus,
     FlowQueryPage,
     FlowQueryQuality,
     FlowQueryResult,
@@ -19,7 +20,6 @@ from ferricstore.protocol_common import _map_get
 
 FLOW_QUERY_RESULT_CONTRACT = "ferric.flow.query.result/v1"
 FLOW_EXPLAIN_CONTRACT = "ferric.flow.explain/v1"
-FLOW_QUERY_INDEXES_CONTRACT = "ferric.flow.query.indexes/v1"
 
 _USAGE_FIELDS = (
     "range_seeks",
@@ -34,6 +34,13 @@ _USAGE_FIELDS = (
     "memory_high_water_bytes",
     "wall_time_us",
 )
+
+_DIAGNOSTIC_TEXT_BYTES = 1_024
+_DIAGNOSTIC_CONTEXT_ENTRIES = 16
+_DIAGNOSTIC_CONTEXT_LIST_ITEMS = 32
+_DIAGNOSTIC_CONTEXT_KEY_BYTES = 128
+_DIAGNOSTIC_CONTEXT_DEPTH = 6
+_DIAGNOSTIC_CONTEXT_NODES = 512
 
 
 def decode_flow_query_result(value: Any) -> FlowQueryResult:
@@ -57,6 +64,8 @@ def decode_flow_query_result(value: Any) -> FlowQueryResult:
         records = tuple(raw_records)
         if usage.result_records != len(records):
             raise _decode_error("FLOW.QUERY usage result_records does not match records", value)
+        if usage.result_records > usage.hydrated_records:
+            raise _decode_error("FLOW.QUERY usage counters are inconsistent", value)
         page = _decode_page(_map_get(mapping, "page"))
         return FlowQueryResult(
             version=FLOW_QUERY_RESULT_CONTRACT,
@@ -99,6 +108,32 @@ def decode_flow_explain_result(value: Any) -> FlowExplainResult:
     plan = _required_map(mapping, "plan", "FLOW.QUERY explain")
     estimate = _required_map(mapping, "estimate", "FLOW.QUERY explain")
     bounds = _required_map(mapping, "bounds", "FLOW.QUERY explain")
+    capabilities = _decode_explain_capabilities(mapping)
+    extended_fields = ("stats", "quality", "pressure", "decision", "alternatives")
+    present = tuple(_has_key(mapping, field) for field in extended_fields)
+    specialized = capabilities is not None and not any(present)
+    if specialized:
+        if status != "planned":
+            raise _decode_error("FLOW.QUERY specialized explain must be planned", value)
+        if _has_key(mapping, "actual") or _has_key(mapping, "diagnostic"):
+            raise _decode_error("FLOW.QUERY specialized explain has extended status fields", value)
+        stats = None
+        quality = None
+        pressure = None
+        decision = None
+        alternatives: tuple[dict[Any, Any], ...] = ()
+    else:
+        if (
+            not all(present)
+            or not _has_key(mapping, "actual")
+            or not _has_key(mapping, "diagnostic")
+        ):
+            raise _decode_error("FLOW.QUERY explain is missing required v1 fields", value)
+        stats = _required_map(mapping, "stats", "FLOW.QUERY explain")
+        quality = _decode_quality(_map_get(mapping, "quality"))
+        pressure = _required_map(mapping, "pressure", "FLOW.QUERY explain")
+        decision = _required_map(mapping, "decision", "FLOW.QUERY explain")
+        alternatives = _decode_explain_alternatives(_map_get(mapping, "alternatives"))
 
     actual_value = _map_get(mapping, "actual")
     if status == "executed":
@@ -127,6 +162,12 @@ def decode_flow_explain_result(value: Any) -> FlowExplainResult:
         plan=plan,
         estimate=estimate,
         bounds=bounds,
+        stats=stats,
+        quality=quality,
+        pressure=pressure,
+        decision=decision,
+        alternatives=alternatives,
+        capabilities=capabilities,
         actual=actual,
         diagnostic=diagnostic,
         raw=mapping,
@@ -137,10 +178,18 @@ def decode_flow_query_error(value: Any, *, raw: Any) -> FlowQueryError | None:
     if not isinstance(value, dict):
         return None
     try:
-        code = _required_text(value, "code", "FLOW.QUERY diagnostic")
-        message = _required_text(value, "message", "FLOW.QUERY diagnostic")
-        detail = _optional_text(value, "detail", "FLOW.QUERY diagnostic")
-        hint = _optional_text(value, "hint", "FLOW.QUERY diagnostic")
+        code = _required_bounded_text(
+            value, "code", "FLOW.QUERY diagnostic", _DIAGNOSTIC_TEXT_BYTES
+        )
+        message = _required_bounded_text(
+            value, "message", "FLOW.QUERY diagnostic", _DIAGNOSTIC_TEXT_BYTES
+        )
+        detail = _optional_bounded_text(
+            value, "detail", "FLOW.QUERY diagnostic", _DIAGNOSTIC_TEXT_BYTES
+        )
+        hint = _optional_bounded_text(
+            value, "hint", "FLOW.QUERY diagnostic", _DIAGNOSTIC_TEXT_BYTES
+        )
         retryable = _required_bool(value, "retryable", "FLOW.QUERY diagnostic")
         safe_to_retry = _required_bool(value, "safe_to_retry", "FLOW.QUERY diagnostic")
         retry_after_ms = _nonnegative_int(
@@ -149,6 +198,8 @@ def decode_flow_query_error(value: Any, *, raw: Any) -> FlowQueryError | None:
         context_value = _map_get(value, "context")
         if context_value is not None and not isinstance(context_value, dict):
             raise _decode_error("FLOW.QUERY diagnostic context must be a map", value)
+        if context_value is not None:
+            _validate_diagnostic_context(context_value)
         position = _decode_position(_map_get(value, "position"))
     except FerricStoreError:
         return None
@@ -163,53 +214,6 @@ def decode_flow_query_error(value: Any, *, raw: Any) -> FlowQueryError | None:
         position=position,
         context=context_value,
         raw=raw,
-    )
-
-
-def decode_flow_query_index_status(value: Any) -> FlowQueryIndexStatus:
-    mapping = _required_map_value(value, "FLOW.QUERY.INDEXES")
-    _require_contract(
-        mapping, "contract_version", FLOW_QUERY_INDEXES_CONTRACT, "FLOW.QUERY.INDEXES"
-    )
-    observed_at_ms = _nonnegative_int(
-        _map_get(mapping, "observed_at_ms"), "FLOW.QUERY.INDEXES observed_at_ms"
-    )
-    statistics_max_age_ms = _nonnegative_int(
-        _map_get(mapping, "statistics_max_age_ms"),
-        "FLOW.QUERY.INDEXES statistics_max_age_ms",
-    )
-    raw_registry = _required_map(mapping, "registry", "FLOW.QUERY.INDEXES")
-    epoch = _unsigned_int(_map_get(raw_registry, "epoch"), "FLOW.QUERY.INDEXES epoch")
-    catalog_version = _positive_unsigned_int(
-        _map_get(raw_registry, "catalog_version"), "FLOW.QUERY.INDEXES catalog_version"
-    )
-    services = _required_map(mapping, "services", "FLOW.QUERY.INDEXES")
-    raw_indexes = _map_get(mapping, "indexes")
-    if not isinstance(raw_indexes, (list, tuple)) or len(raw_indexes) > 32:
-        raise _decode_error("FLOW.QUERY.INDEXES indexes must contain at most 32 entries", value)
-    indexes = tuple(_decode_index(entry, position) for position, entry in enumerate(raw_indexes))
-    return FlowQueryIndexStatus(
-        contract_version=FLOW_QUERY_INDEXES_CONTRACT,
-        observed_at_ms=observed_at_ms,
-        statistics_max_age_ms=statistics_max_age_ms,
-        registry=FlowQueryIndexRegistry(epoch=epoch, catalog_version=catalog_version),
-        services=services,
-        indexes=indexes,
-        raw=mapping,
-    )
-
-
-def _decode_index(value: Any, position: int) -> FlowQueryIndex:
-    mapping = _required_map_value(value, f"FLOW.QUERY.INDEXES index {position}")
-    return FlowQueryIndex(
-        id=_required_text(mapping, "id", "FLOW.QUERY.INDEXES index"),
-        version=_positive_unsigned_int(
-            _map_get(mapping, "version"), "FLOW.QUERY.INDEXES index version"
-        ),
-        build_id=_required_text(mapping, "build_id", "FLOW.QUERY.INDEXES index"),
-        state=_required_text(mapping, "state", "FLOW.QUERY.INDEXES index"),
-        queryable=_required_bool(mapping, "queryable", "FLOW.QUERY.INDEXES index"),
-        raw=mapping,
     )
 
 
@@ -229,15 +233,66 @@ def _decode_usage(value: Any) -> FlowQueryUsage:
         field: _nonnegative_int(_map_get(mapping, field), f"FLOW.QUERY usage {field}")
         for field in _USAGE_FIELDS
     }
-    return FlowQueryUsage(**values)
+    usage = FlowQueryUsage(**values)
+    if not (
+        usage.hydrated_records <= usage.scanned_entries
+        and usage.duplicate_entries <= usage.scanned_entries
+        and usage.range_pages <= usage.scanned_entries + usage.range_seeks
+        and usage.residual_checks <= usage.hydrated_records * 12
+    ):
+        raise _decode_error("FLOW.QUERY usage counters are inconsistent", value)
+    return usage
+
+
+def _decode_explain_capabilities(mapping: dict[Any, Any]) -> dict[Any, Any] | None:
+    if not _has_key(mapping, "capabilities"):
+        return None
+    capabilities = _required_map(mapping, "capabilities", "FLOW.QUERY explain")
+    for field in ("requested", "available", "missing"):
+        values = _bounded_text_sequence(
+            _map_get(capabilities, field),
+            f"FLOW.QUERY explain capabilities {field}",
+            maximum=64,
+        )
+        if len(values) != len(set(values)):
+            raise _decode_error(
+                f"FLOW.QUERY explain capabilities {field} contains duplicates",
+                capabilities,
+            )
+    return capabilities
+
+
+def _decode_explain_alternatives(value: Any) -> tuple[dict[Any, Any], ...]:
+    if not isinstance(value, (list, tuple)) or len(value) > 31:
+        raise _decode_error(
+            "FLOW.QUERY explain alternatives must be an array of at most 31 maps",
+            value,
+        )
+    if not all(isinstance(item, dict) for item in value):
+        raise _decode_error("FLOW.QUERY explain alternatives contain a non-map", value)
+    return tuple(value)
+
+
+def _bounded_text_sequence(value: Any, context: str, *, maximum: int) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or len(value) > maximum:
+        raise _decode_error(f"{context} must be a bounded array", value)
+    decoded: list[str] = []
+    for item in value:
+        text = _text(item)
+        if text is None or text == "" or len(text.encode()) > 128:
+            raise _decode_error(f"{context} contains invalid text", value)
+        decoded.append(text)
+    return tuple(decoded)
 
 
 def _decode_page(value: Any) -> FlowQueryPage:
     mapping = _required_map_value(value, "FLOW.QUERY page")
     has_more = _required_bool(mapping, "has_more", "FLOW.QUERY page")
     cursor = _optional_text(mapping, "cursor", "FLOW.QUERY page")
-    if cursor is not None and (not cursor.startswith("fqc1_") or len(cursor.encode()) > 4096):
-        raise _decode_error("FLOW.QUERY page cursor is invalid", value)
+    if cursor is not None:
+        cursor_bytes = len(cursor.encode())
+        if not cursor.startswith("fqc1_") or not 16 <= cursor_bytes <= 4_096:
+            raise _decode_error("FLOW.QUERY page cursor is invalid", value)
     if has_more != (cursor is not None):
         raise _decode_error("FLOW.QUERY page has_more and cursor are inconsistent", value)
     return FlowQueryPage(has_more=has_more, cursor=cursor)
@@ -271,8 +326,7 @@ def _require_contract(mapping: dict[Any, Any], field: str, expected: str, contex
 
 
 def _required_text(mapping: dict[Any, Any], field: str, context: str) -> str:
-    value = _map_get(mapping, field)
-    text = _text(value)
+    text = _text(_map_get(mapping, field))
     if text is None or text == "":
         raise _decode_error(f"{context} {field} must be non-empty text", mapping)
     return text
@@ -282,7 +336,7 @@ def _required_bounded_text(
     mapping: dict[Any, Any], field: str, context: str, maximum_bytes: int
 ) -> str:
     text = _required_text(mapping, field, context)
-    if len(text.encode("utf-8")) > maximum_bytes:
+    if len(text.encode()) > maximum_bytes:
         raise _decode_error(f"{context} {field} exceeds {maximum_bytes} bytes", mapping)
     return text
 
@@ -297,16 +351,25 @@ def _optional_text(mapping: dict[Any, Any], field: str, context: str) -> str | N
     return text
 
 
+def _optional_bounded_text(
+    mapping: dict[Any, Any], field: str, context: str, maximum_bytes: int
+) -> str | None:
+    text = _optional_text(mapping, field, context)
+    if text is not None and len(text.encode()) > maximum_bytes:
+        raise _decode_error(f"{context} {field} exceeds {maximum_bytes} bytes", mapping)
+    return text
+
+
 def _text(value: Any) -> str | None:
     if isinstance(value, str):
         try:
-            value.encode("utf-8")
+            value.encode()
         except UnicodeEncodeError:
             return None
         return value
     if isinstance(value, bytes):
         try:
-            return value.decode("utf-8")
+            return value.decode()
         except UnicodeDecodeError:
             return None
     return None
@@ -332,21 +395,53 @@ def _positive_int(value: Any, context: str) -> int:
     return parsed
 
 
-def _unsigned_int(value: Any, context: str) -> int:
-    if type(value) is not int or value < 0 or value > 2**64 - 1:
-        raise _decode_error(f"{context} must be an unsigned 64-bit integer", value)
-    return value
-
-
-def _positive_unsigned_int(value: Any, context: str) -> int:
-    parsed = _unsigned_int(value, context)
-    if parsed == 0:
-        raise _decode_error(f"{context} must be positive", value)
-    return parsed
-
-
 def _has_key(mapping: dict[Any, Any], field: str) -> bool:
     return field in mapping or field.encode() in mapping
+
+
+def _validate_diagnostic_context(value: dict[Any, Any]) -> None:
+    if len(value) > _DIAGNOSTIC_CONTEXT_ENTRIES:
+        raise _decode_error("FLOW.QUERY diagnostic context contains too many entries", value)
+    if _validate_context_value(value, _DIAGNOSTIC_CONTEXT_DEPTH, _DIAGNOSTIC_CONTEXT_NODES) < 0:
+        raise _decode_error("FLOW.QUERY diagnostic context is invalid", value)
+
+
+def _validate_context_value(value: Any, depth: int, remaining: int) -> int:
+    if remaining <= 0:
+        return -1
+    if value is None or type(value) is bool:
+        return remaining - 1
+    if type(value) is int:
+        return remaining - 1 if -(2**63) <= value <= 2**63 - 1 else -1
+    if isinstance(value, (str, bytes)):
+        text = _text(value)
+        return (
+            remaining - 1
+            if text is not None and len(text.encode()) <= _DIAGNOSTIC_TEXT_BYTES
+            else -1
+        )
+    if isinstance(value, dict):
+        if depth <= 0 or len(value) > _DIAGNOSTIC_CONTEXT_ENTRIES:
+            return -1
+        remaining -= 1
+        for raw_key, item in value.items():
+            key = _text(raw_key)
+            if key is None or key == "" or len(key.encode()) > _DIAGNOSTIC_CONTEXT_KEY_BYTES:
+                return -1
+            remaining = _validate_context_value(item, depth - 1, remaining)
+            if remaining < 0:
+                return -1
+        return remaining
+    if isinstance(value, (list, tuple)):
+        if depth <= 0 or len(value) > _DIAGNOSTIC_CONTEXT_LIST_ITEMS:
+            return -1
+        remaining -= 1
+        for item in value:
+            remaining = _validate_context_value(item, depth - 1, remaining)
+            if remaining < 0:
+                return -1
+        return remaining
+    return -1
 
 
 def _decode_error(message: str, raw: Any) -> FerricStoreError:

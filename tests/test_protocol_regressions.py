@@ -48,6 +48,26 @@ from ferricstore.topology_lifecycle import EndpointAdapterLifecycle, SyncSingleF
 from tests.flow_query_contract import with_flow_query_contract
 
 
+@pytest.mark.parametrize("retry_after_ms", [True, -1, "1", b"1", 1.5, 2**64])
+def test_protocol_rejects_malformed_server_retry_delay_without_replay(
+    retry_after_ms: Any,
+) -> None:
+    raw = {
+        "message": "busy",
+        "retryable": True,
+        "safe_to_retry": True,
+        "retry_after_ms": retry_after_ms,
+    }
+    response = ProtocolResponse(1, 1, 1, 0, 4, raw)
+
+    with pytest.raises(FerricStoreError, match=r"invalid.*retry_after_ms") as raised:
+        protocol_module._response_value(response)
+
+    assert raised.value.retryable is False
+    assert raised.value.safe_to_retry is False
+    assert raised.value.raw is raw
+
+
 def _single_shard_topology(
     host: str = "leader.local",
     port: int = 6391,

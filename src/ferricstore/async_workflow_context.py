@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import inspect
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 from ferricstore.async_client_core import AsyncFlowClient
@@ -12,6 +12,7 @@ from ferricstore.async_queue_runtime import (
     AsyncFlowJob,
 )
 from ferricstore.async_workflow_budget import AsyncWorkflowBudget as AsyncWorkflowBudget
+from ferricstore.flow_query_builder import _lineage_query_options
 from ferricstore.lifecycle_core import (
     await_cancellation_safe,
     raise_primary_with_cleanup,
@@ -424,28 +425,64 @@ class AsyncWorkflowFlowCommands:
         return await self.client.failures(self._type(type), **kwargs)
 
     async def by_parent(
-        self, parent_flow_id: str | None = None, **kwargs: Any
+        self,
+        parent_flow_id: str | None = None,
+        *,
+        partition_key: str | bytes | None = None,
+        state: str | None = None,
+        count: int | None = None,
+        from_ms: int | None = None,
+        to_ms: int | None = None,
+        rev: bool | None = None,
+        attributes: Mapping[str, Any] | None = None,
+        terminal_only: bool | None = None,
+        include_cold: bool | None = None,
+        consistent_projection: bool | None = None,
     ) -> builtins.list[FlowRecord]:
         target = self._ctx.id if parent_flow_id is None else parent_flow_id
-        return await self.client.by_parent(target, **kwargs)
+        return await self.client.by_parent(target, **_lineage_query_options(locals()))
 
     async def by_root(
-        self, root_flow_id: str | None = None, **kwargs: Any
+        self,
+        root_flow_id: str | None = None,
+        *,
+        partition_key: str | bytes | None = None,
+        state: str | None = None,
+        count: int | None = None,
+        from_ms: int | None = None,
+        to_ms: int | None = None,
+        rev: bool | None = None,
+        attributes: Mapping[str, Any] | None = None,
+        terminal_only: bool | None = None,
+        include_cold: bool | None = None,
+        consistent_projection: bool | None = None,
     ) -> builtins.list[FlowRecord]:
         root = root_flow_id
         if root is None:
             root = getattr(self._ctx, "root_flow_id", None) or self._ctx.id
-        return await self.client.by_root(root, **kwargs)
+        return await self.client.by_root(root, **_lineage_query_options(locals()))
 
     async def by_correlation(
-        self, correlation_id: str | None = None, **kwargs: Any
+        self,
+        correlation_id: str | None = None,
+        *,
+        partition_key: str | bytes | None = None,
+        state: str | None = None,
+        count: int | None = None,
+        from_ms: int | None = None,
+        to_ms: int | None = None,
+        rev: bool | None = None,
+        attributes: Mapping[str, Any] | None = None,
+        terminal_only: bool | None = None,
+        include_cold: bool | None = None,
+        consistent_projection: bool | None = None,
     ) -> builtins.list[FlowRecord]:
         correlation = correlation_id
         if correlation is None:
             correlation = getattr(self._ctx, "correlation_id", None)
         if correlation is None:
             raise ValueError("correlation_id is required when current flow has no correlation_id")
-        return await self.client.by_correlation(correlation, **kwargs)
+        return await self.client.by_correlation(correlation, **_lineage_query_options(locals()))
 
     async def info(self, type: str | None = None, **kwargs: Any) -> dict[Any, Any]:
         return await self.client.info(self._type(type), **kwargs)

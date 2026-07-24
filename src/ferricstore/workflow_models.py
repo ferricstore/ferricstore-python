@@ -3,10 +3,11 @@ from __future__ import annotations
 import builtins
 import contextlib
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
+from ferricstore.flow_query_builder import _lineage_query_options
 from ferricstore.lifecycle_core import (
     raise_primary_with_cleanup,
 )
@@ -437,26 +438,64 @@ class WorkflowFlowCommands:
         return self.client.failures(self._type(type), **kwargs)
 
     def by_parent(
-        self, parent_flow_id: str | None = None, **kwargs: Any
+        self,
+        parent_flow_id: str | None = None,
+        *,
+        partition_key: str | bytes | None = None,
+        state: str | None = None,
+        count: int | None = None,
+        from_ms: int | None = None,
+        to_ms: int | None = None,
+        rev: bool | None = None,
+        attributes: Mapping[str, Any] | None = None,
+        terminal_only: bool | None = None,
+        include_cold: bool | None = None,
+        consistent_projection: bool | None = None,
     ) -> builtins.list[FlowRecord]:
         target = self._ctx.id if parent_flow_id is None else parent_flow_id
-        return self.client.by_parent(target, **kwargs)
+        return self.client.by_parent(target, **_lineage_query_options(locals()))
 
-    def by_root(self, root_flow_id: str | None = None, **kwargs: Any) -> builtins.list[FlowRecord]:
+    def by_root(
+        self,
+        root_flow_id: str | None = None,
+        *,
+        partition_key: str | bytes | None = None,
+        state: str | None = None,
+        count: int | None = None,
+        from_ms: int | None = None,
+        to_ms: int | None = None,
+        rev: bool | None = None,
+        attributes: Mapping[str, Any] | None = None,
+        terminal_only: bool | None = None,
+        include_cold: bool | None = None,
+        consistent_projection: bool | None = None,
+    ) -> builtins.list[FlowRecord]:
         root = root_flow_id
         if root is None:
             root = self._ctx.root_flow_id or self._ctx.id
-        return self.client.by_root(root, **kwargs)
+        return self.client.by_root(root, **_lineage_query_options(locals()))
 
     def by_correlation(
-        self, correlation_id: str | None = None, **kwargs: Any
+        self,
+        correlation_id: str | None = None,
+        *,
+        partition_key: str | bytes | None = None,
+        state: str | None = None,
+        count: int | None = None,
+        from_ms: int | None = None,
+        to_ms: int | None = None,
+        rev: bool | None = None,
+        attributes: Mapping[str, Any] | None = None,
+        terminal_only: bool | None = None,
+        include_cold: bool | None = None,
+        consistent_projection: bool | None = None,
     ) -> builtins.list[FlowRecord]:
         correlation = correlation_id
         if correlation is None:
             correlation = self._ctx.correlation_id
         if correlation is None:
             raise ValueError("correlation_id is required when current flow has no correlation_id")
-        return self.client.by_correlation(correlation, **kwargs)
+        return self.client.by_correlation(correlation, **_lineage_query_options(locals()))
 
     def info(self, type: str | None = None, **kwargs: Any) -> dict[Any, Any]:
         return self.client.info(self._type(type), **kwargs)

@@ -117,6 +117,26 @@ async def _wait_clients_rerouted(
     raise AssertionError(f"sync/async clients did not reroute: {last_error!r}")
 
 
+async def _wait_query_record(
+    client: AsyncFlowClient,
+    query: str,
+    params: dict[str, Any],
+    *,
+    timeout: float = 30.0,
+) -> None:
+    deadline = time.monotonic() + timeout
+    last_error: BaseException | None = None
+    while time.monotonic() < deadline:
+        try:
+            result = await client.query(query, params)
+            if result.records is not None and len(result.records) == 1:
+                return
+        except Exception as exc:
+            last_error = exc
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"query did not become visible after routing change: {last_error!r}")
+
+
 async def _exercise_sync_and_async_failover() -> None:
     urls = _urls()
     if len(urls) < 3:
@@ -131,6 +151,13 @@ async def _exercise_sync_and_async_failover() -> None:
         timeout=1.0,
     )
     key = f"{{py-sdk-dual-failover:{uuid.uuid4().hex}}}:kv"
+    flow_id = f"{key}:flow"
+    flow_type = f"python-sdk-failover-{uuid.uuid4().hex}"
+    query = (
+        "FROM runs WHERE partition_key = @partition AND type = @type AND state = @state "
+        "ORDER BY updated_at_ms ASC LIMIT 1 RETURN RECORDS"
+    )
+    query_params = {"partition": key, "type": flow_type, "state": "ready"}
     stopped_service: str | None = None
     stopped_url: str | None = None
     try:
@@ -142,6 +169,15 @@ async def _exercise_sync_and_async_failover() -> None:
 
         assert sync_client.kv_set(key, {"phase": "before"}) in {b"OK", "OK", True}
         assert await async_client.kv_get(key) == {"phase": "before"}
+        sync_client.create(
+            flow_id,
+            type=flow_type,
+            state="ready",
+            partition_key=key,
+            now_ms=int(time.time() * 1000),
+            idempotent=True,
+        )
+        await _wait_query_record(async_client, query, query_params)
 
         await asyncio.to_thread(_compose, "stop", "-t", "1", stopped_service)
 
@@ -167,6 +203,7 @@ async def _exercise_sync_and_async_failover() -> None:
             True,
         }
         assert sync_client.kv_get(key) == {"phase": "async-after"}
+        await _wait_query_record(async_client, query, query_params)
     finally:
         if stopped_service is not None:
             await asyncio.to_thread(_compose, "start", stopped_service)

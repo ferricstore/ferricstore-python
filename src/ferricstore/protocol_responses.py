@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import struct
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, cast
 
 from ferricstore.errors import FerricStoreError
@@ -38,6 +38,7 @@ from ferricstore.protocol_constants import (
     _DEFAULT_MAX_DECODED_COLLECTION_ITEMS,
     _DEFAULT_MAX_DECOMPRESSED_RESPONSE_BYTES,
     _FLAG_COMPRESSED,
+    _FLAG_CUSTOM_PAYLOAD,
     _FLAG_TRACE,
     _FLOW_RECORD_FIELD_KEYS,
     _FLOW_RECORD_FIELD_KEYS_LEN,
@@ -50,6 +51,7 @@ from ferricstore.protocol_constants import (
     _STATUS_OK,
     ProtocolResponse,
 )
+from ferricstore.protocol_flow_query_result import decode_compact_flow_query_result
 from ferricstore.protocol_framing import (
     decompress_response as _decompress_response,
 )
@@ -769,9 +771,24 @@ _COMPACT_RESPONSE_CODEC_DECODERS.update(
         "flow_record_v1": _try_fast_flow_record,
         "flow_record_list_v1": _try_fast_flow_record_list,
         "flow_claim_jobs_v1": _try_fast_claim,
+        "flow_query_result_v1": decode_compact_flow_query_result,
         "ok_list_v1": _try_fast_many,
     }
 )
+
+
+def _supported_compact_response_codec_names(
+    advertised_codecs: Mapping[int, str],
+) -> list[str]:
+    """Return locally decodable codec names advertised by HELLO."""
+
+    return sorted(
+        {
+            codec_name
+            for codec_name in advertised_codecs.values()
+            if codec_name in _COMPACT_RESPONSE_CODEC_DECODERS
+        }
+    )
 
 
 def _extract_traced_value(value: Any) -> tuple[Any, dict[str, Any]]:
@@ -821,6 +838,11 @@ def _decode_protocol_response(
     )
     expected_collection_items = _pop_response_item_count(adapter, request_id)
     compact_codec = getattr(adapter, "_compact_response_codecs", {}).get(opcode)
+    custom_payload = bool(flags & _FLAG_CUSTOM_PAYLOAD)
+    # FLOW.QUERY's fixed-schema codec is explicitly selected per response.
+    # A negotiated opcode still receives generic typed responses for explain,
+    # future record extensions, and other shapes the compact codec cannot carry.
+    try_compact = custom_payload or compact_codec != "flow_query_result_v1"
     value = (
         _try_compact_response_value_at(
             compact_codec,
@@ -830,7 +852,7 @@ def _decode_protocol_response(
             max_collection_items=collection_limit,
             expected_collection_items=expected_collection_items,
         )
-        if status == _STATUS_OK and compact_codec is not None
+        if status == _STATUS_OK and compact_codec is not None and try_compact
         else None
     )
     fast_decoded = value is not None or _is_custom_compact_nil(
@@ -838,6 +860,14 @@ def _decode_protocol_response(
         body,
         _STATUS.size,
     )
+    if status == _STATUS_OK and custom_payload and not fast_decoded:
+        if compact_codec is None:
+            detail = "codec was not negotiated"
+        elif compact_codec not in _COMPACT_RESPONSE_CODEC_DECODERS:
+            detail = f"codec {compact_codec!r} is unsupported"
+        else:
+            detail = f"codec {compact_codec!r} payload is malformed or has an unknown tag"
+        raise FerricStoreError(f"custom protocol response {detail}")
     if not fast_decoded:
         value, value_end = _decode_value_at(
             body,
@@ -911,6 +941,7 @@ __all__ = [
     "_require_compact_collection_count",
     "_response_value",
     "_status_text",
+    "_supported_compact_response_codec_names",
     "_try_decode_binary_list",
     "_try_decode_claim_jobs_compact",
     "_try_decode_custom_binary_list_list",

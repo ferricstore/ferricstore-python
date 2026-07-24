@@ -35,9 +35,7 @@ from ferricstore.protocol_common import (
     _close_adapter_sync,
     _endpoint_adapter_is_idle,
     _is_retryable_route_error,
-    _is_safe_control_retry,
     _protocol_connection_count,
-    _server_allows_retry,
     _set_wire_future_sources,
     _unique_adapters,
 )
@@ -58,6 +56,7 @@ from ferricstore.protocol_sync_routing import (
     _TopologyGenerationChanged,
 )
 from ferricstore.protocol_sync_topology_mset import SyncTopologyMsetMixin
+from ferricstore.protocol_sync_topology_retry import SyncTopologyRetryMixin
 from ferricstore.topology_core import (
     ControlEndpointSelector,
     FlowWakeSubscriptionRegistry,
@@ -79,6 +78,7 @@ from ferricstore.topology_security import (
 
 
 class TopologyProtocolAdapterPool(
+    SyncTopologyRetryMixin,
     SyncTopologyMsetMixin,
     SyncTopologyEndpointMixin,
     SyncTopologyRoutingMixin,
@@ -88,6 +88,7 @@ class TopologyProtocolAdapterPool(
     client: TopologyProtocolAdapterPool
     requires_explicit_session = True
     supports_concurrent_fanout = True
+    _supports_native_flow_query_options = True
 
     def __init__(
         self,
@@ -391,33 +392,6 @@ class TopologyProtocolAdapterPool(
         self._validate_endpoint(route["endpoint"])
         return route
 
-    def execute_command(self, *args: Any) -> Any:
-        lease: EndpointAdapterLease[tuple[str, int]] | None = None
-        try:
-            while True:
-                route_data = self._route_data(args)
-                if route_data is None:
-                    return self._execute_control_method("execute_command", args)
-                prepared, route = route_data
-                try:
-                    lease = self._leased_adapter_for_endpoint(
-                        route["endpoint"],
-                        generation=int(route["_sdk_generation"]),
-                    )
-                except _TopologyGenerationChanged:
-                    continue
-                break
-            adapter = lease.adapter
-            return self._execute_protocol_command(adapter, prepared, route["lane_id"])
-        except Exception as exc:
-            if _is_retryable_route_error(exc):
-                with contextlib.suppress(Exception):
-                    self.refresh_topology()
-            raise
-        finally:
-            if lease is not None:
-                self._release_adapter_lease(lease)
-
     def execute_command_with_trace(self, *args: Any) -> dict[str, Any]:
         lease: EndpointAdapterLease[tuple[str, int]] | None = None
         try:
@@ -476,21 +450,6 @@ class TopologyProtocolAdapterPool(
         finally:
             if lease is not None:
                 self._release_adapter_lease(lease)
-
-    def _execute_control_method(self, method: str, args: tuple[Any, ...]) -> Any:
-        adapter = self._control_adapter()
-        try:
-            return getattr(adapter, method)(*args)
-        except Exception as exc:
-            if not _is_retryable_route_error(exc):
-                raise
-            refreshed = False
-            with contextlib.suppress(Exception):
-                self.refresh_topology()
-                refreshed = True
-            if refreshed and _is_safe_control_retry(args) and _server_allows_retry(exc):
-                return getattr(self._control_adapter(), method)(*args)
-            raise
 
     def submit_command(self, *args: Any) -> Future[Any]:
         lease: EndpointAdapterLease[tuple[str, int]] | None = None

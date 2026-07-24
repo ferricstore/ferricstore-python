@@ -2313,7 +2313,7 @@ def test_async_management_wrappers_build_control_plane_commands_and_normalize_re
         assert await client.quota_usage("tenant:") == {"keys": 2, "bytes": 256}
         assert await client.cluster_info() == {"cluster": "ok"}
         assert await client.namespace_usage("tenant:") == {"keys": 2}
-        assert await client.flow_query({"type": "order"}, state="queued") == [
+        assert await client.telemetry_flow_query({"type": "order"}, state="queued") == [
             {"id": "f1", "type": "order"}
         ]
         assert await client.flow_history("f1", {"include": "metadata"}) == [{"event": "created"}]

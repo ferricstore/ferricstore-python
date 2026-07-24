@@ -3,11 +3,15 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 _EXPORTS: dict[str, tuple[str, str]] = {
     "ApprovalResult": ("ferricstore.types", "ApprovalResult"),
     "AsyncCommandExecutor": ("ferricstore.adapters", "AsyncCommandExecutor"),
+    "AsyncFlowQueryCommandExecutor": (
+        "ferricstore.adapters",
+        "AsyncFlowQueryCommandExecutor",
+    ),
     "AsyncCommandPipeline": ("ferricstore.async_client_sessions", "AsyncCommandPipeline"),
     "AsyncFlowClient": ("ferricstore.async_client_core", "AsyncFlowClient"),
     "AsyncProtocolAdapter": ("ferricstore.protocol_async", "AsyncProtocolAdapter"),
@@ -61,23 +65,58 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "FetchOrComputeResult": ("ferricstore.types", "FetchOrComputeResult"),
     "FlowAlreadyExistsError": ("ferricstore.errors", "FlowAlreadyExistsError"),
     "FlowClient": ("ferricstore.client_core", "FlowClient"),
+    "FlowEventField": ("ferricstore.flow_query_dsl_types", "FlowEventField"),
+    "FlowField": ("ferricstore.flow_query_dsl_types", "FlowField"),
+    "FlowFields": ("ferricstore.flow_query_dsl_types", "FlowFields"),
     "FlowExplainResult": ("ferricstore.flow_query_types", "FlowExplainResult"),
     "FlowNotFoundError": ("ferricstore.errors", "FlowNotFoundError"),
     "FlowQueryError": ("ferricstore.flow_query_types", "FlowQueryError"),
+    "FlowQueryCommandExecutor": (
+        "ferricstore.adapters",
+        "FlowQueryCommandExecutor",
+    ),
     "FlowQueryErrorPosition": (
         "ferricstore.flow_query_types",
         "FlowQueryErrorPosition",
     ),
+    "FlowRunMapField": ("ferricstore.flow_query_dsl_types", "FlowRunMapField"),
     "FlowQueryIndex": ("ferricstore.flow_query_types", "FlowQueryIndex"),
+    "FlowQueryIndexBuild": ("ferricstore.flow_query_types", "FlowQueryIndexBuild"),
+    "FlowQueryIndexCoverage": (
+        "ferricstore.flow_query_types",
+        "FlowQueryIndexCoverage",
+    ),
+    "FlowQueryIndexField": ("ferricstore.flow_query_types", "FlowQueryIndexField"),
     "FlowQueryIndexRegistry": (
         "ferricstore.flow_query_types",
         "FlowQueryIndexRegistry",
+    ),
+    "FlowQueryIndexRetirement": (
+        "ferricstore.flow_query_types",
+        "FlowQueryIndexRetirement",
+    ),
+    "FlowQueryIndexServices": (
+        "ferricstore.flow_query_types",
+        "FlowQueryIndexServices",
+    ),
+    "FlowQueryIndexStatistics": (
+        "ferricstore.flow_query_types",
+        "FlowQueryIndexStatistics",
     ),
     "FlowQueryIndexStatus": (
         "ferricstore.flow_query_types",
         "FlowQueryIndexStatus",
     ),
+    "FlowQueryIndexValidation": (
+        "ferricstore.flow_query_types",
+        "FlowQueryIndexValidation",
+    ),
     "FlowQueryPage": ("ferricstore.flow_query_types", "FlowQueryPage"),
+    "FlowQuery": ("ferricstore.flow_query_dsl", "FlowQuery"),
+    "FlowQueryParameter": (
+        "ferricstore.flow_query_dsl_types",
+        "FlowQueryParameter",
+    ),
     "FlowQueryQuality": ("ferricstore.flow_query_types", "FlowQueryQuality"),
     "FlowQueryResult": ("ferricstore.flow_query_types", "FlowQueryResult"),
     "FlowQueryUsage": ("ferricstore.flow_query_types", "FlowQueryUsage"),
@@ -144,6 +183,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "WorkflowWorkerResult": ("ferricstore.workflow_types", "WorkflowWorkerResult"),
     "complete": ("ferricstore.workflow_types", "complete"),
     "fail": ("ferricstore.workflow_types", "fail"),
+    "flow_param": ("ferricstore.flow_query_dsl_types", "flow_param"),
     "retry": ("ferricstore.workflow_types", "retry"),
     "state": ("ferricstore.workflow_types", "state"),
     "transition": ("ferricstore.workflow_types", "transition"),
@@ -165,7 +205,12 @@ def __dir__() -> list[str]:
 
 
 if TYPE_CHECKING:
-    from ferricstore.adapters import AsyncCommandExecutor, CommandExecutor
+    from ferricstore.adapters import (
+        AsyncCommandExecutor,
+        AsyncFlowQueryCommandExecutor,
+        CommandExecutor,
+        FlowQueryCommandExecutor,
+    )
     from ferricstore.async_client import (
         AsyncCommandPipeline,
         AsyncFlowClient,
@@ -207,13 +252,29 @@ if TYPE_CHECKING:
         StaleLeaseError,
         StalePolicyGenerationError,
     )
+    from ferricstore.flow_query_dsl import FlowQuery
+    from ferricstore.flow_query_dsl_types import (
+        FlowEventField,
+        FlowField,
+        FlowFields,
+        FlowQueryParameter,
+        FlowRunMapField,
+        flow_param,
+    )
     from ferricstore.flow_query_types import (
         FlowExplainResult,
         FlowQueryError,
         FlowQueryErrorPosition,
         FlowQueryIndex,
+        FlowQueryIndexBuild,
+        FlowQueryIndexCoverage,
+        FlowQueryIndexField,
         FlowQueryIndexRegistry,
+        FlowQueryIndexRetirement,
+        FlowQueryIndexServices,
+        FlowQueryIndexStatistics,
         FlowQueryIndexStatus,
+        FlowQueryIndexValidation,
         FlowQueryPage,
         FlowQueryQuality,
         FlowQueryResult,
@@ -297,6 +358,7 @@ __all__ = [
     "AsyncCommandExecutor",
     "AsyncCommandPipeline",
     "AsyncFlowClient",
+    "AsyncFlowQueryCommandExecutor",
     "AsyncProtocolAdapter",
     "AsyncProtocolAdapterPool",
     "AsyncProtocolPipeline",
@@ -336,18 +398,32 @@ __all__ = [
     "FetchOrComputeResult",
     "FlowAlreadyExistsError",
     "FlowClient",
+    "FlowEventField",
     "FlowExplainResult",
+    "FlowField",
+    "FlowFields",
     "FlowNotFoundError",
+    "FlowQuery",
+    "FlowQueryCommandExecutor",
     "FlowQueryError",
     "FlowQueryErrorPosition",
     "FlowQueryIndex",
+    "FlowQueryIndexBuild",
+    "FlowQueryIndexCoverage",
+    "FlowQueryIndexField",
     "FlowQueryIndexRegistry",
+    "FlowQueryIndexRetirement",
+    "FlowQueryIndexServices",
+    "FlowQueryIndexStatistics",
     "FlowQueryIndexStatus",
+    "FlowQueryIndexValidation",
     "FlowQueryPage",
+    "FlowQueryParameter",
     "FlowQueryQuality",
     "FlowQueryResult",
     "FlowQueryUsage",
     "FlowRecord",
+    "FlowRunMapField",
     "FlowStateMode",
     "FlowStatePolicy",
     "FlowWorkflow",
@@ -398,6 +474,7 @@ __all__ = [
     "__version__",
     "complete",
     "fail",
+    "flow_param",
     "retry",
     "state",
     "transition",

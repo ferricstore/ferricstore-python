@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import builtins
 import contextlib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -10,6 +10,7 @@ from ferricstore.batch_core import BatchValueMatcher
 from ferricstore.client_core import FlowClient
 from ferricstore.config_validation import validate_string_sequence
 from ferricstore.errors import FerricStoreError
+from ferricstore.flow_query_builder import _lineage_query_options
 from ferricstore.lifecycle_core import (
     SyncCloseCoordinator,
     close_resources_sync,
@@ -345,14 +346,56 @@ class Workflow(_WorkflowProducerMixin):
     def failures(self, **kwargs: Any) -> builtins.list[FlowRecord]:
         return self.client.failures(self.type, **kwargs)
 
-    def by_parent(self, parent_flow_id: str, **kwargs: Any) -> builtins.list[FlowRecord]:
-        return self.client.by_parent(parent_flow_id, **kwargs)
+    def by_parent(
+        self,
+        parent_flow_id: str,
+        *,
+        partition_key: str | bytes | None,
+        state: str | None = None,
+        count: int | None = None,
+        from_ms: int | None = None,
+        to_ms: int | None = None,
+        rev: bool | None = None,
+        attributes: Mapping[str, Any] | None = None,
+        terminal_only: bool | None = None,
+        include_cold: bool | None = None,
+        consistent_projection: bool | None = None,
+    ) -> builtins.list[FlowRecord]:
+        return self.client.by_parent(parent_flow_id, **_lineage_query_options(locals()))
 
-    def by_root(self, root_flow_id: str, **kwargs: Any) -> builtins.list[FlowRecord]:
-        return self.client.by_root(root_flow_id, **kwargs)
+    def by_root(
+        self,
+        root_flow_id: str,
+        *,
+        partition_key: str | bytes | None,
+        state: str | None = None,
+        count: int | None = None,
+        from_ms: int | None = None,
+        to_ms: int | None = None,
+        rev: bool | None = None,
+        attributes: Mapping[str, Any] | None = None,
+        terminal_only: bool | None = None,
+        include_cold: bool | None = None,
+        consistent_projection: bool | None = None,
+    ) -> builtins.list[FlowRecord]:
+        return self.client.by_root(root_flow_id, **_lineage_query_options(locals()))
 
-    def by_correlation(self, correlation_id: str, **kwargs: Any) -> builtins.list[FlowRecord]:
-        return self.client.by_correlation(correlation_id, **kwargs)
+    def by_correlation(
+        self,
+        correlation_id: str,
+        *,
+        partition_key: str | bytes | None,
+        state: str | None = None,
+        count: int | None = None,
+        from_ms: int | None = None,
+        to_ms: int | None = None,
+        rev: bool | None = None,
+        attributes: Mapping[str, Any] | None = None,
+        terminal_only: bool | None = None,
+        include_cold: bool | None = None,
+        consistent_projection: bool | None = None,
+    ) -> builtins.list[FlowRecord]:
+        return self.client.by_correlation(correlation_id, **_lineage_query_options(locals()))
 
     def info(self, **kwargs: Any) -> dict[Any, Any]:
         return self.client.info(self.type, **kwargs)

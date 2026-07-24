@@ -758,8 +758,38 @@ def _is_retryable_route_error(exc: BaseException) -> bool:
 def _server_allows_retry(exc: BaseException) -> bool:
     """Require both server retry flags before replaying a response error."""
     if isinstance(exc, FerricStoreError):
-        return exc.retryable is True and exc.safe_to_retry is True
+        return (
+            exc.retryable is True
+            and exc.safe_to_retry is True
+            and _server_retry_delay_seconds(exc) is not None
+        )
     return isinstance(exc, (OSError, TimeoutError, FutureTimeoutError))
+
+
+def _server_retry_delay_seconds(exc: BaseException) -> float | None:
+    """Return a bounded server retry delay, or ``None`` to decline replay."""
+    if not isinstance(exc, FerricStoreError) or exc.retry_after_ms is None:
+        return 0.0
+    delay_ms = exc.retry_after_ms
+    if type(delay_ms) is not int or not 0 <= delay_ms <= 30_000:
+        return None
+    return delay_ms / 1_000.0
+
+
+def _is_topology_refresh_error(exc: BaseException) -> bool:
+    """Distinguish stale routing/transport failures from generic safe transients."""
+    if isinstance(exc, (OSError, TimeoutError, FutureTimeoutError)):
+        return True
+    if not isinstance(exc, FerricStoreError):
+        return False
+    reason = _optional_text(getattr(exc, "raw", None), "reason")
+    if reason is not None and reason.lower() in {"reroute", "leader_changed", "not_leader"}:
+        return True
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in ("reroute", "not leader", "not_leader", "leader changed", "connection closed")
+    )
 
 
 def _is_safe_control_retry(args: tuple[Any, ...]) -> bool:

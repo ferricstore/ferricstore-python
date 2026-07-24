@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import threading
@@ -14,12 +15,15 @@ import pytest
 
 import ferricstore.protocol as protocol_module
 from ferricstore import (
+    AsyncFlowClient,
     ChildSpec,
     ClaimedFlow,
     CreateItem,
     FencedItem,
     FerricStoreError,
     FlowClient,
+    FlowFields,
+    FlowQuery,
     FlowQueryError,
     FlowQueryResult,
     FlowStateMode,
@@ -575,8 +579,8 @@ def _wait_flow_state(
 
 def _wait_flow_query(
     client: FlowClient,
-    query: str,
-    params: dict[str, Any],
+    query: str | FlowQuery,
+    params: dict[str, Any] | None,
     ready: Callable[[FlowQueryResult], bool],
     *,
     timeout: float = 30.0,
@@ -745,6 +749,17 @@ def test_real_ferricstore_flow_query_planner_v010() -> None:
         "FROM runs WHERE partition_key = @partition AND type = @type AND state = @state "
         "ORDER BY updated_at_ms ASC LIMIT 2 RETURN RECORDS"
     )
+    base_dsl = (
+        FlowQuery.runs()
+        .where(
+            FlowFields.partition_key.eq(partition),
+            FlowFields.type.eq(flow_type),
+            FlowFields.state.eq(state),
+        )
+        .order_by(FlowFields.updated_at_ms.asc())
+        .limit(2)
+        .return_records()
+    )
 
     try:
         for index, flow_id in enumerate(ids):
@@ -761,8 +776,8 @@ def test_real_ferricstore_flow_query_planner_v010() -> None:
 
         first = _wait_flow_query(
             client,
-            base_query,
-            params,
+            base_dsl,
+            None,
             lambda result: (
                 result.records is not None
                 and len(result.records) == 2
@@ -775,12 +790,7 @@ def test_real_ferricstore_flow_query_planner_v010() -> None:
         assert first.usage.result_records == 2
         assert first.quality.pagination
 
-        second_params = {**params, "cursor": first.page.cursor}
-        second = client.query(
-            "FROM runs WHERE partition_key = @partition AND type = @type AND state = @state "
-            "ORDER BY updated_at_ms ASC LIMIT 2 CURSOR @cursor RETURN RECORDS",
-            second_params,
-        )
+        second = client.query(base_dsl.cursor(first.page.cursor))
         assert second.records is not None
         assert len(second.records) == 1
         assert second.page is not None
@@ -789,15 +799,80 @@ def test_real_ferricstore_flow_query_planner_v010() -> None:
         assert len(set(paged_ids)) == len(paged_ids)
         assert set(paged_ids) == set(ids)
 
+        point = client.query(
+            FlowQuery.runs()
+            .where(
+                FlowFields.partition_key.eq(partition),
+                FlowFields.run_id.eq(ids[0]),
+            )
+            .return_record()
+        )
+        assert point.records is not None and len(point.records) == 1
+        assert _text(_field(point.records[0], "id")) == ids[0]
+
+        projected_point = client.query(
+            FlowQuery.runs()
+            .where(
+                FlowFields.partition_key.eq(partition),
+                FlowFields.run_id.eq(ids[0]),
+            )
+            .return_record(FlowFields.run_id, FlowFields.state)
+        )
+        assert projected_point.records is not None and len(projected_point.records) == 1
+        assert _text(_field(projected_point.records[0], "id")) == ids[0]
+        assert _text(_field(projected_point.records[0], "state")) == state
+        assert _field(projected_point.records[0], "type") is None
+
         count = _wait_flow_query(
             client,
-            "FROM runs WHERE partition_key = @partition AND type = @type AND state = @state "
-            "RETURN COUNT",
-            params,
+            (
+                FlowQuery.runs()
+                .where(
+                    FlowFields.partition_key.eq(partition),
+                    FlowFields.type.eq(flow_type),
+                    FlowFields.state.eq(state),
+                )
+                .return_count()
+            ),
+            None,
             lambda result: result.count == len(ids),
         )
         assert count.page is None
         assert count.usage.result_records == 1
+
+        events = _wait_flow_query(
+            client,
+            (
+                FlowQuery.events()
+                .where(
+                    FlowFields.partition_key.eq(partition),
+                    FlowFields.run_id.eq(ids[0]),
+                )
+                .order_by(FlowFields.event_id.asc())
+                .limit(20)
+                .return_records()
+            ),
+            None,
+            lambda result: result.records is not None and bool(result.records),
+        )
+        assert events.records is not None
+        assert all(
+            _text(_field(_field(event, "fields"), "id")) == ids[0] for event in events.records
+        )
+
+        projected_events = client.query(
+            FlowQuery.events()
+            .where(
+                FlowFields.partition_key.eq(partition),
+                FlowFields.run_id.eq(ids[0]),
+            )
+            .order_by(FlowFields.event_id.asc())
+            .limit(20)
+            .return_records(FlowFields.event_id)
+        )
+        assert projected_events.records
+        assert all(_field(event, "event_id") is not None for event in projected_events.records)
+        assert all(_field(event, "run_id") is None for event in projected_events.records)
 
         explained = client.explain(base_query, params)
         assert explained.status == "planned"
@@ -834,6 +909,63 @@ def test_real_ferricstore_flow_query_planner_v010() -> None:
         )
     finally:
         client.close()
+
+
+def test_real_ferricstore_async_flow_query_planner_v010() -> None:
+    _require_protocol_transport()
+
+    async def run() -> None:
+        client = AsyncFlowClient.from_url(_integration_url(), codec=JsonCodec())
+        suffix = _suffix()
+        partition = f"py-sdk:async-query:{suffix}:partition"
+        flow_type = f"py-sdk-async-query-{suffix}"
+        flow_id = f"py-sdk:async-query:{suffix}:flow"
+        state = "query-ready"
+        now = int(time.time() * 1000)
+        query = (
+            FlowQuery.runs()
+            .where(
+                FlowFields.partition_key.eq(partition),
+                FlowFields.type.eq(flow_type),
+                FlowFields.state.eq(state),
+            )
+            .order_by(FlowFields.updated_at_ms.asc())
+            .limit(10)
+            .return_records()
+        )
+
+        try:
+            await client.create(
+                flow_id,
+                type=flow_type,
+                state=state,
+                partition_key=partition,
+                now_ms=now,
+                idempotent=True,
+            )
+
+            deadline = time.monotonic() + 10.0
+            result = await client.query(
+                query,
+                deadline_ms=int(time.time() * 1000) + 10_000,
+            )
+            while (result.records is None or len(result.records) != 1) and (
+                time.monotonic() < deadline
+            ):
+                await asyncio.sleep(0.05)
+                result = await client.query(query)
+
+            assert result.records is not None and len(result.records) == 1
+            assert _text(_field(result.records[0], "id")) == flow_id
+            assert (await client.explain(query)).status == "planned"
+            analyzed = await client.explain_analyze(query)
+            assert analyzed.status == "executed"
+            assert analyzed.actual is not None
+            assert (await client.query_indexes()).indexes
+        finally:
+            await client.close()
+
+    asyncio.run(run())
 
 
 def test_real_ferricstore_topology_aware_client_routes_kv_and_flow_commands() -> None:

@@ -4,7 +4,7 @@ from typing import Any
 
 from ferricstore.batch_core import is_pipeline_status_batch
 from ferricstore.errors import FerricStoreError, OverloadedError, classify_server_error
-from ferricstore.protocol_common import _error_message, _map_get, _optional_int, _optional_text
+from ferricstore.protocol_common import _error_message, _map_get, _optional_text
 from ferricstore.protocol_constants import _STATUS_BUSY, _STATUS_OK, ProtocolResponse
 
 
@@ -15,7 +15,7 @@ def _response_value(response: ProtocolResponse) -> Any:
     message = _error_message(response.value)
     retryable = _optional_bool_field(response.value, "retryable")
     safe_to_retry = _optional_bool_field(response.value, "safe_to_retry")
-    retry_after_ms = _optional_int(response.value, "retry_after_ms")
+    retry_after_ms = _retry_after_ms(response.value)
     if response.status == _STATUS_BUSY:
         raise OverloadedError(
             message,
@@ -63,15 +63,29 @@ def _batch_item_value(item: Any) -> Any:
             raw=raw,
             retryable=_optional_bool_field(value, "retryable"),
             safe_to_retry=_optional_bool_field(value, "safe_to_retry"),
-            retry_after_ms=_optional_int(value, "retry_after_ms"),
+            retry_after_ms=_retry_after_ms(value),
         )
     raise classify_server_error(
         message,
         raw=raw,
         retryable=_optional_bool_field(value, "retryable"),
         safe_to_retry=_optional_bool_field(value, "safe_to_retry"),
-        retry_after_ms=_optional_int(value, "retry_after_ms"),
+        retry_after_ms=_retry_after_ms(value),
     )
+
+
+def _retry_after_ms(value: Any) -> int | None:
+    raw = _map_get(value, "retry_after_ms") if isinstance(value, dict) else None
+    if raw is None:
+        return None
+    if type(raw) is not int or not 0 <= raw <= 2**64 - 1:
+        raise FerricStoreError(
+            "invalid server response: retry_after_ms must be an unsigned 64-bit integer",
+            raw=value,
+            retryable=False,
+            safe_to_retry=False,
+        )
+    return raw
 
 
 def _pipeline_pair_list(value: list[Any]) -> bool:
