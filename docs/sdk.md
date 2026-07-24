@@ -536,19 +536,13 @@ The collection convenience methods compile to FQL and also require an explicit
 record = client.get("order-1", partition_key="tenant-a:order-1")
 history = client.history("order-1", partition_key="tenant-a:order-1", count=100)
 queued = client.list("order", partition_key="tenant-a", state="queued", count=100)
-completed = client.terminals(
-    "order", partition_key="tenant-a", state="completed", count=100
-)
+completed = client.terminals("order", partition_key="tenant-a", state="completed", count=100)
 failed = client.failures("order", partition_key="tenant-a", count=100)
 children = client.by_parent("parent-flow-id", partition_key="tenant-a", count=100)
 root = client.by_root("root-flow-id", partition_key="tenant-a", count=100)
-correlated = client.by_correlation(
-    "checkout-123", partition_key="tenant-a", count=100
-)
+correlated = client.by_correlation("checkout-123", partition_key="tenant-a", count=100)
 info = client.info("order")
-stuck = client.stuck(
-    "order", partition_key="tenant-a", older_than_ms=300_000, count=100
-)
+stuck = client.stuck("order", partition_key="tenant-a", older_than_ms=300_000, count=100)
 ```
 
 FQL collection helpers do not support `include_cold` or

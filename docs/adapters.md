@@ -56,9 +56,7 @@ class MyExecutor:
     def execute_command(self, *args):
         return my_transport.send_command(*args)
 
-    def execute_flow_query_command(
-        self, *args, deadline_ms=None, routing_key=None
-    ):
+    def execute_flow_query_command(self, *args, deadline_ms=None, routing_key=None):
         return my_transport.send_flow_query(
             *args,
             deadline_ms=deadline_ms,
@@ -79,9 +77,7 @@ class MyAsyncExecutor:
     async def execute_command(self, *args):
         return await my_transport.send_command(*args)
 
-    async def execute_flow_query_command(
-        self, *args, deadline_ms=None, routing_key=None
-    ):
+    async def execute_flow_query_command(self, *args, deadline_ms=None, routing_key=None):
         return await my_transport.send_flow_query(
             *args,
             deadline_ms=deadline_ms,

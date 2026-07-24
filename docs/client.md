@@ -539,9 +539,7 @@ client.search(
     terminal_only=True,
     count=100,
 )
-client.terminals(
-    "order", partition_key="tenant-a", state="completed", rev=True, count=100
-)
+client.terminals("order", partition_key="tenant-a", state="completed", rev=True, count=100)
 client.failures("order", partition_key="tenant-a", from_ms=0, to_ms=now_ms)
 client.by_parent("parent-flow-id", partition_key="tenant-a")
 client.by_root("root-flow-id", partition_key="tenant-a", state="failed")
