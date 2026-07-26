@@ -64,7 +64,7 @@ def decode_flow_query_result(value: Any) -> FlowQueryResult:
         records = tuple(raw_records)
         if usage.result_records != len(records):
             raise _decode_error("FLOW.QUERY usage result_records does not match records", value)
-        if usage.result_records > usage.hydrated_records:
+        if usage.result_records > usage.scanned_entries:
             raise _decode_error("FLOW.QUERY usage counters are inconsistent", value)
         page = _decode_page(_map_get(mapping, "page"))
         return FlowQueryResult(
@@ -238,7 +238,7 @@ def _decode_usage(value: Any) -> FlowQueryUsage:
         usage.hydrated_records <= usage.scanned_entries
         and usage.duplicate_entries <= usage.scanned_entries
         and usage.range_pages <= usage.scanned_entries + usage.range_seeks
-        and usage.residual_checks <= usage.hydrated_records * 12
+        and usage.residual_checks <= usage.scanned_entries * 12
     ):
         raise _decode_error("FLOW.QUERY usage counters are inconsistent", value)
     return usage

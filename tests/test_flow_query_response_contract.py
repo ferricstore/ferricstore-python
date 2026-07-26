@@ -126,6 +126,19 @@ def _index_response() -> dict[str, Any]:
                 ],
                 "workloads": ["tenant_updated"],
                 "count_prefixes": [1],
+                "covering_fields": [
+                    "partition_key",
+                    "run_id",
+                    "updated_at_ms",
+                    "version",
+                ],
+                "format": {
+                    "query_row": "ferric.flow.query.row/v1",
+                    "key": "ferric.flow.query.composite.key/v1",
+                    "entry": "ferric.flow.query.composite.entry/v2",
+                    "reverse": "ferric.flow.query.composite.reverse/v1",
+                    "counter": "ferric.flow.query.composite.counter/v1",
+                },
                 "coverage": {
                     "complete_shards": 2,
                     "total_shards": 2,
@@ -254,7 +267,6 @@ def test_result_rejects_invalid_envelope_fields(path: tuple[Any, ...], value: An
         lambda usage: usage.update(duplicate_entries=2),
         lambda usage: usage.update(range_pages=3),
         lambda usage: usage.update(residual_checks=13),
-        lambda usage: usage.update(hydrated_records=0),
     ],
 )
 def test_records_result_rejects_internally_inconsistent_usage(mutate: Any) -> None:
@@ -263,6 +275,17 @@ def test_records_result_rejects_internally_inconsistent_usage(mutate: Any) -> No
 
     with pytest.raises(FerricStoreError, match=r"usage.*inconsistent"):
         decode_flow_query_result(response)
+
+
+def test_records_result_accepts_query_row_without_log_hydration() -> None:
+    response = _records_response()
+    response["usage"].update(hydrated_records=0, residual_checks=1)
+
+    result = decode_flow_query_result(response)
+
+    assert result.usage.result_records == 1
+    assert result.usage.hydrated_records == 0
+    assert result.usage.residual_checks == 1
 
 
 @pytest.mark.parametrize(
@@ -866,6 +889,7 @@ def test_index_status_accepts_canonical_quoted_metadata_selectors(selector: str)
         direction="asc",
         encoding="hashed",
     )
+    response["indexes"][0]["covering_fields"][2] = selector
 
     assert decode_flow_query_index_status(response).indexes[0].fields[1].name == selector
 

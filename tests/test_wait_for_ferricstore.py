@@ -5,7 +5,9 @@ import re
 import sys
 from pathlib import Path
 
-INTEGRATION_SERVER_VERSION = "0.10.3"
+from ferricstore.protocol_negotiation import MINIMUM_SERVER_VERSION
+
+INTEGRATION_SERVER_VERSION = MINIMUM_SERVER_VERSION
 INTEGRATION_IMAGE_PATTERN = re.compile(
     rf"ghcr\.io/ferricstore/ferricstore:{INTEGRATION_SERVER_VERSION}"
     r"@sha256:[0-9a-f]{64}"

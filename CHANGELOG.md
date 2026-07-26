@@ -6,6 +6,20 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.8.0 - 2026-07-26
+
+- Require FerricStore 0.11.0 while retaining native wire protocol v1 and the
+  existing FQL1 query/result contracts.
+- Expose bounded query-index `covering_fields` and opaque per-generation
+  `format` codec identities, including the nullable exact-counter format.
+- Validate dynamic covering selectors, identity/index coverage, counter
+  consistency, duplicates, UTF-8, and response-size bounds before exposing
+  index status, with sync and async live OSS integration coverage.
+- Accept covered QueryRow pages whose result records require no authoritative
+  log hydration while retaining server-aligned scan and residual-check bounds.
+- Preserve startup retry when peer shutdown races restoration of the temporary
+  socket write timeout on macOS.
+
 ## 0.7.1 - 2026-07-24
 
 - Require FerricStore 0.10.3 for result projections and the negotiated compact

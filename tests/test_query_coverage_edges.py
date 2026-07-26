@@ -23,6 +23,7 @@ from ferricstore.flow_query_types import (
     FlowQueryIndexBuild,
     FlowQueryIndexCoverage,
     FlowQueryIndexField,
+    FlowQueryIndexFormat,
     FlowQueryIndexRegistry,
     FlowQueryIndexRetirement,
     FlowQueryIndexServices,
@@ -120,6 +121,15 @@ def _status() -> FlowQueryIndexStatus:
         ),
         workloads=("tenant_updated",),
         count_prefixes=(1,),
+        covering_fields=("partition_key", "run_id", "updated_at_ms", "version"),
+        format=FlowQueryIndexFormat(
+            query_row="ferric.flow.query.row/v1",
+            key="ferric.flow.query.composite.key/v1",
+            entry="ferric.flow.query.composite.entry/v2",
+            reverse="ferric.flow.query.composite.reverse/v1",
+            counter="ferric.flow.query.composite.counter/v1",
+            raw={},
+        ),
         coverage=FlowQueryIndexCoverage(2, 2, "passed", {}),
         build=build,
         validation=validation,
@@ -357,7 +367,31 @@ def test_index_contract_recognizes_state_metadata_and_rejects_invalid_quoted_nam
         status.indexes[0].fields[0],
         FlowQueryIndexField("state_meta.running.risk", "asc", "hashed", {}),
     )
-    validate_flow_query_index_contract(_with_index(status, fields=fields))
+    validate_flow_query_index_contract(
+        _with_index(
+            status,
+            fields=fields,
+            covering_fields=("partition_key", "run_id", "state_meta.running.risk", "version"),
+        )
+    )
 
     assert _field_kind("attribute['']") is None
     assert _field_kind("attribute['\ud800']") is None
+
+
+def test_index_contract_validates_covering_identity_and_counter_format() -> None:
+    status = _status()
+
+    with pytest.raises(FerricStoreError, match="covering fields omit"):
+        validate_flow_query_index_contract(
+            _with_index(status, covering_fields=("partition_key", "updated_at_ms"))
+        )
+
+    with pytest.raises(FerricStoreError, match="unsupported covering field"):
+        validate_flow_query_index_contract(
+            _with_index(status, covering_fields=("partition_key", "run_id", "version", "payload"))
+        )
+
+    without_counter = replace(status.indexes[0].format, counter=None)
+    with pytest.raises(FerricStoreError, match="counter format"):
+        validate_flow_query_index_contract(_with_index(status, format=without_counter))

@@ -3,7 +3,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.7.1"
+__version__ = "0.8.0"
 
 _EXPORTS: dict[str, tuple[str, str]] = {
     "ApprovalResult": ("ferricstore.types", "ApprovalResult"),
@@ -87,6 +87,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "FlowQueryIndexCoverage",
     ),
     "FlowQueryIndexField": ("ferricstore.flow_query_types", "FlowQueryIndexField"),
+    "FlowQueryIndexFormat": ("ferricstore.flow_query_types", "FlowQueryIndexFormat"),
     "FlowQueryIndexRegistry": (
         "ferricstore.flow_query_types",
         "FlowQueryIndexRegistry",
@@ -269,6 +270,7 @@ if TYPE_CHECKING:
         FlowQueryIndexBuild,
         FlowQueryIndexCoverage,
         FlowQueryIndexField,
+        FlowQueryIndexFormat,
         FlowQueryIndexRegistry,
         FlowQueryIndexRetirement,
         FlowQueryIndexServices,
@@ -411,6 +413,7 @@ __all__ = [
     "FlowQueryIndexBuild",
     "FlowQueryIndexCoverage",
     "FlowQueryIndexField",
+    "FlowQueryIndexFormat",
     "FlowQueryIndexRegistry",
     "FlowQueryIndexRetirement",
     "FlowQueryIndexServices",

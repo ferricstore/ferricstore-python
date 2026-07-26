@@ -162,6 +162,16 @@ class FlowQueryIndexField:
 
 
 @dataclass(frozen=True, slots=True)
+class FlowQueryIndexFormat:
+    query_row: str
+    key: str
+    entry: str
+    reverse: str
+    counter: str | None
+    raw: dict[Any, Any]
+
+
+@dataclass(frozen=True, slots=True)
 class FlowQueryIndexCoverage:
     complete_shards: int
     total_shards: int
@@ -236,6 +246,8 @@ class FlowQueryIndex:
     fields: tuple[FlowQueryIndexField, ...]
     workloads: tuple[str, ...]
     count_prefixes: tuple[int, ...]
+    covering_fields: tuple[str, ...]
+    format: FlowQueryIndexFormat
     coverage: FlowQueryIndexCoverage
     build: FlowQueryIndexBuild
     validation: FlowQueryIndexValidation
@@ -263,6 +275,7 @@ __all__ = [
     "FlowQueryIndexBuild",
     "FlowQueryIndexCoverage",
     "FlowQueryIndexField",
+    "FlowQueryIndexFormat",
     "FlowQueryIndexRegistry",
     "FlowQueryIndexRetirement",
     "FlowQueryIndexServices",

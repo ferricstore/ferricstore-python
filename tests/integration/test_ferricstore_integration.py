@@ -887,6 +887,14 @@ def test_real_ferricstore_flow_query_planner_v010() -> None:
         indexes = client.query_indexes()
         assert indexes.registry.catalog_version > 0
         assert indexes.indexes
+        assert all(
+            index.covering_fields
+            and index.format.query_row
+            and index.format.key
+            and index.format.entry
+            and index.format.reverse
+            for index in indexes.indexes
+        )
 
         with pytest.raises(FlowQueryError) as error:
             client.query(
@@ -961,7 +969,9 @@ def test_real_ferricstore_async_flow_query_planner_v010() -> None:
             analyzed = await client.explain_analyze(query)
             assert analyzed.status == "executed"
             assert analyzed.actual is not None
-            assert (await client.query_indexes()).indexes
+            indexes = await client.query_indexes()
+            assert indexes.indexes
+            assert all(index.covering_fields and index.format.entry for index in indexes.indexes)
         finally:
             await client.close()
 

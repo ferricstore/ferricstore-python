@@ -131,6 +131,21 @@ def index_response() -> dict[str, Any]:
                 ],
                 "workloads": ["tenant_updated"],
                 "count_prefixes": [1],
+                "covering_fields": [
+                    "partition_key",
+                    "run_id",
+                    "updated_at_ms",
+                    "version",
+                    "attribute.customer",
+                    "state_meta.failed.reason",
+                ],
+                "format": {
+                    "query_row": "ferric.flow.query.row/v1",
+                    "key": "ferric.flow.query.composite.key/v1",
+                    "entry": "ferric.flow.query.composite.entry/v2",
+                    "reverse": "ferric.flow.query.composite.reverse/v1",
+                    "counter": "ferric.flow.query.composite.counter/v1",
+                },
                 "coverage": {
                     "complete_shards": 1,
                     "total_shards": 1,
@@ -382,7 +397,52 @@ def test_explain_analyze_count_and_indexes_have_distinct_strict_contracts() -> N
     assert isinstance(indexes, FlowQueryIndexStatus)
     assert indexes.registry.catalog_version == 3
     assert indexes.indexes[0].queryable is True
+    assert indexes.indexes[0].covering_fields == (
+        "partition_key",
+        "run_id",
+        "updated_at_ms",
+        "version",
+        "attribute.customer",
+        "state_meta.failed.reason",
+    )
+    assert indexes.indexes[0].format.entry == "ferric.flow.query.composite.entry/v2"
+    assert indexes.indexes[0].format.counter == "ferric.flow.query.composite.counter/v1"
     assert executor.calls[-1] == ("FLOW.QUERY.INDEXES", "flow_runs_tenant_updated")
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda index: index.pop("covering_fields"), "covering_fields"),
+        (
+            lambda index: index.__setitem__("covering_fields", ["run_id", "run_id"]),
+            "covering_fields",
+        ),
+        (
+            lambda index: index.__setitem__(
+                "covering_fields", [f"attribute.field_{position}" for position in range(33)]
+            ),
+            "covering_fields",
+        ),
+        (lambda index: index.pop("format"), "format"),
+        (
+            lambda index: index["format"].__setitem__("counter", False),
+            "format counter",
+        ),
+        (
+            lambda index: index["format"].__setitem__("counter", ""),
+            "format counter",
+        ),
+    ],
+)
+def test_v011_index_status_requires_bounded_covering_and_format_metadata(
+    mutate: Any, message: str
+) -> None:
+    response = index_response()
+    mutate(response["indexes"][0])
+
+    with pytest.raises(FerricStoreError, match=message):
+        FlowClient(RecordingExecutor(response)).query_indexes()
 
 
 def test_index_status_accepts_exactly_the_unsigned_64_bit_metadata_domain() -> None:

@@ -15,6 +15,7 @@ from ferricstore.flow_query_types import (
     FlowQueryIndexBuild,
     FlowQueryIndexCoverage,
     FlowQueryIndexField,
+    FlowQueryIndexFormat,
     FlowQueryIndexRegistry,
     FlowQueryIndexRetirement,
     FlowQueryIndexServices,
@@ -101,6 +102,8 @@ def _decode_index(value: Any, position: int) -> FlowQueryIndex:
         fields=fields,
         workloads=workloads,
         count_prefixes=_decode_count_prefixes(_map_get(mapping, "count_prefixes"), len(fields)),
+        covering_fields=_decode_covering_fields(_map_get(mapping, "covering_fields")),
+        format=_decode_format(_map_get(mapping, "format")),
         coverage=_decode_coverage(_map_get(mapping, "coverage")),
         build=_decode_build(_map_get(mapping, "build")),
         validation=_decode_validation(_map_get(mapping, "validation")),
@@ -141,6 +144,32 @@ def _decode_count_prefixes(value: Any, field_count: int) -> tuple[int, ...]:
     if any(item > field_count for item in prefixes) or tuple(sorted(set(prefixes))) != prefixes:
         raise _error(f"{context} are invalid", value)
     return prefixes
+
+
+def _decode_covering_fields(value: Any) -> tuple[str, ...]:
+    context = "FLOW.QUERY.INDEXES index covering_fields"
+    fields = _text_sequence(value, context, maximum=32, text_bytes=512)
+    if len(fields) != len(set(fields)):
+        raise _error(f"{context} contain duplicates", value)
+    return fields
+
+
+def _decode_format(value: Any) -> FlowQueryIndexFormat:
+    context = "FLOW.QUERY.INDEXES index format"
+    mapping = _required_map(value, context)
+    if not _has_key(mapping, "counter"):
+        raise _error(f"{context} is missing nullable counter", value)
+    counter = _optional_text(mapping, "counter", context, 128)
+    if counter == "":
+        raise _error(f"{context} counter must be null or non-empty text", value)
+    return FlowQueryIndexFormat(
+        query_row=_required_text(mapping, "query_row", context, 128),
+        key=_required_text(mapping, "key", context, 128),
+        entry=_required_text(mapping, "entry", context, 128),
+        reverse=_required_text(mapping, "reverse", context, 128),
+        counter=counter,
+        raw=mapping,
+    )
 
 
 def _decode_coverage(value: Any) -> FlowQueryIndexCoverage:

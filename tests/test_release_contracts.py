@@ -18,9 +18,12 @@ from ferricstore.protocol_negotiation import MINIMUM_SERVER_VERSION
 REPOSITORY = Path(__file__).resolve().parents[1]
 
 
-def test_projection_release_versions_are_current() -> None:
-    assert __version__ == "0.7.1"
-    assert MINIMUM_SERVER_VERSION == "0.10.3"
+def test_compact_query_storage_release_versions_are_current() -> None:
+    assert __version__ == "0.8.0"
+    assert MINIMUM_SERVER_VERSION == "0.11.0"
+
+    status = (REPOSITORY / "docs" / "status.md").read_text()
+    assert f"Current version:\n\n```text\n{__version__}\n```" in status
 
 
 def test_package_version_has_one_build_metadata_source() -> None:

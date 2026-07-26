@@ -123,9 +123,9 @@ def _hello(*, max_response_bytes: int = 4096) -> dict[str, Any]:
     }
 
 
-def test_v010_declares_minimum_server_without_changing_wire_v1() -> None:
-    assert ferricstore.MINIMUM_SERVER_VERSION == "0.10.3"
-    assert MINIMUM_SERVER_VERSION == "0.10.3"
+def test_v011_declares_minimum_server_without_changing_wire_v1() -> None:
+    assert ferricstore.MINIMUM_SERVER_VERSION == "0.11.0"
+    assert MINIMUM_SERVER_VERSION == "0.11.0"
     assert _MAGIC == b"FSNP"
     assert _REQUEST_VERSION == 0x01
     assert _RESPONSE_VERSION == 0x81
@@ -157,7 +157,7 @@ def test_hello_drives_compact_codecs_and_response_limit() -> None:
 
 
 def test_pre_010_hello_contract_is_rejected() -> None:
-    with pytest.raises(FerricStoreError, match=r"0\.10\.3"):
+    with pytest.raises(FerricStoreError, match=r"0\.11\.0"):
         parse_hello_capabilities({"protocol": "ferricstore-native", "version": 1})
 
 

@@ -176,7 +176,7 @@ def _unbounded_zero_delay_retry(
 
 
 def _remaining_deadline_seconds(deadline_ms: int | None) -> float | None:
-    if deadline_ms in (None, 0):
+    if deadline_ms is None or deadline_ms == 0:
         return None
     return (deadline_ms - time.time() * 1_000.0) / 1_000.0
 

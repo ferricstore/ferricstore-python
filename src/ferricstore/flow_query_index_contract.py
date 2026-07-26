@@ -113,6 +113,14 @@ def _validate_index(index: FlowQueryIndex, status: FlowQueryIndexStatus) -> None
         for prefix in index.count_prefixes
     ):
         _fail("count prefixes may cover only hashed fields", index.raw)
+    if index.covering_fields:
+        if any(_field_kind(field) is None for field in index.covering_fields):
+            _fail("index contains an unsupported covering field selector", index.raw)
+        required_covering = {"run_id", "version", *(field.name for field in index.fields)}
+        if not required_covering.issubset(index.covering_fields):
+            _fail("index covering fields omit an identity or index field", index.raw)
+    if bool(index.count_prefixes) != bool(index.format.counter):
+        _fail("index counter format is inconsistent with count prefixes", index.raw)
 
     _validate_progress(index.build, BUILD_PHASES, "build")
     _validate_progress(index.validation, VALIDATION_PHASES, "validation")

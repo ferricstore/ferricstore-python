@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import io
 import os
 import socket
@@ -329,11 +330,16 @@ def send_frames(
         if previous_timeout is not None and setsockopt is not None:
             try:
                 setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, previous_timeout)
-            except OSError:
+            except OSError as restore_error:
                 # The reader owns connection shutdown and may retire the socket
-                # immediately after receiving the response.  A completed write
-                # must not become an ambiguous failure solely because restoring
-                # timeout state raced that close.
+                # immediately after receiving the response.  During shutdown,
+                # some kernels reject socket options before close updates
+                # fileno(), so accept only errors that identify that transition.
                 fileno = getattr(sock, "fileno", None)
-                if not callable(fileno) or fileno() >= 0:
+                closing_error = restore_error.errno in {
+                    errno.EBADF,
+                    errno.EINVAL,
+                    errno.ENOTCONN,
+                }
+                if (not callable(fileno) or fileno() >= 0) and not closing_error:
                     raise

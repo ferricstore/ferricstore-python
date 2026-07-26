@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import gc
 import random
 import socket
@@ -1703,6 +1704,33 @@ def test_successful_write_ignores_timeout_restore_after_peer_closed_socket() -> 
             self.writes.append(data)
 
     sock = ClosedAfterWriteSocket()
+
+    send_frames(sock, [b"complete request"], timeout=0.1)
+
+    assert sock.writes == [b"complete request"]
+
+
+def test_successful_write_ignores_timeout_restore_during_peer_shutdown() -> None:
+    class ShuttingDownAfterWriteSocket:
+        def __init__(self) -> None:
+            self.setsockopt_calls = 0
+            self.writes: list[bytes] = []
+
+        def getsockopt(self, *_args: Any) -> bytes:
+            return b"previous"
+
+        def setsockopt(self, *_args: Any) -> None:
+            self.setsockopt_calls += 1
+            if self.setsockopt_calls == 2:
+                raise OSError(errno.EINVAL, "Invalid argument")
+
+        def fileno(self) -> int:
+            return 42
+
+        def sendall(self, data: bytes) -> None:
+            self.writes.append(data)
+
+    sock = ShuttingDownAfterWriteSocket()
 
     send_frames(sock, [b"complete request"], timeout=0.1)
 

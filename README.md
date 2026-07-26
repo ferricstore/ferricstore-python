@@ -2,12 +2,12 @@
 
 Python SDK for FerricStore and FerricFlow.
 
-Status: public alpha `0.7.1`. APIs may change before `1.0`, but the SDK is
+Status: public alpha `0.8.0`. APIs may change before `1.0`, but the SDK is
 tested against command construction, queue/workflow handlers, leases, retries,
 history, indexed attributes, named values, idempotent create, worker loops,
 async flows, and local FerricStore integration scenarios.
 
-Version `0.7.1` requires FerricStore `0.10.3` or newer. This is a breaking beta
+Version `0.8.0` requires FerricStore `0.11.0` or newer. This is a breaking beta
 contract update; the native wire protocol remains v1.
 
 FerricFlow keeps each workflow or job's state and history in one durable place. It
@@ -77,6 +77,12 @@ result = client.query(query, params)
 plan = client.explain(query, params)
 indexes = client.query_indexes()
 ```
+
+`query_indexes()` exposes each generation's bounded `covering_fields` and
+opaque `format` codec identities alongside build, validation, retirement, and
+statistics status. `format.counter` is `None` when an index has no exact-count
+prefix. A format change means the derived query projection must be rebuilt;
+authoritative Flow state is not rewritten.
 
 For bounded request execution, pass `deadline_ms` as an absolute Unix timestamp
 in milliseconds to `query`, `explain`, or `explain_analyze`.
