@@ -6,6 +6,13 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.8.1 - 2026-07-26
+
+- Validate the unchanged compact FQL1 query/result contract against
+  FerricStore 0.11.1's fused index execution and prepared response path.
+- Pin live integration to the immutable FerricStore 0.11.1 image while keeping
+  0.11.0 as the minimum compatible server and native wire protocol v1.
+
 ## 0.8.0 - 2026-07-26
 
 - Require FerricStore 0.11.0 while retaining native wire protocol v1 and the
