@@ -8,7 +8,7 @@ history, indexed attributes, named values, idempotent create, worker loops,
 async flows, and local FerricStore integration scenarios.
 
 Version `0.8.1` requires FerricStore `0.11.0` or newer and is tested against
-FerricStore `0.11.1`; the native wire protocol remains v1.
+FerricStore `0.11.2`; the native wire protocol remains v1.
 
 FerricFlow keeps each workflow or job's state and history in one durable place. It
 is an explicit durable state pipeline, not a hidden deterministic replay engine:

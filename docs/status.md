@@ -9,7 +9,7 @@ Current version:
 ```
 
 The SDK requires FerricStore `0.11.0` or newer, is tested against FerricStore
-`0.11.1`, and continues to use native wire protocol v1.
+`0.11.2`, and continues to use native wire protocol v1.
 
 ## What alpha means
 
