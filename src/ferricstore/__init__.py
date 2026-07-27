@@ -3,7 +3,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 
 _EXPORTS: dict[str, tuple[str, str]] = {
     "ApprovalResult": ("ferricstore.types", "ApprovalResult"),
@@ -68,6 +68,10 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "FlowEventField": ("ferricstore.flow_query_dsl_types", "FlowEventField"),
     "FlowField": ("ferricstore.flow_query_dsl_types", "FlowField"),
     "FlowFields": ("ferricstore.flow_query_dsl_types", "FlowFields"),
+    "FlowExplainCapabilities": (
+        "ferricstore.flow_query_types",
+        "FlowExplainCapabilities",
+    ),
     "FlowExplainResult": ("ferricstore.flow_query_types", "FlowExplainResult"),
     "FlowNotFoundError": ("ferricstore.errors", "FlowNotFoundError"),
     "FlowQueryError": ("ferricstore.flow_query_types", "FlowQueryError"),
@@ -263,6 +267,7 @@ if TYPE_CHECKING:
         flow_param,
     )
     from ferricstore.flow_query_types import (
+        FlowExplainCapabilities,
         FlowExplainResult,
         FlowQueryError,
         FlowQueryErrorPosition,
@@ -401,6 +406,7 @@ __all__ = [
     "FlowAlreadyExistsError",
     "FlowClient",
     "FlowEventField",
+    "FlowExplainCapabilities",
     "FlowExplainResult",
     "FlowField",
     "FlowFields",

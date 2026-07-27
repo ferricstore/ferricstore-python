@@ -104,6 +104,25 @@ def test_compact_flow_query_decoder_rejects_reserved_bits_truncation_and_trailin
             _decode(invalid, _OPCODES["FLOW.QUERY"])
 
 
+def test_compact_flow_query_decoder_rejects_invalid_usage_and_short_cursors() -> None:
+    hydrated_beyond_scan = bytearray(_page_payload())
+    hydrated_beyond_scan[38:46] = _U64.pack(2)
+    wrong_record_count = bytearray(_page_payload())
+    wrong_record_count[62:70] = _U64.pack(2)
+    wrong_count_usage = bytearray(_count_payload(42))
+    wrong_count_usage[62:70] = _U64.pack(0)
+
+    for invalid in (
+        bytes(hydrated_beyond_scan),
+        bytes(wrong_record_count),
+        bytes(wrong_count_usage),
+        _page_payload(cursor=b"fqc1_short"),
+        _page_payload(cursor=b"other_cursor_token"),
+        _page_payload(cursor=b"fqc1_" + b"\xff" * 11),
+    ):
+        assert decode_compact_flow_query_result(invalid, 0, DecodeBudget(1_000)) is None
+
+
 def test_compact_flow_query_tag_requires_negotiated_codec() -> None:
     with pytest.raises(FerricStoreError):
         _decode(_page_payload(), _OPCODES["FLOW.QUERY"], negotiated=False)
@@ -226,5 +245,7 @@ def _count_payload(count: int) -> bytes:
 
 def _usage(result_records: int) -> bytes:
     values = [0] * 11
+    values[2] = result_records
+    values[4] = result_records
     values[7] = result_records
     return b"".join(_U64.pack(value) for value in values)

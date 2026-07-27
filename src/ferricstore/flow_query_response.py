@@ -8,6 +8,7 @@ from ferricstore.flow_query_index_response import (
     decode_flow_query_index_status,
 )
 from ferricstore.flow_query_types import (
+    FlowExplainCapabilities,
     FlowExplainResult,
     FlowQueryError,
     FlowQueryErrorPosition,
@@ -41,6 +42,12 @@ _DIAGNOSTIC_CONTEXT_LIST_ITEMS = 32
 _DIAGNOSTIC_CONTEXT_KEY_BYTES = 128
 _DIAGNOSTIC_CONTEXT_DEPTH = 6
 _DIAGNOSTIC_CONTEXT_NODES = 512
+_QUALITY_VALUES = {
+    "exactness": frozenset(("authoritative", "projected_exact", "exact", "not_applicable")),
+    "freshness": frozenset(("current", "projection_watermark", "not_applicable")),
+    "coverage": frozenset(("complete", "unavailable")),
+    "pagination": frozenset(("none", "complete", "authenticated_seek", "live_seek")),
+}
 
 
 def decode_flow_query_result(value: Any) -> FlowQueryResult:
@@ -220,11 +227,18 @@ def decode_flow_query_error(value: Any, *, raw: Any) -> FlowQueryError | None:
 def _decode_quality(value: Any) -> FlowQueryQuality:
     mapping = _required_map_value(value, "FLOW.QUERY quality")
     return FlowQueryQuality(
-        exactness=_required_bounded_text(mapping, "exactness", "FLOW.QUERY quality", 64),
-        freshness=_required_bounded_text(mapping, "freshness", "FLOW.QUERY quality", 64),
-        coverage=_required_bounded_text(mapping, "coverage", "FLOW.QUERY quality", 64),
-        pagination=_required_bounded_text(mapping, "pagination", "FLOW.QUERY quality", 64),
+        exactness=_decode_quality_value(mapping, "exactness"),
+        freshness=_decode_quality_value(mapping, "freshness"),
+        coverage=_decode_quality_value(mapping, "coverage"),
+        pagination=_decode_quality_value(mapping, "pagination"),
     )
+
+
+def _decode_quality_value(mapping: dict[Any, Any], field: str) -> str:
+    value = _required_bounded_text(mapping, field, "FLOW.QUERY quality", 64)
+    if value not in _QUALITY_VALUES[field]:
+        raise _decode_error(f"FLOW.QUERY quality {field} is unsupported", mapping)
+    return value
 
 
 def _decode_usage(value: Any) -> FlowQueryUsage:
@@ -244,10 +258,11 @@ def _decode_usage(value: Any) -> FlowQueryUsage:
     return usage
 
 
-def _decode_explain_capabilities(mapping: dict[Any, Any]) -> dict[Any, Any] | None:
+def _decode_explain_capabilities(mapping: dict[Any, Any]) -> FlowExplainCapabilities | None:
     if not _has_key(mapping, "capabilities"):
         return None
     capabilities = _required_map(mapping, "capabilities", "FLOW.QUERY explain")
+    decoded: dict[str, tuple[str, ...]] = {}
     for field in ("requested", "available", "missing"):
         values = _bounded_text_sequence(
             _map_get(capabilities, field),
@@ -259,7 +274,13 @@ def _decode_explain_capabilities(mapping: dict[Any, Any]) -> dict[Any, Any] | No
                 f"FLOW.QUERY explain capabilities {field} contains duplicates",
                 capabilities,
             )
-    return capabilities
+        decoded[field] = values
+    return FlowExplainCapabilities(
+        requested=decoded["requested"],
+        available=decoded["available"],
+        missing=decoded["missing"],
+        raw=capabilities,
+    )
 
 
 def _decode_explain_alternatives(value: Any) -> tuple[dict[Any, Any], ...]:

@@ -9,7 +9,7 @@ on:
       ferricstore_image:
         description: "FerricStore image for integration tests"
         required: false
-        default: "ghcr.io/ferricstore/ferricstore:0.11.2@sha256:90758c3a2d191659928a728c5fb5e5f61d0ee910583e263f3bad543e5055bff8"
+        default: "ghcr.io/ferricstore/ferricstore:0.11.3@sha256:c2eef2036f45e7916359edfb92a50e3f36b8ea3c7a4067f22581305f5253c217"
 
 permissions:
   contents: read
@@ -84,7 +84,7 @@ jobs:
     name: FerricStore integration
     runs-on: ubuntu-latest
     env:
-      FERRICSTORE_IMAGE: ${{ inputs.ferricstore_image || 'ghcr.io/ferricstore/ferricstore:0.11.2@sha256:90758c3a2d191659928a728c5fb5e5f61d0ee910583e263f3bad543e5055bff8' }}
+      FERRICSTORE_IMAGE: ${{ inputs.ferricstore_image || 'ghcr.io/ferricstore/ferricstore:0.11.3@sha256:c2eef2036f45e7916359edfb92a50e3f36b8ea3c7a4067f22581305f5253c217' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6

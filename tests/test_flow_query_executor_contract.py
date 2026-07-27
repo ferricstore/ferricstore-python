@@ -30,8 +30,8 @@ def _query_response() -> dict[str, Any]:
         "records": [],
         "page": {"has_more": False, "cursor": None},
         "quality": {
-            "exactness": "authoritative_exact",
-            "freshness": "authoritative",
+            "exactness": "authoritative",
+            "freshness": "current",
             "coverage": "complete",
             "pagination": "none",
         },

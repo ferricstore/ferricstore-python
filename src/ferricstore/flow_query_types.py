@@ -86,6 +86,14 @@ class FlowQueryError(FerricStoreError):
 
 
 @dataclass(frozen=True, slots=True)
+class FlowExplainCapabilities:
+    requested: tuple[str, ...]
+    available: tuple[str, ...]
+    missing: tuple[str, ...]
+    raw: dict[Any, Any]
+
+
+@dataclass(frozen=True, slots=True)
 class FlowExplainResult:
     version: str
     query_fingerprint: str
@@ -98,7 +106,7 @@ class FlowExplainResult:
     pressure: dict[Any, Any] | None
     decision: dict[Any, Any] | None
     alternatives: tuple[dict[Any, Any], ...]
-    capabilities: dict[Any, Any] | None
+    capabilities: FlowExplainCapabilities | None
     actual: FlowQueryUsage | None
     diagnostic: FlowQueryError | None
     raw: dict[Any, Any]
@@ -268,6 +276,7 @@ class FlowQueryIndexStatus:
 
 
 __all__ = [
+    "FlowExplainCapabilities",
     "FlowExplainResult",
     "FlowQueryError",
     "FlowQueryErrorPosition",

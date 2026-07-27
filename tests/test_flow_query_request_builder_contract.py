@@ -343,6 +343,7 @@ def test_query_index_id_accepts_only_the_wire_identifier_domain(index_id: str, v
         ("  explain\tFROM runs", True),
         ("ExPlAiN\nFROM runs", True),
         ("\u00a0EXPLAIN FROM runs", False),
+        ("EXPLA\u0131N FROM runs", False),
         ("explained FROM runs", False),
         ("explain_analyze FROM runs", False),
         ("FROM runs", False),

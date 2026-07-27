@@ -8,6 +8,7 @@ from ferricstore.protocol_codec import DecodeBudget, DecodedCollectionLimitError
 
 _TAG: Final = 0xA0
 _MAX_RECORDS: Final = 100
+_MIN_CURSOR_BYTES: Final = 16
 _MAX_CURSOR_BYTES: Final = 4_096
 _MAX_INTEGER: Final = 2**63 - 1
 _NULL_U32: Final = 0xFFFF_FFFF
@@ -86,12 +87,16 @@ def decode_compact_flow_query_result(
             if value > _MAX_INTEGER:
                 raise FerricStoreError("compact FLOW.QUERY usage exceeds signed 64-bit range")
             usage[field] = value
+        if not _valid_usage(usage):
+            raise FerricStoreError("compact FLOW.QUERY usage counters are inconsistent")
 
         if kind == 0:
             page, offset = _read_page(data, offset)
             count, offset = _read_u32(data, offset)
             if count > _MAX_RECORDS:
                 raise FerricStoreError("compact FLOW.QUERY page exceeds 100 records")
+            if usage[b"result_records"] != count or count > usage[b"scanned_entries"]:
+                raise FerricStoreError("compact FLOW.QUERY record usage is inconsistent")
             budget.consume(count)
             records: list[dict[bytes, Any]] = []
             for _ in range(count):
@@ -105,6 +110,8 @@ def decode_compact_flow_query_result(
                 b"usage": usage,
             }
         elif kind == 1:
+            if usage[b"result_records"] != 1:
+                raise FerricStoreError("compact FLOW.QUERY count usage is inconsistent")
             count, offset = _read_u64(data, offset)
             if count > _MAX_INTEGER:
                 raise FerricStoreError("compact FLOW.QUERY count exceeds signed 64-bit range")
@@ -135,10 +142,27 @@ def _read_page(data: bytes, offset: int) -> tuple[dict[bytes, Any], int]:
     offset += 1 + _U32.size
     if has_more == 0 and size == _NULL_U32:
         return {b"has_more": False, b"cursor": None}, offset
-    if has_more != 1 or size in (0, _NULL_U32) or size > _MAX_CURSOR_BYTES:
+    if has_more != 1 or size < _MIN_CURSOR_BYTES or size == _NULL_U32 or size > _MAX_CURSOR_BYTES:
         raise FerricStoreError("invalid compact FLOW.QUERY page cursor")
     _require(data, offset, size)
-    return {b"has_more": True, b"cursor": data[offset : offset + size]}, offset + size
+    cursor = data[offset : offset + size]
+    try:
+        cursor.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise FerricStoreError("invalid compact FLOW.QUERY page cursor") from error
+    if not cursor.startswith(b"fqc1_"):
+        raise FerricStoreError("invalid compact FLOW.QUERY page cursor")
+    return {b"has_more": True, b"cursor": cursor}, offset + size
+
+
+def _valid_usage(usage: dict[bytes, int]) -> bool:
+    scanned = usage[b"scanned_entries"]
+    return (
+        usage[b"hydrated_records"] <= scanned
+        and usage[b"duplicate_entries"] <= scanned
+        and usage[b"range_pages"] <= scanned + usage[b"range_seeks"]
+        and usage[b"residual_checks"] <= scanned * 12
+    )
 
 
 def _read_record(

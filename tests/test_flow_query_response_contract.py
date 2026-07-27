@@ -12,6 +12,7 @@ from ferricstore.flow_query_response import (
     decode_flow_query_index_status,
     decode_flow_query_result,
 )
+from ferricstore.flow_query_types import FlowExplainCapabilities
 
 
 class EncodeBomb(str):
@@ -245,6 +246,7 @@ def test_records_result_rejects_malformed_shapes(mutate: Any) -> None:
         (("version",), "future/v2"),
         (("quality",), []),
         (("quality", "coverage"), ""),
+        (("quality", "exactness"), "future_exactness"),
         (("quality", "pagination"), "x" * 65),
         (("usage",), []),
         (("usage", "range_seeks"), True),
@@ -379,16 +381,17 @@ def test_extended_explain_requires_nullable_status_shape_keys(field: str) -> Non
         decode_flow_explain_result(response)
 
 
-def test_specialized_explain_requires_and_preserves_capabilities() -> None:
+def test_specialized_explain_decodes_typed_capabilities_and_preserves_raw() -> None:
+    capabilities = {
+        b"requested": [b"flow_query_point_v1"],
+        b"available": [b"flow_query_point_v1", b"flow_query_history_v1"],
+        b"missing": [],
+    }
     response = {
         "version": "ferric.flow.explain/v1",
         "query_fingerprint": "a" * 64,
         "status": "planned",
-        "capabilities": {
-            "requested": [],
-            "available": ["flow_query_point_v1"],
-            "missing": [],
-        },
+        "capabilities": capabilities,
         "plan": {"path": "primary_key", "extension": {"future": True}},
         "estimate": {"scan_records": 1},
         "bounds": {"scan_records": 1},
@@ -396,7 +399,13 @@ def test_specialized_explain_requires_and_preserves_capabilities() -> None:
 
     result = decode_flow_explain_result(response)
 
-    assert result.capabilities is response["capabilities"]
+    assert result.capabilities == FlowExplainCapabilities(
+        requested=("flow_query_point_v1",),
+        available=("flow_query_point_v1", "flow_query_history_v1"),
+        missing=(),
+        raw=capabilities,
+    )
+    assert result.capabilities.raw is capabilities
     assert result.quality is None
     assert result.stats is None
     assert result.alternatives == ()

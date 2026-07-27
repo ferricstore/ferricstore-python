@@ -6,6 +6,15 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.8.2 - 2026-07-27
+
+- Expose specialized-plan capabilities as a public immutable typed result.
+- Reject unsupported quality values, malformed compact cursors, inconsistent
+  usage counters, and result-count mismatches before exposing query results.
+- Keep the compact result corpus byte-for-byte aligned with FerricStore 0.11.3
+  and pin live integration to its immutable release image while retaining
+  FerricStore 0.11.0 as the compatibility floor and native wire v1.
+
 ## 0.8.1 - 2026-07-26
 
 - Validate the unchanged compact FQL1 query/result contract against
