@@ -12,14 +12,19 @@ def schedule_record(**overrides: object) -> dict[str, object]:
         "attempts": 0,
         "catchup_policy": "fire_once",
         "coalesced_count": 0,
+        "created_at_ms": 50,
+        "cron": None,
+        "every_ms": 1_000,
         "fire_count": 0,
         "id": "daily",
         "kind": "interval",
         "last_coalesced_count": 0,
         "overlap_policy": "allow",
+        "overlap_retry_ms": None,
         "skipped_count": 0,
         "state": "active",
         "target": {"id_prefix": "daily", "type": "task"},
+        "timezone": None,
     }
     record.update(overrides)
     return record
@@ -52,6 +57,10 @@ def test_schedule_responses_use_distinct_canonical_types() -> None:
     )
 
     assert record.last_planning_error == "ERR invalid recurrence"
+    assert record.created_at_ms == 50
+    assert record.every_ms == 1_000
+    assert record.cron is None
+    assert record.overlap_retry_ms is None
     assert isinstance(fire.schedule, ScheduleRecord)
     assert fire.target_id == "daily:1000:1"
     assert due.claimed == 1

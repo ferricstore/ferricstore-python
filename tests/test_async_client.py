@@ -118,14 +118,19 @@ class FakeAsyncExecutor:
             b"attempts": 0,
             b"catchup_policy": None,
             b"coalesced_count": 0,
+            b"created_at_ms": 100,
+            b"cron": b"0 9 * * *",
+            b"every_ms": None,
             b"fire_count": 0,
             b"id": b"item-1",
             b"kind": b"cron",
             b"last_coalesced_count": 0,
             b"overlap_policy": b"allow",
+            b"overlap_retry_ms": None,
             b"skipped_count": 0,
             b"state": b"active",
             b"target": {b"id_prefix": b"flow", b"type": b"report"},
+            b"timezone": b"Asia/Jerusalem",
         }
         if command == "FLOW.SCHEDULE.LIST":
             return [schedule_record]

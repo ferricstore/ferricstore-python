@@ -2138,6 +2138,11 @@ def test_real_ferricstore_native_protocol_flow_admin_surface() -> None:
             now_ms=now,
         )
         assert created_catchup.catchup_policy == "fire_once"
+        assert created_catchup.created_at_ms == now
+        assert created_catchup.every_ms == catchup_every
+        assert created_catchup.cron is None
+        assert created_catchup.timezone is None
+        assert created_catchup.overlap_retry_ms is None
 
         catchup_summary = client.schedule_fire_due(
             now_ms=catchup_recovery,
@@ -2154,6 +2159,11 @@ def test_real_ferricstore_native_protocol_flow_admin_surface() -> None:
         assert stored_catchup.last_coalesced_count == 10
         assert stored_catchup.last_catchup_at_ms == catchup_recovery
         assert stored_catchup.next_run_at_ms == catchup_recovery + catchup_every
+        assert stored_catchup.created_at_ms == now
+        assert stored_catchup.every_ms == catchup_every
+        assert stored_catchup.cron is None
+        assert stored_catchup.timezone is None
+        assert stored_catchup.overlap_retry_ms is None
 
         gov_flow_id, gov_partition, gov_job = _create_and_claim(
             client, flow_type, suffix, "native-governance", now_ms=now

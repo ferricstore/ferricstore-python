@@ -27,14 +27,19 @@ def _canonical_schedule_response(**overrides: object) -> dict[str, object]:
         "attempts": 0,
         "catchup_policy": "fire_once",
         "coalesced_count": 0,
+        "created_at_ms": 50,
+        "cron": None,
+        "every_ms": 1_000,
         "fire_count": 0,
         "id": "daily",
         "kind": "interval",
         "last_coalesced_count": 0,
         "overlap_policy": "allow",
+        "overlap_retry_ms": None,
         "skipped_count": 0,
         "state": "active",
         "target": {"id_prefix": "daily", "type": "task"},
+        "timezone": None,
     }
     response.update(overrides)
     return response
@@ -68,14 +73,19 @@ def test_schedule_record_decodes_the_kv_view_shape() -> None:
             b"attempts": 0,
             b"catchup_policy": b"fire_once",
             b"coalesced_count": 12,
+            b"created_at_ms": 50,
+            b"cron": None,
+            b"every_ms": 1_000,
             b"last_catchup_at_ms": 1_950,
             b"last_coalesced_count": 4,
             b"overlap_policy": b"allow",
+            b"overlap_retry_ms": None,
             b"next_run_at_ms": 2_000,
             b"fire_count": 3,
             b"skipped_count": 1,
             b"last_target_id": b"daily:1000:3",
             b"target": {b"id_prefix": b"daily", b"type": b"task"},
+            b"timezone": None,
         }
     )
 
@@ -172,6 +182,9 @@ def test_schedule_fire_result_decodes_manual_fire_envelope() -> None:
                 b"attempts": 0,
                 b"catchup_policy": b"fire_once",
                 b"coalesced_count": 0,
+                b"created_at_ms": 50,
+                b"cron": None,
+                b"every_ms": 1_000,
                 b"id": b"daily",
                 b"state": b"active",
                 b"kind": b"interval",
@@ -179,8 +192,10 @@ def test_schedule_fire_result_decodes_manual_fire_envelope() -> None:
                 b"next_run_at_ms": 2_000,
                 b"fire_count": 1,
                 b"overlap_policy": b"allow",
+                b"overlap_retry_ms": None,
                 b"skipped_count": 0,
                 b"target": {b"id_prefix": b"daily", b"type": b"task"},
+                b"timezone": None,
             },
         }
     )
@@ -203,7 +218,9 @@ def test_schedule_fire_result_decodes_manual_fire_envelope() -> None:
         (_canonical_schedule_response(coalesced_count="1"), "coalesced_count"),
         (_canonical_schedule_response(last_coalesced_count=-1), "last_coalesced_count"),
         (
-            _canonical_schedule_response(kind="one_shot", catchup_policy=None, coalesced_count=1),
+            _canonical_schedule_response(
+                kind="one_shot", every_ms=None, catchup_policy=None, coalesced_count=1
+            ),
             "coalesced_count",
         ),
         (
@@ -235,6 +252,53 @@ def test_schedule_record_rejects_malformed_canonical_records(
 ) -> None:
     with pytest.raises((TypeError, ValueError), match=message):
         ScheduleRecord.from_resp(response)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["created_at_ms", "every_ms", "cron", "timezone", "overlap_retry_ms"],
+)
+def test_schedule_record_requires_complete_recurrence_shape(field: str) -> None:
+    response = _canonical_schedule_response()
+    del response[field]
+
+    with pytest.raises(ValueError, match=field):
+        ScheduleRecord.from_resp(response)
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"every_ms": 0}, "every_ms"),
+        ({"cron": "* * * * *"}, "cron"),
+        ({"timezone": "Etc/UTC"}, "timezone"),
+        (
+            {
+                "kind": "cron",
+                "every_ms": None,
+                "cron": "* * * * *",
+                "timezone": None,
+                "catchup_policy": None,
+            },
+            "timezone",
+        ),
+        ({"overlap_retry_ms": 5}, "overlap_retry_ms"),
+        (
+            {
+                "kind": "one_shot",
+                "every_ms": None,
+                "catchup_policy": None,
+                "overlap_policy": "skip",
+            },
+            "overlap_policy",
+        ),
+    ],
+)
+def test_schedule_record_validates_recurrence_shape(
+    overrides: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        ScheduleRecord.from_resp(_canonical_schedule_response(**overrides))
 
 
 @pytest.mark.parametrize(

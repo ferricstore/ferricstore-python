@@ -6,6 +6,13 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.11.4 - 2026-07-28
+
+- Decode and validate the complete durable-schedule recurrence response,
+  including creation time, interval period, cron expression, timezone, and
+  overlap retry configuration.
+- Require FerricStore 0.11.4 while retaining native wire protocol v1.
+
 ## 0.8.2 - 2026-07-27
 
 - Expose specialized-plan capabilities as a public immutable typed result.

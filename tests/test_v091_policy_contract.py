@@ -87,8 +87,8 @@ class AsyncRecordingExecutor(RecordingExecutor):
 
 
 def test_v011_declares_minimum_server_without_changing_native_protocol_v1() -> None:
-    assert ferricstore.__version__ == "0.8.2"
-    assert ferricstore.MINIMUM_SERVER_VERSION == "0.11.0"
+    assert ferricstore.__version__ == "0.11.4"
+    assert ferricstore.MINIMUM_SERVER_VERSION == "0.11.4"
     assert _MAGIC == b"FSNP"
     assert _REQUEST_VERSION == 0x01
     assert _RESPONSE_VERSION == 0x81
@@ -113,7 +113,7 @@ def test_hello_requires_and_records_policy_cas_fields() -> None:
     ],
 )
 def test_hello_rejects_server_without_policy_cas_fields(policy_fields: list[str]) -> None:
-    with pytest.raises(ferricstore.FerricStoreError, match=r"0\.11\.0.*FLOW\.POLICY\.SET"):
+    with pytest.raises(ferricstore.FerricStoreError, match=r"0\.11\.4.*FLOW\.POLICY\.SET"):
         parse_hello_capabilities(_hello(policy_fields=policy_fields))
 
 

@@ -272,14 +272,19 @@ def _schedule_test_response(command: object) -> dict[object, object]:
         "attempts": 0,
         "catchup_policy": "fire_once",
         "coalesced_count": 0,
+        "created_at_ms": 50,
+        "cron": None,
+        "every_ms": 1_000,
         "fire_count": 1,
         "id": "daily",
         "kind": "interval",
         "last_coalesced_count": 0,
         "overlap_policy": "allow",
+        "overlap_retry_ms": None,
         "skipped_count": 0,
         "state": "active",
         "target": {"id_prefix": "daily", "type": "task"},
+        "timezone": None,
     }
     if command == "FLOW.SCHEDULE.FIRE":
         return {"fired": 1, "schedule": schedule, "target_id": "daily:125:1"}

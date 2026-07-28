@@ -611,8 +611,11 @@ schedule = client.schedule_create(
 )
 ```
 
-Schedule reads expose `catchup_policy`, `coalesced_count`,
+Schedule reads expose the complete recurrence configuration through
+`created_at_ms`, `every_ms`, `cron`, `timezone`, `overlap_policy`, and
+`overlap_retry_ms`, in addition to `catchup_policy`, `coalesced_count`,
 `last_coalesced_count`, `last_catchup_at_ms`, and `last_planning_error`.
+Non-applicable recurrence fields are `None` rather than omitted.
 If planning fails, `state` is `"failed"`, `end_reason` is
 `"planning_failed"`, and `last_planning_error` contains the actionable error.
 `schedule_fire_due()` exposes

@@ -28,6 +28,12 @@ def optional_text(value: dict[str, Any], field: str) -> str | None:
     return _optional_str(raw)
 
 
+def required_nullable_text(value: dict[str, Any], field: str) -> str | None:
+    if field not in value:
+        raise ValueError(f"schedule response is missing {field}")
+    return optional_text(value, field)
+
+
 def required_exact_integer(value: dict[str, Any], field: str) -> int:
     if field not in value or value[field] is None:
         raise ValueError(f"schedule response is missing {field}")
@@ -41,6 +47,12 @@ def optional_exact_integer(value: dict[str, Any], field: str) -> int | None:
     if field not in value or value[field] is None:
         return None
     return required_exact_integer(value, field)
+
+
+def required_nullable_exact_integer(value: dict[str, Any], field: str) -> int | None:
+    if field not in value:
+        raise ValueError(f"schedule response is missing {field}")
+    return optional_exact_integer(value, field)
 
 
 def schedule_errors(value: dict[str, Any]) -> list[tuple[str, str]]:

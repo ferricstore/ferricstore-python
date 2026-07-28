@@ -15,6 +15,8 @@ class ScheduleRecord(_MappingResult):
     kind: str = ""
     state: str = ""
     target: dict[str, Any] | None = None
+    created_at_ms: int = 0
+    every_ms: int | None = None
     timezone: str | None = None
     cron: str | None = None
     catchup_policy: str | None = None
@@ -22,6 +24,7 @@ class ScheduleRecord(_MappingResult):
     last_catchup_at_ms: int | None = None
     last_coalesced_count: int = 0
     overlap_policy: str | None = None
+    overlap_retry_ms: int | None = None
     next_run_at_ms: int | None = None
     last_fire_at_ms: int | None = None
     fire_count: int = 0

@@ -6,7 +6,7 @@ from typing import Any
 from ferricstore.errors import FerricStoreError
 from ferricstore.protocol_common import _map_get
 
-MINIMUM_SERVER_VERSION = "0.11.0"
+MINIMUM_SERVER_VERSION = "0.11.4"
 UNAUTHENTICATED_MAX_FRAME_BYTES = 64 * 1024
 
 _FLOW_QUERY_CAPABILITIES = frozenset(
@@ -58,7 +58,7 @@ class NegotiatedProtocolCapabilities:
 
 
 def parse_hello_capabilities(value: Any) -> NegotiatedProtocolCapabilities:
-    """Validate and normalize the FerricStore 0.11.0 HELLO capability contract."""
+    """Validate and normalize the FerricStore 0.11.4 HELLO capability contract."""
     if not isinstance(value, dict):
         raise _incompatible_server("HELLO response is not a map")
     if _text(_map_get(value, "protocol")) != "ferricstore-native":
