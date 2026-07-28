@@ -14,7 +14,7 @@ def test_every_declared_public_export_resolves() -> None:
     assert missing == []
 
 
-def test_serializable_public_values_keep_pre_refactor_pickle_modules() -> None:
+def test_serializable_public_values_use_stable_public_modules() -> None:
     import ferricstore.workflow as workflow_module
 
     values = [
@@ -26,7 +26,9 @@ def test_serializable_public_values_keep_pre_refactor_pickle_modules() -> None:
         workflow_module.Fail(),
         ferricstore.QueueFlowWorkerResult(),
         ferricstore.AsyncWorkflowWorkerResult(),
-        ferricstore.ScheduleResult(),
+        ferricstore.ScheduleRecord(),
+        ferricstore.ScheduleFireResult(),
+        ferricstore.ScheduleFireDueResult(),
     ]
     expected_modules = [
         "ferricstore.workflow",
@@ -37,6 +39,8 @@ def test_serializable_public_values_keep_pre_refactor_pickle_modules() -> None:
         "ferricstore.workflow",
         "ferricstore.worker",
         "ferricstore.async_worker",
+        "ferricstore.types",
+        "ferricstore.types",
         "ferricstore.types",
     ]
 
@@ -150,7 +154,7 @@ assert not loaded.intersection(
 """,
         """
 import sys
-from ferricstore import ScheduleResult
+from ferricstore import ScheduleRecord
 loaded = {name for name in sys.modules if name.startswith("ferricstore")}
 assert "ferricstore.schedule_types" in loaded
 assert "ferricstore.types" not in loaded

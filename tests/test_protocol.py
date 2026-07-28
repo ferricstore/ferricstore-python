@@ -8585,20 +8585,23 @@ def test_encodes_protocol_flow_schedule_governance_and_attribute_commands():
         "FLOW.SCHEDULE.CREATE",
         "daily-report",
         "TARGET",
-        {"id": "flow-1", "type": "report", "state": "queued"},
+        {"id_prefix": "flow", "type": "report", "state": "queued"},
         "KIND",
-        "one_shot",
-        "TIMEZONE",
-        "Asia/Jerusalem",
+        "interval",
+        "EVERY_MS",
+        1_000,
+        "CATCHUP_POLICY",
+        "fire_once",
         "OVERWRITE",
         "true",
     )
     assert schedule.opcode == 0x0225
     assert schedule.payload == {
         "id": "daily-report",
-        "target": {"id": "flow-1", "type": "report", "state": "queued"},
-        "kind": "one_shot",
-        "timezone": "Asia/Jerusalem",
+        "target": {"id_prefix": "flow", "type": "report", "state": "queued"},
+        "kind": "interval",
+        "every_ms": 1_000,
+        "catchup_policy": "fire_once",
         "overwrite": True,
     }
 

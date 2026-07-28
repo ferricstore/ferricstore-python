@@ -576,7 +576,7 @@ Flow state machine handles the rest.
 client.schedule_create(
     "daily-report",
     target={
-        "id": "report-2026-06-17",
+        "id_prefix": "daily-report",
         "type": "report",
         "state": "queued",
         "partition_key": "tenant-a",
@@ -587,14 +587,57 @@ client.schedule_create(
     overlap_policy="skip",
 )
 
-due = client.schedule_fire_due(limit=100, block_ms=1000)
 client.schedule_pause("daily-report")
 client.schedule_resume("daily-report")
 client.schedule_fire("daily-report")  # manual/admin fire
-client.schedule_delete("daily-report")
+assert client.schedule_delete("daily-report") is None
 ```
 
 Use `overwrite=True` only when replacing an existing schedule definition.
+
+Interval schedules use bounded `fire_once` catch-up. If the scheduler recovers
+one or more complete periods late, FerricStore creates one target, coalesces the
+additional elapsed occurrences in constant time, and sets the next run one
+full interval after recovery:
+
+```python
+schedule = client.schedule_create(
+    "billing-sweep",
+    target={"id_prefix": "billing-sweep", "type": "billing"},
+    kind="interval",
+    every_ms=60_000,
+    catchup_policy="fire_once",
+    overlap_policy="queue_after_previous",
+)
+```
+
+Schedule reads expose `catchup_policy`, `coalesced_count`,
+`last_coalesced_count`, `last_catchup_at_ms`, and `last_planning_error`.
+If planning fails, `state` is `"failed"`, `end_reason` is
+`"planning_failed"`, and `last_planning_error` contains the actionable error.
+`schedule_fire_due()` exposes
+the batch `coalesced` total. Its `errors` entries correspond to claimed
+schedules; `claim_error` separately reports a failure to request a later wave
+after completed outcomes were preserved. Catch-up handles scheduler delay;
+`overlap_policy` separately handles a previous target that is still active.
+The async client has the same arguments and result fields. `fire_once` is the
+default and only catch-up policy for interval schedules; other kinds reject it.
+
+Recurring targets reject a fixed `id`. Set `id_prefix` to choose their
+generated prefix, or omit it to use the schedule ID. Returned schedule state
+may briefly be `"running"` while the server owns a due-execution lease. Bounded
+catch-up is interval-only; overdue cron schedules advance one matching
+occurrence per successful automatic fire. Unknown target fields are rejected
+locally before a request is sent.
+
+The server's built-in scheduler normally owns due execution. Call
+`schedule_fire_due()` only from tests, administrative recovery, or a deployment
+that deliberately disables the built-in runner and supplies one custom runner:
+
+```python
+due = client.schedule_fire_due(worker="scheduler-a", limit=100, block_ms=1_000)
+print(due.fired, due.coalesced)
+```
 
 ## Governance
 
@@ -732,7 +775,7 @@ Schedule, effect, approval, circuit, budget, and overview calls return typed res
 objects for autocomplete:
 
 ```python
-schedule.status
+schedule.state
 effect.external_id
 approval.flow_id
 circuit.status
@@ -747,7 +790,7 @@ effect["status"]
 approval.get("reason")
 ```
 
-The public result classes are `ScheduleResult`, `EffectResult`, `PolicySnapshot`,
+The public result classes are `ScheduleRecord`, `ScheduleFireResult`, `ScheduleFireDueResult`, `EffectResult`, `PolicySnapshot`,
 `ApprovalResult`, `CircuitBreakerStatus`, `BudgetResult`, and
 `GovernanceOverview`.
 

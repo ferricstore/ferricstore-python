@@ -2114,9 +2114,46 @@ def test_real_ferricstore_native_protocol_flow_admin_surface() -> None:
             overwrite=True,
             now_ms=now,
         )
-        assert client.schedule_delete(delete_schedule_id, now_ms=now + 3)
+        assert client.schedule_delete(delete_schedule_id, now_ms=now + 3) is None
         assert client.schedule_fire(schedule_id, now_ms=now + 3)
         assert client.schedule_fire_due(now_ms=now + 4, limit=1) is not None
+
+        catchup_schedule_id = f"py-sdk:native-schedule-catchup:{suffix}"
+        catchup_target_prefix = f"py-sdk:native-scheduled-catchup:{suffix}"
+        catchup_due = now + 800
+        catchup_every = 5
+        catchup_recovery = catchup_due + 10 * catchup_every
+        created_catchup = client.schedule_create(
+            catchup_schedule_id,
+            target={
+                "id_prefix": catchup_target_prefix,
+                "type": flow_type,
+                "state": "scheduled",
+                "partition_key": partition,
+            },
+            kind="interval",
+            every_ms=catchup_every,
+            start_at_ms=catchup_due,
+            catchup_policy="fire_once",
+            now_ms=now,
+        )
+        assert created_catchup.catchup_policy == "fire_once"
+
+        catchup_summary = client.schedule_fire_due(
+            now_ms=catchup_recovery,
+            worker="py-sdk-catchup-scheduler",
+            limit=100,
+        )
+        assert catchup_summary.fired >= 1
+        assert catchup_summary.coalesced >= 10
+
+        stored_catchup = client.schedule_get(catchup_schedule_id)
+        assert stored_catchup is not None
+        assert stored_catchup.fire_count == 1
+        assert stored_catchup.coalesced_count == 10
+        assert stored_catchup.last_coalesced_count == 10
+        assert stored_catchup.last_catchup_at_ms == catchup_recovery
+        assert stored_catchup.next_run_at_ms == catchup_recovery + catchup_every
 
         gov_flow_id, gov_partition, gov_job = _create_and_claim(
             client, flow_type, suffix, "native-governance", now_ms=now

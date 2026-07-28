@@ -8,7 +8,7 @@ import pytest
 
 from ferricstore import AsyncFlowClient, FerricStoreError, FlowClient
 from ferricstore.async_workflow_budget import AsyncWorkflowBudget
-from ferricstore.types import BudgetResult, ScheduleResult
+from ferricstore.types import BudgetResult
 from ferricstore.workflow_budget import WorkflowBudget
 
 PACKAGE = Path(__file__).resolve().parents[1] / "src" / "ferricstore"
@@ -127,13 +127,12 @@ def test_async_schedule_delete_normalizes_ok_like_sync_client() -> None:
             assert args == ("FLOW.SCHEDULE.DELETE", "daily", "NOW", 200)
             return "OK"
 
-    async def exercise() -> ScheduleResult:
+    async def exercise() -> None:
         return await AsyncFlowClient(Executor()).schedule_delete("daily", now_ms=200)  # type: ignore[arg-type]
 
     result = asyncio.run(exercise())
 
-    assert result.id == "daily"
-    assert result.status == "deleted"
+    assert result is None
 
 
 def test_workflow_budget_helpers_cannot_overwrite_an_open_reservation() -> None:
@@ -254,7 +253,7 @@ class _SyncExecutor:
 
     def execute_command(self, *args: object) -> dict[object, object]:
         self.calls.append(args)
-        return {}
+        return _schedule_test_response(args[0])
 
 
 class _AsyncExecutor:
@@ -263,7 +262,28 @@ class _AsyncExecutor:
 
     async def execute_command(self, *args: object) -> dict[object, object]:
         self.calls.append(args)
-        return {}
+        return _schedule_test_response(args[0])
+
+
+def _schedule_test_response(command: object) -> dict[object, object]:
+    if command == "FLOW.SCHEDULE.FIRE_DUE":
+        return {"claimed": 0, "coalesced": 0, "errors": [], "fired": 0, "skipped": 0}
+    schedule: dict[object, object] = {
+        "attempts": 0,
+        "catchup_policy": "fire_once",
+        "coalesced_count": 0,
+        "fire_count": 1,
+        "id": "daily",
+        "kind": "interval",
+        "last_coalesced_count": 0,
+        "overlap_policy": "allow",
+        "skipped_count": 0,
+        "state": "active",
+        "target": {"id_prefix": "daily", "type": "task"},
+    }
+    if command == "FLOW.SCHEDULE.FIRE":
+        return {"fired": 1, "schedule": schedule, "target_id": "daily:125:1"}
+    return schedule
 
 
 def test_schedule_fire_exposes_kv_logical_occurrence_time() -> None:

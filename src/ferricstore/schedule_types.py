@@ -1,33 +1,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
-from ferricstore.model_core import (
-    _int,
-    _MappingResult,
-    _optional_int,
-    _optional_str,
-    _raw_map,
-    _str,
-)
+from ferricstore.model_core import _MappingResult, _raw_map
 
 
 @dataclass(frozen=True, slots=True)
-class ScheduleResult(_MappingResult):
-    """Typed response for Flow scheduler commands."""
+class ScheduleRecord(_MappingResult):
+    """Canonical durable schedule state returned by the server."""
 
     id: str = ""
     flow_id: str = ""
     kind: str = ""
-    status: str = ""
+    state: str = ""
     target: dict[str, Any] | None = None
     timezone: str | None = None
     cron: str | None = None
+    catchup_policy: str | None = None
+    coalesced_count: int = 0
+    last_catchup_at_ms: int | None = None
+    last_coalesced_count: int = 0
     overlap_policy: str | None = None
-    next_fire_at_ms: int | None = None
+    next_run_at_ms: int | None = None
     last_fire_at_ms: int | None = None
-    fires: int = 0
+    fire_count: int = 0
     max_fires: int | None = None
     end_at_ms: int | None = None
     attempts: int = 0
@@ -39,78 +36,60 @@ class ScheduleResult(_MappingResult):
     skipped_count: int = 0
     overlap_queued_due_at_ms: int | None = None
     end_reason: str | None = None
-    fired: int = 0
-    claimed: int = 0
-    skipped: int = 0
-    target_id: str | None = None
-    reason: str | None = None
-    errors: list[Any] | None = None
-    schedule: ScheduleResult | None = None
+    last_planning_error: str | None = None
     raw: dict[str, Any] | None = None
 
     @classmethod
-    def from_resp(cls, value: dict[Any, Any]) -> ScheduleResult:
-        raw = _raw_map(value)
-        nested_schedule = raw.get("schedule")
-        view = _raw_map(nested_schedule) if isinstance(nested_schedule, dict) else raw
-        target = view.get("target")
-        state = view.get("state", view.get("status"))
-        next_run_at_ms = view.get("next_run_at_ms", view.get("next_fire_at_ms"))
-        fire_count = view.get("fire_count", view.get("fires"))
-        return cls(
-            id=_str(view.get("id")),
-            flow_id=_str(view.get("flow_id")),
-            kind=_str(view.get("kind")),
-            status=_str(state),
-            target=target if isinstance(target, dict) else None,
-            timezone=_optional_str(view.get("timezone")),
-            cron=_optional_str(view.get("cron")),
-            overlap_policy=_optional_str(view.get("overlap_policy")),
-            next_fire_at_ms=_optional_int(next_run_at_ms),
-            last_fire_at_ms=_optional_int(view.get("last_fire_at_ms")),
-            fires=_int(fire_count),
-            max_fires=_optional_int(view.get("max_fires")),
-            end_at_ms=_optional_int(view.get("end_at_ms")),
-            attempts=_int(view.get("attempts")),
-            last_target_id=_optional_str(view.get("last_target_id")),
-            last_overlap_at_ms=_optional_int(view.get("last_overlap_at_ms")),
-            last_overlap_target_id=_optional_str(view.get("last_overlap_target_id")),
-            last_overlap_reason=_optional_str(view.get("last_overlap_reason")),
-            last_skipped_at_ms=_optional_int(view.get("last_skipped_at_ms")),
-            skipped_count=_int(view.get("skipped_count")),
-            overlap_queued_due_at_ms=_optional_int(view.get("overlap_queued_due_at_ms")),
-            end_reason=_optional_str(view.get("end_reason")),
-            fired=_int(raw.get("fired")),
-            claimed=_int(raw.get("claimed")),
-            skipped=_int(raw.get("skipped")),
-            target_id=_optional_str(raw.get("target_id")),
-            reason=_optional_str(raw.get("reason")),
-            errors=raw.get("errors") if isinstance(raw.get("errors"), list) else None,
-            schedule=cls.from_resp(nested_schedule) if isinstance(nested_schedule, dict) else None,
-            raw=raw,
+    def from_resp(cls, value: dict[Any, Any]) -> ScheduleRecord:
+        from ferricstore.schedule_response_record import parse_schedule_record
+
+        return cast(ScheduleRecord, parse_schedule_record(cls, _raw_map(value)))
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleFireResult(_MappingResult):
+    """Outcome of one explicit schedule fire."""
+
+    fired: int = 0
+    skipped: int = 0
+    target_id: str | None = None
+    reason: str | None = None
+    schedule: ScheduleRecord | None = None
+    raw: dict[str, Any] | None = None
+
+    @classmethod
+    def from_resp(cls, value: dict[Any, Any]) -> ScheduleFireResult:
+        from ferricstore.schedule_response_outcomes import parse_schedule_fire
+
+        return cast(
+            ScheduleFireResult,
+            parse_schedule_fire(cls, ScheduleRecord, _raw_map(value)),
         )
 
-    @property
-    def state(self) -> str:
-        """KV-native alias for ``status``."""
 
-        return self.status
+@dataclass(frozen=True, slots=True)
+class ScheduleFireDueResult(_MappingResult):
+    """Aggregate outcome of one bounded due-schedule batch."""
 
-    @property
-    def next_run_at_ms(self) -> int | None:
-        """KV-native alias for ``next_fire_at_ms``."""
+    claimed: int = 0
+    fired: int = 0
+    skipped: int = 0
+    coalesced: int = 0
+    errors: list[tuple[str, str]] | None = None
+    claim_error: str | None = None
+    last_target_id: str | None = None
+    last_skip_reason: str | None = None
+    raw: dict[str, Any] | None = None
 
-        return self.next_fire_at_ms
+    @classmethod
+    def from_resp(cls, value: dict[Any, Any]) -> ScheduleFireDueResult:
+        from ferricstore.schedule_response_outcomes import parse_schedule_fire_due
 
-    @property
-    def fire_count(self) -> int:
-        """KV-native alias for ``fires``."""
-
-        return self.fires
+        return cast(ScheduleFireDueResult, parse_schedule_fire_due(cls, _raw_map(value)))
 
 
-# Preserve the original public pickle path across the module extraction.
-ScheduleResult.__module__ = "ferricstore.types"
+for result_type in (ScheduleRecord, ScheduleFireResult, ScheduleFireDueResult):
+    result_type.__module__ = "ferricstore.types"
 
 
-__all__ = ["ScheduleResult"]
+__all__ = ["ScheduleFireDueResult", "ScheduleFireResult", "ScheduleRecord"]

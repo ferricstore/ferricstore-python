@@ -87,6 +87,7 @@ FLOW_OPTION_FIELD_NAMES = {
     "OPEN_MS": "open_ms",
     "OPERATION_DIGEST": "operation_digest",
     "OVERRIDE": "override",
+    "CATCHUP_POLICY": "catchup_policy",
     "OVERLAP_POLICY": "overlap_policy",
     "OVERLAP_RETRY_MS": "overlap_retry_ms",
     "OVERWRITE": "overwrite",

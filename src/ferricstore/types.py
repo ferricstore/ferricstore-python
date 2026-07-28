@@ -26,7 +26,11 @@ from ferricstore.model_core import (
     _str_key_map,
     _str_or_bytes,
 )
-from ferricstore.schedule_types import ScheduleResult as ScheduleResult
+from ferricstore.schedule_types import (
+    ScheduleFireDueResult as ScheduleFireDueResult,
+)
+from ferricstore.schedule_types import ScheduleFireResult as ScheduleFireResult
+from ferricstore.schedule_types import ScheduleRecord as ScheduleRecord
 
 PartitionKey: TypeAlias = str | bytes
 

@@ -17,7 +17,7 @@ from ferricstore.governance_validation import (
     validate_schedule_list,
     validate_schedule_operation,
 )
-from ferricstore.types import ScheduleResult
+from ferricstore.types import ScheduleFireDueResult, ScheduleFireResult, ScheduleRecord
 
 
 class _AsyncClientSchedulesMixin(_AsyncClientMixinBase):
@@ -33,6 +33,7 @@ class _AsyncClientSchedulesMixin(_AsyncClientMixinBase):
         every_ms: int | None = None,
         cron: str | None = None,
         timezone: str | None = None,
+        catchup_policy: str | None = None,
         overlap_policy: str | None = None,
         overlap_retry_ms: int | None = None,
         max_fires: int | None = None,
@@ -40,7 +41,7 @@ class _AsyncClientSchedulesMixin(_AsyncClientMixinBase):
         overwrite: bool | None = None,
         now_ms: int | None = None,
         extra_options: dict[str, Any] | None = None,
-    ) -> ScheduleResult:
+    ) -> ScheduleRecord:
         validate_schedule_create(
             id,
             target=target,
@@ -51,6 +52,7 @@ class _AsyncClientSchedulesMixin(_AsyncClientMixinBase):
             every_ms=every_ms,
             cron=cron,
             timezone=timezone,
+            catchup_policy=catchup_policy,
             overlap_policy=overlap_policy,
             overlap_retry_ms=overlap_retry_ms,
             max_fires=max_fires,
@@ -67,6 +69,7 @@ class _AsyncClientSchedulesMixin(_AsyncClientMixinBase):
         _append(args, "CRON", cron)
         _append(args, "TIMEZONE", timezone)
         _append(args, "TARGET", target)
+        _append(args, "CATCHUP_POLICY", catchup_policy)
         _append(args, "OVERLAP_POLICY", overlap_policy)
         _append(args, "OVERLAP_RETRY_MS", overlap_retry_ms)
         _append(args, "MAX_FIRES", max_fires)
@@ -74,22 +77,21 @@ class _AsyncClientSchedulesMixin(_AsyncClientMixinBase):
         _append_bool(args, "OVERWRITE", overwrite)
         _append(args, "NOW", now_ms)
         _append_extra_options(args, extra_options)
-        return ScheduleResult.from_resp(
+        return ScheduleRecord.from_resp(
             cast(
                 dict[str, Any],
                 _normalize_admin_response(await self.executor.execute_command(*args)),
             )
         )
 
-    async def schedule_get(self, id: str, *, now_ms: int | None = None) -> ScheduleResult | None:
-        validate_schedule_operation(id, now_ms=now_ms)
+    async def schedule_get(self, id: str) -> ScheduleRecord | None:
+        validate_schedule_operation(id, now_ms=None)
         args: builtins.list[Any] = ["FLOW.SCHEDULE.GET", id]
-        _append(args, "NOW", now_ms)
         response = cast(
             dict[str, Any] | None,
             _normalize_admin_response(await self.executor.execute_command(*args)),
         )
-        return ScheduleResult.from_resp(response) if response is not None else None
+        return ScheduleRecord.from_resp(response) if response is not None else None
 
     async def schedule_fire(
         self,
@@ -97,48 +99,48 @@ class _AsyncClientSchedulesMixin(_AsyncClientMixinBase):
         *,
         fire_at_ms: int | None = None,
         now_ms: int | None = None,
-    ) -> ScheduleResult:
+    ) -> ScheduleFireResult:
         validate_schedule_operation(id, fire_at_ms=fire_at_ms, now_ms=now_ms)
         args: builtins.list[Any] = ["FLOW.SCHEDULE.FIRE", id]
         _append(args, "FIRE_AT_MS", fire_at_ms)
         _append(args, "NOW", now_ms)
-        return ScheduleResult.from_resp(
+        return ScheduleFireResult.from_resp(
             cast(
                 dict[str, Any],
                 _normalize_admin_response(await self.executor.execute_command(*args)),
             )
         )
 
-    async def schedule_pause(self, id: str, *, now_ms: int | None = None) -> ScheduleResult:
+    async def schedule_pause(self, id: str, *, now_ms: int | None = None) -> ScheduleRecord:
         validate_schedule_operation(id, now_ms=now_ms)
         args: builtins.list[Any] = ["FLOW.SCHEDULE.PAUSE", id]
         _append(args, "NOW", now_ms)
-        return ScheduleResult.from_resp(
+        return ScheduleRecord.from_resp(
             cast(
                 dict[str, Any],
                 _normalize_admin_response(await self.executor.execute_command(*args)),
             )
         )
 
-    async def schedule_resume(self, id: str, *, now_ms: int | None = None) -> ScheduleResult:
+    async def schedule_resume(self, id: str, *, now_ms: int | None = None) -> ScheduleRecord:
         validate_schedule_operation(id, now_ms=now_ms)
         args: builtins.list[Any] = ["FLOW.SCHEDULE.RESUME", id]
         _append(args, "NOW", now_ms)
-        return ScheduleResult.from_resp(
+        return ScheduleRecord.from_resp(
             cast(
                 dict[str, Any],
                 _normalize_admin_response(await self.executor.execute_command(*args)),
             )
         )
 
-    async def schedule_delete(self, id: str, *, now_ms: int | None = None) -> ScheduleResult:
+    async def schedule_delete(self, id: str, *, now_ms: int | None = None) -> None:
         validate_schedule_operation(id, now_ms=now_ms)
         args: builtins.list[Any] = ["FLOW.SCHEDULE.DELETE", id]
         _append(args, "NOW", now_ms)
         response = _normalize_admin_response(await self.executor.execute_command(*args))
         if _ok_response(response):
-            return ScheduleResult(id=id, status="deleted", raw={"id": id, "status": "deleted"})
-        return ScheduleResult.from_resp(cast(dict[str, Any], response))
+            return None
+        raise TypeError("FLOW.SCHEDULE.DELETE response must be OK")
 
     async def schedule_fire_due(
         self,
@@ -148,7 +150,7 @@ class _AsyncClientSchedulesMixin(_AsyncClientMixinBase):
         lease_ms: int | None = None,
         block_ms: int | None = None,
         limit: int | None = None,
-    ) -> ScheduleResult:
+    ) -> ScheduleFireDueResult:
         validate_schedule_fire_due(
             now_ms=now_ms,
             worker=worker,
@@ -162,7 +164,7 @@ class _AsyncClientSchedulesMixin(_AsyncClientMixinBase):
         _append(args, "LEASE_MS", lease_ms)
         _append(args, "BLOCK", block_ms)
         _append(args, "LIMIT", limit)
-        return ScheduleResult.from_resp(
+        return ScheduleFireDueResult.from_resp(
             cast(
                 dict[str, Any],
                 _normalize_admin_response(await self.executor.execute_command(*args)),
@@ -180,7 +182,7 @@ class _AsyncClientSchedulesMixin(_AsyncClientMixinBase):
         to_ms: int | None = None,
         count: int | None = None,
         rev: bool | None = None,
-    ) -> builtins.list[ScheduleResult]:
+    ) -> builtins.list[ScheduleRecord]:
         validate_schedule_list(
             kind=kind,
             state=state,
@@ -204,4 +206,4 @@ class _AsyncClientSchedulesMixin(_AsyncClientMixinBase):
             builtins.list[dict[str, Any]],
             _normalize_admin_response(await self.executor.execute_command(*args)),
         )
-        return [ScheduleResult.from_resp(item) for item in response]
+        return [ScheduleRecord.from_resp(item) for item in response]

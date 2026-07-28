@@ -300,7 +300,7 @@ requested values, not history replay.
 - `QueueClient` / `AsyncQueueClient` for durable queues.
 - `WorkflowClient` / `AsyncWorkflowClient` for explicit durable state machines.
 - `FlowClient` / `AsyncFlowClient` for advanced command-level control.
-- `ScheduleResult`, `EffectResult`, `ApprovalResult`, `CircuitBreakerStatus`,
+- `ScheduleRecord`, `ScheduleFireResult`, `ScheduleFireDueResult`, `EffectResult`, `ApprovalResult`, `CircuitBreakerStatus`,
   `BudgetResult`, and `GovernanceOverview` for typed admin/governance responses
   with dict fallback.
 - `RetryPolicy`, `WorkerConfig`, `ValueConfig`, and `ExceptionPolicy` for runtime defaults.

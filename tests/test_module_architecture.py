@@ -165,14 +165,31 @@ def test_worker_configuration_is_a_dedicated_acyclic_boundary() -> None:
 def test_result_model_parsing_is_a_dedicated_acyclic_boundary() -> None:
     """Keep shared parsing and scheduler models out of the broad type facade."""
 
-    from ferricstore import ScheduleResult as PublicScheduleResult
-    from ferricstore.schedule_types import ScheduleResult as CanonicalScheduleResult
-    from ferricstore.types import ScheduleResult as CompatibilityScheduleResult
+    from ferricstore import ScheduleFireDueResult, ScheduleFireResult, ScheduleRecord
+    from ferricstore.schedule_types import (
+        ScheduleFireDueResult as CanonicalScheduleFireDueResult,
+    )
+    from ferricstore.schedule_types import ScheduleFireResult as CanonicalScheduleFireResult
+    from ferricstore.schedule_types import ScheduleRecord as CanonicalScheduleRecord
 
     assert _module_lines("model_core") <= 150
     assert _module_lines("schedule_types") <= 150
-    _assert_acyclic_modules({"model_core", "schedule_types", "types"})
-    assert PublicScheduleResult is CompatibilityScheduleResult is CanonicalScheduleResult
+    assert _module_lines("schedule_response_values") <= 150
+    assert _module_lines("schedule_response_record") <= 150
+    assert _module_lines("schedule_response_outcomes") <= 150
+    _assert_acyclic_modules(
+        {
+            "model_core",
+            "schedule_response_outcomes",
+            "schedule_response_record",
+            "schedule_response_values",
+            "schedule_types",
+            "types",
+        }
+    )
+    assert ScheduleRecord is CanonicalScheduleRecord
+    assert ScheduleFireResult is CanonicalScheduleFireResult
+    assert ScheduleFireDueResult is CanonicalScheduleFireDueResult
 
 
 def test_autobatch_queue_state_is_a_dedicated_acyclic_boundary() -> None:

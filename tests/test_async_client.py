@@ -31,7 +31,8 @@ from ferricstore.types import (
     FencedItem,
     GovernanceOverview,
     RetryPolicy,
-    ScheduleResult,
+    ScheduleFireDueResult,
+    ScheduleRecord,
 )
 
 
@@ -113,8 +114,22 @@ class FakeAsyncExecutor:
             return [{b"name": b"tenant", b"count": 3}]
         if command == "FLOW.ATTRIBUTE_VALUES":
             return [{b"value": b"acme", b"count": 2}]
+        schedule_record = {
+            b"attempts": 0,
+            b"catchup_policy": None,
+            b"coalesced_count": 0,
+            b"fire_count": 0,
+            b"id": b"item-1",
+            b"kind": b"cron",
+            b"last_coalesced_count": 0,
+            b"overlap_policy": b"allow",
+            b"skipped_count": 0,
+            b"state": b"active",
+            b"target": {b"id_prefix": b"flow", b"type": b"report"},
+        }
+        if command == "FLOW.SCHEDULE.LIST":
+            return [schedule_record]
         if command in {
-            "FLOW.SCHEDULE.LIST",
             "FLOW.APPROVAL.LIST",
             "FLOW.GOVERNANCE.LEDGER",
             "FLOW.LIMIT.LIST",
@@ -157,14 +172,19 @@ class FakeAsyncExecutor:
                 b"reserved_at_ms": 1_000,
                 b"settled_at_ms": 2_000,
             }
+        if command == "FLOW.SCHEDULE.FIRE_DUE":
+            return {b"claimed": 0, b"coalesced": 0, b"errors": [], b"fired": 0, b"skipped": 0}
+        if command == "FLOW.SCHEDULE.FIRE":
+            return {b"fired": 1, b"schedule": schedule_record, b"target_id": b"item-1:1"}
         if command in {
             "FLOW.SCHEDULE.CREATE",
             "FLOW.SCHEDULE.GET",
-            "FLOW.SCHEDULE.FIRE",
             "FLOW.SCHEDULE.PAUSE",
             "FLOW.SCHEDULE.RESUME",
+        }:
+            return schedule_record
+        if command in {
             "FLOW.SCHEDULE.DELETE",
-            "FLOW.SCHEDULE.FIRE_DUE",
             "FLOW.EFFECT.RESERVE",
             "FLOW.EFFECT.CONFIRM",
             "FLOW.EFFECT.FAIL",
@@ -2476,9 +2496,9 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
             overwrite=True,
             now_ms=100,
         )
-        assert isinstance(schedule, ScheduleResult)
-        assert schedule.status == "active"
-        assert schedule["status"] == "active"
+        assert isinstance(schedule, ScheduleRecord)
+        assert schedule.state == "active"
+        assert schedule["state"] == "active"
         assert executor.calls[-1] == (
             "FLOW.SCHEDULE.CREATE",
             "daily-report",
@@ -2497,12 +2517,13 @@ def test_async_admin_flow_wrappers_build_readable_commands_and_normalize_respons
         )
 
         due = await client.schedule_fire_due(block_ms=1000, limit=50)
-        assert isinstance(due, ScheduleResult)
-        assert due["status"] == "active"
+        assert isinstance(due, ScheduleFireDueResult)
+        assert due.claimed == 0
+        assert due.coalesced == 0
         assert executor.calls[-1] == ("FLOW.SCHEDULE.FIRE_DUE", "BLOCK", 1000, "LIMIT", 50)
         schedules = await client.schedule_list(target_type="flow")
-        assert isinstance(schedules[0], ScheduleResult)
-        assert schedules[0]["status"] == "active"
+        assert isinstance(schedules[0], ScheduleRecord)
+        assert schedules[0]["state"] == "active"
         assert executor.calls[-1] == ("FLOW.SCHEDULE.LIST", "TARGET_TYPE", "flow")
 
         effect = await client.effect_reserve(

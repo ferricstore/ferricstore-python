@@ -17,8 +17,32 @@ _MAX_RESERVATION_ID_BYTES = 256
 _MAX_EXACT_INTEGER = 9_007_199_254_740_991
 _APPROVAL_STATUSES = frozenset({"pending", "approved", "rejected"})
 _SCHEDULE_KINDS = frozenset({"one_shot", "delay", "interval", "cron"})
+_SCHEDULE_LIST_STATES = frozenset(
+    {"active", "paused", "running", "completed", "failed", "cancelled", "all"}
+)
 _RECURRING_SCHEDULE_KINDS = frozenset({"interval", "cron"})
+_SCHEDULE_CATCHUP_POLICIES = frozenset({"fire_once"})
 _SCHEDULE_OVERLAP_POLICIES = frozenset({"allow", "skip", "queue_after_previous", "fail_schedule"})
+_RESERVED_SCHEDULE_TYPE = "__ferricstore_schedule"
+_RESERVED_SCHEDULE_ID_PREFIX = "__ferricstore_schedule__:"
+_SCHEDULE_TARGET_FIELDS = frozenset(
+    {
+        "type",
+        "state",
+        "id",
+        "id_prefix",
+        "partition_key",
+        "correlation_id",
+        "parent_flow_id",
+        "root_flow_id",
+        "run_at_ms",
+        "priority",
+        "payload",
+        "payload_ref",
+        "values",
+        "value_refs",
+    }
+)
 
 
 def validate_nonempty_string(value: object, *, name: str) -> str:
@@ -85,7 +109,12 @@ def _known_first_schedule_run(
 def _validate_schedule_target(value: object, *, recurring: bool) -> None:
     if not isinstance(value, Mapping):
         raise ValueError("target must be a mapping with a non-empty type")
-    validate_nonempty_string(value.get("type"), name="target type")
+    for key in value:
+        if key not in _SCHEDULE_TARGET_FIELDS:
+            raise ValueError(f"target contains unknown field {key!r}")
+    target_type = validate_nonempty_string(value.get("type"), name="target type")
+    if target_type == _RESERVED_SCHEDULE_TYPE:
+        raise ValueError("target type is reserved for internal use")
     for key in (
         "state",
         "id",
@@ -98,15 +127,42 @@ def _validate_schedule_target(value: object, *, recurring: bool) -> None:
         if key in value:
             validate_optional_nonempty_string(value[key], name=f"target {key}")
     if "run_at_ms" in value:
-        validate_optional_nonnegative_int(value["run_at_ms"], name="target run_at_ms")
+        _validate_optional_exact_nonnegative_int(value["run_at_ms"], name="target run_at_ms")
     if "priority" in value:
         validate_bounded_nonnegative_int(
             value["priority"],
             name="target priority",
             maximum=2,
         )
+    if value.get("id") is not None and value.get("id_prefix") is not None:
+        raise ValueError("target cannot set both id and id_prefix")
     if recurring and value.get("id") is not None:
         raise ValueError("target id is not supported for recurring schedules; use id_prefix")
+    for key in ("id", "id_prefix"):
+        identifier = value.get(key)
+        if isinstance(identifier, str) and identifier.startswith(_RESERVED_SCHEDULE_ID_PREFIX):
+            raise ValueError(f"target {key} is reserved for internal use")
+
+
+def _validate_schedule_timing(
+    kind: str,
+    *,
+    at_ms: object | None,
+    delay_ms: object | None,
+    start_at_ms: object | None,
+    every_ms: object | None,
+    cron: object | None,
+) -> None:
+    if at_ms is not None and start_at_ms is not None:
+        raise ValueError("cannot set both at_ms and start_at_ms")
+    if delay_ms is not None and kind != "delay":
+        raise ValueError("delay_ms is only supported for delay schedules")
+    if every_ms is not None and kind != "interval":
+        raise ValueError("every_ms is only supported for interval schedules")
+    if cron is not None and kind != "cron":
+        raise ValueError("cron is only supported for cron schedules")
+    if kind == "delay" and (at_ms is not None or start_at_ms is not None):
+        raise ValueError("at_ms and start_at_ms are not supported for delay schedules")
 
 
 def validate_schedule_create(
@@ -120,6 +176,7 @@ def validate_schedule_create(
     every_ms: object | None,
     cron: object | None,
     timezone: object | None,
+    catchup_policy: object | None,
     overlap_policy: object | None,
     overlap_retry_ms: object | None,
     max_fires: object | None,
@@ -135,19 +192,42 @@ def validate_schedule_create(
         every_ms=every_ms,
         cron=cron,
     )
+    _validate_schedule_timing(
+        effective_kind,
+        at_ms=at_ms,
+        delay_ms=delay_ms,
+        start_at_ms=start_at_ms,
+        every_ms=every_ms,
+        cron=cron,
+    )
     recurring = effective_kind in _RECURRING_SCHEDULE_KINDS
     _validate_schedule_target(target, recurring=recurring)
-    validate_optional_nonnegative_int(at_ms, name="at_ms")
-    validate_optional_nonnegative_int(delay_ms, name="delay_ms")
-    validate_optional_nonnegative_int(start_at_ms, name="start_at_ms")
-    validate_optional_positive_int(every_ms, name="every_ms")
-    validate_optional_positive_int(overlap_retry_ms, name="overlap_retry_ms")
-    validate_optional_nonnegative_int(end_at_ms, name="end_at_ms")
+    _validate_optional_exact_nonnegative_int(at_ms, name="at_ms")
+    _validate_optional_exact_nonnegative_int(delay_ms, name="delay_ms")
+    _validate_optional_exact_nonnegative_int(start_at_ms, name="start_at_ms")
+    _validate_optional_exact_positive_int(every_ms, name="every_ms")
+    _validate_optional_exact_positive_int(overlap_retry_ms, name="overlap_retry_ms")
+    _validate_optional_exact_nonnegative_int(end_at_ms, name="end_at_ms")
     validate_optional_bool(overwrite, name="overwrite")
-    validate_optional_nonnegative_int(now_ms, name="now_ms")
+    _validate_optional_exact_nonnegative_int(now_ms, name="now_ms")
+    validated_catchup_policy = validate_optional_nonempty_string(
+        catchup_policy,
+        name="catchup_policy",
+    )
+    validated_overlap_policy = validate_optional_nonempty_string(
+        overlap_policy,
+        name="overlap_policy",
+    )
 
     if effective_kind == "delay" and delay_ms is None:
         raise ValueError("delay_ms is required for delay schedules")
+    if (
+        effective_kind == "delay"
+        and isinstance(now_ms, int)
+        and isinstance(delay_ms, int)
+        and now_ms > _MAX_EXACT_INTEGER - delay_ms
+    ):
+        raise ValueError("now_ms plus delay_ms exceeds the exact integer range")
     if effective_kind == "interval" and every_ms is None:
         raise ValueError("every_ms is required for interval schedules")
     if effective_kind == "cron":
@@ -156,12 +236,26 @@ def validate_schedule_create(
     elif timezone is not None:
         raise ValueError("timezone is only supported for cron schedules")
 
+    if effective_kind == "interval":
+        if (
+            validated_catchup_policy is not None
+            and validated_catchup_policy not in _SCHEDULE_CATCHUP_POLICIES
+        ):
+            raise ValueError("catchup_policy must be fire_once")
+    elif validated_catchup_policy is not None:
+        raise ValueError("catchup_policy is only supported for interval schedules")
+
     if recurring:
-        if overlap_policy is not None and overlap_policy not in _SCHEDULE_OVERLAP_POLICIES:
+        if (
+            validated_overlap_policy is not None
+            and validated_overlap_policy not in _SCHEDULE_OVERLAP_POLICIES
+        ):
             raise ValueError(
                 "overlap_policy must be allow, skip, queue_after_previous, or fail_schedule"
             )
-        validate_optional_positive_int(max_fires, name="max_fires")
+        if overlap_retry_ms is not None and validated_overlap_policy != "queue_after_previous":
+            raise ValueError("overlap_retry_ms requires overlap_policy queue_after_previous")
+        _validate_optional_exact_positive_int(max_fires, name="max_fires")
         first_run = _known_first_schedule_run(
             effective_kind,
             at_ms=at_ms,
@@ -172,8 +266,10 @@ def validate_schedule_create(
         if isinstance(end_at_ms, int) and first_run is not None and end_at_ms < first_run:
             raise ValueError("end_at_ms must be at or after first run")
     else:
-        if overlap_policy is not None:
+        if validated_overlap_policy is not None:
             raise ValueError("overlap_policy is only supported for recurring schedules")
+        if overlap_retry_ms is not None:
+            raise ValueError("overlap_retry_ms requires overlap_policy queue_after_previous")
         if max_fires is not None:
             raise ValueError("max_fires is only supported for recurring schedules")
         if end_at_ms is not None:
@@ -187,8 +283,8 @@ def validate_schedule_operation(
     fire_at_ms: object | None = None,
 ) -> None:
     validate_nonempty_string(id, name="id")
-    validate_optional_nonnegative_int(now_ms, name="now_ms")
-    validate_optional_nonnegative_int(fire_at_ms, name="fire_at_ms")
+    _validate_optional_exact_nonnegative_int(now_ms, name="now_ms")
+    _validate_optional_exact_nonnegative_int(fire_at_ms, name="fire_at_ms")
 
 
 def validate_schedule_fire_due(
@@ -199,11 +295,14 @@ def validate_schedule_fire_due(
     block_ms: object | None,
     limit: object | None,
 ) -> None:
-    validate_optional_nonnegative_int(now_ms, name="now_ms")
+    _validate_optional_exact_nonnegative_int(now_ms, name="now_ms")
     validate_optional_nonempty_string(worker, name="worker")
-    validate_optional_positive_int(lease_ms, name="lease_ms")
+    validated_lease_ms = _validate_optional_exact_positive_int(lease_ms, name="lease_ms")
     validate_optional_nonnegative_int(block_ms, name="block_ms")
     validate_optional_positive_int(limit, name="limit")
+    effective_lease_ms = 30_000 if validated_lease_ms is None else validated_lease_ms
+    if isinstance(now_ms, int) and now_ms > _MAX_EXACT_INTEGER - effective_lease_ms:
+        raise ValueError("now_ms plus lease_ms exceeds the exact integer range")
 
 
 def validate_schedule_list(
@@ -218,11 +317,17 @@ def validate_schedule_list(
     rev: object | None,
 ) -> None:
     _validate_schedule_kind(kind)
-    validate_optional_nonempty_string(state, name="state")
+    validated_state = validate_optional_nonempty_string(state, name="state")
+    if validated_state is not None and validated_state not in _SCHEDULE_LIST_STATES:
+        raise ValueError(
+            "state must be active, paused, running, completed, failed, cancelled, or all"
+        )
     validate_optional_nonempty_string(timezone, name="timezone")
     validate_optional_nonempty_string(target_type, name="target_type")
-    validate_optional_nonnegative_int(from_ms, name="from_ms")
-    validate_optional_nonnegative_int(to_ms, name="to_ms")
+    _validate_optional_exact_nonnegative_int(from_ms, name="from_ms")
+    _validate_optional_exact_nonnegative_int(to_ms, name="to_ms")
+    if isinstance(from_ms, int) and isinstance(to_ms, int) and from_ms > to_ms:
+        raise ValueError("from_ms must not exceed to_ms")
     validate_optional_positive_int(count, name="count")
     validate_optional_bool(rev, name="rev")
 
@@ -250,6 +355,12 @@ def _validate_exact_positive_int(value: object, *, name: str) -> int:
     if validated > _MAX_EXACT_INTEGER:
         raise ValueError(f"{name} cannot exceed {_MAX_EXACT_INTEGER}")
     return validated
+
+
+def _validate_optional_exact_positive_int(value: object | None, *, name: str) -> int | None:
+    if value is None:
+        return None
+    return _validate_exact_positive_int(value, name=name)
 
 
 def validate_effect_reserve(

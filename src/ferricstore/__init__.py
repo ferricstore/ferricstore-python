@@ -164,7 +164,9 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "Retry": ("ferricstore.workflow_types", "Retry"),
     "RetryPolicy": ("ferricstore.retry_policy", "RetryPolicy"),
     "RoutingTopology": ("ferricstore.protocol_common", "RoutingTopology"),
-    "ScheduleResult": ("ferricstore.schedule_types", "ScheduleResult"),
+    "ScheduleFireDueResult": ("ferricstore.schedule_types", "ScheduleFireDueResult"),
+    "ScheduleFireResult": ("ferricstore.schedule_types", "ScheduleFireResult"),
+    "ScheduleRecord": ("ferricstore.schedule_types", "ScheduleRecord"),
     "StaleLeaseError": ("ferricstore.errors", "StaleLeaseError"),
     "StalePolicyGenerationError": (
         "ferricstore.errors",
@@ -302,7 +304,7 @@ if TYPE_CHECKING:
     )
     from ferricstore.protocol_negotiation import MINIMUM_SERVER_VERSION
     from ferricstore.retry_policy import RetryPolicy
-    from ferricstore.schedule_types import ScheduleResult
+    from ferricstore.schedule_types import ScheduleFireDueResult, ScheduleFireResult, ScheduleRecord
     from ferricstore.types import (
         ApprovalResult,
         BudgetPolicy,
@@ -464,7 +466,9 @@ __all__ = [
     "Retry",
     "RetryPolicy",
     "RoutingTopology",
-    "ScheduleResult",
+    "ScheduleFireDueResult",
+    "ScheduleFireResult",
+    "ScheduleRecord",
     "StaleLeaseError",
     "StalePolicyGenerationError",
     "TopologyProtocolAdapterPool",
