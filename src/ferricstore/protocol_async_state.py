@@ -159,6 +159,7 @@ class _AsyncProtocolStateMixin(ProtocolTLSContextMixin):
         self._auth_required = False
         self._authenticated = False
         self._negotiated_capabilities: Any = None
+        self._compact_stream_xadd = False
         self._events: deque[Any] = deque()
         self._events_cv = asyncio.Condition()
         self._event_error: BaseException | None = None

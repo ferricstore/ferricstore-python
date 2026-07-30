@@ -29,6 +29,7 @@ from ferricstore.protocol_constants import (
     _COMPACT_SISMEMBER_PIPELINE_MODE,
     _COMPACT_SMEMBERS_PIPELINE_MODE,
     _COMPACT_SREM_PIPELINE_MODE,
+    _COMPACT_STREAM_XADD_PIPELINE_MODE,
     _COMPACT_ZADD_PIPELINE_MODE,
     _COMPACT_ZRANGE_PIPELINE_MODE,
     _COMPACT_ZREM_PIPELINE_MODE,
@@ -62,6 +63,9 @@ from ferricstore.protocol_pipeline_codec import (
     _compact_pipeline_set_payload_from_raw,
     _compact_pipeline_two_binary_payload_from_raw,
     _compact_pipeline_zadd_payload_from_raw,
+)
+from ferricstore.protocol_pipeline_mutations import (
+    _compact_pipeline_stream_xadd_payload_from_raw,
 )
 
 
@@ -228,6 +232,7 @@ def _compact_pipeline_payload_from_raw(
     protocol_commands: Sequence[ProtocolCommand] | None = None,
     max_payload_bytes: int | None = None,
     pending_limit: int | None = None,
+    allow_stream_xadd: bool = True,
 ) -> bytes | None:
     if not commands:
         return None
@@ -259,6 +264,19 @@ def _compact_pipeline_payload_from_raw(
             max_payload_bytes=max_payload_bytes,
             pending_limit=pending_limit,
         )
+    if name == "XADD":
+        if not allow_stream_xadd:
+            return None
+        mode = _COMPACT_STREAM_XADD_PIPELINE_MODE | (0x80 if values_only else 0)
+        try:
+            return _compact_pipeline_stream_xadd_payload_from_raw(
+                commands,
+                mode,
+                max_payload_bytes=max_payload_bytes,
+                pending_limit=pending_limit,
+            )
+        except (OverflowError, struct.error):
+            return None
 
     spec = _RAW_COMPACT_PIPELINE_SPECS.get(name)
     standard_size = _raw_standard_pipeline_size(commands, name) if spec is not None else None

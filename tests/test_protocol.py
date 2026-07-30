@@ -55,6 +55,7 @@ from ferricstore.protocol import (
     encode_value,
 )
 from ferricstore.protocol_codec import MAX_VALUE_NESTING
+from ferricstore.protocol_lifecycle import PendingRequestCapacityError
 from ferricstore.protocol_pipeline_codec import (
     _blocks_forever,
     _expected_command_collection_items,
@@ -3830,6 +3831,123 @@ def test_compact_data_structure_write_pipeline_modes_keep_exact_wire_shape():
         + struct.pack(">d", 2.25)
         + binary(b"m2")
     )
+
+
+def test_compact_stream_xadd_pipeline_mode_keeps_exact_wire_shape():
+    def binary(value: bytes) -> bytes:
+        return struct.pack(">I", len(value)) + value
+
+    assert _compact_pipeline_payload_from_raw(
+        [
+            ("XADD", b"stream-a", "*", b"field", b"one"),
+            ("xadd", "stream-b", b"*", "first", "two", "second", "three"),
+        ],
+        values_only=True,
+    ) == (
+        bytes([_COMPACT_PIPELINE_REQUEST, 0x80 | 34])
+        + struct.pack(">I", 2)
+        + binary(b"stream-a")
+        + struct.pack(">H", 1)
+        + binary(b"field")
+        + binary(b"one")
+        + binary(b"stream-b")
+        + struct.pack(">H", 2)
+        + binary(b"first")
+        + binary(b"two")
+        + binary(b"second")
+        + binary(b"three")
+    )
+
+
+def test_compact_stream_xadd_pipeline_budget_matches_exact_wire_size():
+    commands = [
+        ("XADD", "stream", "*", "field", "välue"),
+        ("XADD", b"stream", b"*", b"field", b"value"),
+    ]
+    payload = _compact_pipeline_payload_from_raw(commands, values_only=True)
+
+    assert payload is not None
+    assert (
+        _compact_pipeline_payload_from_raw(
+            commands,
+            values_only=True,
+            max_payload_bytes=len(payload),
+            pending_limit=len(payload),
+        )
+        == payload
+    )
+    with pytest.raises(PendingRequestCapacityError):
+        _compact_pipeline_payload_from_raw(
+            commands,
+            values_only=True,
+            max_payload_bytes=len(payload) - 1,
+            pending_limit=len(payload) - 1,
+        )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("XADD", "stream", "1-0", "field", "value"),
+        ("XADD", "stream", "NOMKSTREAM", "*", "field", "value"),
+        ("XADD", "stream", "MAXLEN", "~", 100, "*", "field", "value"),
+        ("XADD", "stream", "*"),
+        ("XADD", "stream", "*", "field"),
+        ("XADD", "stream", "*", "field", object()),
+        ("XADD", "stream", [], "field", "value"),
+    ],
+)
+def test_compact_stream_xadd_pipeline_declines_non_fast_path_grammar(
+    command: tuple[Any, ...],
+) -> None:
+    assert _compact_pipeline_payload_from_raw([command], values_only=True) is None
+
+
+def test_protocol_submit_batch_uses_compact_stream_xadd_mode(monkeypatch):
+    monkeypatch.setattr(ProtocolAdapter, "_connect", lambda self: None)
+
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+
+        def sendall(self, data):
+            self.sent.append(data)
+
+    adapter = ProtocolAdapter("127.0.0.1", 6388, lanes=16)
+    adapter._sock = FakeSocket()
+    adapter._compact_stream_xadd = True
+
+    future = adapter.submit_batch(
+        [
+            ("XADD", "stream-a", "*", "field", "one"),
+            ("XADD", "stream-b", "*", "field", "two"),
+        ]
+    )
+
+    assert not future.done()
+    assert frame_opcodes(adapter._sock.sent[0]) == [0x000E]
+    assert adapter._sock.sent[0][24 : 24 + 6] == struct.pack(
+        ">BBI", _COMPACT_PIPELINE_REQUEST, 0x80 | 34, 2
+    )
+
+
+def test_protocol_submit_batch_keeps_generic_xadd_for_legacy_server(monkeypatch):
+    monkeypatch.setattr(ProtocolAdapter, "_connect", lambda self: None)
+
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+
+        def sendall(self, data):
+            self.sent.append(data)
+
+    adapter = ProtocolAdapter("127.0.0.1", 6388, lanes=16)
+    adapter._sock = FakeSocket()
+    adapter._compact_stream_xadd = False
+
+    adapter.submit_batch([("XADD", "stream", "*", "field", "value")])
+
+    assert adapter._sock.sent[0][24] != _COMPACT_PIPELINE_REQUEST
 
 
 def test_protocol_submit_batch_writes_one_pipeline_frame(monkeypatch):

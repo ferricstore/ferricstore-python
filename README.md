@@ -2,14 +2,14 @@
 
 Python SDK for FerricStore and FerricFlow.
 
-Status: public alpha `0.11.4`. APIs may change before `1.0`, but the SDK is
+Status: public alpha `0.11.5`. APIs may change before `1.0`, but the SDK is
 tested against command construction, queue/workflow handlers, leases, retries,
 history, indexed attributes, named values, idempotent create, worker loops,
 async flows, and local FerricStore integration scenarios.
 
-Python SDK `0.11.4` requires FerricStore `0.11.4` or newer because schedule
-responses now use the complete recurrence contract; the native wire protocol
-remains v1.
+Python SDK `0.11.5` requires FerricStore `0.11.4` or newer. With FerricStore
+0.11.5 it negotiates compact Stream mode 34 for homogeneous auto-ID `XADD`
+batches; native wire protocol v1 and the generic compatibility path remain.
 
 FerricFlow keeps each workflow or job's state and history in one durable place. It
 is an explicit durable state pipeline, not a hidden deterministic replay engine:
