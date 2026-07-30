@@ -278,15 +278,35 @@ def _decode_value_at(
         count = _read_u32(data, offset)
         offset += _U32.size
         budget.consume(count)
-        list_values = []
-        for _ in range(count):
+        if count == 3:
+            first, offset = _decode_value_at(
+                data,
+                offset,
+                depth=depth + 1,
+                budget=budget,
+            )
+            second, offset = _decode_value_at(
+                data,
+                offset,
+                depth=depth + 1,
+                budget=budget,
+            )
+            third, offset = _decode_value_at(
+                data,
+                offset,
+                depth=depth + 1,
+                budget=budget,
+            )
+            return [first, second, third], offset
+        list_values: list[Any] = [None] * count
+        for index in range(count):
             value, offset = _decode_value_at(
                 data,
                 offset,
                 depth=depth + 1,
                 budget=budget,
             )
-            list_values.append(value)
+            list_values[index] = value
         return list_values, offset
     if tag == 6:
         count = _read_u32(data, offset)

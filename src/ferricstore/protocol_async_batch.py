@@ -106,6 +106,7 @@ class AsyncProtocolBatchMixin:
                 protocol_commands=protocol_commands,
                 max_payload_bytes=max_payload_bytes,
                 pending_limit=pending_limit,
+                allow_stream_xadd=getattr(self, "_compact_stream_xadd", False),
             )
         except PendingRequestCapacityError as exc:
             raise FerricStoreError(str(exc)) from exc

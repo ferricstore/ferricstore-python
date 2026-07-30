@@ -87,7 +87,7 @@ class AsyncRecordingExecutor(RecordingExecutor):
 
 
 def test_v011_declares_minimum_server_without_changing_native_protocol_v1() -> None:
-    assert ferricstore.__version__ == "0.11.4"
+    assert ferricstore.__version__ == "0.11.5"
     assert ferricstore.MINIMUM_SERVER_VERSION == "0.11.4"
     assert _MAGIC == b"FSNP"
     assert _REQUEST_VERSION == 0x01
@@ -103,6 +103,19 @@ def test_hello_requires_and_records_policy_cas_fields() -> None:
     negotiated = parse_hello_capabilities(_hello())
 
     assert negotiated.flow_policy_set_fields >= {"replace", "expected_generation"}
+
+
+def test_hello_negotiates_stream_xadd_pipeline_mode_without_raising_server_floor() -> None:
+    legacy = parse_hello_capabilities(_hello())
+    assert legacy.compact_stream_xadd is False
+
+    advertised = _hello()
+    advertised["capabilities"]["pipeline"] = {
+        "compact_request": "pipeline_v1",
+        "values_only_mode_bit": 0x80,
+        "modes": {"stream_xadd_auto": 34},
+    }
+    assert parse_hello_capabilities(advertised).compact_stream_xadd is True
 
 
 @pytest.mark.parametrize(

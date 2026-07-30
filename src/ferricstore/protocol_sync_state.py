@@ -151,6 +151,7 @@ class _SyncProtocolStateMixin(ProtocolTLSContextMixin):
         self._auth_required = False
         self._authenticated = False
         self._negotiated_capabilities: Any = None
+        self._compact_stream_xadd = False
         self._pending_transport_bindings: dict[
             int, tuple[int, socket.socket | ssl.SSLSocket | None]
         ] = {}
@@ -490,8 +491,7 @@ class _SyncProtocolStateMixin(ProtocolTLSContextMixin):
                 listeners = list(idle_listeners)
         _notify_event_listeners(listeners)
 
-    # Implemented by ProtocolAdapter; declared here so this mixin remains
-    # independently type-checkable without importing the facade back.
+    # Facade-owned hooks keep this mixin independently type-checkable.
     def _connect(self) -> None:
         raise NotImplementedError
 

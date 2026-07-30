@@ -55,6 +55,7 @@ class NegotiatedProtocolCapabilities:
     auth_required: bool
     flow_policy_set_fields: frozenset[str]
     flow_query: FlowQueryCapabilities
+    compact_stream_xadd: bool
 
 
 def parse_hello_capabilities(value: Any) -> NegotiatedProtocolCapabilities:
@@ -82,6 +83,11 @@ def parse_hello_capabilities(value: Any) -> NegotiatedProtocolCapabilities:
         missing = ", ".join(sorted(missing_policy_fields))
         raise _incompatible_server(f"FLOW.POLICY.SET schema is missing required fields: {missing}")
     flow_query = _parse_flow_query_capabilities(capabilities, schemas)
+    pipeline = _map_get(capabilities, "pipeline")
+    modes = _map_get(pipeline, "modes") if isinstance(pipeline, dict) else None
+    compact_stream_xadd = (
+        isinstance(modes, dict) and _plain_int(_map_get(modes, "stream_xadd_auto")) == 34
+    )
 
     by_opcode: dict[int, str] = {}
     for raw_name, raw_opcodes in compact_opcodes.items():
@@ -105,6 +111,7 @@ def parse_hello_capabilities(value: Any) -> NegotiatedProtocolCapabilities:
         auth_required=auth_required,
         flow_policy_set_fields=frozenset(policy_set_fields),
         flow_query=flow_query,
+        compact_stream_xadd=compact_stream_xadd,
     )
 
 
@@ -128,6 +135,7 @@ def apply_hello_negotiation(adapter: Any, value: Any) -> NegotiatedProtocolCapab
     adapter._auth_required = negotiated.auth_required
     adapter._authenticated = not negotiated.auth_required
     adapter._negotiated_capabilities = negotiated
+    adapter._compact_stream_xadd = negotiated.compact_stream_xadd
     _reconfigure_frame_assembler(adapter)
     return negotiated
 
@@ -143,6 +151,7 @@ def reset_hello_negotiation(adapter: Any) -> None:
     adapter._auth_required = False
     adapter._authenticated = False
     adapter._negotiated_capabilities = None
+    adapter._compact_stream_xadd = False
     assembler = getattr(adapter, "_response_frame_assembler", None)
     if assembler is not None:
         assembler.clear()

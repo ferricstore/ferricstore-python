@@ -1557,6 +1557,32 @@ def test_real_ferricstore_protocol_helpers_and_diagnostics() -> None:
         client.close()
 
 
+def test_real_ferricstore_compact_stream_pipeline_spans_topics() -> None:
+    _require_protocol_transport()
+
+    client = _client()
+    prefix = f"py-sdk:stream-pipeline:{_suffix()}:"
+    first = f"{prefix}{{a}}:first"
+    second = f"{prefix}{{b}}:second"
+
+    try:
+        results = (
+            client.pipeline()
+            .command("XADD", first, "*", "field", "one")
+            .command("XADD", second, "*", "field", "two")
+            .command("XADD", first, "*", "field", "three")
+            .execute()
+        )
+
+        assert len(results) == 3
+        assert all(isinstance(result, (bytes, str)) for result in results)
+        assert client.command("XLEN", first) == 2
+        assert client.command("XLEN", second) == 1
+    finally:
+        _delete_prefixed_keys(client, prefix)
+        client.close()
+
+
 def test_real_ferricstore_raw_store_command_families() -> None:
     _require_protocol_transport()
 

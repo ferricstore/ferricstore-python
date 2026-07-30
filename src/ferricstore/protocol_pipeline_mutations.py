@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import math
+import struct
 from typing import Any
 
 from ferricstore.protocol_common import _command_name
+from ferricstore.protocol_compact_budget import _bounded_maybe_bytes, _CompactPayloadBudget
 from ferricstore.protocol_constants import (
     _COMPACT_F64,
     _COMPACT_I64,
@@ -12,6 +14,23 @@ from ferricstore.protocol_constants import (
     _COMPACT_U32,
 )
 from ferricstore.protocol_flow_codec import _compact_i64, _maybe_bytes, _raw_int
+
+_COMPACT_U16 = struct.Struct(">H")
+
+
+def _compact_stream_xadd_pair_count(command: tuple[Any, ...]) -> int | None:
+    if len(command) < 5 or (len(command) - 3) % 2 != 0:
+        return None
+    raw_name = command[0]
+    try:
+        if raw_name != "XADD" and _command_name(raw_name) != "XADD":
+            return None
+    except Exception:
+        return None
+    if command[2] != "*" and command[2] != b"*":
+        return None
+    pair_count = (len(command) - 3) // 2
+    return pair_count if pair_count <= 0xFFFF else None
 
 
 def _compact_pipeline_range_payload_from_raw(
@@ -155,9 +174,49 @@ def _compact_pipeline_zadd_payload_from_raw(
     return bytes(payload)
 
 
+def _compact_pipeline_stream_xadd_payload_from_raw(
+    commands: list[tuple[Any, ...]],
+    mode: int,
+    *,
+    max_payload_bytes: int | None = None,
+    pending_limit: int | None = None,
+) -> bytes | None:
+    budget = _CompactPayloadBudget(
+        max_payload_bytes,
+        pending_limit,
+        initial_size=_COMPACT_PIPELINE_HEADER.size,
+    )
+    payload = bytearray(
+        _COMPACT_PIPELINE_HEADER.pack(_COMPACT_PIPELINE_REQUEST, mode, len(commands))
+    )
+    pack_u16 = _COMPACT_U16.pack
+    pack_u32 = _COMPACT_U32.pack
+    extend = payload.extend
+    for command in commands:
+        pair_count = _compact_stream_xadd_pair_count(command)
+        if pair_count is None:
+            return None
+        key = _bounded_maybe_bytes(command[1], budget=budget)
+        if key is None:
+            return None
+        budget.reserve(_COMPACT_U16.size)
+        extend(pack_u32(len(key)))
+        extend(key)
+        extend(pack_u16(pair_count))
+        for index in range(3, len(command)):
+            value = _bounded_maybe_bytes(command[index], budget=budget)
+            if value is None:
+                return None
+            extend(pack_u32(len(value)))
+            extend(value)
+    return bytes(payload)
+
+
 __all__ = [
     "_compact_pipeline_hmget_payload_from_raw",
     "_compact_pipeline_hset_payload_from_raw",
     "_compact_pipeline_range_payload_from_raw",
+    "_compact_pipeline_stream_xadd_payload_from_raw",
     "_compact_pipeline_zadd_payload_from_raw",
+    "_compact_stream_xadd_pair_count",
 ]
