@@ -108,14 +108,17 @@ def test_hello_requires_and_records_policy_cas_fields() -> None:
 def test_hello_negotiates_stream_xadd_pipeline_mode_without_raising_server_floor() -> None:
     legacy = parse_hello_capabilities(_hello())
     assert legacy.compact_stream_xadd is False
+    assert legacy.compact_pubsub_publish is False
 
     advertised = _hello()
     advertised["capabilities"]["pipeline"] = {
         "compact_request": "pipeline_v1",
         "values_only_mode_bit": 0x80,
-        "modes": {"stream_xadd_auto": 34},
+        "modes": {"stream_xadd_auto": 34, "pubsub_publish": 35},
     }
-    assert parse_hello_capabilities(advertised).compact_stream_xadd is True
+    negotiated = parse_hello_capabilities(advertised)
+    assert negotiated.compact_stream_xadd is True
+    assert negotiated.compact_pubsub_publish is True
 
 
 @pytest.mark.parametrize(

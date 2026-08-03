@@ -5,7 +5,8 @@ import re
 import sys
 from pathlib import Path
 
-INTEGRATION_SERVER_VERSION = "0.11.4"
+INTEGRATION_SERVER_VERSION = "0.11.5"
+COMPATIBILITY_SERVER_VERSION = "0.11.4"
 INTEGRATION_IMAGE_PATTERN = re.compile(
     rf"ghcr\.io/ferricstore/ferricstore:{INTEGRATION_SERVER_VERSION}"
     r"@sha256:[0-9a-f]{64}"
@@ -94,12 +95,18 @@ def test_ci_fixtures_target_current_ferricstore_server_version():
     root = Path(__file__).resolve().parents[1]
     for name in (
         ".github/workflows/ci.yml",
-        ".github/workflows/extended-validation.yml",
         ".github/workflows/publish.yml",
     ):
         text = (root / name).read_text()
         assert f"ghcr.io/ferricstore/ferricstore:{INTEGRATION_SERVER_VERSION}" in text
         assert "ghcr.io/ferricstore/ferricstore:0.9.1" not in text
+
+
+def test_extended_validation_targets_minimum_compatible_server_version():
+    root = Path(__file__).resolve().parents[1]
+    text = (root / ".github/workflows/extended-validation.yml").read_text()
+    assert f' server-version: ["{COMPATIBILITY_SERVER_VERSION}"]' in text
+    assert f"ghcr.io/ferricstore/ferricstore:{COMPATIBILITY_SERVER_VERSION}@sha256:" in text
 
 
 def test_integration_fixtures_share_one_immutable_server_image():
@@ -110,7 +117,6 @@ def test_integration_fixtures_share_one_immutable_server_image():
         "docker-compose.security.yml",
         ".env.example",
         ".github/workflows/ci.yml",
-        ".github/workflows/extended-validation.yml",
         ".github/workflows/publish.yml",
     )
     images = set()
