@@ -6,12 +6,17 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
-## 0.11.5 - 2026-07-30
+## 0.11.5 - 2026-08-03
 
 - Negotiate FerricStore 0.11.5's compact Stream producer capability and encode
   homogeneous `XADD key * field value...` batches with mode 34. Servers that do
   not advertise the mode, plus explicit IDs, trimming, `NOMKSTREAM`, malformed
   pairs, and unsupported values, retain the generic native pipeline path.
+- Encode homogeneous `PUBLISH channel message` pipelines with compact mode 35
+  when advertised, otherwise retaining the generic native pipeline path.
+- Negotiate `pubsub_batch_v1` only when the server advertises the typed event
+  opcode, and expand each batch into ordered, legacy-compatible Pub/Sub messages
+  before applying client queue limits.
 - Retain FerricStore 0.11.4 as the minimum server and native wire protocol v1.
 
 ## 0.11.4 - 2026-07-28

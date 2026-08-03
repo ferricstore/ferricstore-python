@@ -2805,6 +2805,17 @@ def test_real_ferricstore_native_protocol_named_session_and_data_structure_surfa
         assert message is not None
         assert message.channel == channel
         assert message.message == {"event": 1}
+        published = (
+            producer.pipeline()
+            .command("PUBLISH", channel, producer.codec.encode({"event": 2}))
+            .command("PUBLISH", channel, producer.codec.encode({"event": 3}))
+            .execute()
+        )
+        assert len(published) == 2
+        assert [pubsub.get_message(timeout=3).message for _ in range(2)] == [
+            {"event": 2},
+            {"event": 3},
+        ]
         pubsub.unsubscribe(channel)
         pubsub.close()
 

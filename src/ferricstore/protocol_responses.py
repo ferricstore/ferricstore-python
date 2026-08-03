@@ -47,6 +47,7 @@ from ferricstore.protocol_constants import (
     _OP_MSET,
     _OP_PIPELINE,
     _OP_SET,
+    _OPCODES,
     _STATUS,
     _STATUS_OK,
     ProtocolResponse,
@@ -785,8 +786,9 @@ def _supported_compact_response_codec_names(
     return sorted(
         {
             codec_name
-            for codec_name in advertised_codecs.values()
+            for opcode, codec_name in advertised_codecs.items()
             if codec_name in _COMPACT_RESPONSE_CODEC_DECODERS
+            or (codec_name == "pubsub_batch_v1" and opcode == _OPCODES["EVENT"])
         }
     )
 

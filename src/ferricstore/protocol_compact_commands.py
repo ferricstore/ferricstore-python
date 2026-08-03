@@ -24,6 +24,7 @@ from ferricstore.protocol_constants import (
     _COMPACT_LRANGE_PIPELINE_MODE,
     _COMPACT_PIPELINE_HEADER,
     _COMPACT_PIPELINE_REQUEST,
+    _COMPACT_PUBSUB_PUBLISH_PIPELINE_MODE,
     _COMPACT_RPUSH_PIPELINE_MODE,
     _COMPACT_SADD_PIPELINE_MODE,
     _COMPACT_SISMEMBER_PIPELINE_MODE,
@@ -132,6 +133,10 @@ _RAW_COMPACT_PIPELINE_SPECS: dict[str, tuple[int, _RawPipelineEncoder]] = {
         _COMPACT_ZREM_PIPELINE_MODE,
         partial(_compact_pipeline_two_binary_payload_from_raw, name="ZREM"),
     ),
+    "PUBLISH": (
+        _COMPACT_PUBSUB_PUBLISH_PIPELINE_MODE,
+        partial(_compact_pipeline_two_binary_payload_from_raw, name="PUBLISH"),
+    ),
 }
 
 
@@ -173,6 +178,7 @@ def _raw_standard_pipeline_size(
             "SADD",
             "SREM",
             "ZREM",
+            "PUBLISH",
         }:
             if len(command) != 3 or not add_binary(command[1]) or not add_binary(command[2]):
                 return None
@@ -233,6 +239,7 @@ def _compact_pipeline_payload_from_raw(
     max_payload_bytes: int | None = None,
     pending_limit: int | None = None,
     allow_stream_xadd: bool = True,
+    allow_pubsub_publish: bool = True,
 ) -> bytes | None:
     if not commands:
         return None
@@ -277,6 +284,8 @@ def _compact_pipeline_payload_from_raw(
             )
         except (OverflowError, struct.error):
             return None
+    if name == "PUBLISH" and not allow_pubsub_publish:
+        return None
 
     spec = _RAW_COMPACT_PIPELINE_SPECS.get(name)
     standard_size = _raw_standard_pipeline_size(commands, name) if spec is not None else None

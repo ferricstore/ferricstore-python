@@ -764,6 +764,75 @@ def test_async_protocol_event_queue_is_bounded_deque():
     asyncio.run(run())
 
 
+def test_protocol_pubsub_batch_expands_before_event_queue_limit(monkeypatch):
+    monkeypatch.setattr(ProtocolAdapter, "_connect", lambda self: None)
+    adapter = ProtocolAdapter(heartbeat_interval=None, max_event_queue_size=2)
+    batch = {
+        "event": "PUBSUB_MESSAGE",
+        "at_ms": 1234,
+        "payload": {
+            "kind": "message_batch",
+            "channel": b"jobs",
+            "messages": [b"one", b"two"],
+        },
+    }
+
+    adapter._enqueue_event(batch)
+
+    assert list(adapter._events) == [
+        {
+            "event": "PUBSUB_MESSAGE",
+            "at_ms": 1234,
+            "payload": {"kind": "message", "channel": b"jobs", "message": b"one"},
+        },
+        {
+            "event": "PUBSUB_MESSAGE",
+            "at_ms": 1234,
+            "payload": {"kind": "message", "channel": b"jobs", "message": b"two"},
+        },
+    ]
+
+
+def test_protocol_pubsub_batch_overflow_does_not_partially_enqueue(monkeypatch):
+    monkeypatch.setattr(ProtocolAdapter, "_connect", lambda self: None)
+    adapter = ProtocolAdapter(heartbeat_interval=None, max_event_queue_size=2)
+    adapter._enqueue_event("existing")
+
+    with pytest.raises(FerricStoreError, match="event queue"):
+        adapter._enqueue_event(
+            {
+                "event": "PUBSUB_MESSAGE",
+                "at_ms": 1234,
+                "payload": {
+                    "kind": "message_batch",
+                    "channel": b"jobs",
+                    "messages": [b"one", b"two"],
+                },
+            }
+        )
+
+    assert list(adapter._events) == ["existing"]
+
+
+def test_async_protocol_pubsub_batch_expands_before_event_queue_limit():
+    async def run() -> None:
+        adapter = AsyncProtocolAdapter(heartbeat_interval=None, max_event_queue_size=2)
+        await adapter._enqueue_event(
+            {
+                "event": "PUBSUB_MESSAGE",
+                "at_ms": 1234,
+                "payload": {
+                    "kind": "message_batch",
+                    "channel": b"jobs",
+                    "messages": [b"one", b"two"],
+                },
+            }
+        )
+        assert [item["payload"]["message"] for item in adapter._events] == [b"one", b"two"]
+
+    asyncio.run(run())
+
+
 def test_protocol_event_listener_is_notified_on_transport_error(monkeypatch):
     monkeypatch.setattr(ProtocolAdapter, "_connect", lambda self: None)
     adapter = ProtocolAdapter(heartbeat_interval=None)
@@ -3901,6 +3970,84 @@ def test_compact_stream_xadd_pipeline_declines_non_fast_path_grammar(
     command: tuple[Any, ...],
 ) -> None:
     assert _compact_pipeline_payload_from_raw([command], values_only=True) is None
+
+
+def test_compact_pubsub_publish_pipeline_mode_keeps_exact_wire_shape():
+    def binary(value: bytes) -> bytes:
+        return struct.pack(">I", len(value)) + value
+
+    assert _compact_pipeline_payload_from_raw(
+        [
+            ("PUBLISH", b"channel-a", b"one"),
+            ("publish", "channel-b", "two"),
+        ],
+        values_only=True,
+        allow_pubsub_publish=True,
+    ) == (
+        bytes([_COMPACT_PIPELINE_REQUEST, 0x80 | 35])
+        + struct.pack(">I", 2)
+        + binary(b"channel-a")
+        + binary(b"one")
+        + binary(b"channel-b")
+        + binary(b"two")
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("PUBLISH", "channel"),
+        ("PUBLISH", "channel", "message", "extra"),
+        ("PUBLISH", object(), "message"),
+        ("PUBLISH", "channel", object()),
+    ],
+)
+def test_compact_pubsub_publish_pipeline_declines_non_fast_path_grammar(
+    command: tuple[Any, ...],
+) -> None:
+    assert (
+        _compact_pipeline_payload_from_raw([command], values_only=True, allow_pubsub_publish=True)
+        is None
+    )
+
+
+def test_compact_pubsub_publish_pipeline_budget_and_negotiation_are_exact():
+    commands = [("PUBLISH", "channel", "välue")]
+    payload = _compact_pipeline_payload_from_raw(
+        commands, values_only=True, allow_pubsub_publish=True
+    )
+
+    assert payload is not None
+    assert (
+        _compact_pipeline_payload_from_raw(
+            commands,
+            values_only=True,
+            allow_pubsub_publish=True,
+            max_payload_bytes=len(payload),
+            pending_limit=len(payload),
+        )
+        == payload
+    )
+    with pytest.raises(PendingRequestCapacityError):
+        _compact_pipeline_payload_from_raw(
+            commands,
+            values_only=True,
+            allow_pubsub_publish=True,
+            max_payload_bytes=len(payload) - 1,
+            pending_limit=len(payload) - 1,
+        )
+    assert (
+        _compact_pipeline_payload_from_raw(commands, values_only=True, allow_pubsub_publish=False)
+        is None
+    )
+
+
+def test_startup_selects_advertised_pubsub_batch_event_codec():
+    advertised = {0x0100: "flow_query_result_v1", 0x0010: "pubsub_batch_v1"}
+    assert protocol_response_module._supported_compact_response_codec_names(advertised) == [
+        "flow_query_result_v1",
+        "pubsub_batch_v1",
+    ]
 
 
 def test_protocol_submit_batch_uses_compact_stream_xadd_mode(monkeypatch):

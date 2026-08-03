@@ -9,7 +9,9 @@ async flows, and local FerricStore integration scenarios.
 
 Python SDK `0.11.5` requires FerricStore `0.11.4` or newer. With FerricStore
 0.11.5 it negotiates compact Stream mode 34 for homogeneous auto-ID `XADD`
-batches; native wire protocol v1 and the generic compatibility path remain.
+batches, compact Pub/Sub mode 35 for homogeneous `PUBLISH` pipelines, and the
+`pubsub_batch_v1` event codec for compatible subscriptions. Native wire
+protocol v1 and generic compatibility paths remain.
 
 FerricFlow keeps each workflow or job's state and history in one durable place. It
 is an explicit durable state pipeline, not a hidden deterministic replay engine:

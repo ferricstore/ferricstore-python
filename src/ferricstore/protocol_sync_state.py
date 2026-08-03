@@ -35,6 +35,7 @@ from ferricstore.protocol_constants import (
     _DEFAULT_PROTOCOL_LANES,
     ProtocolResponse,
 )
+from ferricstore.protocol_events import append_expanded_pubsub_events
 from ferricstore.protocol_framing import ResponseFrameAssembler, ResponseIdentity
 from ferricstore.protocol_lifecycle import (
     DEFAULT_MAX_BATCH_ITEMS,
@@ -151,7 +152,7 @@ class _SyncProtocolStateMixin(ProtocolTLSContextMixin):
         self._auth_required = False
         self._authenticated = False
         self._negotiated_capabilities: Any = None
-        self._compact_stream_xadd = False
+        self._compact_pubsub_publish = self._compact_stream_xadd = False
         self._pending_transport_bindings: dict[
             int, tuple[int, socket.socket | ssl.SSLSocket | None]
         ] = {}
@@ -217,11 +218,9 @@ class _SyncProtocolStateMixin(ProtocolTLSContextMixin):
         error: FerricStoreError | None = None
         with self._events_cv:
             limit = self.max_event_queue_size
-            if limit is not None and len(self._events) >= limit:
+            if not append_expanded_pubsub_events(self._events, value, limit):
                 error = FerricStoreError("protocol event queue exceeds max_event_queue_size")
                 self._event_error = error
-            else:
-                self._events.append(value)
             listeners = list(self._event_listeners)
             self._events_cv.notify_all()
         _notify_event_listeners(listeners)
