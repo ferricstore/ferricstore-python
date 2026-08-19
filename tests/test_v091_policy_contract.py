@@ -87,7 +87,7 @@ class AsyncRecordingExecutor(RecordingExecutor):
 
 
 def test_v011_declares_minimum_server_without_changing_native_protocol_v1() -> None:
-    assert ferricstore.__version__ == "0.11.5"
+    assert ferricstore.__version__ == "0.11.6"
     assert ferricstore.MINIMUM_SERVER_VERSION == "0.11.4"
     assert _MAGIC == b"FSNP"
     assert _REQUEST_VERSION == 0x01

@@ -5,10 +5,10 @@ import re
 import sys
 from pathlib import Path
 
-INTEGRATION_SERVER_VERSION = "0.11.5"
+INTEGRATION_SERVER_VERSION = "0.11.6"
 COMPATIBILITY_SERVER_VERSION = "0.11.4"
 INTEGRATION_IMAGE_PATTERN = re.compile(
-    rf"ghcr\.io/ferricstore/ferricstore:{INTEGRATION_SERVER_VERSION}"
+    rf"quay\.io/ferricstore/ferricstore:{INTEGRATION_SERVER_VERSION}"
     r"@sha256:[0-9a-f]{64}"
 )
 
@@ -86,7 +86,7 @@ def test_compose_fixtures_target_current_ferricstore_server_version():
         ".env.example",
     ):
         text = (root / name).read_text()
-        assert f"ghcr.io/ferricstore/ferricstore:{INTEGRATION_SERVER_VERSION}" in text
+        assert f"quay.io/ferricstore/ferricstore:{INTEGRATION_SERVER_VERSION}" in text
         assert "ghcr.io/ferricstore/ferricstore:0.7.2" not in text
         assert "ferricstore/ferricstore:latest" not in text
 
@@ -98,7 +98,7 @@ def test_ci_fixtures_target_current_ferricstore_server_version():
         ".github/workflows/publish.yml",
     ):
         text = (root / name).read_text()
-        assert f"ghcr.io/ferricstore/ferricstore:{INTEGRATION_SERVER_VERSION}" in text
+        assert f"quay.io/ferricstore/ferricstore:{INTEGRATION_SERVER_VERSION}" in text
         assert "ghcr.io/ferricstore/ferricstore:0.9.1" not in text
 
 
