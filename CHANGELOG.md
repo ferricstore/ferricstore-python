@@ -6,6 +6,21 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.11.8 - 2026-08-23
+
+- Keep long-lived single-request blocking commands available over HTTP, extend
+  implicit client deadlines by finite server waits, and let `BLOCK 0` disable
+  only the SDK-created default deadline while preserving caller cancellation.
+- Isolate blocking requests from independent HTTP micro-batches, preserve
+  deliberately ordered mixed pipelines, and retain bounded async capacity until
+  cancelled worker requests actually finish.
+- Reject connection-affine controls through direct, nested, and structured
+  command forms before network I/O while retaining blocking command policy for
+  gateways that implement those single-request operations.
+- Validate the native TCP integration surface against the immutable FerricStore
+  0.11.10 multi-architecture image while retaining FerricStore 0.11.4 as the
+  minimum supported server and native wire protocol v1.
+
 ## 0.11.7 - 2026-08-22
 
 - Add synchronous and asynchronous HTTP(S) transports behind the existing

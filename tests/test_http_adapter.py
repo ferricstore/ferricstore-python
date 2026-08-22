@@ -659,6 +659,157 @@ def test_async_single_commands_use_the_same_coalescing_contract() -> None:
     assert len(state.requests[0]["commands"]) == 8
 
 
+def test_coalescing_never_joins_a_blocking_command_to_an_independent_request() -> None:
+    barrier = threading.Barrier(2)
+
+    with proxy_server(command_responder) as (url, state):
+        adapter = HttpAdapter(
+            url,
+            max_connections=2,
+            coalesce_window_ms=50,
+            coalesce_max_items=2,
+        )
+
+        def execute(command: tuple[Any, ...]) -> Any:
+            barrier.wait()
+            return adapter.execute_command(*command)
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                assert list(executor.map(execute, [("BLPOP", "jobs", 0.01), ("PING",)])) == [
+                    [b"BLPOP", b"jobs", 0.01],
+                    [b"PING"],
+                ]
+        finally:
+            adapter.close()
+
+    assert len(state.requests) == 2
+    assert all(len(request["commands"]) == 1 for request in state.requests)
+
+
+def test_ordered_batch_keeps_blocking_and_normal_commands_in_one_request() -> None:
+    with proxy_server(command_responder) as (url, state):
+        adapter = HttpAdapter(url, timeout=0.05, coalesce_window_ms=50)
+        try:
+            assert adapter.execute_batch([("BLPOP", "jobs", 0.01), ("PING",)]) == [
+                [b"BLPOP", b"jobs", 0.01],
+                [b"PING"],
+            ]
+        finally:
+            adapter.close()
+
+    assert len(state.requests) == 1
+    assert len(state.requests[0]["commands"]) == 2
+
+
+def test_expired_coalesced_follower_is_not_submitted_after_its_timeout() -> None:
+    with proxy_server(command_responder) as (url, state):
+        adapter = HttpAdapter(
+            url,
+            max_connections=2,
+            coalesce_window_ms=80,
+            coalesce_max_items=3,
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                leader = executor.submit(
+                    adapter._execute_command_with_deadline,
+                    ("ECHO", "leader"),
+                    http_transport_module._HttpDeadline(1),
+                )
+                deadline = time.monotonic() + 1
+                while time.monotonic() < deadline:
+                    pending = adapter._coalescer._pending if adapter._coalescer else None
+                    if pending is not None and len(pending.calls) == 1:
+                        break
+                    time.sleep(0.001)
+                follower = executor.submit(
+                    adapter._execute_command_with_deadline,
+                    ("ECHO", "expired"),
+                    http_transport_module._HttpDeadline(0.01),
+                )
+                with pytest.raises(HttpError) as exc_info:
+                    follower.result()
+                assert exc_info.value.error_code == "transport_timeout"
+                assert leader.result() == [b"ECHO", b"leader"]
+        finally:
+            adapter.close()
+
+    assert len(state.requests) == 1
+    assert _decode_wire(state.requests[0]["commands"]) == [["ECHO", "leader"]]
+
+
+def test_async_cancelled_coalesced_follower_is_never_submitted() -> None:
+    async def run(url: str) -> Any:
+        adapter = AsyncHttpAdapter(
+            url,
+            max_connections=2,
+            max_concurrent_requests=2,
+            coalesce_window_ms=100,
+            coalesce_max_items=3,
+        )
+        try:
+            leader = asyncio.create_task(adapter.execute_command("ECHO", "leader"))
+            deadline = asyncio.get_running_loop().time() + 1
+            while asyncio.get_running_loop().time() < deadline:
+                pending = adapter._sync._coalescer._pending if adapter._sync._coalescer else None
+                if pending is not None and len(pending.calls) == 1:
+                    break
+                await asyncio.sleep(0.001)
+            follower = asyncio.create_task(adapter.execute_command("ECHO", "cancelled"))
+            while asyncio.get_running_loop().time() < deadline:
+                pending = adapter._sync._coalescer._pending if adapter._sync._coalescer else None
+                if pending is not None and len(pending.calls) == 2:
+                    break
+                await asyncio.sleep(0.001)
+            follower.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await follower
+            return await leader
+        finally:
+            await adapter.close()
+
+    with proxy_server(command_responder) as (url, state):
+        assert asyncio.run(run(url)) == [b"ECHO", b"leader"]
+
+    assert len(state.requests) == 1
+    assert _decode_wire(state.requests[0]["commands"]) == [["ECHO", "leader"]]
+
+
+def test_async_cancellation_retains_capacity_until_the_worker_finishes() -> None:
+    release = threading.Event()
+    started = threading.Event()
+
+    def responder(envelope: dict[str, Any]) -> Response:
+        started.set()
+        release.wait(1)
+        return command_responder(envelope)
+
+    async def run(url: str) -> None:
+        adapter = AsyncHttpAdapter(url, max_connections=1, max_concurrent_requests=1)
+        try:
+            blocked = asyncio.create_task(adapter.execute_command("BLPOP", "jobs", 0))
+            assert await asyncio.to_thread(started.wait, 1)
+            blocked.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await blocked
+            assert adapter._slots.locked()
+
+            ping = asyncio.create_task(adapter.execute_command("PING"))
+            await asyncio.sleep(0.01)
+            assert not ping.done()
+            release.set()
+            assert await ping == [b"PING"]
+        finally:
+            release.set()
+            await adapter.close()
+
+    with proxy_server(responder) as (url, state):
+        asyncio.run(run(url))
+
+    assert len(state.requests) == 2
+
+
 @pytest.mark.parametrize("http2", [False, True])
 def test_compact_envelope_round_trips_arbitrary_bytes_and_binary_map_keys(
     http2: bool,
@@ -790,6 +941,238 @@ def test_http_timeout_includes_waiting_for_client_capacity() -> None:
     assert time.monotonic() - started < 0.2
     assert exc_info.value.error_code == "transport_timeout"
     assert exc_info.value.safe_to_retry is True
+
+
+@pytest.mark.parametrize(
+    ("command", "minimum_timeout"),
+    [
+        (("BLMOVE", "source", "target", "LEFT", "RIGHT", 0.04), 0.05),
+        (("BLMPOP", 0.04, 1, "jobs", "LEFT"), 0.05),
+        (("BLPOP", "jobs", 0.04), 0.05),
+        (("BRPOP", "jobs", 0.04), 0.05),
+        (("BRPOPLPUSH", "source", "target", 0.04), 0.05),
+        (("BZMPOP", 0.04, 1, "scores", "MIN"), 0.05),
+        (("BZPOPMAX", "scores", 0.04), 0.05),
+        (("BZPOPMIN", "scores", 0.04), 0.05),
+        (("XREAD", "BLOCK", 40, "STREAMS", "events", "$"), 0.05),
+        (
+            (
+                "XREADGROUP",
+                "GROUP",
+                "workers",
+                "worker-1",
+                "BLOCK",
+                40,
+                "STREAMS",
+                "events",
+                ">",
+            ),
+            0.05,
+        ),
+        (("WAIT", 1, 40), 0.05),
+        (("WAITAOF", 1, 1, 40), 0.05),
+        (
+            (
+                "FLOW.CLAIM_DUE",
+                "BLOCK",
+                "STATE",
+                "BLOCK",
+                "WORKER",
+                "worker-1",
+                "LEASE_MS",
+                1_000,
+                "LIMIT",
+                1,
+                "BLOCK",
+                40,
+            ),
+            0.05,
+        ),
+        (("FLOW.SCHEDULE.FIRE_DUE", "BLOCK", 40, "LIMIT", 1), 0.05),
+        (("COMMAND_EXEC", "BLPOP", "jobs", 0.04), 0.05),
+    ],
+)
+def test_finite_blocking_commands_extend_the_default_http_deadline(
+    command: tuple[Any, ...],
+    minimum_timeout: float,
+) -> None:
+    observed: list[float | None] = []
+    adapter = HttpAdapter("https://proxy.example.com", timeout=0.02)
+
+    def request_json(
+        _method: str,
+        _path: str,
+        *,
+        body: dict[str, Any],
+        _deadline: http_transport_module._HttpDeadline,
+    ) -> tuple[int, dict[str, Any]]:
+        observed.append(_deadline.remaining())
+        return 200, {
+            "encoding": "ferricstore-json-v1",
+            "results": [{"status": "ok", "value": None} for _command in body["commands"]],
+        }
+
+    adapter._transport.request_json = request_json  # type: ignore[method-assign]
+    try:
+        assert adapter.execute_command(*command) is None
+    finally:
+        adapter.close()
+
+    assert observed[0] is not None
+    assert observed[0] >= minimum_timeout
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("BLPOP", "jobs", 0),
+        ("BZMPOP", 0, 1, "scores", "MIN"),
+        ("BZPOPMIN", "scores", 0),
+        ("XREAD", "BLOCK", 0, "STREAMS", "events", "$"),
+        (
+            "XREADGROUP",
+            "GROUP",
+            "workers",
+            "worker-1",
+            "BLOCK",
+            0,
+            "STREAMS",
+            "events",
+            ">",
+        ),
+        ("WAIT", 1, 0),
+        ("WAITAOF", 1, 1, 0),
+        ("FLOW.SCHEDULE.FIRE_DUE", "BLOCK", 0, "LIMIT", 1),
+    ],
+)
+def test_blocking_zero_disables_only_the_implicit_http_deadline(
+    command: tuple[Any, ...],
+) -> None:
+    observed: list[float | None] = []
+    adapter = HttpAdapter("https://proxy.example.com", timeout=0.01)
+
+    def request_json(
+        _method: str,
+        _path: str,
+        *,
+        body: dict[str, Any],
+        _deadline: http_transport_module._HttpDeadline,
+    ) -> tuple[int, dict[str, Any]]:
+        observed.append(_deadline.remaining())
+        return 200, {
+            "encoding": "ferricstore-json-v1",
+            "results": [{"status": "ok", "value": None} for _command in body["commands"]],
+        }
+
+    adapter._transport.request_json = request_json  # type: ignore[method-assign]
+    try:
+        assert adapter.execute_command(*command) is None
+    finally:
+        adapter.close()
+
+    assert observed == [None]
+
+
+def test_blocking_batch_aggregates_sequential_waits_but_explicit_deadline_wins() -> None:
+    observed: list[float | None] = []
+    adapter = HttpAdapter("https://proxy.example.com", timeout=0.02)
+
+    def request_json(
+        _method: str,
+        _path: str,
+        *,
+        body: dict[str, Any],
+        _deadline: http_transport_module._HttpDeadline,
+    ) -> tuple[int, dict[str, Any]]:
+        observed.append(_deadline.remaining())
+        return 200, {
+            "encoding": "ferricstore-json-v1",
+            "results": [{"status": "ok", "value": None} for _command in body["commands"]],
+        }
+
+    adapter._transport.request_json = request_json  # type: ignore[method-assign]
+    try:
+        assert adapter.execute_batch(
+            [("BLPOP", "one", 0.03), ("XREAD", "BLOCK", 40, "STREAMS", "s", "$")]
+        ) == [None, None]
+        assert adapter._execute_batch_with_deadline(
+            [("BLPOP", "one", 1)],
+            http_transport_module._HttpDeadline(0.04),
+        ) == [None]
+    finally:
+        adapter.close()
+
+    assert observed[0] is not None and observed[0] >= 0.08
+    assert observed[1] is not None and observed[1] < 0.05
+
+
+def test_nonblocking_flow_claim_zero_keeps_the_implicit_http_deadline() -> None:
+    observed: list[float | None] = []
+    adapter = HttpAdapter("https://proxy.example.com", timeout=0.02)
+
+    def request_json(
+        _method: str,
+        _path: str,
+        *,
+        body: dict[str, Any],
+        _deadline: http_transport_module._HttpDeadline,
+    ) -> tuple[int, dict[str, Any]]:
+        observed.append(_deadline.remaining())
+        return 200, {
+            "encoding": "ferricstore-json-v1",
+            "results": [{"status": "ok", "value": None} for _command in body["commands"]],
+        }
+
+    adapter._transport.request_json = request_json  # type: ignore[method-assign]
+    try:
+        assert (
+            adapter.execute_command(
+                "FLOW.CLAIM_DUE",
+                "jobs",
+                "WORKER",
+                "worker-1",
+                "LEASE_MS",
+                1_000,
+                "LIMIT",
+                1,
+                "BLOCK",
+                0,
+            )
+            is None
+        )
+    finally:
+        adapter.close()
+
+    assert observed[0] is not None and observed[0] < 0.03
+
+
+def test_async_blocking_command_uses_the_same_extended_deadline() -> None:
+    observed: list[float | None] = []
+
+    async def run() -> None:
+        adapter = AsyncHttpAdapter("https://proxy.example.com", timeout=0.01)
+
+        def request_json(
+            _method: str,
+            _path: str,
+            *,
+            body: dict[str, Any],
+            _deadline: http_transport_module._HttpDeadline,
+        ) -> tuple[int, dict[str, Any]]:
+            observed.append(_deadline.remaining())
+            return 200, {
+                "encoding": "ferricstore-json-v1",
+                "results": [{"status": "ok", "value": None} for _command in body["commands"]],
+            }
+
+        adapter._sync._transport.request_json = request_json  # type: ignore[method-assign]
+        try:
+            assert await adapter.execute_command("BLPOP", "jobs", 0.04) is None
+        finally:
+            await adapter.close()
+
+    asyncio.run(run())
+    assert observed[0] is not None and observed[0] >= 0.04
 
 
 def test_http_timeout_is_one_deadline_across_redirects() -> None:
@@ -1250,7 +1633,50 @@ def test_http_adapter_rejects_connection_affine_commands() -> None:
     assert state.requests == []
 
 
-@pytest.mark.parametrize("command", ["AUTH", "MULTI", "WATCH", "PSUBSCRIBE"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ASKING",
+        "AUTH",
+        "BACKPRESSURE",
+        "CLIENT",
+        "CLIENT.INFO",
+        "CLIENT.SETNAME",
+        "DISCARD",
+        "EVENT",
+        "EXEC",
+        "GOAWAY",
+        "HELLO",
+        "MONITOR",
+        "MULTI",
+        "OPTIONS",
+        "PIPELINE",
+        "PSUBSCRIBE",
+        "PSYNC",
+        "PUNSUBSCRIBE",
+        "QUIT",
+        "READONLY",
+        "READWRITE",
+        "REPLCONF",
+        "RESET",
+        "ROUTE",
+        "ROUTE_BATCH",
+        "SANDBOX",
+        "SELECT",
+        "SHARDS",
+        "SSUBSCRIBE",
+        "STARTUP",
+        "SUBSCRIBE",
+        "SUBSCRIBE_EVENTS",
+        "SUNSUBSCRIBE",
+        "SYNC",
+        "UNSUBSCRIBE",
+        "UNSUBSCRIBE_EVENTS",
+        "UNWATCH",
+        "WATCH",
+        "WINDOW_UPDATE",
+    ],
+)
 def test_http_adapter_rejects_every_connection_affine_command_family(command: str) -> None:
     with proxy_server(command_responder) as (url, state):
         adapter = HttpAdapter(url)
@@ -1258,6 +1684,100 @@ def test_http_adapter_rejects_every_connection_affine_command_family(command: st
             adapter.execute_command(command)
 
     assert state.requests == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "BLMOVE",
+        "BLMPOP",
+        "BLPOP",
+        "BRPOP",
+        "BRPOPLPUSH",
+        "BZMPOP",
+        "BZPOPMAX",
+        "BZPOPMIN",
+        "XREAD",
+        "XREADGROUP",
+    ],
+)
+def test_http_adapter_keeps_single_request_blocking_commands_supported(command: str) -> None:
+    with proxy_server(command_responder) as (url, state):
+        adapter = HttpAdapter(url)
+        try:
+            assert adapter.execute_command(command) == [command.encode()]
+        finally:
+            adapter.close()
+
+    assert len(state.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("COMMAND_EXEC", "MONITOR"),
+        ("COMMAND_EXEC", "COMMAND_EXEC", "READONLY"),
+        ("COMMAND_EXEC", b"SUBSCRIBE", "events", "REQUEST_CONTEXT", {"subject": "job"}),
+    ],
+)
+def test_http_adapter_rejects_wrapped_connection_affine_commands(
+    command: tuple[Any, ...],
+) -> None:
+    with proxy_server(command_responder) as (url, state):
+        adapter = HttpAdapter(url)
+        try:
+            with pytest.raises(InvalidCommandError):
+                adapter.execute_command(*command)
+        finally:
+            adapter.close()
+
+    assert state.requests == []
+
+
+def test_http_adapter_bounds_nested_command_exec_wrappers() -> None:
+    command = ("COMMAND_EXEC",) * 9 + ("GET", "key")
+
+    with proxy_server(command_responder) as (url, state):
+        adapter = HttpAdapter(url)
+        try:
+            with pytest.raises(InvalidCommandError, match="nesting"):
+                adapter.execute_command(*command)
+        finally:
+            adapter.close()
+
+    assert state.requests == []
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_http_adapter_encodes_supported_command_exec_as_a_structured_descriptor(
+    compact: bool,
+) -> None:
+    def responder(_envelope: dict[str, Any]) -> Response:
+        return 200, {"results": [{"status": "ok", "value": None}]}, {}
+
+    with proxy_server(responder) as (url, state):
+        adapter = HttpAdapter(url, compact=compact)
+        try:
+            assert (
+                adapter.execute_command(
+                    "COMMAND_EXEC",
+                    "GET",
+                    "key",
+                    "REQUEST_CONTEXT",
+                    {"subject": "worker", "scopes": ["read"]},
+                )
+                is None
+            )
+        finally:
+            adapter.close()
+
+    descriptor = state.requests[0]["commands"][0]
+    assert descriptor["command"] == "COMMAND_EXEC"
+    assert _decode_wire(descriptor["payload"]) == {
+        "command": "GET",
+        "args": ["key"],
+        "request_context": {"subject": "worker", "scopes": ["read"]},
+    }
 
 
 def test_http_adapter_lifecycle_and_url_validation() -> None:

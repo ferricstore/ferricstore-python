@@ -896,6 +896,8 @@ def test_protocol_dependency_direction_keeps_wire_code_transport_free() -> None:
 def test_http_transport_is_a_bounded_acyclic_adapter_boundary() -> None:
     limits = {
         "http_adapter": 850,
+        "http_coalescing": 300,
+        "http_command_policy": 300,
         "http_transport": 950,
         "http_connection_pool": 175,
         "http_validation": 150,

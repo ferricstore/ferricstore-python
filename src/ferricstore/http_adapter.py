@@ -8,9 +8,9 @@ import threading
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from time import monotonic
 from typing import Any, cast
 
+import ferricstore.http_command_policy as _http_command_policy
 from ferricstore.command_grammar import split_flow_value_mget
 from ferricstore.errors import (
     FerricStoreError,
@@ -19,21 +19,17 @@ from ferricstore.errors import (
     OverloadedError,
     classify_server_error,
 )
+from ferricstore.http_coalescing import CommandCoalescer
 from ferricstore.http_transport import JsonHttpTransport, _HttpDeadline
 from ferricstore.protocol_commands import build_protocol_command
 
-_HTTP_UNSUPPORTED_COMMANDS = {
-    "AUTH",
-    "DISCARD",
-    "EXEC",
-    "MULTI",
-    "PSUBSCRIBE",
-    "PUNSUBSCRIBE",
-    "SUBSCRIBE",
-    "UNSUBSCRIBE",
-    "UNWATCH",
-    "WATCH",
-}
+_command_name = _http_command_policy.command_name
+_command_values = _http_command_policy.command_values
+_effective_command_values = _http_command_policy.effective_command_values
+_effective_timeout = _http_command_policy.effective_timeout
+_is_blocking_command = _http_command_policy.is_blocking_command
+_require_http_command = _http_command_policy.require_http_command
+_unwrapped_command_values = _http_command_policy.unwrapped_command_values
 
 _HTTP_STRUCTURED_FLOW_COMMANDS = frozenset(
     {
@@ -82,129 +78,6 @@ _BINARY_ENCODING = "ferricstore-json-v1"
 _COMPACT_ENCODING = "ferricstore-msgpack-v1"
 _BYTES_TAG = "$ferricstore_bytes"
 _MAP_TAG = "$ferricstore_map"
-_UNSET = object()
-
-
-class _CoalescedCall:
-    def __init__(self, command: tuple[Any, ...], encoded: Any) -> None:
-        self.command = command
-        self.encoded = encoded
-        self.event = threading.Event()
-        self.result: Any = _UNSET
-        self.error: BaseException | None = None
-
-
-class _CoalescedBatch:
-    def __init__(self) -> None:
-        self.calls: list[_CoalescedCall] = []
-
-    def can_accept(
-        self,
-        call: _CoalescedCall,
-        *,
-        adapter: HttpAdapter,
-        max_items: int,
-        max_bytes: int,
-    ) -> bool:
-        if len(self.calls) >= max_items:
-            return False
-        if not self.calls:
-            return True
-        encoded = [existing.encoded for existing in self.calls] + [call.encoded]
-        return adapter._request_body_size(encoded) <= max_bytes
-
-    def add(self, call: _CoalescedCall) -> None:
-        self.calls.append(call)
-
-
-class _CommandCoalescer:
-    """Briefly joins independent calls without sharing their command outcomes."""
-
-    def __init__(
-        self,
-        adapter: HttpAdapter,
-        *,
-        window_ms: float,
-        max_items: int,
-        max_bytes: int,
-    ) -> None:
-        self._adapter = adapter
-        self._window_seconds = window_ms / 1_000
-        self._max_items = max_items
-        self._max_bytes = max_bytes
-        self._condition = threading.Condition()
-        self._pending: _CoalescedBatch | None = None
-
-    def execute(self, command: tuple[Any, ...], deadline: _HttpDeadline) -> Any:
-        call = _CoalescedCall(command, self._adapter._encode_command(command, 0))
-
-        with self._condition:
-            batch = self._pending
-            leader = batch is None or not batch.can_accept(
-                call,
-                adapter=self._adapter,
-                max_items=self._max_items,
-                max_bytes=self._max_bytes,
-            )
-            if leader:
-                batch = _CoalescedBatch()
-                self._pending = batch
-            if batch is None:
-                raise RuntimeError("coalescing batch was not initialized")
-            batch.add(call)
-            if len(batch.calls) >= self._max_items:
-                self._condition.notify_all()
-
-        if leader:
-            self._dispatch(batch, deadline)
-
-        try:
-            remaining = deadline.remaining()
-        except TimeoutError as exc:
-            raise _coalesced_timeout_error() from exc
-        if not call.event.wait(remaining):
-            raise _coalesced_timeout_error()
-        if call.error is not None:
-            raise call.error
-        if call.result is _UNSET:
-            raise RuntimeError("coalesced command completed without a result")
-        return call.result
-
-    def _dispatch(self, batch: _CoalescedBatch, deadline: _HttpDeadline) -> None:
-        expires_at = monotonic() + self._window_seconds
-        with self._condition:
-            while self._pending is batch and len(batch.calls) < self._max_items:
-                remaining = expires_at - monotonic()
-                try:
-                    deadline_remaining = deadline.remaining()
-                except TimeoutError:
-                    break
-                if deadline_remaining is not None:
-                    remaining = min(remaining, deadline_remaining)
-                if remaining <= 0:
-                    break
-                self._condition.wait(remaining)
-            if self._pending is batch:
-                self._pending = None
-
-        try:
-            results, binary = self._adapter._request_batch_with_deadline(
-                [call.command for call in batch.calls],
-                deadline,
-            )
-        except BaseException as exc:
-            for call in batch.calls:
-                call.error = exc
-                call.event.set()
-            return
-
-        for call, result in zip(batch.calls, results, strict=True):
-            try:
-                call.result = _command_result(result, binary=binary)
-            except BaseException as exc:
-                call.error = exc
-            finally:
-                call.event.set()
 
 
 class HttpAdapter:
@@ -284,11 +157,12 @@ class HttpAdapter:
         self._state_lock = threading.Lock()
         self.client = self
         self._coalescer = (
-            _CommandCoalescer(
+            CommandCoalescer(
                 self,
                 window_ms=self.coalesce_window_ms,
                 max_items=self.coalesce_max_items,
                 max_bytes=max_request_bytes,
+                command_result=_command_result,
             )
             if self.coalesce_window_ms > 0 and self.coalesce_max_items > 1
             else None
@@ -303,19 +177,24 @@ class HttpAdapter:
         return ("http", self._transport.base_url)
 
     def execute_command(self, *args: Any) -> Any:
-        return self._execute_command_with_deadline(args, self._transport.new_deadline())
+        return self._execute_command_with_deadline(args, self._command_deadline([args]))
 
     def _execute_command_with_deadline(
         self,
         command: tuple[Any, ...],
         deadline: _HttpDeadline,
+        cancelled: threading.Event | None = None,
     ) -> Any:
-        if self._coalescer is not None:
-            return self._coalescer.execute(command, deadline)
+        if self._coalescer is not None and not _is_blocking_command(command):
+            return self._coalescer.execute(command, deadline, cancelled)
         return self._execute_batch_with_deadline([command], deadline)[0]
 
     def execute_batch(self, commands: Sequence[Sequence[Any]]) -> list[Any]:
-        return self._execute_batch_with_deadline(commands, self._transport.new_deadline())
+        command_list = list(commands)
+        return self._execute_batch_with_deadline(
+            command_list,
+            self._command_deadline(command_list),
+        )
 
     def _execute_batch_with_deadline(
         self,
@@ -401,6 +280,11 @@ class HttpAdapter:
     def _encode_command(self, command: Sequence[Any], index: int) -> Any:
         values = _command_values(command, index)
         name = _command_name(values[0], index).upper()
+        effective_values = _effective_command_values(values, index)
+        effective_name = _command_name(effective_values[0], index).upper()
+        _require_http_command(effective_name)
+        if name == "COMMAND_EXEC":
+            return _structured_command_exec(values, index, compact=self.compact)
         if name in _HTTP_STRUCTURED_FLOW_COMMANDS:
             return _structured_flow_command(values, index, compact=self.compact)
         if self.compact:
@@ -447,6 +331,9 @@ class HttpAdapter:
             return self._slots.acquire()
         return self._slots.acquire(timeout=remaining)
 
+    def _command_deadline(self, commands: Sequence[Sequence[Any]]) -> _HttpDeadline:
+        return _HttpDeadline(_effective_timeout(commands, self._transport.timeout))
+
 
 class AsyncHttpAdapter:
     """Async command adapter backed by bounded worker-thread HTTP requests."""
@@ -478,36 +365,35 @@ class AsyncHttpAdapter:
         return ("async-http", self._sync._transport.base_url)
 
     async def execute_command(self, *args: Any) -> Any:
-        if self._sync._coalescer is None:
+        if self._sync._coalescer is None or _is_blocking_command(args):
             return (await self.execute_batch([args]))[0]
-        deadline = self._sync._transport.new_deadline()
+        deadline = self._sync._command_deadline([args])
+        cancelled = threading.Event()
         self._require_open()
         await self._acquire_slot(deadline)
-        try:
-            self._require_open()
-            return await self._submit(self._sync._execute_command_with_deadline, args, deadline)
-        finally:
-            self._slots.release()
+        return await self._submit(
+            self._sync._execute_command_with_deadline,
+            args,
+            deadline,
+            cancelled,
+            _cancelled=cancelled,
+        )
 
     async def execute_batch(self, commands: Sequence[Sequence[Any]]) -> list[Any]:
         command_list = list(commands)
         if not command_list:
             return []
-        deadline = self._sync._transport.new_deadline()
+        deadline = self._sync._command_deadline(command_list)
         self._require_open()
         await self._acquire_slot(deadline)
-        try:
-            self._require_open()
-            return cast(
-                list[Any],
-                await self._submit(
-                    self._sync._execute_batch_with_deadline,
-                    command_list,
-                    deadline,
-                ),
-            )
-        finally:
-            self._slots.release()
+        return cast(
+            list[Any],
+            await self._submit(
+                self._sync._execute_batch_with_deadline,
+                command_list,
+                deadline,
+            ),
+        )
 
     async def execute_batch_ordered(self, commands: Sequence[Sequence[Any]]) -> list[Any]:
         return await self.execute_batch(commands)
@@ -547,11 +433,32 @@ class AsyncHttpAdapter:
         except (TimeoutError, asyncio.TimeoutError) as exc:
             raise _capacity_timeout_error() from exc
 
-    async def _submit(self, operation: Callable[..., Any], *args: Any) -> Any:
-        with self._submission_lock:
-            self._require_open()
-            future = self._executor.submit(partial(operation, *args))
-        return await asyncio.wrap_future(future)
+    async def _submit(
+        self,
+        operation: Callable[..., Any],
+        *args: Any,
+        _cancelled: threading.Event | None = None,
+    ) -> Any:
+        release_slot = True
+        try:
+            with self._submission_lock:
+                self._require_open()
+                future = self._executor.submit(partial(operation, *args))
+            try:
+                return await asyncio.wrap_future(future)
+            except asyncio.CancelledError:
+                if _cancelled is not None:
+                    _cancelled.set()
+                if not future.done():
+                    release_slot = False
+                    loop = asyncio.get_running_loop()
+                    future.add_done_callback(
+                        lambda _future: loop.call_soon_threadsafe(self._slots.release)
+                    )
+                raise
+        finally:
+            if release_slot:
+                self._slots.release()
 
     def _require_open(self) -> None:
         if self._closed:
@@ -564,15 +471,6 @@ def _capacity_timeout_error() -> HttpError:
         error_code="transport_timeout",
         retryable=True,
         safe_to_retry=True,
-    )
-
-
-def _coalesced_timeout_error() -> HttpError:
-    return HttpError(
-        "FerricStore HTTP coalesced request deadline exceeded",
-        error_code="transport_timeout",
-        retryable=True,
-        safe_to_retry=False,
     )
 
 
@@ -602,34 +500,28 @@ def _json_command(command: Sequence[Any], index: int) -> list[Any]:
     encoded = [_command_name(values[0], index)] + [_json_value(value) for value in values[1:]]
     if not isinstance(encoded[0], str) or not encoded[0]:
         raise TypeError(f"HTTP command {index} name must be text")
-    command_name = encoded[0].upper()
-    if command_name in _HTTP_UNSUPPORTED_COMMANDS:
-        raise InvalidCommandError(
-            f"{command_name} requires a connection-affine native transport and "
-            "is not supported through the HTTP transport"
-        )
+    _require_http_command(encoded[0].upper())
     return encoded
 
 
 def _compact_command(command: Sequence[Any], index: int) -> list[Any]:
     values = _command_values(command, index)
     encoded = [_command_name(values[0], index)] + [_compact_value(value) for value in values[1:]]
-    command_name = encoded[0].upper()
-    if command_name in _HTTP_UNSUPPORTED_COMMANDS:
-        raise InvalidCommandError(
-            f"{command_name} requires a connection-affine native transport and "
-            "is not supported through the HTTP transport"
-        )
+    _require_http_command(encoded[0].upper())
     return encoded
 
 
-def _command_values(command: Sequence[Any], index: int) -> list[Any]:
-    if isinstance(command, (str, bytes, bytearray)):
-        raise TypeError(f"HTTP command {index} must be a sequence of command arguments")
-    values = list(command)
-    if not values:
-        raise ValueError(f"HTTP command {index} cannot be empty")
-    return values
+def _structured_command_exec(values: list[Any], index: int, *, compact: bool) -> dict[str, Any]:
+    unwrapped = _unwrapped_command_values(values, index)
+    protocol_command = build_protocol_command("COMMAND_EXEC", *unwrapped)
+    if not isinstance(protocol_command.payload, Mapping):
+        raise InvalidCommandError("COMMAND_EXEC requires a structured native payload over HTTP")
+    encode = _compact_value if compact else _json_value
+    return {
+        "command": "COMMAND_EXEC",
+        "opcode": protocol_command.opcode,
+        "payload": encode(protocol_command.payload),
+    }
 
 
 def _structured_flow_command(values: list[Any], index: int, *, compact: bool) -> dict[str, Any]:
@@ -692,19 +584,6 @@ def _compact_value(value: Any) -> Any:
             decoded[compact_key] = _compact_value(item)
         return decoded
     raise TypeError(f"HTTP command value is not MessagePack-compatible: {type(value).__name__}")
-
-
-def _command_name(value: Any, index: int) -> str:
-    if isinstance(value, str) and value:
-        return value
-    if isinstance(value, (bytes, bytearray)):
-        try:
-            decoded = bytes(value).decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise TypeError(f"HTTP command {index} name must be UTF-8 text") from exc
-        if decoded:
-            return decoded
-    raise TypeError(f"HTTP command {index} name must be text")
 
 
 def _native_value(value: Any) -> Any:
