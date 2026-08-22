@@ -299,7 +299,9 @@ def _integration_client_options() -> dict[str, Any]:
     if password is not None:
         options["password"] = password
     if ca_file is not None:
-        options["ssl_context"] = ssl.create_default_context(cafile=ca_file)
+        context = ssl.create_default_context(cafile=ca_file)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        options["ssl_context"] = context
     return options
 
 

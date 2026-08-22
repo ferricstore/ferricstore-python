@@ -744,18 +744,15 @@ class JsonHttpTransport:
             pool.release(key, connection, reusable=False)
             raise
 
-        pooled = _PooledResponse(
+        with _PooledResponse(
             response,
             url=url,
             pool=pool,
             key=key,
             connection=connection,
             deadline=deadline,
-        )
-        try:
+        ) as pooled:
             return response.status, response.headers, _read_bounded(pooled, self.max_response_bytes)
-        finally:
-            pooled.close()
 
     def _request_with_opener(
         self,

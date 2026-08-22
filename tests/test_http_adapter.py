@@ -27,7 +27,6 @@ from ferricstore.errors import (
     OverloadedError,
 )
 from ferricstore.http_connection_pool import _KeepAlivePool
-from ferricstore.http_transport import JsonHttpTransport
 
 Response = tuple[int, Any, dict[str, str]]
 
@@ -918,7 +917,7 @@ def test_http_adapter_close_closes_idle_keep_alive_connections() -> None:
 
 
 def test_http_transport_builds_basic_auth_from_existing_username_password_options() -> None:
-    transport = JsonHttpTransport(
+    transport = http_transport_module.JsonHttpTransport(
         "https://proxy.example.com",
         username="worker",
         password="secret:with:colons",
@@ -929,7 +928,9 @@ def test_http_transport_builds_basic_auth_from_existing_username_password_option
 
 
 def test_http_transport_uses_default_user_for_password_only_authentication() -> None:
-    transport = JsonHttpTransport("https://proxy.example.com", password="secret")
+    transport = http_transport_module.JsonHttpTransport(
+        "https://proxy.example.com", password="secret"
+    )
 
     encoded = base64.b64encode(b"default:secret").decode()
     assert transport.headers["Authorization"] == f"Basic {encoded}"
@@ -1315,7 +1316,7 @@ def test_custom_urllib_opener_keeps_pooling_and_http_error_contracts() -> None:
     opener = http_transport_module.build_opener(http_transport_module._PooledHTTPHandler(pool))
     try:
         with proxy_server(responder) as (url, state):
-            transport = JsonHttpTransport(url, _opener=opener)
+            transport = http_transport_module.JsonHttpTransport(url, _opener=opener)
             status, payload = transport.request_json(
                 "POST",
                 "/v1/commands",
@@ -1429,7 +1430,7 @@ def test_http2_backend_classifies_optional_dependency_and_client_errors(
 
 
 def test_transport_direct_api_edges(monkeypatch: pytest.MonkeyPatch) -> None:
-    transport = JsonHttpTransport("http://127.0.0.1:1")
+    transport = http_transport_module.JsonHttpTransport("http://127.0.0.1:1")
     try:
         with pytest.raises(RuntimeError, match="MessagePack transport was not enabled"):
             transport.request_messagepack("POST", "/v1/commands", body={})
@@ -1465,13 +1466,13 @@ def test_transport_direct_api_edges(monkeypatch: pytest.MonkeyPatch) -> None:
 )
 def test_transport_rejects_non_boolean_protocol_flags(kwargs: dict[str, Any]) -> None:
     with pytest.raises(TypeError, match="must be a boolean"):
-        JsonHttpTransport("https://example.com", **kwargs)
+        http_transport_module.JsonHttpTransport("https://example.com", **kwargs)
 
 
 def test_transport_rejects_http2_with_a_custom_opener() -> None:
     opener = http_transport_module.build_opener()
     with pytest.raises(ValueError, match="custom urllib opener"):
-        JsonHttpTransport("https://example.com", http2=True, _opener=opener)
+        http_transport_module.JsonHttpTransport("https://example.com", http2=True, _opener=opener)
 
 
 def test_error_response_fallbacks_and_retry_after_validation() -> None:
