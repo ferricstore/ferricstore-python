@@ -16,6 +16,8 @@ from typing import Any
 import msgpack
 import pytest
 
+import ferricstore.http_adapter as http_adapter_module
+import ferricstore.http_transport as http_transport_module
 from ferricstore import AsyncFlowClient, AsyncHttpAdapter, FlowClient, HttpAdapter
 from ferricstore.errors import (
     FerricStoreError,
@@ -24,6 +26,7 @@ from ferricstore.errors import (
     InvalidCommandError,
     OverloadedError,
 )
+from ferricstore.http_connection_pool import _KeepAlivePool
 from ferricstore.http_transport import JsonHttpTransport
 
 Response = tuple[int, Any, dict[str, str]]
@@ -1296,3 +1299,320 @@ def test_async_http_adapter_lifecycle_matches_sync_adapter() -> None:
 def test_http_adapters_are_publicly_constructible() -> None:
     assert HttpAdapter.__name__ == "HttpAdapter"
     assert AsyncHttpAdapter.__name__ == "AsyncHttpAdapter"
+
+
+def test_custom_urllib_opener_keeps_pooling_and_http_error_contracts() -> None:
+    calls = 0
+
+    def responder(envelope: dict[str, Any]) -> Response:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            return 503, {"error": {"code": "overload", "message": "busy"}}, {}
+        return command_responder(envelope)
+
+    pool = _KeepAlivePool(1)
+    opener = http_transport_module.build_opener(http_transport_module._PooledHTTPHandler(pool))
+    try:
+        with proxy_server(responder) as (url, state):
+            transport = JsonHttpTransport(url, _opener=opener)
+            status, payload = transport.request_json(
+                "POST",
+                "/v1/commands",
+                body={"commands": [["PING"]]},
+            )
+            assert status == 200
+            assert payload["results"][0]["status"] == "ok"
+            with pytest.raises(OverloadedError):
+                transport.request_json(
+                    "POST",
+                    "/v1/commands",
+                    body={"commands": [["PING"]]},
+                )
+    finally:
+        pool.close()
+
+    assert calls == 2
+    assert len(set(state.connection_ports)) == 1
+
+
+def test_transport_helpers_enforce_bounded_http2_responses() -> None:
+    class Response:
+        def __init__(self, headers: dict[str, str], chunks: list[bytes]) -> None:
+            self.headers = headers
+            self._chunks = chunks
+
+        def iter_bytes(self) -> Iterator[bytes]:
+            yield from self._chunks
+
+    assert (
+        http_transport_module._read_http2_bounded(
+            Response({"Content-Length": "invalid"}, [b"ab", b"cd"]),
+            4,
+        )
+        == b"abcd"
+    )
+
+    with pytest.raises(HttpError, match="max_response_bytes"):
+        http_transport_module._read_http2_bounded(
+            Response({"Content-Length": "5"}, []),
+            4,
+        )
+    with pytest.raises(HttpError, match="max_response_bytes"):
+        http_transport_module._read_http2_bounded(Response({}, [b"abc", b"de"]), 4)
+
+
+def test_http_deadline_and_transport_error_classification() -> None:
+    assert http_transport_module._HttpDeadline(None).remaining() is None
+    expired = http_transport_module._HttpDeadline(1)
+    expired._expires_at = 0
+    with pytest.raises(TimeoutError, match="deadline exceeded"):
+        expired.remaining()
+
+    timeout = http_transport_module._http_transport_error("GET", TimeoutError("late"))
+    assert timeout.error_code == "transport_timeout"
+    assert timeout.safe_to_retry is True
+    failure = http_transport_module._http_transport_error("POST", OSError("closed"))
+    assert failure.error_code == "transport_error"
+    assert failure.safe_to_retry is False
+
+
+def test_http2_backend_classifies_optional_dependency_and_client_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_import = http_transport_module.importlib.import_module
+
+    def missing_httpx(name: str) -> Any:
+        if name == "httpx":
+            raise ImportError("missing")
+        return original_import(name)
+
+    monkeypatch.setattr(http_transport_module.importlib, "import_module", missing_httpx)
+    with pytest.raises(ImportError, match="optional dependency"):
+        http_transport_module._Http2Backend(max_connections=1, ssl_context=None)
+
+    class FakeTimeout(Exception):
+        pass
+
+    class FakeHttpError(Exception):
+        pass
+
+    class FakeHttpx:
+        TimeoutException = FakeTimeout
+        HTTPError = FakeHttpError
+
+    class Client:
+        def __init__(self, error: Exception) -> None:
+            self.error = error
+
+        def build_request(self, *_args: Any, **_kwargs: Any) -> object:
+            return object()
+
+        def send(self, _request: object, *, stream: bool) -> Any:
+            assert stream is True
+            raise self.error
+
+    for error, timed_out in ((FakeTimeout("late"), True), (FakeHttpError("closed"), False)):
+        backend = http_transport_module._Http2Backend.__new__(http_transport_module._Http2Backend)
+        backend._httpx = FakeHttpx
+        backend._client = Client(error)
+        with pytest.raises(http_transport_module._Http2BackendError) as exc_info:
+            backend.request(
+                "POST",
+                "https://example.com/v1/commands",
+                headers={},
+                data=b"{}",
+                deadline=http_transport_module._HttpDeadline(1),
+                max_response_bytes=100,
+            )
+        assert exc_info.value.timed_out is timed_out
+
+
+def test_transport_direct_api_edges(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport = JsonHttpTransport("http://127.0.0.1:1")
+    try:
+        with pytest.raises(RuntimeError, match="MessagePack transport was not enabled"):
+            transport.request_messagepack("POST", "/v1/commands", body={})
+        with pytest.raises(RuntimeError, match="MessagePack transport was not enabled"):
+            transport.messagepack_size({})
+        with pytest.raises(ValueError, match="JSON-compatible"):
+            transport.request_json("POST", "/v1/commands", body={"bad": object()})
+
+        monkeypatch.setattr(
+            transport,
+            "_request_raw",
+            lambda *_args, **_kwargs: (200, {}, b"binary"),
+        )
+        assert transport.request_bytes("/artifact", headers={"X-Test": "yes"}) == b"binary"
+        monkeypatch.setattr(
+            transport,
+            "_request_raw",
+            lambda *_args, **_kwargs: (404, {}, b"not-json"),
+        )
+        with pytest.raises(HttpError) as exc_info:
+            transport.request_bytes("/missing")
+        assert exc_info.value.status_code == 404
+    finally:
+        transport.close()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"http2": "yes"},
+        {"messagepack": "yes"},
+    ],
+)
+def test_transport_rejects_non_boolean_protocol_flags(kwargs: dict[str, Any]) -> None:
+    with pytest.raises(TypeError, match="must be a boolean"):
+        JsonHttpTransport("https://example.com", **kwargs)
+
+
+def test_transport_rejects_http2_with_a_custom_opener() -> None:
+    opener = http_transport_module.build_opener()
+    with pytest.raises(ValueError, match="custom urllib opener"):
+        JsonHttpTransport("https://example.com", http2=True, _opener=opener)
+
+
+def test_error_response_fallbacks_and_retry_after_validation() -> None:
+    fallback = http_transport_module._decode_error_object(b"not-json", status_code=502)
+    assert fallback["error"]["code"] == "http_error"
+    assert fallback["raw_body"] == "not-json"
+
+    overloaded = http_transport_module._response_error(
+        "POST",
+        500,
+        {"error": {"code": "overloaded"}, "retry_after_ms": 25},
+        retry_after_ms=None,
+    )
+    assert isinstance(overloaded, OverloadedError)
+    assert overloaded.retry_after_ms == 25
+    assert http_transport_module._retry_after_ms({"Retry-After": "invalid"}) is None
+    assert http_transport_module._retry_after_ms({"Retry-After": "-1"}) is None
+    assert http_transport_module._retry_after_ms(None) is None
+
+
+@pytest.mark.parametrize("flag", ["http2", "compact"])
+def test_http_adapter_rejects_non_boolean_protocol_flags(flag: str) -> None:
+    with pytest.raises(TypeError, match="must be a boolean"):
+        HttpAdapter("https://example.com", **{flag: "yes"})
+
+
+def test_http_adapter_rejects_invalid_coalescing_limits() -> None:
+    with pytest.raises(ValueError, match="cannot exceed"):
+        HttpAdapter(
+            "https://example.com",
+            max_batch_items=1,
+            coalesce_max_items=2,
+        )
+    with pytest.raises(ValueError, match="non-negative"):
+        HttpAdapter("https://example.com", coalesce_window_ms=-1)
+
+
+def test_http_adapter_rejects_unknown_response_encoding() -> None:
+    def responder(_envelope: dict[str, Any]) -> Response:
+        return 200, {"encoding": "future-v2", "results": [{"status": "ok"}]}, {}
+
+    with proxy_server(responder) as (url, _state):
+        adapter = HttpAdapter(url)
+        with pytest.raises(HttpError) as exc_info:
+            adapter.execute_command("PING")
+
+    assert exc_info.value.error_code == "invalid_response"
+
+
+def test_http_adapter_ordered_lifecycle_and_unbounded_slot_paths() -> None:
+    with proxy_server(command_responder) as (url, state):
+        adapter = HttpAdapter(url, timeout=None, max_concurrent_requests=1)
+        assert adapter._acquire_slot(http_transport_module._HttpDeadline(None)) is True
+        adapter._slots.release()
+        assert adapter.execute_batch_ordered([("PING",)]) == [[b"PING"]]
+        assert adapter.invalidate() is None
+        adapter.close()
+        adapter.close()
+
+    assert len(state.requests) == 1
+
+
+def test_coalesced_transport_failure_is_shared_without_replaying_post() -> None:
+    adapter = HttpAdapter(
+        "http://127.0.0.1:1",
+        timeout=0.2,
+        coalesce_window_ms=1,
+        coalesce_max_items=2,
+    )
+    try:
+        with pytest.raises(HttpError) as exc_info:
+            adapter.execute_command("SET", "key", "value")
+    finally:
+        adapter.close()
+
+    assert exc_info.value.error_code == "transport_error"
+    assert exc_info.value.safe_to_retry is False
+
+
+def test_compact_command_value_and_name_edge_contracts() -> None:
+    assert http_adapter_module._compact_value(bytearray(b"value")) == b"value"
+    with pytest.raises(ValueError, match="finite"):
+        http_adapter_module._compact_value(float("nan"))
+    with pytest.raises(TypeError, match="hashable"):
+        http_adapter_module._compact_value({("key",): "value", "bad": {}} | {("x",): []})
+    with pytest.raises(TypeError, match="MessagePack-compatible"):
+        http_adapter_module._compact_value(object())
+
+    assert http_adapter_module._command_name(b"PING", 0) == "PING"
+    with pytest.raises(TypeError, match="UTF-8"):
+        http_adapter_module._command_name(b"\xff", 0)
+    with pytest.raises(TypeError, match="must be text"):
+        http_adapter_module._command_name(b"", 0)
+    with pytest.raises(TypeError, match="sequence"):
+        http_adapter_module._compact_command("PING", 0)
+    with pytest.raises(ValueError, match="cannot be empty"):
+        http_adapter_module._compact_command([], 0)
+    with pytest.raises(InvalidCommandError):
+        http_adapter_module._compact_command(["AUTH"], 0)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"$ferricstore_bytes": 123},
+        {"$ferricstore_map": "bad"},
+        {"$ferricstore_map": [["missing-value"]]},
+    ],
+)
+def test_malformed_binary_result_markers_are_rejected(value: Any) -> None:
+    with pytest.raises(HttpError) as exc_info:
+        http_adapter_module._command_result(
+            {"status": "ok", "value": value},
+            binary=True,
+        )
+    assert exc_info.value.error_code == "invalid_response"
+
+
+def test_command_result_overload_preserves_command_retry_metadata() -> None:
+    with pytest.raises(OverloadedError) as exc_info:
+        http_adapter_module._command_result(
+            {
+                "status": "error",
+                "error": {
+                    "code": "overload",
+                    "message": "busy",
+                    "retry_after_ms": 10,
+                },
+            }
+        )
+    assert exc_info.value.retry_after_ms == 10
+
+
+def test_async_http_adapter_empty_batch_invalidation_and_idempotent_close() -> None:
+    async def run() -> None:
+        adapter = AsyncHttpAdapter("http://127.0.0.1:1", timeout=None)
+        assert await adapter.execute_batch([]) == []
+        await adapter.invalidate()
+        await adapter._acquire_slot(http_transport_module._HttpDeadline(None))
+        adapter._slots.release()
+        await adapter.close()
+        await adapter.close()
+
+    asyncio.run(run())
