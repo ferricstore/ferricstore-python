@@ -41,6 +41,84 @@ Only override `max_connections`, `lanes`, `command_connections`, or
 `claim_connections` after profiling shows the client socket or Python process is
 the bottleneck.
 
+For `http://` / `https://`, the same clients use a FerricStore HTTP endpoint:
+
+```python
+client = QueueClient.from_url(
+    "https://ferricstore.example.com",
+    bearer_token="http-token",
+    timeout=10,
+    max_connections=8,
+    max_request_bytes=1024 * 1024,
+    max_response_bytes=16 * 1024 * 1024,
+    max_batch_items=1_000,
+)
+```
+
+`max_connections` bounds both concurrent HTTP requests and the actual persistent
+HTTP/TLS sockets owned by one adapter. Fully consumed responses return their
+connection to the keep-alive pool; closing the SDK client closes idle pooled
+connections. `timeout` is one end-to-end deadline for local capacity admission,
+redirects, pool checkout, connection/send work, and bounded response reading;
+each redirect does not receive a fresh timeout. `headers` can supply trusted
+gateway context headers when the endpoint is explicitly configured to accept them.
+Do not put credentials in the URL;
+use `username` and `password` for per-user HTTP ACL authentication or
+`bearer_token` for an endpoint configured with a shared static bearer. Native-only
+settings such as `lanes`, `compression`, topology seeds, and heartbeat timing
+are not accepted by the HTTP adapter. See
+[HTTP transport scope](adapters.md#http-transport-scope) for the intentional
+request/response boundary and current JSON value limitation.
+
+For an HTTP/2-capable TLS endpoint, install `ferricstore[http2]` and opt in:
+
+```python
+client = QueueClient.from_url(
+    "https://ferricstore.example.com",
+    bearer_token="http-token",
+    http2=True,
+    max_connections=1,
+    max_concurrent_requests=100,
+)
+```
+
+`max_connections` then caps physical connections while
+`max_concurrent_requests` independently bounds multiplexed in-flight requests.
+HTTP/1.1 remains the default. Without HTTP/2, concurrent requests default to
+`max_connections`; with HTTP/2 they default to 100. The remote TLS endpoint
+must advertise HTTP/2 through ALPN; the optional backend safely falls back to
+HTTP/1.1 when it does not.
+
+High-concurrency producers can opt into micro-batching of simultaneous single
+commands:
+
+```python
+client = QueueClient.from_url(
+    "https://ferricstore.example.com",
+    coalesce_window_ms=0.5,
+    coalesce_max_items=32,
+)
+```
+
+This applies only to concurrently arriving `command(...)` calls. Explicit SDK
+pipelines are already sent as one ordered HTTP batch. Coalescing is disabled by
+default because its short collection window trades latency for throughput. A
+coalesced request never exceeds `coalesce_max_items`, `max_batch_items`, or
+`max_request_bytes`, and one command error is returned only to that command's
+caller.
+
+For binary-heavy commands, install `ferricstore[compact]` and pass
+`compact=True`. This selects the endpoint's MessagePack command envelope, avoids
+JSON Base64 expansion, and keeps the same command API, limits, authentication,
+error classification, redirects, and deadlines. JSON remains the default.
+`compact=True` can be combined with HTTP/2 and coalescing.
+
+Async HTTP clients use a dedicated bounded worker executor sized to
+`max_concurrent_requests`, plus asynchronous admission before work reaches a thread.
+Queued coroutines therefore do not occupy worker threads, and unrelated work on
+the event loop's default executor does not reduce the configured HTTP
+concurrency.
+
 ## Inheritance
 
 Configuration is inherited in this order:

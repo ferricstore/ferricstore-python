@@ -22,7 +22,9 @@ def native_is_ready(url: str) -> bool:
         kwargs = {}
         ca_file = os.environ.get("FERRICSTORE_TLS_CA_FILE")
         if ca_file:
-            kwargs["ssl_context"] = ssl.create_default_context(cafile=ca_file)
+            context = ssl.create_default_context(cafile=ca_file)
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            kwargs["ssl_context"] = context
         client = FlowClient.from_url(url, timeout=1.0, **kwargs)
         try:
             return client.command("PING") in (b"PONG", "PONG")

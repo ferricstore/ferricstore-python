@@ -124,6 +124,33 @@ class OverloadedError(FerricStoreError):
         self.reason = reason
 
 
+class HttpError(FerricStoreError):
+    """Raised when a FerricStore HTTP endpoint rejects a request."""
+
+    code = "http_error"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_code: str | None = None,
+        raw: Any = None,
+        retryable: bool | None = None,
+        safe_to_retry: bool | None = None,
+        retry_after_ms: int | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            raw=raw,
+            retryable=retryable,
+            safe_to_retry=safe_to_retry,
+            retry_after_ms=retry_after_ms,
+        )
+        self.status_code = status_code
+        self.error_code = error_code
+
+
 def classify_server_error(
     message: str,
     *,

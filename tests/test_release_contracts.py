@@ -49,9 +49,33 @@ def test_publish_requires_tag_validation_and_live_integration() -> None:
     assert "workflow_dispatch:" not in workflow
     assert "scripts/check_release_version.py" in workflow
     assert "integration:" in workflow
-    assert 'FERRICSTORE_INTEGRATION: "1"' in workflow
-    assert "FERRICSTORE_WAIT_STABLE_SECONDS=15" in workflow
+    assert "scripts/run_native_integration.sh" in workflow
     assert "needs: [build, integration]" in workflow
+
+
+def test_native_integration_runner_uses_an_isolated_docker_network() -> None:
+    runner = (REPOSITORY / "scripts" / "run_native_integration.sh").read_text()
+
+    assert "FERRICSTORE_NATIVE_ADVERTISE_HOST:-ferricstore" in runner
+    assert "FERRICSTORE_NATIVE_ADVERTISE_PORT:-6388" in runner
+    assert '--network "$network_name"' in runner
+    assert "FERRICSTORE_INTEGRATION=1" in runner
+    assert "FERRICSTORE_URL=ferric://ferricstore:6388" in runner
+
+    for workflow_name in ("ci.yml", "publish.yml"):
+        workflow = (REPOSITORY / ".github" / "workflows" / workflow_name).read_text()
+        assert "scripts/run_native_integration.sh" in workflow
+        assert 'FERRICSTORE_URL: "ferric://127.0.0.1:6388"' not in workflow
+
+
+def test_http_redirect_responsibility_is_documented_without_disabling_redirects() -> None:
+    adapters = (REPOSITORY / "docs" / "adapters.md").read_text()
+    security = (REPOSITORY / "docs" / "security.md").read_text()
+
+    assert "Standard HTTP redirects remain enabled" in adapters
+    assert "authorization headers" in adapters
+    assert "Standard HTTP redirects remain enabled" in security
+    assert "every redirect destination" in security
 
 
 def test_native_integration_coverage_is_observation_based() -> None:

@@ -2,7 +2,10 @@
 
 This guide covers the public Python SDK surface and when to use each layer.
 
-FerricStore Python SDK uses the native `ferric://` / `ferrics://` protocol. It defaults to one multiplexed connection with 8 request lanes. The SDK gives typed helpers for FerricFlow and FerricStore commands, while still letting you call lower-level data-structure commands through one passthrough method.
+FerricStore Python SDK supports direct native `ferric://` / `ferrics://`
+connections and `http://` / `https://` connections through a FerricStore HTTP
+endpoint. The URL changes the network adapter, not the typed command API. Native
+connections default to one multiplexed connection with 8 request lanes.
 
 If you are new, start with [Quickstart](quickstart.md). If you need
 production-style examples for sagas, IoT fanout, AI orchestration, human
@@ -21,7 +24,7 @@ approval, webhooks, or batch fanout, read [Use Case Examples](use-cases.md).
 | Protocol FerricStore commands | `cas`, `lock`, `ratelimit_add`, `fetch_or_compute`, `key_info`, cluster/admin helpers |
 | Data-structure commands | typed helpers such as `kv_set`, `hash_set`, `list_push`, or `client.command(...)` |
 | Payload codecs | `RawCodec`, `JsonCodec` |
-| Transport adapter | native protocol adapter, or a custom `CommandExecutor` for tests/advanced embedding |
+| Transport adapter | native TCP/TLS, HTTP endpoint, or a custom `CommandExecutor` |
 
 For production deployment defaults, worker sizing, lease/reclaim policy,
 observability, graceful shutdown, and security guidance, read
@@ -50,7 +53,22 @@ from ferricstore import WorkflowClient
 client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 ```
 
-`from_url` uses the native FerricStore protocol adapter. URLs must use `ferric://` or `ferrics://`.
+`from_url` selects the adapter from the scheme:
+
+```python
+http_client = WorkflowClient.from_url(
+    "https://ferricstore.example.com",
+    bearer_token="http-token",
+)
+```
+
+Both clients build the same commands. The HTTP adapter posts them to
+`/v1/commands`; the endpoint dispatches them through FerricStore's stateless
+command gateway.
+HTTP intentionally covers bounded request/response operations. Live or
+connection-affine sessions remain native-only, and the current JSON envelope
+uses a tagged binary-safe encoding for arbitrary bytes and map keys. See
+[HTTP transport scope](adapters.md#http-transport-scope).
 
 Use JSON payloads when you want language-neutral structured values:
 

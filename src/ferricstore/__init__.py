@@ -14,6 +14,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "AsyncCommandPipeline": ("ferricstore.async_client_sessions", "AsyncCommandPipeline"),
     "AsyncFlowClient": ("ferricstore.async_client_core", "AsyncFlowClient"),
+    "AsyncHttpAdapter": ("ferricstore.http_adapter", "AsyncHttpAdapter"),
     "AsyncProtocolAdapter": ("ferricstore.protocol_async", "AsyncProtocolAdapter"),
     "AsyncProtocolAdapterPool": (
         "ferricstore.protocol_async_pool",
@@ -131,6 +132,8 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "FlowWorkflow": ("ferricstore.workflow_runtime", "FlowWorkflow"),
     "FlowWrongStateError": ("ferricstore.errors", "FlowWrongStateError"),
     "GovernanceOverview": ("ferricstore.types", "GovernanceOverview"),
+    "HttpAdapter": ("ferricstore.http_adapter", "HttpAdapter"),
+    "HttpError": ("ferricstore.errors", "HttpError"),
     "InvalidCommandError": ("ferricstore.errors", "InvalidCommandError"),
     "JsonCodec": ("ferricstore.codecs", "JsonCodec"),
     "KeyInfo": ("ferricstore.types", "KeyInfo"),
@@ -251,6 +254,7 @@ if TYPE_CHECKING:
         FlowAlreadyExistsError,
         FlowNotFoundError,
         FlowWrongStateError,
+        HttpError,
         InvalidCommandError,
         LockHeldError,
         LockNotOwnedError,
@@ -289,6 +293,7 @@ if TYPE_CHECKING:
         FlowQueryResult,
         FlowQueryUsage,
     )
+    from ferricstore.http_adapter import AsyncHttpAdapter, HttpAdapter
     from ferricstore.policy_types import PolicySnapshot
     from ferricstore.protocol import (
         AsyncProtocolAdapter,
@@ -368,6 +373,7 @@ __all__ = [
     "AsyncCommandPipeline",
     "AsyncFlowClient",
     "AsyncFlowQueryCommandExecutor",
+    "AsyncHttpAdapter",
     "AsyncProtocolAdapter",
     "AsyncProtocolAdapterPool",
     "AsyncProtocolPipeline",
@@ -440,6 +446,8 @@ __all__ = [
     "FlowWorkflow",
     "FlowWrongStateError",
     "GovernanceOverview",
+    "HttpAdapter",
+    "HttpError",
     "InvalidCommandError",
     "JsonCodec",
     "KeyInfo",

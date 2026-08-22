@@ -29,7 +29,7 @@ docker run --name ferricstore-dev \
   -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore-dev-data:/data \
-  ghcr.io/ferricstore/ferricstore:0.11.4
+  quay.io/ferricstore/ferricstore:0.11.6
 ```
 
 This starts one local FerricStore server on:
@@ -65,11 +65,19 @@ pytest
 Unit tests use fake command executors and do not require the server. Integration
 or benchmark runs need a local FerricStore server.
 
-Run the integration test against the Compose server:
+Run the native integration suite with its isolated Docker network:
 
 ```bash
-FERRICSTORE_INTEGRATION=1 pytest tests/integration
-FERRICSTORE_INTEGRATION=1 FERRICSTORE_URL=ferric://127.0.0.1:6388 pytest tests/integration
+scripts/run_native_integration.sh
+```
+
+The runner starts the pinned FerricStore image, executes the Python SDK tests in
+the same Compose network, and removes the stack afterward. This also avoids
+Docker Desktop host-port forwarding issues with native protocol frames. Pass a
+test path or normal pytest selectors to narrow a run:
+
+```bash
+scripts/run_native_integration.sh tests/integration/test_ferricstore_integration.py -k topology
 ```
 
 ## Stop local services

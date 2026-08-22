@@ -25,7 +25,9 @@ def _plain_url() -> str:
 
 
 def _context() -> ssl.SSLContext:
-    return ssl.create_default_context(cafile=os.environ["FERRICSTORE_TLS_CA_FILE"])
+    context = ssl.create_default_context(cafile=os.environ["FERRICSTORE_TLS_CA_FILE"])
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    return context
 
 
 def test_tls_verification_and_plaintext_rejection() -> None:

@@ -893,6 +893,37 @@ def test_protocol_dependency_direction_keeps_wire_code_transport_free() -> None:
         assert _top_level_imports(module).isdisjoint(forbidden), module
 
 
+def test_http_transport_is_a_bounded_acyclic_adapter_boundary() -> None:
+    limits = {
+        "http_adapter": 850,
+        "http_transport": 950,
+        "http_connection_pool": 175,
+        "http_validation": 150,
+        "http_compact_codec": 100,
+    }
+    oversized = {
+        module: (_module_lines(module), limit)
+        for module, limit in limits.items()
+        if _module_lines(module) > limit
+    }
+
+    assert not oversized
+    _assert_acyclic_modules(set(limits))
+
+    native_socket_modules = {
+        "ferricstore.protocol_sync",
+        "ferricstore.protocol_sync_pool",
+        "ferricstore.protocol_sync_topology",
+        "ferricstore.protocol_async",
+        "ferricstore.protocol_async_pool",
+        "ferricstore.protocol_async_topology",
+    }
+    assert _top_level_imports("http_adapter").isdisjoint(native_socket_modules)
+    assert _top_level_imports("http_transport").isdisjoint(native_socket_modules)
+    assert "ferricstore.protocol_commands" in _top_level_imports("http_adapter")
+    assert "ferricstore.http_adapter" not in _top_level_imports("http_transport")
+
+
 def test_client_components_do_not_depend_on_compatibility_facade() -> None:
     for module in (
         "client_claim_options",

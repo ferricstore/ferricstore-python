@@ -36,18 +36,25 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+compact = [
+  "msgpack>=1.2.1,<2",
+]
 dev = [
   "bandit[toml]>=1.8,<2",
   "build>=1.2,<2",
   "hypothesis>=6,<7",
+  "httpx[http2]>=0.28.1,<1",
   "pip-audit>=2.9,<3",
   "pytest>=9.0.3,<10",
   "pytest-cov>=6,<8",
-  "ruff==0.16.0",
+  "ruff==0.16.4",
   "mypy>=1.11",
   "msgpack>=1.2.1,<2",
   "twine>=7,<8",
   "tomli>=2,<3; python_version < '3.11'",
+]
+http2 = [
+  "httpx[http2]>=0.28.1,<1",
 ]
 
 [project.urls]
@@ -130,6 +137,8 @@ skip_covered = false
 "src/ferricstore/flow_query_retry.py" = 95.0
 "src/ferricstore/flow_query_selectors.py" = 100.0
 "src/ferricstore/flow_query_types.py" = 100.0
+"src/ferricstore/http_adapter.py" = 90.0
+"src/ferricstore/http_transport.py" = 75.0
 "src/ferricstore/lifecycle_core.py" = 80.0
 "src/ferricstore/protocol_codec.py" = 78.0
 "src/ferricstore/protocol_command_schema.py" = 97.0

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ssl
 import threading
 import time
 from types import SimpleNamespace
@@ -857,25 +858,20 @@ def test_cross_shard_routing_stops_at_the_first_mismatch() -> None:
 @pytest.mark.parametrize("adapter_type", [ProtocolAdapter, AsyncProtocolAdapter])
 def test_default_tls_context_is_cached_across_reconnects(
     adapter_type: type[ProtocolAdapter] | type[AsyncProtocolAdapter],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sentinel = object()
-    calls = 0
-
-    def create_default_context() -> object:
-        nonlocal calls
-        calls += 1
-        return sentinel
-
-    monkeypatch.setattr("ssl.create_default_context", create_default_context)
     adapter = object.__new__(adapter_type)
     adapter.tls = True
     adapter.ssl_context = None
     adapter._default_ssl_context = None
 
-    assert adapter._tls_context() is sentinel
-    assert adapter._tls_context() is sentinel
-    assert calls == 1
+    context = adapter._tls_context()
+
+    assert context is not None
+    assert adapter._tls_context() is context
+    assert context.protocol == ssl.PROTOCOL_TLS_CLIENT
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname is True
+    assert context.minimum_version is ssl.TLSVersion.TLSv1_2
 
 
 @pytest.mark.parametrize(

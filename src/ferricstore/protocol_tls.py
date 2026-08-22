@@ -10,6 +10,13 @@ class _TLSContextHost(Protocol):
     _default_ssl_context: ssl.SSLContext | None
 
 
+def _create_default_tls_context() -> ssl.SSLContext:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_default_certs()
+    return context
+
+
 class ProtocolTLSContextMixin:
     """Lazily create one default TLS context per adapter lifetime."""
 
@@ -24,7 +31,7 @@ class ProtocolTLSContextMixin:
         if context is None:
             context = self._default_ssl_context
             if context is None:
-                context = ssl.create_default_context()
+                context = _create_default_tls_context()
                 self._default_ssl_context = context
         return context
 
