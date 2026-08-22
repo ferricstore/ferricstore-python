@@ -1,6 +1,6 @@
 services:
   ferricstore:
-    image: ${FERRICSTORE_IMAGE:-quay.io/ferricstore/ferricstore:0.11.6@sha256:0d615217030ecfc3bb21109109d4dd23fd615b994d2e3b28e037692dce937fdf}
+    image: ${FERRICSTORE_IMAGE:-quay.io/ferricstore/ferricstore:0.11.8@sha256:d472b337fcec536b46e4ba7549689bc5c7fc67948071f6e39cc13ca0e8879ce2}
     environment:
       FERRICSTORE_PROTECTED_MODE: "false"
       FERRICSTORE_FLOW_SCHEDULER_ENABLED: "false"

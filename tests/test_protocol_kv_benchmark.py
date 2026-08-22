@@ -1,4 +1,5 @@
 import importlib.util
+import time
 from concurrent.futures import Future
 from pathlib import Path
 
@@ -862,6 +863,9 @@ def test_protocol_kv_test_time_runs_until_deadline(monkeypatch):
 
     class FakeAdapter:
         def __init__(self):
+            # Setup may legitimately exceed a very short measurement window;
+            # the benchmark duration starts only after the adapter is ready.
+            time.sleep(0.02)
             self.batches = []
             created.append(self)
 

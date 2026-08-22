@@ -2,13 +2,13 @@
 
 Python SDK for FerricStore and FerricFlow.
 
-Status: public alpha `0.11.6`. APIs may change before `1.0`, but the SDK is
+Status: public alpha `0.11.7`. APIs may change before `1.0`, but the SDK is
 tested against command construction, queue/workflow handlers, leases, retries,
 history, indexed attributes, named values, idempotent create, worker loops,
 async flows, and local FerricStore integration scenarios.
 
-Python SDK `0.11.6` requires FerricStore `0.11.4` or newer. With FerricStore
-0.11.6 it negotiates compact Stream mode 34 for homogeneous auto-ID `XADD`
+Python SDK `0.11.7` requires FerricStore `0.11.4` or newer. With FerricStore
+0.11.8 it negotiates compact Stream mode 34 for homogeneous auto-ID `XADD`
 batches, compact Pub/Sub mode 35 for homogeneous `PUBLISH` pipelines, and the
 `pubsub_batch_v1` event codec for compatible subscriptions. Native wire
 protocol v1 and generic compatibility paths remain.
