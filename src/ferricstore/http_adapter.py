@@ -37,6 +37,7 @@ _HTTP_UNSUPPORTED_COMMANDS = {
 
 _HTTP_STRUCTURED_FLOW_COMMANDS = frozenset(
     {
+        "FLOW.QUERY",
         "FLOW.VALUE.MGET",
         "FLOW.STEP_CONTINUE",
         "FLOW.START_AND_CLAIM",
@@ -755,6 +756,8 @@ def _command_result(result: Any, *, binary: bool = False) -> Any:
     retry_after_ms = (
         retry_after_value if isinstance(retry_after_value, int) and retry_after_value >= 0 else None
     )
+    retryable = details.get("retryable") is True
+    safe_to_retry = details.get("safe_to_retry") is True
     if code in {"overload", "overloaded"}:
         raise OverloadedError(
             message,
@@ -776,8 +779,8 @@ def _command_result(result: Any, *, binary: bool = False) -> Any:
     raise classify_server_error(
         message,
         raw=result,
-        retryable=False,
-        safe_to_retry=False,
+        retryable=retryable,
+        safe_to_retry=safe_to_retry,
         retry_after_ms=retry_after_ms,
     )
 
