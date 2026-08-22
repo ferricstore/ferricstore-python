@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ssl
 import threading
 import time
 from types import SimpleNamespace
@@ -859,10 +860,10 @@ def test_default_tls_context_is_cached_across_reconnects(
     adapter_type: type[ProtocolAdapter] | type[AsyncProtocolAdapter],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sentinel = object()
+    sentinel = SimpleNamespace(minimum_version=None)
     calls = 0
 
-    def create_default_context() -> object:
+    def create_default_context() -> Any:
         nonlocal calls
         calls += 1
         return sentinel
@@ -875,6 +876,7 @@ def test_default_tls_context_is_cached_across_reconnects(
 
     assert adapter._tls_context() is sentinel
     assert adapter._tls_context() is sentinel
+    assert sentinel.minimum_version is ssl.TLSVersion.TLSv1_2
     assert calls == 1
 
 

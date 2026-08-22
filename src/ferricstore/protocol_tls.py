@@ -25,6 +25,7 @@ class ProtocolTLSContextMixin:
             context = self._default_ssl_context
             if context is None:
                 context = ssl.create_default_context()
+                context.minimum_version = ssl.TLSVersion.TLSv1_2
                 self._default_ssl_context = context
         return context
 
