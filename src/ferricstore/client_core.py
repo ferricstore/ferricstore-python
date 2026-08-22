@@ -69,8 +69,22 @@ class _ClientCoreMixin(_ClientMixinBase):
         backpressure: BackpressurePolicy | None = None,
         **kwargs: Any,
     ) -> FlowClient:
-        if urlparse(url).scheme.lower() not in {"ferric", "ferrics"}:
-            raise ValueError("FerricStore SDK URLs must use ferric:// or ferrics://")
+        scheme = urlparse(url).scheme.lower()
+        if scheme in {"http", "https"}:
+            from ferricstore.http_adapter import HttpAdapter
+
+            return cast(
+                FlowClient,
+                cls(
+                    HttpAdapter.from_url(url, **kwargs),
+                    codec=codec,
+                    backpressure=backpressure,
+                ),
+            )
+        if scheme not in {"ferric", "ferrics"}:
+            raise ValueError(
+                "FerricStore SDK URLs must use ferric://, ferrics://, http://, or https://"
+            )
 
         from ferricstore.protocol import ProtocolAdapterPool
 
@@ -95,7 +109,10 @@ class _ClientCoreMixin(_ClientMixinBase):
         resolved_urls = validate_string_sequence(urls, name="urls", allow_empty=False)
         for url in resolved_urls:
             if urlparse(url).scheme.lower() not in {"ferric", "ferrics"}:
-                raise ValueError("FerricStore SDK URLs must use ferric:// or ferrics://")
+                raise ValueError(
+                    "from_urls() supports native ferric:// or ferrics:// topology seeds; "
+                    "use from_url() for one HTTP endpoint"
+                )
 
         from ferricstore.protocol import ProtocolAdapterPool
 

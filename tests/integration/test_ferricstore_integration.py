@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import ssl
 import subprocess
 import threading
 import time
@@ -69,7 +70,7 @@ _NATIVE_PROTOCOL_COMMANDS: set[str] = set(
     FLOW.SCHEDULE.FIRE FLOW.SCHEDULE.FIRE_DUE FLOW.SCHEDULE.GET FLOW.SCHEDULE.LIST
     FLOW.SCHEDULE.PAUSE FLOW.SCHEDULE.RESUME FLOW.SIGNAL FLOW.SPAWN_CHILDREN
     FLOW.START_AND_CLAIM FLOW.STATS FLOW.STEP_CONTINUE
-    FLOW.TRANSITION FLOW.TRANSITION_MANY FLOW.VALUE.PUT FLUSHALL FLUSHDB GEOADD
+    FLOW.TRANSITION FLOW.TRANSITION_MANY FLOW.VALUE.MGET FLOW.VALUE.PUT FLUSHALL FLUSHDB GEOADD
     GEODIST GEOHASH GEOPOS GEOSEARCH GEOSEARCHSTORE GET GETBIT GETDEL GETEX
     GETRANGE GETSET HDEL HELLO HEXISTS HEXPIRE HEXPIRETIME HGET HGETALL HGETDEL
     HGETEX HINCRBY HINCRBYFLOAT HKEYS HLEN HMGET HPERSIST HPEXPIRE HPTTL
@@ -266,6 +267,7 @@ def _client() -> FlowClient:
         FlowClient.from_url(
             _integration_url(),
             codec=JsonCodec(),
+            **_integration_client_options(),
         )
     )
 
@@ -282,6 +284,23 @@ def _topology_client() -> FlowClient:
 
 def _integration_url() -> str:
     return os.environ.get("FERRICSTORE_URL", "ferric://127.0.0.1:6388")
+
+
+def _integration_client_options() -> dict[str, Any]:
+    if not _integration_url().startswith(("http://", "https://")):
+        return {}
+
+    options: dict[str, Any] = {}
+    username = os.environ.get("FERRICSTORE_USERNAME")
+    password = os.environ.get("FERRICSTORE_PASSWORD")
+    ca_file = os.environ.get("FERRICSTORE_CA_FILE")
+    if username is not None:
+        options["username"] = username
+    if password is not None:
+        options["password"] = password
+    if ca_file is not None:
+        options["ssl_context"] = ssl.create_default_context(cafile=ca_file)
+    return options
 
 
 def _integration_urls() -> list[str]:
@@ -416,7 +435,8 @@ def _wait_cluster_synced(*, minimum_members: int = 3, timeout: float = 120.0) ->
 
 
 def _require_protocol_transport() -> None:
-    if not _integration_url().startswith(("ferric://", "ferrics://")):
+    http_coverage = os.environ.get("FERRICSTORE_HTTP_COMMAND_COVERAGE") == "1"
+    if not http_coverage and not _integration_url().startswith(("ferric://", "ferrics://")):
         pytest.skip("native protocol coverage runs with FERRICSTORE_URL=ferric://...")
 
 
@@ -424,10 +444,16 @@ def _require_protocol_transport() -> None:
 def _assert_observed_native_protocol_coverage() -> Any:
     with _NATIVE_PROTOCOL_INTEGRATION_OBSERVED_LOCK:
         _NATIVE_PROTOCOL_INTEGRATION_OBSERVED.clear()
-    if os.environ.get("FERRICSTORE_SKIP_CATALOG_COVERAGE") == "1":
-        yield
-        return
     yield
+
+    observed_path = os.environ.get("FERRICSTORE_OBSERVED_COMMANDS_FILE")
+    if observed_path:
+        with _NATIVE_PROTOCOL_INTEGRATION_OBSERVED_LOCK:
+            observed = sorted(_NATIVE_PROTOCOL_INTEGRATION_OBSERVED)
+        Path(observed_path).write_text("\n".join(observed) + "\n", encoding="utf-8")
+
+    if os.environ.get("FERRICSTORE_SKIP_CATALOG_COVERAGE") == "1":
+        return
 
     if not _integration_url().startswith(("ferric://", "ferrics://")):
         return
@@ -2359,6 +2385,8 @@ def test_real_ferricstore_native_protocol_flow_admin_surface() -> None:
         assert client.limit_get(limit_scope, now_ms=now + 28) is not None
         assert isinstance(client.limit_list(scope=limit_scope, limit=10, now_ms=now + 29), list)
         assert isinstance(client.governance_overview(limit=10), object)
+        assert client.query_indexes() is not None
+        assert isinstance(client.retention_cleanup(limit=10), dict)
     finally:
         client.close()
 

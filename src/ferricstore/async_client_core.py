@@ -78,8 +78,22 @@ class _AsyncClientCoreMixin(_AsyncClientMixinBase):
         backpressure: BackpressurePolicy | None = None,
         **kwargs: Any,
     ) -> AsyncFlowClient:
-        if urlparse(url).scheme.lower() not in {"ferric", "ferrics"}:
-            raise ValueError("FerricStore SDK URLs must use ferric:// or ferrics://")
+        scheme = urlparse(url).scheme.lower()
+        if scheme in {"http", "https"}:
+            from ferricstore.http_adapter import AsyncHttpAdapter
+
+            return cast(
+                "AsyncFlowClient",
+                cls(
+                    AsyncHttpAdapter.from_url(url, **kwargs),
+                    codec=codec,
+                    backpressure=backpressure,
+                ),
+            )
+        if scheme not in {"ferric", "ferrics"}:
+            raise ValueError(
+                "FerricStore SDK URLs must use ferric://, ferrics://, http://, or https://"
+            )
 
         from ferricstore.protocol import AsyncProtocolAdapterPool
 
@@ -104,7 +118,10 @@ class _AsyncClientCoreMixin(_AsyncClientMixinBase):
         resolved_urls = validate_string_sequence(urls, name="urls", allow_empty=False)
         for url in resolved_urls:
             if urlparse(url).scheme.lower() not in {"ferric", "ferrics"}:
-                raise ValueError("FerricStore SDK URLs must use ferric:// or ferrics://")
+                raise ValueError(
+                    "from_urls() supports native ferric:// or ferrics:// topology seeds; "
+                    "use from_url() for one HTTP endpoint"
+                )
 
         from ferricstore.protocol import AsyncProtocolAdapterPool
 

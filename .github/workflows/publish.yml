@@ -72,36 +72,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
-          cache: pip
-
-      - name: Install package
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
-
-      - name: Start FerricStore
-        run: |
-          docker compose up -d ferricstore
-          FERRICSTORE_PORT=6388 FERRICSTORE_WAIT_STABLE_SECONDS=15 \
-            python scripts/wait_for_ferricstore.py
-
       - name: Run native integration tests
-        run: python -m pytest tests/integration
-        env:
-          FERRICSTORE_INTEGRATION: "1"
-          FERRICSTORE_URL: "ferric://127.0.0.1:6388"
-
-      - name: FerricStore logs
-        if: always()
-        run: docker compose logs ferricstore
-
-      - name: Stop FerricStore
-        if: always()
-        run: docker compose down -v
+        run: scripts/run_native_integration.sh
 
   publish:
     name: Publish to PyPI

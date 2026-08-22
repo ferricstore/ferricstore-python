@@ -10,7 +10,22 @@ from ferricstore import FlowClient
 client = FlowClient.from_url("ferric://127.0.0.1:6388")
 ```
 
-The SDK only opens FerricStore native protocol connections from URLs. Use `ferric://` for plaintext development and `ferrics://` for TLS deployments.
+The URL chooses only the network adapter; command construction and typed client
+methods stay the same:
+
+| URL | Path |
+| --- | --- |
+| `ferric://` / `ferrics://` | Python SDK -> native TCP/TLS -> FerricStore |
+| `http://` / `https://` | Python SDK -> FerricStore HTTP endpoint |
+
+```python
+http_client = FlowClient.from_url(
+    "https://ferricstore.example.com",
+    bearer_token="http-token",
+)
+```
+
+The HTTP URL is the endpoint base URL; the adapter appends `/v1/commands`.
 
 ## Parity
 
@@ -30,7 +45,15 @@ The SDK only opens FerricStore native protocol connections from URLs. Use `ferri
 | Management reads/writes | `capabilities`, `acl_*`, `ensure_namespace`, `get_namespace`, `list_namespaces`, `delete_namespace`, `set_quota`, `get_quota`, `quota_usage`, `cluster_info`, `namespace_usage`, `telemetry_flow_query`, `flow_history`, `invocation_*` |
 | Policy/cleanup | `install_policy`, `policy_get`, `retention_cleanup` |
 
-`from_url` uses the native FerricStore protocol adapter.
+`from_url` selects the native or HTTP adapter from the URL scheme. HTTP
+is a deliberate request/response subset: ordinary commands and pipelines retain
+the same API, and a pipeline is sent as one HTTP command batch. Live or
+connection-affine sessions (`WATCH`/transactions and pushed Pub/Sub) require the
+native transport. Topology-aware routing belongs to the HTTP endpoint rather
+than the SDK caller. Native FLOW.QUERY deadline metadata is not currently
+exposed by the HTTP command endpoint. The adapter automatically uses the endpoint's versioned
+binary-safe JSON envelope for `bytes` and maps, including non-UTF-8 values and
+binary map keys. See [HTTP transport scope](adapters.md#http-transport-scope).
 
 ## `create`
 

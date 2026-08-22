@@ -58,6 +58,43 @@ server command. The SDK examples assume:
 ferric://127.0.0.1:6388
 ```
 
+The same clients can send the same commands through a FerricStore HTTP endpoint:
+
+```python
+from ferricstore import FlowClient
+
+client = FlowClient.from_url(
+    "https://ferricstore.example.com",
+    username="platform_worker",
+    password="service-secret",
+)
+client.kv_set("key", "value")
+assert client.kv_get("key") == b"value"
+```
+
+The path is `Python SDK -> HTTP(S) endpoint -> FerricStore`. The endpoint can be
+the in-process `ferricstore-http` server or a compatible gateway. Use `http://`
+/ `https://` for HTTP and `ferric://` / `ferrics://` for a direct native
+connection. HTTP is a deliberate request/response transport:
+ordinary commands and pipelines use the same client API, while live or
+connection-affine sessions such as Pub/Sub, `WATCH`, and transactions remain
+native-only. The current JSON envelope accepts JSON-compatible values; byte
+arguments use an automatic tagged Base64 envelope when arbitrary bytes or maps
+must cross JSON. See
+[Command executors](docs/adapters.md#http-transport-scope) for the complete
+boundary.
+
+For HTTP ACL authentication, the SDK sends the username and password using
+standard HTTP Basic authentication. This mode requires `https://`. Static
+`bearer_token` authentication remains available for compatible endpoint deployments.
+The SDK keeps a bounded pool of HTTP/TLS connections to the endpoint, so
+successive commands avoid repeated TCP and TLS handshakes.
+For multiplexing through an HTTP/2-capable TLS gateway, install
+`ferricstore[http2]` and pass `http2=True`; use `max_connections` to cap physical
+sockets and `max_concurrent_requests` to cap in-flight commands independently.
+Binary-heavy callers can install `ferricstore[compact]` and pass `compact=True`
+to use the endpoint's MessagePack envelope without changing command methods.
+
 ### 3. Query durable runs
 
 Use parameterized FQL for bounded, partition-scoped reads. Cursors are opaque

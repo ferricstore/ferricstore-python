@@ -60,16 +60,51 @@ Guidance:
 | Setting | Production rule |
 | --- | --- |
 | Protocol transport | Prefer `ferric://` / `ferrics://` for new SDK services. |
+| HTTP transport | Use `https://` when direct TCP is unavailable or an HTTP boundary is required. |
 | Protocol connections | Default is one multiplexed connection. Keep it unless profiling shows socket/client saturation. |
 | Protocol lanes | Default is 8 request lanes. Raise only for measured throughput workloads. |
 | Timeouts | Set connect and command timeouts explicitly. |
 | Async client | One async client per event loop is the simple safe default. |
 | Sync client | One client per process/service component is usually enough; use multiple clients for isolated pools. |
 
-The SDK URL transport is native-only. Use `ferric://` or `ferrics://`; tune
-`max_connections` and `lanes` only after measuring. Both values must be
-positive. In topology mode, `max_connections` is allocated per discovered
-endpoint, so calculate the cluster-wide connection budget accordingly.
+The URL scheme selects direct native or HTTP transport. Use `ferric://`
+or `ferrics://` for long-lived workers and latency-sensitive services. Use
+`https://` for HTTPS-only/serverless environments and security boundaries that
+terminate at a FerricStore HTTP endpoint. Tune `max_connections` and native
+`lanes` only after measuring. In topology mode, native `max_connections` is
+allocated per discovered endpoint, so calculate the cluster-wide connection
+budget accordingly.
+
+HTTP clients keep connections alive and reuse their TLS connections. Reuse a
+long-lived SDK client instead of constructing one per command, and close it
+during graceful shutdown so its idle HTTP sockets are released. HTTP is a
+deliberate request/response subset; review
+[HTTP transport scope](adapters.md#http-transport-scope) before moving a native
+workload behind the HTTP endpoint. Treat `timeout` as the complete command latency
+budget, including time queued behind `max_connections` and time spent following
+redirects.
+
+For a TLS gateway that negotiates HTTP/2, `ferricstore[http2]` can reduce socket
+and handshake pressure. Start with `http2=True`, `max_connections=1`, and a
+bounded `max_concurrent_requests` sized to the function or service concurrency.
+Increase physical connections only after measurements show one HTTP/2 connection
+is saturated or a gateway limits concurrent streams.
+
+Keep HTTP/1.1 for the usual Lambda shape where each warm execution environment
+sends one request at a time. Each environment already reuses its own persistent
+connection, so HTTP/2 multiplexing adds no benefit and has higher client
+overhead. Enable HTTP/2 only when a single invocation or long-lived process has
+multiple simultaneous requests; use an explicit pipeline first when commands
+can be issued together.
+
+If producers issue many simultaneous one-command calls, benchmark opt-in
+micro-batching (`coalesce_window_ms` and `coalesce_max_items`). Keep the window
+sub-millisecond initially. Pipelines need no coalescing because they already use
+one HTTP command batch.
+
+For payloads dominated by bytes, benchmark `compact=True` from the
+`ferricstore[compact]` extra. It removes Base64 expansion while retaining the
+same request and response byte limits.
 
 Connection sizing defaults:
 
