@@ -514,6 +514,16 @@ def test_diagnostic_accepts_every_bounded_context_scalar_and_container() -> None
     assert error is not None and error.context == response["context"]
 
 
+def test_diagnostic_unwraps_http_command_errors_while_preserving_the_raw_envelope() -> None:
+    envelope = {"status": "error", "error": _diagnostic()}
+
+    error = decode_flow_query_error(envelope, raw=envelope)
+
+    assert error is not None
+    assert error.code == "unsupported_field"
+    assert error.raw is envelope
+
+
 def test_index_status_decodes_the_stable_v1_surface_and_preserves_raw() -> None:
     response = _index_response()
     response["services"]["future_service"] = {"status": "ready"}

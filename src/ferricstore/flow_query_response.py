@@ -182,6 +182,10 @@ def decode_flow_explain_result(value: Any) -> FlowExplainResult:
 
 
 def decode_flow_query_error(value: Any, *, raw: Any) -> FlowQueryError | None:
+    if isinstance(value, dict):
+        nested = _map_get(value, "error")
+        if _map_get(value, "status") == "error" and isinstance(nested, dict):
+            value = nested
     if not isinstance(value, dict):
         return None
     try:

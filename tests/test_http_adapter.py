@@ -250,6 +250,33 @@ def test_flow_value_mget_uses_its_existing_native_opcode_over_http(compact: bool
     }
 
 
+@pytest.mark.parametrize("compact", [False, True])
+def test_flow_query_uses_its_validated_native_payload_over_http(compact: bool) -> None:
+    adapter = HttpAdapter("http://127.0.0.1:1", compact=compact)
+    query = (
+        "FROM runs WHERE partition_key = @partition_key AND type = @type "
+        "ORDER BY updated_at_ms ASC LIMIT 10 RETURN RECORDS"
+    )
+
+    try:
+        encoded = adapter._encode_command(
+            ("FLOW.QUERY", "FQL1", query, "partition_key", "tenant-a", "type", "workflow"),
+            0,
+        )
+    finally:
+        adapter.close()
+
+    assert _decode_wire(encoded) == {
+        "command": "FLOW.QUERY",
+        "opcode": 0x0231,
+        "payload": {
+            "version": "FQL1",
+            "query": query,
+            "params": {"partition_key": "tenant-a", "type": "workflow"},
+        },
+    }
+
+
 def test_http_keep_alive_reuses_one_connection_for_sequential_commands() -> None:
     with proxy_server(command_responder) as (url, state):
         adapter = HttpAdapter(url, max_connections=2)
@@ -1604,6 +1631,28 @@ def test_command_result_overload_preserves_command_retry_metadata() -> None:
             }
         )
     assert exc_info.value.retry_after_ms == 10
+
+
+def test_command_result_preserves_structured_query_diagnostic_and_retry_contract() -> None:
+    details = {
+        "code": "query_projection_changed",
+        "message": "ERR Flow visibility projection changed during the query",
+        "retryable": True,
+        "safe_to_retry": True,
+        "retry_after_ms": 0,
+    }
+
+    result = {"status": "error", "error": details}
+
+    with pytest.raises(FerricStoreError) as exc_info:
+        http_adapter_module._command_result(
+            result,
+        )
+
+    assert exc_info.value.raw == result
+    assert exc_info.value.retryable is True
+    assert exc_info.value.safe_to_retry is True
+    assert exc_info.value.retry_after_ms == 0
 
 
 def test_async_http_adapter_empty_batch_invalidation_and_idempotent_close() -> None:
