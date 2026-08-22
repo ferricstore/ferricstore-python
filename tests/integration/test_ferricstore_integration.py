@@ -638,13 +638,19 @@ def _wait_flow_records(
 ) -> list[Any]:
     deadline = time.monotonic() + timeout
     last_records: list[Any] = []
+    last_error: FerricStoreError | None = None
     while time.monotonic() < deadline:
-        last_records = fetch()
-        if any(record.id == expected_id for record in last_records):
-            return last_records
+        try:
+            last_records = fetch()
+            last_error = None
+            if any(record.id == expected_id for record in last_records):
+                return last_records
+        except FerricStoreError as exc:
+            last_error = exc
         time.sleep(0.05)
     raise AssertionError(
-        f"FLOW.QUERY projection did not expose flow {expected_id!r}; last={last_records!r}"
+        f"FLOW.QUERY projection did not expose flow {expected_id!r}; "
+        f"last={last_records!r}, error={last_error!r}"
     )
 
 
