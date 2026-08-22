@@ -5,7 +5,7 @@ import re
 import sys
 from pathlib import Path
 
-INTEGRATION_SERVER_VERSION = "0.11.8"
+INTEGRATION_SERVER_VERSION = "0.11.10"
 COMPATIBILITY_SERVER_VERSION = "0.11.4"
 INTEGRATION_IMAGE_PATTERN = re.compile(
     rf"quay\.io/ferricstore/ferricstore:{INTEGRATION_SERVER_VERSION}"
@@ -118,13 +118,20 @@ def test_integration_fixtures_share_one_immutable_server_image():
         ".env.example",
         ".github/workflows/ci.yml",
         ".github/workflows/publish.yml",
+        ".github/workflows/extended-validation.yml",
     )
     images = set()
 
     for name in names:
-        matches = INTEGRATION_IMAGE_PATTERN.findall((root / name).read_text())
+        text = (root / name).read_text()
+        matches = INTEGRATION_IMAGE_PATTERN.findall(text)
         assert matches, f"{name} does not pin an immutable integration image"
         images.update(matches)
+
+        all_quay_images = re.findall(
+            r"quay\.io/ferricstore/ferricstore:[^@\s]+@sha256:[0-9a-f]{64}", text
+        )
+        assert set(all_quay_images) == set(matches), f"{name} contains a stale latest-server pin"
 
     assert len(images) == 1
 

@@ -174,6 +174,10 @@ class _HttpDeadline:
     def __init__(self, timeout: float | None) -> None:
         self._expires_at = None if timeout is None else monotonic() + timeout
 
+    @property
+    def expires_at(self) -> float | None:
+        return self._expires_at
+
     def remaining(self) -> float | None:
         if self._expires_at is None:
             return None

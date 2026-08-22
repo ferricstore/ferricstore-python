@@ -5,11 +5,11 @@ FerricStore Python SDK is public alpha.
 Current version:
 
 ```text
-0.11.7
+0.11.8
 ```
 
-Python SDK `0.11.7` requires FerricStore `0.11.4` or newer and validates the
-native TCP and request/response HTTP transports against FerricStore 0.11.8.
+Python SDK `0.11.8` requires FerricStore `0.11.4` or newer and validates the
+native TCP and request/response HTTP transports against FerricStore 0.11.10.
 Native wire protocol v1 is unchanged.
 
 ## What alpha means

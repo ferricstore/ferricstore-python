@@ -50,6 +50,14 @@ operation deadline, including local capacity waits and redirects. Async clients
 use their own bounded worker executor rather than consuming the event loop's
 default executor while waiting for HTTP capacity.
 
+Single-request blocking commands such as `BLPOP`, `BLMPOP`, and
+`XREAD ... BLOCK` are supported. A finite server wait is added to the configured
+client timeout so the ordinary network/capacity budget remains available after
+the wait. A zero blocking duration disables only that implicit SDK deadline.
+Async task cancellation still stops the caller's wait, but cannot recall a POST
+that already reached the endpoint. Sequential blocking waits in one explicit
+pipeline are added together.
+
 Optional HTTP/2 keeps the same command behavior while allowing concurrent
 requests to share fewer physical TLS connections:
 
@@ -73,6 +81,9 @@ For measured burst workloads, `coalesce_window_ms` and `coalesce_max_items` can
 combine concurrent single-command calls into ordered HTTP batches. The feature
 is opt-in so latency-sensitive calls do not wait for a batching window. Per-call
 results and errors remain isolated even when the wire request is shared.
+Blocking calls are never joined to independent requests, although a blocking
+command intentionally placed in an explicit ordered pipeline stays in that
+pipeline.
 
 The optional `ferricstore[compact]` extra enables `compact=True`, which replaces
 the JSON command envelope with MessagePack and carries arbitrary bytes natively.
@@ -105,9 +116,11 @@ session tunnel.
   gateways is responsible for ensuring that authorization headers are sent
   only to destinations it trusts.
 
-Blocking commands are native-only in the current stateless HTTP gateway. Their
-wait state requires a persistent native session and must not occupy an HTTP
-request or shared execution batch.
+Blocking commands that complete within one request are supported. Commands
+whose meaning spans requests or depends on one native connection remain
+native-only, including transactions, pushed subscriptions, authentication and
+handshake controls, `MONITOR`, replica synchronization controls, and
+connection-routing controls.
 
 ## Custom executor
 

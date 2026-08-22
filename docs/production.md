@@ -82,7 +82,11 @@ deliberate request/response subset; review
 [HTTP transport scope](adapters.md#http-transport-scope) before moving a native
 workload behind the HTTP endpoint. Treat `timeout` as the complete command latency
 budget, including time queued behind `max_connections` and time spent following
-redirects.
+redirects. For a finite blocking command, the SDK adds the declared server wait
+to that budget. A zero blocking duration disables the implicit SDK deadline, so
+choose a finite blocking duration when an unbounded server wait is not
+acceptable. Cancelling an async task stops the caller's wait but cannot recall
+an HTTP request that was already dispatched.
 
 For a TLS gateway that negotiates HTTP/2, `ferricstore[http2]` can reduce socket
 and handshake pressure. Start with `http2=True`, `max_connections=1`, and a
@@ -100,7 +104,10 @@ can be issued together.
 If producers issue many simultaneous one-command calls, benchmark opt-in
 micro-batching (`coalesce_window_ms` and `coalesce_max_items`). Keep the window
 sub-millisecond initially. Pipelines need no coalescing because they already use
-one HTTP command batch.
+one HTTP command batch. Blocking commands are isolated from independent
+micro-batches to avoid head-of-line blocking; an explicit ordered pipeline can
+still contain both blocking and ordinary commands when that ordering is
+intentional.
 
 For payloads dominated by bytes, benchmark `compact=True` from the
 `ferricstore[compact]` extra. It removes Base64 expansion while retaining the

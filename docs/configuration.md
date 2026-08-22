@@ -105,7 +105,9 @@ pipelines are already sent as one ordered HTTP batch. Coalescing is disabled by
 default because its short collection window trades latency for throughput. A
 coalesced request never exceeds `coalesce_max_items`, `max_batch_items`, or
 `max_request_bytes`, and one command error is returned only to that command's
-caller.
+caller. Blocking commands bypass this independent-request coalescer so they
+cannot hold unrelated calls behind a server wait. They may still be combined
+deliberately inside one explicit ordered pipeline.
 
 For binary-heavy commands, install `ferricstore[compact]` and pass
 `compact=True`. This selects the endpoint's MessagePack command envelope, avoids
@@ -117,7 +119,9 @@ Async HTTP clients use a dedicated bounded worker executor sized to
 `max_concurrent_requests`, plus asynchronous admission before work reaches a thread.
 Queued coroutines therefore do not occupy worker threads, and unrelated work on
 the event loop's default executor does not reduce the configured HTTP
-concurrency.
+concurrency. Cancelling a coroutine returns control promptly, but its capacity
+slot remains reserved until any HTTP worker that already started has finished;
+repeated cancellation therefore cannot create an unbounded worker queue.
 
 ## Inheritance
 
