@@ -29,7 +29,7 @@ docker run --name ferricstore-dev \
   -p 6388:6388 \
   -e FERRICSTORE_PROTECTED_MODE=false \
   -v ferricstore-dev-data:/data \
-  quay.io/ferricstore/ferricstore:0.11.6
+  quay.io/ferricstore/ferricstore:0.11.7
 ```
 
 This starts one local FerricStore server on:

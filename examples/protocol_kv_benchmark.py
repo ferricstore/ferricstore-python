@@ -706,7 +706,7 @@ def _run_thread(
     request_count: int,
     sequence_start: int,
     value: bytes,
-    deadline: float | None = None,
+    test_time: float | None = None,
 ) -> dict[str, Any]:
     adapters = [
         ProtocolAdapter.from_url(
@@ -756,6 +756,10 @@ def _run_thread(
     )
     wire_field = _wire_value_fragment(b"field")
     wire_value = _wire_value_fragment(value)
+    # Connection and request-shape setup must not consume the configured test
+    # window. Each worker receives its full measurement duration once it is
+    # ready to issue commands.
+    deadline = None if test_time is None else time.perf_counter() + test_time
 
     try:
         while _should_issue(issued, request_count, deadline) or pending_batches:
@@ -1085,10 +1089,8 @@ def _run_process(
     sequence_start: int,
     value: bytes,
 ) -> dict[str, Any]:
-    deadline = None
     if args.test_time is not None:
         counts = [sys.maxsize for _ in range(args.threads)]
-        deadline = time.perf_counter() + args.test_time
     else:
         counts = _split_counts(request_count, args.threads)
 
@@ -1110,7 +1112,7 @@ def _run_process(
                 request_count=count,
                 sequence_start=starts[index],
                 value=value,
-                deadline=deadline,
+                test_time=args.test_time,
             )
             for index, count in enumerate(counts)
             if count > 0

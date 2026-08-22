@@ -19,7 +19,7 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 
 
 def test_compact_query_storage_release_versions_are_current() -> None:
-    assert __version__ == "0.11.6"
+    assert __version__ == "0.11.7"
     assert MINIMUM_SERVER_VERSION == "0.11.4"
 
     status = (REPOSITORY / "docs" / "status.md").read_text()

@@ -5,12 +5,12 @@ FerricStore Python SDK is public alpha.
 Current version:
 
 ```text
-0.11.6
+0.11.7
 ```
 
-Python SDK `0.11.6` requires FerricStore `0.11.4` or newer and negotiates the
-compact Stream producer path with FerricStore 0.11.6. Native wire protocol v1
-is unchanged.
+Python SDK `0.11.7` requires FerricStore `0.11.4` or newer and validates the
+native TCP and request/response HTTP transports against FerricStore 0.11.7.
+Native wire protocol v1 is unchanged.
 
 ## What alpha means
 
@@ -28,6 +28,7 @@ is unchanged.
 The SDK includes:
 
 - Sync and async Flow clients.
+- Sync and async HTTP(S) transport for ordinary commands and pipelines.
 - High-level queue and workflow clients.
 - Worker runtimes.
 - Retry/backoff policy helpers.

@@ -6,6 +6,18 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.11.7 - 2026-08-22
+
+- Add synchronous and asynchronous HTTP(S) transports behind the existing
+  client command surface, with pooled HTTP/1.1 connections, optional HTTP/2,
+  Basic or bearer authentication, bounded concurrency, redirect support, TLS
+  verification, and JSON or MessagePack envelopes.
+- Preserve the native Flow query contract over HTTP, including query-builder
+  parameters, absolute deadlines, typed projections, structured errors, and
+  projection-visibility waits.
+- Keep direct `ferric://` and `ferrics://` behavior unchanged and validate both
+  the TCP and HTTP paths against FerricStore 0.11.7.
+
 ## 0.11.6 - 2026-08-19
 
 - Validate the unchanged native protocol v1 and FerricStore 0.11.4 compatibility
