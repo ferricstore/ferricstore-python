@@ -43,7 +43,7 @@ dev = [
   "pip-audit>=2.9,<3",
   "pytest>=9.0.3,<10",
   "pytest-cov>=6,<8",
-  "ruff==0.16.0",
+  "ruff==0.16.3",
   "mypy>=1.11",
   "msgpack>=1.2.1,<2",
   "twine>=7,<8",
