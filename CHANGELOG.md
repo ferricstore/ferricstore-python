@@ -16,7 +16,7 @@ The project is currently public alpha. APIs may change before `1.0`.
   parameters, absolute deadlines, typed projections, structured errors, and
   projection-visibility waits.
 - Keep direct `ferric://` and `ferrics://` behavior unchanged and validate both
-  the TCP and HTTP paths against FerricStore 0.11.7.
+  the TCP and HTTP paths against FerricStore 0.11.8.
 
 ## 0.11.6 - 2026-08-19
 
