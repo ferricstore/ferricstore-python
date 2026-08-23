@@ -277,6 +277,54 @@ def test_flow_query_uses_its_validated_native_payload_over_http(compact: bool) -
     }
 
 
+def test_http_flow_query_executor_preserves_deadline_for_sync_and_async() -> None:
+    query = "FROM runs WHERE run_id = @id RETURN RECORDS"
+
+    def responder(_envelope: dict[str, Any]) -> Response:
+        return 200, {"results": [{"status": "ok", "value": []}]}, {}
+
+    async def run_async(url: str) -> None:
+        adapter = AsyncHttpAdapter(url)
+        try:
+            await adapter.execute_flow_query_command(
+                "FLOW.QUERY",
+                "FQL1",
+                query,
+                "id",
+                "run-1",
+                deadline_ms=123_456,
+                routing_key="route-only",
+            )
+        finally:
+            await adapter.close()
+
+    with proxy_server(responder) as (url, state):
+        adapter = HttpAdapter(url)
+        try:
+            adapter.execute_flow_query_command(
+                "FLOW.QUERY",
+                "FQL1",
+                query,
+                "id",
+                "run-1",
+                deadline_ms=123_456,
+                routing_key="route-only",
+            )
+        finally:
+            adapter.close()
+        asyncio.run(run_async(url))
+
+    assert len(state.requests) == 2
+    for request in state.requests:
+        command = _decode_wire(request["commands"])[0]
+        assert command["payload"] == {
+            "version": "FQL1",
+            "query": query,
+            "params": {"id": "run-1"},
+            "deadline_ms": 123_456,
+        }
+
+
 def test_http_keep_alive_reuses_one_connection_for_sequential_commands() -> None:
     with proxy_server(command_responder) as (url, state):
         adapter = HttpAdapter(url, max_connections=2)
@@ -630,7 +678,19 @@ def test_coalescing_does_not_create_an_oversized_request() -> None:
     assert all(len(request["commands"]) == 1 for request in state.requests)
 
 
-def test_async_single_commands_use_the_same_coalescing_contract() -> None:
+def test_async_single_commands_use_the_same_coalescing_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coalescer_type = http_adapter_module.CommandCoalescer
+    original_dispatch = coalescer_type._dispatch
+
+    def dispatch_after_all_calls_join(self: Any, batch: Any) -> None:
+        with self._condition:
+            assert self._condition.wait_for(lambda: len(batch.calls) == 8, timeout=1.0)
+        original_dispatch(self, batch)
+
+    monkeypatch.setattr(coalescer_type, "_dispatch", dispatch_after_all_calls_join)
+
     async def run(url: str) -> list[Any]:
         adapter = AsyncHttpAdapter(
             url,
@@ -1645,6 +1705,9 @@ def test_http_adapter_rejects_connection_affine_commands() -> None:
         "DISCARD",
         "EVENT",
         "EXEC",
+        "FETCH_OR_COMPUTE",
+        "FETCH_OR_COMPUTE_ERROR",
+        "FETCH_OR_COMPUTE_RESULT",
         "GOAWAY",
         "HELLO",
         "MONITOR",
@@ -1716,6 +1779,7 @@ def test_http_adapter_keeps_single_request_blocking_commands_supported(command: 
     "command",
     [
         ("COMMAND_EXEC", "MONITOR"),
+        ("COMMAND_EXEC", "FETCH_OR_COMPUTE", "cache", 1_000),
         ("COMMAND_EXEC", "COMMAND_EXEC", "READONLY"),
         ("COMMAND_EXEC", b"SUBSCRIBE", "events", "REQUEST_CONTEXT", {"subject": "job"}),
     ],

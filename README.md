@@ -2,13 +2,13 @@
 
 Python SDK for FerricStore and FerricFlow.
 
-Status: public alpha `0.11.8`. APIs may change before `1.0`, but the SDK is
+Status: public alpha `0.11.9`. APIs may change before `1.0`, but the SDK is
 tested against command construction, queue/workflow handlers, leases, retries,
 history, indexed attributes, named values, idempotent create, worker loops,
 async flows, and local FerricStore integration scenarios.
 
-Python SDK `0.11.8` requires FerricStore `0.11.4` or newer. With FerricStore
-0.11.10 it negotiates compact Stream mode 34 for homogeneous auto-ID `XADD`
+Python SDK `0.11.9` requires FerricStore `0.11.4` or newer. With FerricStore
+0.11.11 it negotiates compact Stream mode 34 for homogeneous auto-ID `XADD`
 batches, compact Pub/Sub mode 35 for homogeneous `PUBLISH` pipelines, and the
 `pubsub_batch_v1` event codec for compatible subscriptions. Native wire
 protocol v1 and generic compatibility paths remain.
@@ -94,6 +94,19 @@ For multiplexing through an HTTP/2-capable TLS gateway, install
 sockets and `max_concurrent_requests` to cap in-flight commands independently.
 Binary-heavy callers can install `ferricstore[compact]` and pass `compact=True`
 to use the endpoint's MessagePack envelope without changing command methods.
+
+Run the repository's complete HTTP-compatible integration surface through a
+real TLS listener and ACL boundary with:
+
+```bash
+FERRICSTORE_IMAGE=quay.io/ferricstore/ferricstore:0.11.11@sha256:d9f488539f0d6c1a513d2315e7a9c2947cc795b393f3774c9de8ba5e5b5c21b5 \
+  scripts/run_http_integration.sh
+```
+
+The runner creates a private CA, rejects an unauthenticated probe and a
+restricted user's forbidden `SET`, and supplies `FERRICSTORE_USERNAME`,
+`FERRICSTORE_PASSWORD`, and `FERRICSTORE_CA_FILE` to the SDK tests. Native-only
+sessions continue to run in `scripts/run_native_integration.sh`.
 
 ### 3. Query durable runs
 

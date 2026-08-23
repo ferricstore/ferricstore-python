@@ -36,6 +36,7 @@ from ferricstore import (
 )
 from ferricstore.command_core import normalize_command_name
 from ferricstore.commands import DataCommandsMixin
+from ferricstore.http_command_policy import HTTP_UNSUPPORTED_COMMANDS
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("FERRICSTORE_INTEGRATION") != "1",
@@ -160,6 +161,7 @@ class _ObservedExecutor:
             "execute_batch",
             "execute_batch_on_lane",
             "execute_batch_ordered",
+            "execute_flow_query_command",
             "execute_command_on_lane",
             "execute_command_with_trace",
             "execute_command_with_trace_on_lane",
@@ -185,6 +187,19 @@ class _ObservedExecutor:
     def execute_command(self, *args: Any) -> Any:
         _observe_command(args)
         return self._executor.execute_command(*args)
+
+    def execute_flow_query_command(
+        self,
+        *args: Any,
+        deadline_ms: int | None = None,
+        routing_key: str | bytes | None = None,
+    ) -> Any:
+        _observe_command(("FLOW.QUERY", *args))
+        return self._executor.execute_flow_query_command(
+            *args,
+            deadline_ms=deadline_ms,
+            routing_key=routing_key,
+        )
 
     def execute_command_on_lane(self, args: tuple[Any, ...], lane_id: int) -> Any:
         _observe_command(args)
@@ -257,6 +272,19 @@ class _ObservedExecutor:
         return getattr(self._executor, name)
 
 
+def test_observer_preserves_optional_flow_query_capability() -> None:
+    class WireExecutor:
+        def execute_command(self, *_args: Any) -> None:
+            return None
+
+    class QueryExecutor(WireExecutor):
+        def execute_flow_query_command(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    assert not hasattr(_ObservedExecutor(WireExecutor()), "execute_flow_query_command")
+    assert callable(getattr(_ObservedExecutor(QueryExecutor()), "execute_flow_query_command", None))
+
+
 def _observe_client(client: FlowClient) -> FlowClient:
     executor = client.executor._executor
     if not isinstance(executor, _ObservedExecutor):
@@ -286,6 +314,10 @@ def _topology_client() -> FlowClient:
 
 def _integration_url() -> str:
     return os.environ.get("FERRICSTORE_URL", "ferric://127.0.0.1:6388")
+
+
+def _http_integration() -> bool:
+    return _integration_url().startswith(("http://", "https://"))
 
 
 def _integration_client_options() -> dict[str, Any]:
@@ -444,6 +476,15 @@ def _require_protocol_transport() -> None:
         pytest.skip("native protocol coverage runs with FERRICSTORE_URL=ferric://...")
 
 
+def _require_native_transport(feature: str) -> None:
+    if _http_integration():
+        pytest.skip(f"{feature} requires a connection-affine native transport")
+
+
+def _catalog_commands_for_transport(catalog: set[str], *, http: bool) -> set[str]:
+    return catalog - HTTP_UNSUPPORTED_COMMANDS if http else catalog
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _assert_observed_native_protocol_coverage() -> Any:
     with _NATIVE_PROTOCOL_INTEGRATION_OBSERVED_LOCK:
@@ -459,7 +500,11 @@ def _assert_observed_native_protocol_coverage() -> Any:
     if os.environ.get("FERRICSTORE_SKIP_CATALOG_COVERAGE") == "1":
         return
 
-    if not _integration_url().startswith(("ferric://", "ferrics://")):
+    native_transport = _integration_url().startswith(("ferric://", "ferrics://"))
+    http_coverage = (
+        _http_integration() and os.environ.get("FERRICSTORE_HTTP_COMMAND_COVERAGE") == "1"
+    )
+    if not native_transport and not http_coverage:
         return
     client = _client()
     try:
@@ -468,15 +513,20 @@ def _assert_observed_native_protocol_coverage() -> Any:
         client.close()
 
     unknown = catalog_names - _NATIVE_PROTOCOL_COMMANDS
-    missing = (
-        catalog_names
-        - _NATIVE_PROTOCOL_INTEGRATION_OBSERVED
-        - set(_NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED)
-    )
+    if http_coverage:
+        missing = (
+            _catalog_commands_for_transport(catalog_names, http=True)
+            - _NATIVE_PROTOCOL_INTEGRATION_OBSERVED
+            - set(_NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED)
+        )
+    else:
+        missing = (
+            catalog_names
+            - _NATIVE_PROTOCOL_INTEGRATION_OBSERVED
+            - set(_NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED)
+        )
     assert unknown == set(), f"server command catalog is missing from SDK contract: {unknown}"
-    assert missing == set(), (
-        f"native commands were not exercised by live integration tests: {missing}"
-    )
+    assert missing == set(), f"commands were not exercised by live integration tests: {missing}"
 
 
 def _suffix() -> str:
@@ -719,6 +769,7 @@ def test_real_ferricstore_native_protocol_command_coverage_contract() -> None:
 
 def test_real_ferricstore_native_options_opcode_table_matches_sdk() -> None:
     _require_protocol_transport()
+    _require_native_transport("OPTIONS negotiation")
 
     client = _client()
     try:
@@ -1000,7 +1051,9 @@ def test_real_ferricstore_async_flow_query_planner_v010() -> None:
     _require_protocol_transport()
 
     async def run() -> None:
-        client = AsyncFlowClient.from_url(_integration_url(), codec=JsonCodec())
+        client = AsyncFlowClient.from_url(
+            _integration_url(), codec=JsonCodec(), **_integration_client_options()
+        )
         suffix = _suffix()
         partition = f"py-sdk:async-query:{suffix}:partition"
         flow_type = f"py-sdk-async-query-{suffix}"
@@ -1057,6 +1110,7 @@ def test_real_ferricstore_async_flow_query_planner_v010() -> None:
 
 def test_real_ferricstore_topology_aware_client_routes_kv_and_flow_commands() -> None:
     _require_protocol_transport()
+    _require_native_transport("topology routing")
 
     client = _topology_client()
     suffix = _suffix()
@@ -1589,31 +1643,32 @@ def test_real_ferricstore_protocol_helpers_and_diagnostics() -> None:
         assert info.type in {"string", "binary", "unknown", ""}
         assert info.raw
 
-        with client.transaction(watch=[key]) as transaction:
-            assert _ok(transaction.unwatch())
+        if not _http_integration():
+            with client.transaction(watch=[key]) as transaction:
+                assert _ok(transaction.unwatch())
 
-        with (
-            pytest.raises(RuntimeError, match="exercise transaction rollback"),
-            client.transaction(watch=[key]),
-        ):
-            raise RuntimeError("exercise transaction rollback")
+            with (
+                pytest.raises(RuntimeError, match="exercise transaction rollback"),
+                client.transaction(watch=[key]),
+            ):
+                raise RuntimeError("exercise transaction rollback")
 
-        first = client.fetch_or_compute(cache_key, ttl_ms=60_000, hint="integration")
-        assert first.should_compute
-        assert client.fetch_or_compute_result(
-            cache_key,
-            first.ownership_token,
-            {"computed": True},
-            ttl_ms=60_000,
-        )
-        cached = client.fetch_or_compute(cache_key, ttl_ms=60_000)
-        assert cached.hit
-        assert cached.value == {"computed": True}
+            first = client.fetch_or_compute(cache_key, ttl_ms=60_000, hint="integration")
+            assert first.should_compute
+            assert client.fetch_or_compute_result(
+                cache_key,
+                first.ownership_token,
+                {"computed": True},
+                ttl_ms=60_000,
+            )
+            cached = client.fetch_or_compute(cache_key, ttl_ms=60_000)
+            assert cached.hit
+            assert cached.value == {"computed": True}
 
-        error_key = f"{prefix}cache-error"
-        first_error = client.fetch_or_compute(error_key, ttl_ms=60_000)
-        assert first_error.should_compute
-        assert client.fetch_or_compute_error(error_key, first_error.ownership_token, "boom")
+            error_key = f"{prefix}cache-error"
+            first_error = client.fetch_or_compute(error_key, ttl_ms=60_000)
+            assert first_error.should_compute
+            assert client.fetch_or_compute_error(error_key, first_error.ownership_token, "boom")
 
         assert isinstance(client.cluster_health(), dict)
         assert isinstance(client.cluster_stats(), dict)
@@ -1947,8 +2002,9 @@ def test_real_ferricstore_native_protocol_store_and_admin_surface() -> None:
         second_key = key("string2")
         third_key = key("string3")
         assert client.command("PING") in (b"PONG", "PONG", True)
-        assert _ok(client.command("CLIENT.SETNAME", f"py-sdk-native-{suffix}"))
-        assert client.command("CLIENT.INFO") is not None
+        if not _http_integration():
+            assert _ok(client.command("CLIENT.SETNAME", f"py-sdk-native-{suffix}"))
+            assert client.command("CLIENT.INFO") is not None
         assert client.command("FERRICSTORE.DOCTOR", "LIST") is not None
         assert _ok(client.command("SET", string_key, "abc", "PX", 60_000))
         assert client.command("GET", string_key) in (b"abc", "abc")
@@ -2023,27 +2079,28 @@ def test_real_ferricstore_native_protocol_store_and_admin_surface() -> None:
         assert rate.count >= 1
         assert rate.remaining >= 0
 
-        cache_key = key("cache")
-        first = client.fetch_or_compute(cache_key, ttl_ms=60_000, hint="native-integration")
-        assert first.should_compute
-        assert client.fetch_or_compute_result(
-            cache_key,
-            first.ownership_token,
-            {"computed": True},
-            ttl_ms=60_000,
-        )
-        cached = client.fetch_or_compute(cache_key, ttl_ms=60_000)
-        assert cached.hit
-        assert cached.value == {"computed": True}
+        if not _http_integration():
+            cache_key = key("cache")
+            first = client.fetch_or_compute(cache_key, ttl_ms=60_000, hint="native-integration")
+            assert first.should_compute
+            assert client.fetch_or_compute_result(
+                cache_key,
+                first.ownership_token,
+                {"computed": True},
+                ttl_ms=60_000,
+            )
+            cached = client.fetch_or_compute(cache_key, ttl_ms=60_000)
+            assert cached.hit
+            assert cached.value == {"computed": True}
 
-        error_cache_key = key("cache-error")
-        first_error = client.fetch_or_compute(error_cache_key, ttl_ms=60_000)
-        assert first_error.should_compute
-        assert client.fetch_or_compute_error(
-            error_cache_key,
-            first_error.ownership_token,
-            "boom",
-        )
+            error_cache_key = key("cache-error")
+            first_error = client.fetch_or_compute(error_cache_key, ttl_ms=60_000)
+            assert first_error.should_compute
+            assert client.fetch_or_compute_error(
+                error_cache_key,
+                first_error.ownership_token,
+                "boom",
+            )
 
         info = client.key_info(string_key)
         assert info.raw
@@ -2858,9 +2915,10 @@ def test_real_ferricstore_native_protocol_named_session_and_data_structure_surfa
         assert client.xlen(stream_key) == 1
 
         tx_key = key("tx")
-        with client.transaction() as tx:
-            assert tx.kv_set(tx_key, {"tx": True}) in {"QUEUED", b"QUEUED"}
-        assert client.kv_get(tx_key) == {"tx": True}
+        if not _http_integration():
+            with client.transaction() as tx:
+                assert tx.kv_set(tx_key, {"tx": True}) in {"QUEUED", b"QUEUED"}
+            assert client.kv_get(tx_key) == {"tx": True}
 
         blocking_key = key("blocking")
         holder: dict[str, Any] = {}
@@ -2876,39 +2934,40 @@ def test_real_ferricstore_native_protocol_named_session_and_data_structure_surfa
         assert not thread.is_alive()
         assert _decode(client, holder["result"][1]) == {"work": 1}
 
-        channel = key("channel")
-        pubsub = client.pubsub_session()
-        pubsub.subscribe(channel)
-        assert producer.publish(channel, {"event": 1}) >= 1
-        message = pubsub.get_message(timeout=3)
-        assert message is not None
-        assert message.channel == channel
-        assert message.message == {"event": 1}
-        published = (
-            producer.pipeline()
-            .command("PUBLISH", channel, producer.codec.encode({"event": 2}))
-            .command("PUBLISH", channel, producer.codec.encode({"event": 3}))
-            .execute()
-        )
-        assert len(published) == 2
-        assert [pubsub.get_message(timeout=3).message for _ in range(2)] == [
-            {"event": 2},
-            {"event": 3},
-        ]
-        pubsub.unsubscribe(channel)
-        pubsub.close()
+        if not _http_integration():
+            channel = key("channel")
+            pubsub = client.pubsub_session()
+            pubsub.subscribe(channel)
+            assert producer.publish(channel, {"event": 1}) >= 1
+            message = pubsub.get_message(timeout=3)
+            assert message is not None
+            assert message.channel == channel
+            assert message.message == {"event": 1}
+            published = (
+                producer.pipeline()
+                .command("PUBLISH", channel, producer.codec.encode({"event": 2}))
+                .command("PUBLISH", channel, producer.codec.encode({"event": 3}))
+                .execute()
+            )
+            assert len(published) == 2
+            assert [pubsub.get_message(timeout=3).message for _ in range(2)] == [
+                {"event": 2},
+                {"event": 3},
+            ]
+            pubsub.unsubscribe(channel)
+            pubsub.close()
 
-        pattern_pubsub = client.pubsub_session()
-        pattern = f"{channel}:*"
-        pattern_channel = f"{channel}:pattern"
-        pattern_pubsub.psubscribe(pattern)
-        assert producer.publish(pattern_channel, {"event": 2}) >= 1
-        pattern_message = pattern_pubsub.get_message(timeout=3)
-        assert pattern_message is not None
-        assert pattern_message.channel == pattern_channel
-        assert pattern_message.message == {"event": 2}
-        pattern_pubsub.punsubscribe(pattern)
-        pattern_pubsub.close()
+            pattern_pubsub = client.pubsub_session()
+            pattern = f"{channel}:*"
+            pattern_channel = f"{channel}:pattern"
+            pattern_pubsub.psubscribe(pattern)
+            assert producer.publish(pattern_channel, {"event": 2}) >= 1
+            pattern_message = pattern_pubsub.get_message(timeout=3)
+            assert pattern_message is not None
+            assert pattern_message.channel == pattern_channel
+            assert pattern_message.message == {"event": 2}
+            pattern_pubsub.punsubscribe(pattern)
+            pattern_pubsub.close()
     finally:
         with suppress(Exception):
             if keys:
@@ -3233,11 +3292,12 @@ def test_real_ferricstore_named_data_helpers_cover_native_protocol_surface() -> 
         assert call("command_info", "GET") is not None
         assert call("slowlog", "GET", 10) is not None
         assert call("config", "GET", "*") is not None
-        with client.transaction(watch=[key("watched")]) as transaction:
-            assert transaction.set(key("tx-set"), "value", encode=False) in (
-                b"QUEUED",
-                "QUEUED",
-            )
+        if not _http_integration():
+            with client.transaction(watch=[key("watched")]) as transaction:
+                assert transaction.set(key("tx-set"), "value", encode=False) in (
+                    b"QUEUED",
+                    "QUEUED",
+                )
         assert call("publish", key("channel"), {"event": "helper"}) >= 0
         assert call("pubsub", "CHANNELS") is not None
 

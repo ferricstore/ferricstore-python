@@ -19,14 +19,14 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 
 
 def test_compact_query_storage_release_versions_are_current() -> None:
-    assert __version__ == "0.11.8"
+    assert __version__ == "0.11.9"
     assert MINIMUM_SERVER_VERSION == "0.11.4"
 
     status = (REPOSITORY / "docs" / "status.md").read_text()
     assert f"Current version:\n\n```text\n{__version__}\n```" in status
 
     changelog = (REPOSITORY / "CHANGELOG.md").read_text()
-    assert "## 0.11.8 - 2026-08-23" in changelog
+    assert "## 0.11.9 - 2026-08-23" in changelog
 
 
 def test_package_version_has_one_build_metadata_source() -> None:
@@ -69,6 +69,54 @@ def test_native_integration_runner_uses_an_isolated_docker_network() -> None:
         workflow = (REPOSITORY / ".github" / "workflows" / workflow_name).read_text()
         assert "scripts/run_native_integration.sh" in workflow
         assert 'FERRICSTORE_URL: "ferric://127.0.0.1:6388"' not in workflow
+
+
+def test_tls_http_integration_is_required_by_ci_and_publish() -> None:
+    runner = (REPOSITORY / "scripts" / "run_http_integration.sh").read_text()
+    assert all(
+        "@sha256:" in line
+        for line in runner.splitlines()
+        if "quay.io/ferricstore/ferricstore:" in line
+    )
+    for required in (
+        "FERRICSTORE_HTTP_TLS_ENABLED=true",
+        "FERRICSTORE_USERNAME",
+        "FERRICSTORE_PASSWORD",
+        "FERRICSTORE_CA_FILE",
+        "@sha256:",
+        "chmod 700",
+        "chmod 600",
+        "basicConstraints=critical,CA:TRUE",
+        "keyUsage=critical,keyCertSign,cRLSign",
+        "basicConstraints=critical,CA:FALSE",
+        "keyUsage=critical,digitalSignature,keyEncipherment",
+        'rm -f "$tls_dir/ca.key"',
+        "source=$tls_dir/server.key,target=/tls/server.key,readonly",
+        "sdk-http-denied",
+        "ACL authorization probe unexpectedly allowed SET",
+        "unauthenticated HTTP request returned",
+        "tests/integration/test_ferricstore_integration.py",
+    ):
+        assert required in runner
+
+    for workflow_name in ("ci.yml", "publish.yml"):
+        workflow = (REPOSITORY / ".github" / "workflows" / workflow_name).read_text()
+        assert "scripts/run_http_integration.sh" in workflow
+        assert "@sha256:" in workflow
+        assert all(
+            "@sha256:" in line
+            for line in workflow.splitlines()
+            if "quay.io/ferricstore/ferricstore:" in line
+        )
+        integration_job = workflow.split("\n  integration:", 1)[1]
+        if "\n  publish:" in integration_job:
+            integration_job = integration_job.split("\n  publish:", 1)[0]
+        assert "actions/setup-python@v6" in integration_job
+        assert 'python -m pip install -e ".[dev]"' in integration_job
+
+    readme = (REPOSITORY / "README.md").read_text()
+    assert "run_http_integration.sh" in readme
+    assert "FERRICSTORE_CA_FILE" in readme
 
 
 def test_http_redirect_responsibility_is_documented_without_disabling_redirects() -> None:
@@ -124,6 +172,17 @@ def test_native_integration_observer_preserves_executor_capabilities() -> None:
     observed.clear()
     integration["_observe_command"](("CLIENT.SETNAME", "sdk-test"))
     assert "CLIENT" in observed
+
+
+def test_http_integration_catalog_coverage_excludes_only_native_session_commands() -> None:
+    integration = runpy.run_path(
+        str(REPOSITORY / "tests" / "integration" / "test_ferricstore_integration.py")
+    )
+    select = integration["_catalog_commands_for_transport"]
+    catalog = {"CLIENT", "FETCH_OR_COMPUTE", "FLOW.QUERY", "GET"}
+
+    assert select(catalog, http=False) == catalog
+    assert select(catalog, http=True) == {"FLOW.QUERY", "GET"}
 
 
 def test_critical_coverage_checker_rejects_per_module_regressions(tmp_path: Path) -> None:

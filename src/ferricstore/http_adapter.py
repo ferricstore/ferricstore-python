@@ -19,6 +19,7 @@ from ferricstore.errors import (
     OverloadedError,
     classify_server_error,
 )
+from ferricstore.flow_query_request import _with_flow_query_command_options
 from ferricstore.http_coalescing import CommandCoalescer
 from ferricstore.http_transport import JsonHttpTransport, _HttpDeadline
 from ferricstore.protocol_commands import build_protocol_command
@@ -178,6 +179,19 @@ class HttpAdapter:
 
     def execute_command(self, *args: Any) -> Any:
         return self._execute_command_with_deadline(args, self._command_deadline([args]))
+
+    def execute_flow_query_command(
+        self,
+        *args: Any,
+        deadline_ms: int | None = None,
+        routing_key: str | bytes | None = None,
+    ) -> Any:
+        command = _with_flow_query_command_options(
+            args,
+            deadline_ms=deadline_ms,
+            routing_key=routing_key,
+        )
+        return self.execute_command(*command)
 
     def _execute_command_with_deadline(
         self,
@@ -378,6 +392,19 @@ class AsyncHttpAdapter:
             cancelled,
             _cancelled=cancelled,
         )
+
+    async def execute_flow_query_command(
+        self,
+        *args: Any,
+        deadline_ms: int | None = None,
+        routing_key: str | bytes | None = None,
+    ) -> Any:
+        command = _with_flow_query_command_options(
+            args,
+            deadline_ms=deadline_ms,
+            routing_key=routing_key,
+        )
+        return await self.execute_command(*command)
 
     async def execute_batch(self, commands: Sequence[Sequence[Any]]) -> list[Any]:
         command_list = list(commands)
