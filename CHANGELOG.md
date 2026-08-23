@@ -6,6 +6,18 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.11.9 - 2026-08-23
+
+- Run the complete HTTP-compatible integration surface against an authenticated
+  TLS listener in CI and publish validation while retaining native-only session
+  tests in their existing gate.
+- Preserve validated `FLOW.QUERY` absolute deadlines in synchronous and
+  asynchronous HTTP structured payloads.
+- Reject direct and `COMMAND_EXEC`-wrapped `FETCH_OR_COMPUTE*` commands locally
+  because their ownership lifecycle requires a persistent native session.
+- Document the reproducible HTTPS integration runner, keep its temporary TLS
+  directory owner-only, and delete the CA key before the container starts.
+
 ## 0.11.8 - 2026-08-23
 
 - Keep long-lived single-request blocking commands available over HTTP, extend

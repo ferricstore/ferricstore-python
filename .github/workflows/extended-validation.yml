@@ -49,7 +49,7 @@ jobs:
     name: TLS and ACL authentication
     runs-on: ubuntu-latest
     env:
-      FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.10@sha256:3af390b7429ea3fea2983938eb7adcdd3e8005d06c67473f769f29ebd48e8ab3
+      FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.11@sha256:d9f488539f0d6c1a513d2315e7a9c2947cc795b393f3774c9de8ba5e5b5c21b5
       FERRICSTORE_SECURITY_PLAIN_PORT: "56420"
       FERRICSTORE_SECURITY_TLS_PORT: "56421"
       FERRICSTORE_TLS_URL: ferrics://127.0.0.1:56421
@@ -100,7 +100,7 @@ jobs:
     name: Prolonged outage and restart recovery
     runs-on: ubuntu-latest
     env:
-      FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.10@sha256:3af390b7429ea3fea2983938eb7adcdd3e8005d06c67473f769f29ebd48e8ab3
+      FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.11@sha256:d9f488539f0d6c1a513d2315e7a9c2947cc795b393f3774c9de8ba5e5b5c21b5
       FERRICSTORE_PORT: "56410"
       FERRICSTORE_NATIVE_ADVERTISE_PORT: "56410"
       FERRICSTORE_URL: ferric://127.0.0.1:56410
@@ -133,7 +133,7 @@ jobs:
     name: Three-node leader failover
     runs-on: ubuntu-latest
     env:
-      FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.10@sha256:3af390b7429ea3fea2983938eb7adcdd3e8005d06c67473f769f29ebd48e8ab3
+      FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.11@sha256:d9f488539f0d6c1a513d2315e7a9c2947cc795b393f3774c9de8ba5e5b5c21b5
       FERRICSTORE_CLUSTER_PORT_0: "56430"
       FERRICSTORE_CLUSTER_PORT_1: "56431"
       FERRICSTORE_CLUSTER_PORT_2: "56432"
@@ -173,7 +173,7 @@ jobs:
     name: Sync and async soak
     runs-on: ubuntu-latest
     env:
-      FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.10@sha256:3af390b7429ea3fea2983938eb7adcdd3e8005d06c67473f769f29ebd48e8ab3
+      FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.11@sha256:d9f488539f0d6c1a513d2315e7a9c2947cc795b393f3774c9de8ba5e5b5c21b5
       FERRICSTORE_PORT: "56440"
       FERRICSTORE_NATIVE_ADVERTISE_PORT: "56440"
       FERRICSTORE_URL: ferric://127.0.0.1:56440

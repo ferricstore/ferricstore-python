@@ -7198,12 +7198,14 @@ def test_protocol_adapter_allows_multiple_inflight_requests():
             with conn:
                 _serve_v091_handshake(conn, recv_frame, response)
 
-                first_opcode, first_lane, first_id, _first_payload = recv_frame(conn)
-                second_opcode, second_lane, second_id, _second_payload = recv_frame(conn)
+                first_opcode, first_lane, first_id, first_payload = recv_frame(conn)
+                second_opcode, second_lane, second_id, second_payload = recv_frame(conn)
                 received.extend([(first_opcode, first_lane), (second_opcode, second_lane)])
 
-                conn.sendall(response(first_opcode, first_lane, first_id, b"one"))
-                conn.sendall(response(second_opcode, second_lane, second_id, b"two"))
+                conn.sendall(
+                    response(second_opcode, second_lane, second_id, second_payload[b"key"])
+                )
+                conn.sendall(response(first_opcode, first_lane, first_id, first_payload[b"key"]))
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
@@ -7212,12 +7214,13 @@ def test_protocol_adapter_allows_multiple_inflight_requests():
         with ThreadPoolExecutor(max_workers=2) as pool:
             first = pool.submit(adapter.execute_command, "GET", "a")
             second = pool.submit(adapter.execute_command, "GET", "b")
-            assert [first.result(timeout=1.0), second.result(timeout=1.0)] == [b"one", b"two"]
+            assert [first.result(timeout=1.0), second.result(timeout=1.0)] == [b"a", b"b"]
     finally:
         adapter.close()
         thread.join(timeout=1.0)
 
-    assert received == [(0x0101, 1), (0x0101, 2)]
+    assert [opcode for opcode, _lane in received] == [0x0101, 0x0101]
+    assert {lane for _opcode, lane in received} == {1, 2}
 
 
 def test_protocol_adapter_submit_command_returns_future_without_waiting():
@@ -7310,12 +7313,14 @@ def test_async_protocol_adapter_allows_multiple_inflight_requests():
                 )
                 startup_codecs.extend(startup[3][b"compact_response_codecs"])
 
-                first_opcode, first_lane, first_id, _first_payload = await recv_frame(reader)
-                second_opcode, second_lane, second_id, _second_payload = await recv_frame(reader)
+                first_opcode, first_lane, first_id, first_payload = await recv_frame(reader)
+                second_opcode, second_lane, second_id, second_payload = await recv_frame(reader)
                 received.extend([(first_opcode, first_lane), (second_opcode, second_lane)])
 
-                writer.write(response(first_opcode, first_lane, first_id, b"one"))
-                writer.write(response(second_opcode, second_lane, second_id, b"two"))
+                writer.write(
+                    response(second_opcode, second_lane, second_id, second_payload[b"key"])
+                )
+                writer.write(response(first_opcode, first_lane, first_id, first_payload[b"key"]))
                 await writer.drain()
             finally:
                 writer.close()
@@ -7332,7 +7337,7 @@ def test_async_protocol_adapter_allows_multiple_inflight_requests():
                 ),
                 timeout=1.0,
             )
-            assert result == [b"one", b"two"]
+            assert result == [b"a", b"b"]
         finally:
             await adapter.close()
             server.close()
@@ -7340,7 +7345,8 @@ def test_async_protocol_adapter_allows_multiple_inflight_requests():
 
     asyncio.run(run())
 
-    assert received == [(0x0101, 1), (0x0101, 2)]
+    assert [opcode for opcode, _lane in received] == [0x0101, 0x0101]
+    assert {lane for _opcode, lane in received} == {1, 2}
     assert startup_codecs == []
 
 

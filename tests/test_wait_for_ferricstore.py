@@ -5,7 +5,7 @@ import re
 import sys
 from pathlib import Path
 
-INTEGRATION_SERVER_VERSION = "0.11.10"
+INTEGRATION_SERVER_VERSION = "0.11.11"
 COMPATIBILITY_SERVER_VERSION = "0.11.4"
 INTEGRATION_IMAGE_PATTERN = re.compile(
     rf"quay\.io/ferricstore/ferricstore:{INTEGRATION_SERVER_VERSION}"
