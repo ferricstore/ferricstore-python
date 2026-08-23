@@ -75,7 +75,9 @@ _NATIVE_PROTOCOL_COMMANDS: set[str] = set(
     GETRANGE GETSET HDEL HELLO HEXISTS HEXPIRE HEXPIRETIME HGET HGETALL HGETDEL
     HGETEX HINCRBY HINCRBYFLOAT HKEYS HLEN HMGET HPERSIST HPEXPIRE HPTTL
     HRANDFIELD HSCAN HSET HSETEX HSETNX HSTRLEN HTTL HVALS INCR INCRBY
-    INCRBYFLOAT INFO KEY_INFO KEYS LASTSAVE LINDEX LINSERT LLEN LMOVE LOCK LOLWUT
+    INCRBYFLOAT INFO INVOCATION.CREATE INVOCATION.DEFINITION.GET
+    INVOCATION.DEFINITION.LIST INVOCATION.DEFINITION.PUT INVOCATION.GET
+    INVOCATION.PARTITION.LIST KEY_INFO KEYS LASTSAVE LINDEX LINSERT LLEN LMOVE LOCK LOLWUT
     LPOP LPOS LPUSH LPUSHX LRANGE LREM LSET LTRIM MEMORY MGET MODULE MSET MSETNX
     MULTI OBJECT PERSIST PEXPIRE PEXPIREAT PEXPIRETIME PFADD PFCOUNT PFMERGE PING
     PSETEX PSUBSCRIBE PTTL PUBLISH PUBSUB PUNSUBSCRIBE QUIT RANDOMKEY RATELIMIT.ADD
@@ -765,6 +767,47 @@ def test_real_ferricstore_command_and_flow_cycle() -> None:
     finally:
         with suppress(Exception):
             client.command("DEL", key)
+        client.close()
+
+
+def test_real_ferricstore_invocation_cycle() -> None:
+    client = _client()
+    suffix = _suffix()
+    name = f"py-sdk-invocation-{suffix}"
+
+    try:
+        catalog_names = _command_catalog_names(client.command("COMMAND"))
+        if "INVOCATION.CREATE" not in catalog_names:
+            pytest.skip("server does not expose the invocation command family")
+
+        assert _ok(
+            client.invocation_definition_put(
+                {"name": name, "enabled": True, "initial_state": "queued"}
+            )
+        )
+
+        definition = client.invocation_definition_get(name)
+        assert _text(_field(definition, "name")) == name
+        assert any(
+            _text(_field(candidate, "name")) == name
+            for candidate in client.invocation_definition_list()
+        )
+
+        created = client.invocation_create(
+            name,
+            {"payload": {"source": "python-sdk-integration"}},
+            idempotency_key=f"py-sdk-{suffix}",
+        )
+        invocation_id = _text(_field(created, "invocation_id"))
+        partition_key = _text(_field(created, "partition_key"))
+        assert invocation_id.startswith("inv1.")
+
+        invocation = client.invocation_get(invocation_id)
+        assert _text(_field(invocation, "id")) == invocation_id
+        assert partition_key in {
+            _text(candidate) for candidate in client.invocation_partition_list(name)
+        }
+    finally:
         client.close()
 
 
