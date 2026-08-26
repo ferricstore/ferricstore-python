@@ -36,6 +36,7 @@ APIs, and access to normal FerricStore commands.
 | Payload codecs | [Payload Codecs](codecs.md) |
 | Command executors | [Command Executors](adapters.md) |
 | Async APIs | [Async APIs](async.md) |
+| LangGraph and LangChain checkpoint persistence | [LangGraph and LangChain Persistence](langgraph.md) |
 | Children and fanout | [Children and Fanout](children.md) |
 | Retry and errors | [Retry and Errors](retry.md) |
 | Celery, Temporal, DBOS comparisons | [If You Know Celery, Temporal, or DBOS](compare.md) |

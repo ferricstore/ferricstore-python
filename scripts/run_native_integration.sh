@@ -70,6 +70,6 @@ docker run --rm \
   "$PYTHON_TEST_IMAGE" \
   sh -c '
     python scripts/wait_for_ferricstore.py
-    python -m pip install -q "pytest==9.0.3"
+    python -m pip install -q "pytest==9.0.3" ".[langchain]"
     python -m pytest -p no:cacheprovider "$@"
   ' native-integration "$@"
