@@ -2,12 +2,12 @@
 
 Python SDK for FerricStore and FerricFlow.
 
-Status: public alpha `0.11.9`. APIs may change before `1.0`, but the SDK is
+Status: public alpha `0.12.0`. APIs may change before `1.0`, but the SDK is
 tested against command construction, queue/workflow handlers, leases, retries,
 history, indexed attributes, named values, idempotent create, worker loops,
 async flows, and local FerricStore integration scenarios.
 
-Python SDK `0.11.9` requires FerricStore `0.11.4` or newer. With FerricStore
+Python SDK `0.12.0` requires FerricStore `0.11.4` or newer. With FerricStore
 0.11.11 it negotiates compact Stream mode 34 for homogeneous auto-ID `XADD`
 batches, compact Pub/Sub mode 35 for homogeneous `PUBLISH` pipelines, and the
 `pubsub_batch_v1` event codec for compatible subscriptions. Native wire
@@ -348,11 +348,64 @@ requested values, not history replay.
 | `StaleLeaseError` | A worker tried to complete with an old lease. | Keep handlers under `lease_ms` or renew/retry safely. |
 | `OverloadedError` | Server backpressure rejected a safe operation. | Let the SDK retry/back off; reduce request rate under sustained pressure. |
 
+### 9. Persist LangGraph and LangChain threads
+
+Install the optional integration and compile a graph with a FerricStore-backed
+checkpointer:
+
+```bash
+pip install "ferricstore[langgraph]"
+```
+
+```python
+from ferricstore import FlowClient
+from ferricstore.langgraph import FerricStoreSaver
+
+client = FlowClient.from_url("ferric://127.0.0.1:6388")
+checkpointer = FerricStoreSaver(client)
+graph = builder.compile(checkpointer=checkpointer)
+
+config = {"configurable": {"thread_id": "conversation-123"}}
+result = graph.invoke({"messages": messages}, config)
+```
+
+LangChain's modern `create_agent` API accepts the same checkpointer plus a
+`FerricStoreStore` for memory shared across conversation threads. Install
+`ferricstore[langchain]`, then pass both adapters when creating the agent:
+
+```python
+from ferricstore.langgraph import FerricStoreSaver, FerricStoreStore
+
+agent = create_agent(
+    model=model,
+    tools=tools,
+    checkpointer=FerricStoreSaver(client),
+    store=FerricStoreStore(client),
+)
+```
+
+Reusing a `thread_id` restores one conversation; an explicit store namespace
+can be read from different thread IDs.
+
+The graph definition remains application code. FerricStore persists thread
+checkpoints, metadata, pending writes, and interrupt/resume state. Use
+`AsyncFerricStoreSaver` with `AsyncFlowClient` for native asynchronous I/O.
+Use `LangGraphFlow` or `AsyncLangGraphFlow` inside a FerricFlow state handler
+when the graph also needs an outer business state machine, durable retries,
+leases, schedules, signals, or governance. The bridge maps each Flow identity
+to a collision-safe LangGraph thread and translates graph completion or
+interrupts into normal Flow outcomes.
+See [LangGraph and LangChain persistence](docs/langgraph.md) for the complete
+contract, LangChain example, and the distinction between thread checkpoints
+and cross-thread memory.
+
 ## What you use
 
 - `QueueClient` / `AsyncQueueClient` for durable queues.
 - `WorkflowClient` / `AsyncWorkflowClient` for explicit durable state machines.
 - `FlowClient` / `AsyncFlowClient` for advanced command-level control.
+- `FerricStoreSaver` / `AsyncFerricStoreSaver` for LangGraph checkpoints and
+  `FerricStoreStore` / `AsyncFerricStoreStore` for cross-thread agent memory.
 - `ScheduleRecord`, `ScheduleFireResult`, `ScheduleFireDueResult`, `EffectResult`, `ApprovalResult`, `CircuitBreakerStatus`,
   `BudgetResult`, and `GovernanceOverview` for typed admin/governance responses
   with dict fallback.
@@ -405,6 +458,7 @@ lane counts after profiling shows client-side saturation.
 - [Data in workflows](docs/data.md)
 - [Worker runtime](docs/worker.md)
 - [Async APIs](docs/async.md)
+- [LangGraph and LangChain persistence](docs/langgraph.md)
 - [Use cases](docs/use-cases.md)
 - [Testing](docs/testing.md)
 - [Troubleshooting](docs/troubleshooting.md)
@@ -415,6 +469,8 @@ lane counts after profiling shows client-side saturation.
 - `examples/queue_worker.py`: queue producer and worker.
 - `examples/async_queue_worker.py`: async queue producer and worker.
 - `examples/state_machine_workflow.py`: explicit workflow runner.
+- `examples/langgraph_checkpoint.py`: LangGraph state persisted in FerricStore.
+- `examples/langgraph_flow.py`: run a checkpointed LangGraph from FerricFlow.
 - `examples/protocol_commands.py`: FerricStore command helpers.
 - `examples/protocol_kv_benchmark.py`: protocol SET/GET benchmark.
 - `examples/protocol_dbos_benchmark.py`: protocol DBOS-style queued workflow benchmark.

@@ -6,6 +6,29 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.12.0 - 2026-08-27
+
+- Add optional LangGraph 1.2 checkpoint persistence with synchronous and
+  asynchronous FerricStore savers backed by one shared command-plan storage
+  core, plus sync and async FerricFlow bridges for durable retries, signals,
+  interrupt/resume workflows, governance context, thread cleanup,
+  documentation, examples, and live-server integration coverage. Add a
+  `langchain` installation extra, direct `create_agent` persistence tests, and
+  full LangChain-agent-to-FerricFlow integration coverage. Add synchronous and
+  native-async LangGraph `BaseStore` adapters with batched operations,
+  hierarchical namespaces, structured filters, deterministic pagination, and
+  live cross-thread LangChain memory coverage. Make checkpoint publication and
+  thread deletion safe under overlapping operations, keep latest-checkpoint
+  selection monotonic, and use cleaned, ordered per-item store indexes for
+  bounded-memory pagination without namespace tombstones. Add ordered
+  checkpoint-ID indexes, hashed per-thread namespace catalogs, distributed
+  mutation locking across sync and async adapters, and recursive JSON-object
+  key validation so concurrent cleanup remains exact and stored values cannot
+  change shape silently. Make checkpoint and BaseStore visibility recoverable
+  across interrupted multi-command mutations, renew held mutation locks with
+  `EXTEND`, and replace global thread scans with a paginated ordered checkpoint
+  locator index.
+
 ## 0.11.9 - 2026-08-23
 
 - Run the complete HTTP-compatible integration surface against an authenticated
