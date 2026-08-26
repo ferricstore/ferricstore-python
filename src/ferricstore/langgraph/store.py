@@ -74,8 +74,7 @@ def _batch_items(value: Any, expected: int) -> builtins.list[Any]:
         raise TypeError("FerricStore command batch returned an invalid response")
     if len(value) != expected:
         raise ValueError(
-            f"FerricStore command batch returned {len(value)} responses for "
-            f"{expected} commands"
+            f"FerricStore command batch returned {len(value)} responses for {expected} commands"
         )
     return list(value)
 
@@ -198,9 +197,7 @@ def _decode_ordered_text(value: bytes, offset: int) -> tuple[str, int]:
             try:
                 return decoded.decode("utf-8"), offset
             except UnicodeDecodeError as exc:
-                raise ValueError(
-                    "invalid UTF-8 in FerricStore LangGraph catalog member"
-                ) from exc
+                raise ValueError("invalid UTF-8 in FerricStore LangGraph catalog member") from exc
         if escaped == 255:
             decoded.append(0)
             continue
@@ -247,8 +244,7 @@ def _compare_value(item_value: Any, filter_value: Any) -> bool:
         if not isinstance(item_value, dict):
             return False
         return all(
-            _compare_value(item_value.get(key), expected)
-            for key, expected in filter_value.items()
+            _compare_value(item_value.get(key), expected) for key, expected in filter_value.items()
         )
     if isinstance(filter_value, (list, tuple)):
         return (
@@ -281,9 +277,7 @@ def _apply_operator(value: Any, operator: str, expected: Any) -> bool:
 def _matches_filter(value: dict[str, Any], filter: dict[str, Any] | None) -> bool:
     if not filter:
         return True
-    return all(
-        _compare_value(value.get(key), expected) for key, expected in filter.items()
-    )
+    return all(_compare_value(value.get(key), expected) for key, expected in filter.items())
 
 
 def _matches_namespace(condition: MatchCondition, namespace: tuple[str, ...]) -> bool:
@@ -372,9 +366,7 @@ class _FerricStoreMemoryStorage:
         updated_at: datetime,
     ) -> bytes:
         value = op.value
-        if not isinstance(value, dict) or not all(
-            isinstance(key, str) for key in value
-        ):
+        if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
             raise TypeError("LangGraph store values must be dictionaries with string keys")
         return self._serialize(
             {
@@ -395,9 +387,7 @@ class _FerricStoreMemoryStorage:
             raise NotImplementedError("TTL is not supported by FerricStoreStore")
         if op.value is None:
             return
-        if not isinstance(op.value, dict) or not all(
-            isinstance(key, str) for key in op.value
-        ):
+        if not isinstance(op.value, dict) or not all(isinstance(key, str) for key in op.value):
             raise TypeError("LangGraph store values must be dictionaries with string keys")
         _validate_json_keys(op.value)
         self._serialize(op.value)
@@ -454,9 +444,7 @@ class _FerricStoreMemoryStorage:
         )
         if response is None:
             return []
-        if not isinstance(response, Sequence) or isinstance(
-            response, (str, bytes, bytearray)
-        ):
+        if not isinstance(response, Sequence) or isinstance(response, (str, bytes, bytearray)):
             raise TypeError("FerricStore ZRANGE returned an invalid response")
         return [_decode_catalog_member(member) for member in response]
 
@@ -576,15 +564,10 @@ class _FerricStoreMemoryStorage:
                     continue
                 namespace = item.namespace
                 if op.match_conditions and not all(
-                    _matches_namespace(condition, namespace)
-                    for condition in op.match_conditions
+                    _matches_namespace(condition, namespace) for condition in op.match_conditions
                 ):
                     continue
-                selected = (
-                    namespace[: op.max_depth]
-                    if op.max_depth is not None
-                    else namespace
-                )
+                selected = namespace[: op.max_depth] if op.max_depth is not None else namespace
                 if selected == last_namespace:
                     continue
                 last_namespace = selected
@@ -658,10 +641,7 @@ class _FerricStoreMemoryStorage:
                 if response is None:
                     continue
                 existing = self._decode_item(response)
-                if (
-                    existing.namespace != item.op.namespace
-                    or existing.key != item.op.key
-                ):
+                if existing.namespace != item.op.namespace or existing.key != item.op.key:
                     raise ValueError("FerricStore LangGraph item key mismatch")
                 created_at[(item.op.namespace, item.op.key)] = existing.created_at
 

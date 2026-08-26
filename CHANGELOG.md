@@ -6,6 +6,8 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.12.0 - 2026-08-27
+
 - Add optional LangGraph 1.2 checkpoint persistence with synchronous and
   asynchronous FerricStore savers backed by one shared command-plan storage
   core, plus sync and async FerricFlow bridges for durable retries, signals,

@@ -5,8 +5,9 @@ Trusted Publishing.
 
 ## Before tagging
 
-1. Update `version` in `pyproject.toml`.
-2. Update `__version__` in `src/ferricstore/__init__.py`.
+1. Update `__version__` in `src/ferricstore/__init__.py`; the build reads this
+   as the package's single version source.
+2. Update README and project-status version references.
 3. Move relevant `CHANGELOG.md` entries from `Unreleased` to the release version.
 4. Run local validation:
 

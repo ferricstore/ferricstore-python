@@ -124,7 +124,7 @@ def _unpack_typed(value: Any) -> tuple[str, bytes]:
     type_end = _TYPE_LENGTH.size + type_length
     if len(payload) < type_end:
         raise ValueError("truncated FerricStore LangGraph payload")
-    return payload[_TYPE_LENGTH.size:type_end].decode("utf-8"), payload[type_end:]
+    return payload[_TYPE_LENGTH.size : type_end].decode("utf-8"), payload[type_end:]
 
 
 def _scan_page(response: Any) -> tuple[int, builtins.list[tuple[Any, Any]]]:
@@ -136,9 +136,7 @@ def _scan_page(response: Any) -> tuple[int, builtins.list[tuple[Any, Any]]]:
     raw_items = response[1]
     if isinstance(raw_items, Mapping):
         return cursor, list(raw_items.items())
-    if not isinstance(raw_items, Sequence) or isinstance(
-        raw_items, (str, bytes, bytearray)
-    ):
+    if not isinstance(raw_items, Sequence) or isinstance(raw_items, (str, bytes, bytearray)):
         raise TypeError("FerricStore HSCAN items must be a mapping or sequence")
     if len(raw_items) % 2:
         raise ValueError("FerricStore HSCAN returned an odd number of field/value items")
@@ -171,9 +169,7 @@ def _run_sync(client: _SyncCommandClient, plan: _CommandPlan[_ResultT]) -> _Resu
             return cast(_ResultT, stopped.value)
 
 
-async def _run_async(
-    client: _AsyncCommandClient, plan: _CommandPlan[_ResultT]
-) -> _ResultT:
+async def _run_async(client: _AsyncCommandClient, plan: _CommandPlan[_ResultT]) -> _ResultT:
     """Execute one shared storage command plan with an asynchronous client."""
     try:
         command = next(plan)
@@ -280,10 +276,7 @@ class _FerricStoreCheckpointStorage:
 
     @staticmethod
     def _write_field(checkpoint_id: str, task_id: str, index: int) -> str:
-        return (
-            f"write:{_encode_component(checkpoint_id)}:"
-            f"{_encode_component(task_id)}:{index}"
-        )
+        return f"write:{_encode_component(checkpoint_id)}:{_encode_component(task_id)}:{index}"
 
     def _serialize(self, value: Any) -> bytes:
         return _pack_typed(self.serde.dumps_typed(value))
@@ -367,9 +360,7 @@ class _FerricStoreCheckpointStorage:
             }
         )
 
-    def _decode_pending_writes(
-        self, values: Sequence[Any]
-    ) -> builtins.list[tuple[str, str, Any]]:
+    def _decode_pending_writes(self, values: Sequence[Any]) -> builtins.list[tuple[str, str, Any]]:
         records: builtins.list[Mapping[str, Any]] = []
         for value in values:
             decoded = self._deserialize(value)
@@ -393,9 +384,7 @@ class _FerricStoreCheckpointStorage:
             for item in records
         ]
 
-    def _scan_hash(
-        self, key: str, pattern: str
-    ) -> _CommandPlan[builtins.list[tuple[Any, Any]]]:
+    def _scan_hash(self, key: str, pattern: str) -> _CommandPlan[builtins.list[tuple[Any, Any]]]:
         cursor = 0
         items: builtins.list[tuple[Any, Any]] = []
         while True:
@@ -419,9 +408,7 @@ class _FerricStoreCheckpointStorage:
         items = yield from self._scan_hash(key, self._writes_pattern(checkpoint_id))
         return self._decode_pending_writes([value for _, value in items])
 
-    def _read_record(
-        self, key: str, checkpoint_id: str
-    ) -> _CommandPlan[Mapping[str, Any] | None]:
+    def _read_record(self, key: str, checkpoint_id: str) -> _CommandPlan[Mapping[str, Any] | None]:
         value = yield ("HGET", key, self._checkpoint_field(checkpoint_id))
         if value is None:
             return None
@@ -469,9 +456,7 @@ class _FerricStoreCheckpointStorage:
         values = (yield ("SMEMBERS", self.thread_catalog_key(thread_id))) or []
         return sorted(_text(value, name="thread checkpoint key") for value in values)
 
-    def _candidate_keys(
-        self, config: RunnableConfig | None
-    ) -> _CommandPlan[builtins.list[str]]:
+    def _candidate_keys(self, config: RunnableConfig | None) -> _CommandPlan[builtins.list[str]]:
         if config is None:
             raise ValueError("global checkpoint listing uses the ordered locator index")
         configurable = config.get("configurable")
@@ -497,9 +482,7 @@ class _FerricStoreCheckpointStorage:
         )
         if response is None:
             return []
-        if not isinstance(response, Sequence) or isinstance(
-            response, (str, bytes, bytearray)
-        ):
+        if not isinstance(response, Sequence) or isinstance(response, (str, bytes, bytearray)):
             raise TypeError("FerricStore ZREVRANGE returned an invalid response")
         return [_text(item, name="checkpoint id") for item in response]
 
@@ -515,14 +498,9 @@ class _FerricStoreCheckpointStorage:
         )
         if response is None:
             return []
-        if not isinstance(response, Sequence) or isinstance(
-            response, (str, bytes, bytearray)
-        ):
+        if not isinstance(response, Sequence) or isinstance(response, (str, bytes, bytearray)):
             raise TypeError("FerricStore ZREVRANGE returned an invalid response")
-        return [
-            (member, *self.decode_checkpoint_locator(member))
-            for member in response
-        ]
+        return [(member, *self.decode_checkpoint_locator(member)) for member in response]
 
     def _list_global(
         self,
@@ -723,9 +701,7 @@ class _FerricStoreCheckpointStorage:
             locators = yield ("ZRANGE", locator_catalog_key, 0, self.scan_count - 1)
             if not locators:
                 break
-            if not isinstance(locators, Sequence) or isinstance(
-                locators, (str, bytes, bytearray)
-            ):
+            if not isinstance(locators, Sequence) or isinstance(locators, (str, bytes, bytearray)):
                 raise TypeError("FerricStore ZRANGE returned an invalid response")
             yield ("ZREM", self.catalog_key, *locators)
             yield ("ZREM", locator_catalog_key, *locators)

@@ -185,9 +185,7 @@ def config(
     return {"configurable": configurable}
 
 
-def pending_value(
-    writes: Sequence[tuple[str, str, Any]] | None, channel: str
-) -> Any:
+def pending_value(writes: Sequence[tuple[str, str, Any]] | None, channel: str) -> Any:
     assert writes is not None
     return next(value for _, stored_channel, value in writes if stored_channel == channel)
 
@@ -257,16 +255,13 @@ def test_sync_saver_round_trip_history_filters_and_pending_write_semantics() -> 
         second_id,
         first_id,
     ]
-    assert [item.config for item in saver.list(config("thread-1"), limit=1)] == [
-        second_config
-    ]
+    assert [item.config for item in saver.list(config("thread-1"), limit=1)] == [second_config]
     assert [item.config for item in saver.list(config("thread-1"), before=second_config)] == [
         first_config
     ]
-    assert [
-        item.config
-        for item in saver.list(config("thread-1"), filter={"source": "input"})
-    ] == [first_config]
+    assert [item.config for item in saver.list(config("thread-1"), filter={"source": "input"})] == [
+        first_config
+    ]
     assert [item.config for item in saver.list(None)] == [second_config, first_config]
 
 
@@ -308,8 +303,7 @@ def test_latest_checkpoint_is_monotonic_when_older_put_commits_last() -> None:
     assert latest.checkpoint["channel_values"] == {"value": 2}
     assert any(command[0] == "ZREVRANGE" for command in client.commands)
     assert not any(
-        command[0] == "HSCAN" and command[4] == "checkpoint:*"
-        for command in client.commands
+        command[0] == "HSCAN" and command[4] == "checkpoint:*" for command in client.commands
     )
 
 
@@ -372,17 +366,11 @@ def test_delete_thread_and_put_cannot_create_hidden_live_checkpoint() -> None:
     assert saver.get_tuple(config("delete-race")) is not None
     assert [item.config for item in saver.list(None)] == [replacement_configs[0]]
     thread_key = saver._storage.thread_key("delete-race", "")
-    assert client.sets[saver._storage.thread_catalog_key("delete-race")] == {
-        thread_key
-    }
+    assert client.sets[saver._storage.thread_catalog_key("delete-race")] == {thread_key}
     locator = saver._storage.checkpoint_locator(replacement_id, thread_key)
-    assert client.zsets[saver._storage.thread_locator_catalog_key("delete-race")] == {
-        locator: 0.0
-    }
+    assert client.zsets[saver._storage.thread_locator_catalog_key("delete-race")] == {locator: 0.0}
     assert client.zsets[saver._storage.catalog_key] == {locator: 0.0}
-    assert client.zsets[saver._storage.checkpoint_index_key(thread_key)] == {
-        replacement_id: 0.0
-    }
+    assert client.zsets[saver._storage.checkpoint_index_key(thread_key)] == {replacement_id: 0.0}
 
 
 def test_delete_thread_uses_its_thread_catalog_instead_of_global_scan() -> None:
@@ -403,8 +391,7 @@ def test_delete_thread_uses_its_thread_catalog_instead_of_global_scan() -> None:
     smembers = [command for command in client.commands if command[0] == "SMEMBERS"]
     assert smembers == [("SMEMBERS", saver._storage.thread_catalog_key("thread-7"))]
     assert any(
-        command[:2]
-        == ("ZRANGE", saver._storage.thread_locator_catalog_key("thread-7"))
+        command[:2] == ("ZRANGE", saver._storage.thread_locator_catalog_key("thread-7"))
         for command in client.commands
     )
     assert not any(command[0] == "HGET" for command in client.commands)
@@ -428,8 +415,7 @@ def test_checkpoint_list_limit_bounds_index_reads() -> None:
     assert len(ranges) == 1
     assert ranges[0][2:] == (0, 0)
     assert not any(
-        command[0] == "HSCAN" and command[4] == "checkpoint:*"
-        for command in client.commands
+        command[0] == "HSCAN" and command[4] == "checkpoint:*" for command in client.commands
     )
 
 
@@ -459,9 +445,7 @@ def test_interrupted_checkpoint_put_never_publishes_a_partial_record() -> None:
     assert latest is not None
     assert latest.config == older_config
     assert saver.get_tuple(config("failure-atomic", checkpoint_id=newer_id)) is None
-    assert [item.config for item in saver.list(config("failure-atomic"), limit=1)] == [
-        older_config
-    ]
+    assert [item.config for item in saver.list(config("failure-atomic"), limit=1)] == [older_config]
     assert [item.config for item in saver.list(None)] == [older_config]
 
     repaired = saver.put(config("failure-atomic"), checkpoint(newer_id, 2), {}, {})

@@ -138,13 +138,16 @@ def test_default_thread_identity_separates_types_and_partitions() -> None:
     )
 
     assert bridge.thread_id(base).startswith("ferricflow:")
-    assert len(
-        {
-            bridge.thread_id(base),
-            bridge.thread_id(other_partition),
-            bridge.thread_id(other_type),
-        }
-    ) == 3
+    assert (
+        len(
+            {
+                bridge.thread_id(base),
+                bridge.thread_id(other_partition),
+                bridge.thread_id(other_type),
+            }
+        )
+        == 3
+    )
 
 
 class ReviewState(TypedDict):

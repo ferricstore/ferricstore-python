@@ -5,10 +5,10 @@ FerricStore Python SDK is public alpha.
 Current version:
 
 ```text
-0.11.9
+0.12.0
 ```
 
-Python SDK `0.11.9` requires FerricStore `0.11.4` or newer and validates the
+Python SDK `0.12.0` requires FerricStore `0.11.4` or newer and validates the
 native TCP and request/response HTTP transports against FerricStore 0.11.11.
 Native wire protocol v1 is unchanged.
 
@@ -34,6 +34,8 @@ The SDK includes:
 - Retry/backoff policy helpers.
 - Named values and value refs.
 - Query/history helpers.
+- LangGraph checkpoint persistence and cross-thread memory stores.
+- LangChain agent memory and FerricFlow-to-LangGraph execution bridges.
 - Tests for command construction and SDK runtime behavior.
 
 ## Not yet stable

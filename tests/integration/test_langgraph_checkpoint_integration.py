@@ -185,9 +185,7 @@ def test_langchain_agent_shares_ferricstore_memory_across_threads() -> None:
         )
 
         tool_messages = [
-            message
-            for message in result["messages"]
-            if isinstance(message, ToolMessage)
+            message for message in result["messages"] if isinstance(message, ToolMessage)
         ]
         assert [message.content for message in tool_messages] == ["Bob"]
         stored = store.get(namespace, "profile")
@@ -228,9 +226,7 @@ def test_async_langgraph_store_uses_native_ferricstore_client() -> None:
                 namespace[:2],
                 filter={"score": {"$gte": 8}},
             )
-            assert [(match.namespace, match.key) for match in matches] == [
-                (namespace, "profile")
-            ]
+            assert [(match.namespace, match.key) for match in matches] == [(namespace, "profile")]
             assert await store.alist_namespaces(prefix=namespace[:1]) == [namespace]
             await store.adelete(namespace, "profile")
             assert await store.aget(namespace, "profile") is None
@@ -261,10 +257,7 @@ def test_langgraph_store_pages_ordered_indexes_and_cleans_deleted_data() -> None
     catalog_keys = {
         store._storage.catalog_key,
         store._storage.prefix_catalog_key(root),
-        *(
-            store._storage.prefix_catalog_key(namespace)
-            for namespace in namespaces
-        ),
+        *(store._storage.prefix_catalog_key(namespace) for namespace in namespaces),
     }
 
     try:
@@ -358,9 +351,7 @@ def test_ferricflow_signal_resumes_checkpointed_langgraph() -> None:
         assert len(first) == 1
         assert getattr(first[0], "error", None) is None
         assert len(thread_ids) == 1
-        assert saver.get_tuple(
-            {"configurable": {"thread_id": thread_ids[0]}}
-        ) is not None
+        assert saver.get_tuple({"configurable": {"thread_id": thread_ids[0]}}) is not None
         waiting = workflow.get(flow_id)
         assert waiting is not None
         assert waiting.state == "waiting_review", (first, waiting.error, waiting.raw)
@@ -377,9 +368,7 @@ def test_ferricflow_signal_resumes_checkpointed_langgraph() -> None:
         completed = workflow.get(flow_id)
         assert completed is not None
         assert completed.state == "completed"
-        resumed = saver.get_tuple(
-            {"configurable": {"thread_id": thread_ids[0]}}
-        )
+        resumed = saver.get_tuple({"configurable": {"thread_id": thread_ids[0]}})
         assert resumed is not None
         assert resumed.checkpoint["channel_values"]["approved"] is True
     finally:
@@ -396,9 +385,7 @@ def test_ferricflow_runs_checkpointed_langchain_agent() -> None:
     url = os.environ.get("FERRICSTORE_URL", "ferric://127.0.0.1:6388")
     workflow_client = WorkflowClient.from_url(url, codec=JsonCodec())
     saver = FerricStoreSaver(workflow_client.flow, key_prefix=key_prefix)
-    model = FakeMessagesListChatModel(
-        responses=[AIMessage(content="Completed by LangChain.")]
-    )
+    model = FakeMessagesListChatModel(responses=[AIMessage(content="Completed by LangChain.")])
     agent = create_agent(model=model, tools=[], checkpointer=saver)
 
     def flow_value(ctx: Any, name: str) -> Any:
@@ -412,9 +399,7 @@ def test_ferricflow_runs_checkpointed_langchain_agent() -> None:
     bridge = LangGraphFlow(
         agent,
         input_factory=lambda ctx: flow_value(ctx, "agent_input"),
-        on_complete=lambda run, _ctx: complete(
-            result=run.value["messages"][-1].content
-        ),
+        on_complete=lambda run, _ctx: complete(result=run.value["messages"][-1].content),
     )
     workflow = workflow_client.workflow(
         type=f"langchain-agent-{suffix}",
@@ -435,11 +420,7 @@ def test_ferricflow_runs_checkpointed_langchain_agent() -> None:
     try:
         workflow.start(
             flow_id,
-            values={
-                "agent_input": {
-                    "messages": [{"role": "user", "content": "Handle this."}]
-                }
-            },
+            values={"agent_input": {"messages": [{"role": "user", "content": "Handle this."}]}},
         )
         claimed = workflow.run_once("run_agent", worker="langchain-integration")
         assert len(claimed) == 1
@@ -456,13 +437,9 @@ def test_ferricflow_runs_checkpointed_langchain_agent() -> None:
             if isinstance(result_metadata, dict)
             else result_metadata
         )
-        assert workflow_client.flow.value_mget([result_ref])[0] == (
-            "Completed by LangChain."
-        )
+        assert workflow_client.flow.value_mget([result_ref])[0] == ("Completed by LangChain.")
         assert len(thread_ids) == 1
-        stored = saver.get_tuple(
-            {"configurable": {"thread_id": thread_ids[0]}}
-        )
+        stored = saver.get_tuple({"configurable": {"thread_id": thread_ids[0]}})
         assert stored is not None
         messages = stored.checkpoint["channel_values"]["messages"]
         assert [message.content for message in messages] == [

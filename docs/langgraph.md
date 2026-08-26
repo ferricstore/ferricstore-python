@@ -272,12 +272,8 @@ from ferricstore.langgraph import LangGraphFlow
 
 agent_flow = LangGraphFlow(
     agent,
-    input_factory=lambda ctx: {
-        "messages": [{"role": "user", "content": ctx.payload["prompt"]}]
-    },
-    on_complete=lambda run, _ctx: complete(
-        result=run.value["messages"][-1].content
-    ),
+    input_factory=lambda ctx: {"messages": [{"role": "user", "content": ctx.payload["prompt"]}]},
+    on_complete=lambda run, _ctx: complete(result=run.value["messages"][-1].content),
 )
 
 

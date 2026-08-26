@@ -183,9 +183,7 @@ async def run_async_with_locks(
                 retry = False
                 for key in acquired:
                     try:
-                        response = await client.command(
-                            "EXTEND", key, owner, _LOCK_TTL_MS
-                        )
+                        response = await client.command("EXTEND", key, owner, _LOCK_TTL_MS)
                     except BaseException as exc:  # pragma: no cover - transport-specific
                         if now - last_extended[key] >= ttl_seconds:
                             heartbeat_error.append(_lease_lost(key, str(exc)))

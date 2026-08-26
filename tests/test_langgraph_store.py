@@ -212,9 +212,7 @@ def test_store_search_filters_namespace_prefix_and_pagination() -> None:
             "profile": {"tier": "pro"},
         },
     )
-    assert [(item.namespace, item.key, item.score) for item in results] == [
-        (user_one, "b", None)
-    ]
+    assert [(item.namespace, item.key, item.score) for item in results] == [(user_one, "b", None)]
 
     paged = store.search(("users",), query="ignored without an index", limit=2, offset=1)
     assert [(item.namespace, item.key) for item in paged] == [
@@ -362,17 +360,13 @@ def test_store_search_and_namespace_limits_stop_on_ordered_index_pages() -> None
 
     client.commands.clear()
     results = store.search(("users",), limit=1)
-    assert [(item.namespace, item.key) for item in results] == [
-        (("users", "user-00"), "profile")
-    ]
+    assert [(item.namespace, item.key) for item in results] == [(("users", "user-00"), "profile")]
     assert sum(command[0] == "ZRANGE" for command in client.commands) == 1
     assert sum(command[0] == "HGET" for command in client.commands) == 3
     assert not any(command[0] in {"SMEMBERS", "HSCAN"} for command in client.commands)
 
     client.commands.clear()
-    assert store.list_namespaces(prefix=("users",), limit=1) == [
-        ("users", "user-00")
-    ]
+    assert store.list_namespaces(prefix=("users",), limit=1) == [("users", "user-00")]
     assert sum(command[0] == "ZRANGE" for command in client.commands) == 1
     assert sum(command[0] == "HGET" for command in client.commands) == 3
 
@@ -388,9 +382,7 @@ def test_store_ordered_index_pages_through_filters_and_duplicate_namespaces() ->
         )
 
     matches = store.search(("users",), filter={"match": True}, limit=1)
-    assert [(item.namespace, item.key) for item in matches] == [
-        (("users", "user-3"), "item-7")
-    ]
+    assert [(item.namespace, item.key) for item in matches] == [(("users", "user-3"), "item-7")]
     assert store.list_namespaces(prefix=("users",), limit=2, offset=1) == [
         ("users", "user-1"),
         ("users", "user-2"),
@@ -430,9 +422,7 @@ def test_sync_and_native_async_store_apis() -> None:
         native_item = await async_store.aget(namespace, "native")
         assert native_item is not None
         assert native_item.value == {"mode": "native-async"}
-        assert [item.key for item in await async_store.asearch(("users",))] == [
-            "native"
-        ]
+        assert [item.key for item in await async_store.asearch(("users",))] == ["native"]
         assert await async_store.alist_namespaces(prefix=("users",)) == [namespace]
         await async_store.adelete(namespace, "native")
         assert await async_store.aget(namespace, "native") is None
@@ -507,9 +497,7 @@ def test_langchain_agent_shares_store_memory_across_threads() -> None:
         {"configurable": {"thread_id": "thread-2"}},
     )
 
-    tool_messages = [
-        message for message in result["messages"] if isinstance(message, ToolMessage)
-    ]
+    tool_messages = [message for message in result["messages"] if isinstance(message, ToolMessage)]
     assert [message.content for message in tool_messages] == ["Bob"]
     stored = store.get(("users", "user-1"), "profile")
     assert stored is not None
