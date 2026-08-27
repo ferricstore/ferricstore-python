@@ -25,7 +25,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -87,7 +87,7 @@ jobs:
       FERRICSTORE_IMAGE: ${{ inputs.ferricstore_image || 'quay.io/ferricstore/ferricstore:0.11.11@sha256:d9f488539f0d6c1a513d2315e7a9c2947cc795b393f3774c9de8ba5e5b5c21b5' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -102,7 +102,7 @@ jobs:
 
       - name: Checkout FerricStore server
         if: ${{ env.FERRICSTORE_IMAGE == 'ferricstore-sdk-ci:local' }}
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ferricstore/ferricstore
           path: ferricstore-server
