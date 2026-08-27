@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import runpy
 from pathlib import Path
 
@@ -111,7 +112,11 @@ def test_tls_http_integration_is_required_by_ci_and_publish() -> None:
         integration_job = workflow.split("\n  integration:", 1)[1]
         if "\n  publish:" in integration_job:
             integration_job = integration_job.split("\n  publish:", 1)[0]
-        assert "actions/setup-python@v6" in integration_job
+        assert re.search(
+            r"^\s*uses:\s+actions/setup-python@v\d+\s*$",
+            integration_job,
+            re.MULTILINE,
+        )
         assert 'python -m pip install -e ".[dev]"' in integration_job
 
     readme = (REPOSITORY / "README.md").read_text()
