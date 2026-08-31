@@ -3,11 +3,58 @@ from __future__ import annotations
 import builtins
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 if TYPE_CHECKING:
+    from ferricstore.async_client_core import AsyncFlowClient
+    from ferricstore.client_core import FlowClient
     from ferricstore.retry_policy import RetryPolicy
-    from ferricstore.types import BudgetPolicy, FlowStateMode
+    from ferricstore.types import BudgetPolicy, BudgetResult, FlowStateMode
+
+
+FLOW_MANY_BATCH_LIMIT = 1000
+
+
+class WorkflowHost(Protocol):
+    """Minimal synchronous runtime surface consumed by a workflow context."""
+
+    client: FlowClient
+    type: str
+    initial_state: str
+    value_config: Any
+    _states: dict[str, StateConfig]
+
+
+class AsyncWorkflowHost(Protocol):
+    """Minimal asynchronous runtime surface consumed by a workflow context."""
+
+    client: AsyncFlowClient
+    type: str
+    initial_state: str
+    value_config: Any
+    value_max_bytes: int | None
+
+
+class WorkflowBudgetContext(Protocol):
+    """Synchronous context operations required by budget settlement."""
+
+    @property
+    def client(self) -> FlowClient:
+        pass
+
+    def _record_budget_result(self, prefix: str, result: BudgetResult) -> None:
+        pass
+
+
+class AsyncWorkflowBudgetContext(Protocol):
+    """Asynchronous context operations required by budget settlement."""
+
+    @property
+    def client(self) -> AsyncFlowClient:
+        pass
+
+    def _record_budget_result(self, prefix: str, result: BudgetResult) -> None:
+        pass
 
 
 @dataclass(frozen=True, slots=True)

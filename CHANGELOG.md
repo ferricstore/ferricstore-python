@@ -6,6 +6,25 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.13.0 - 2026-08-31
+
+- Add chainable synchronous and asynchronous `advance(job, to_state=...)`
+  APIs that infer workflow identity, logical state, lease, and fencing data
+  from the claimed job and return the refreshed claim.
+- Add durable synchronous and asynchronous
+  `step(job, name=..., run=..., to_state=...)` APIs with stable cross-SDK
+  journal names, codec-consistent replay, external-idempotency guidance, and a
+  deprecated low-level `step_continue()` migration alias.
+- Integrate durable operations with real sync and async workers, including
+  refreshed-claim continuation, waiting-state release, stale-writer fencing,
+  pre-commit retry, external-effect idempotency, committed-response-loss
+  recovery, and mixed-batch isolation.
+- Fail closed on malformed result references, missing committed blobs,
+  incomplete full-record responses, and uncertain commit outcomes so workers
+  never issue a stale retry, failure, or second transition.
+- Exercise the recovery matrix over native TCP, TLS HTTP/1.1, and HTTP/2 while
+  preserving the existing TCP and HTTP command suites.
+
 ## 0.12.0 - 2026-08-27
 
 - Add optional LangGraph 1.2 checkpoint persistence with synchronous and

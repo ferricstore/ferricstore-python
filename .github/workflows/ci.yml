@@ -113,7 +113,13 @@ jobs:
 
       - name: Run native integration tests
         run: scripts/run_native_integration.sh
-      - name: Run authenticated TLS HTTP integration tests
+      - name: Run authenticated TLS HTTP/1.1 integration tests
         env:
           FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.14@sha256:f7d29befefa15bce4b3755bf786cf7620c814f13bbd336c0d9955581b323b60e
+          FERRICSTORE_HTTP2: "0"
+        run: scripts/run_http_integration.sh
+      - name: Run authenticated TLS HTTP/2 integration tests
+        env:
+          FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.14@sha256:f7d29befefa15bce4b3755bf786cf7620c814f13bbd336c0d9955581b323b60e
+          FERRICSTORE_HTTP2: "1"
         run: scripts/run_http_integration.sh

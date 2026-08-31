@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 image="${FERRICSTORE_IMAGE:-quay.io/ferricstore/ferricstore:0.11.14@sha256:f7d29befefa15bce4b3755bf786cf7620c814f13bbd336c0d9955581b323b60e}"
 container="ferricstore-python-http-integration-$$"
 tls_dir="$(mktemp -d /tmp/ferricstore-python-http-integration.XXXXXX)"
@@ -73,4 +74,10 @@ authenticated="$(curl --silent --show-error --output /dev/null --write-out '%{ht
   exit 1
 }
 
-env FERRICSTORE_INTEGRATION=1 FERRICSTORE_URL="https://127.0.0.1:$port" FERRICSTORE_USERNAME="$username" FERRICSTORE_PASSWORD="$password" FERRICSTORE_CA_FILE="$tls_dir/ca.pem" FERRICSTORE_HTTP_COMMAND_COVERAGE=1 python -m pytest -q tests/integration/test_ferricstore_integration.py
+if [ "$#" -eq 0 ]; then
+  set -- \
+    tests/integration/test_ferricstore_integration.py \
+    tests/integration/test_durable_step_recovery_integration.py
+fi
+
+env PYTHONPATH="$root_dir/src${PYTHONPATH:+:$PYTHONPATH}" FERRICSTORE_INTEGRATION=1 FERRICSTORE_URL="https://127.0.0.1:$port" FERRICSTORE_USERNAME="$username" FERRICSTORE_PASSWORD="$password" FERRICSTORE_CA_FILE="$tls_dir/ca.pem" FERRICSTORE_HTTP_COMMAND_COVERAGE=1 python -m pytest -q "$@"

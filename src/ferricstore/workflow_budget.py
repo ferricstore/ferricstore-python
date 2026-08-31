@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from ferricstore.errors import FerricStoreError
 from ferricstore.governance_validation import validate_workflow_budget_options
 from ferricstore.lifecycle_core import raise_primary_with_cleanup
 from ferricstore.types import BudgetResult
-
-if TYPE_CHECKING:
-    from ferricstore.workflow_models import WorkflowContext
+from ferricstore.workflow_types import WorkflowBudgetContext
 
 
 class WorkflowBudget:
@@ -30,7 +28,7 @@ class WorkflowBudget:
 
     def __init__(
         self,
-        ctx: WorkflowContext,
+        ctx: WorkflowBudgetContext,
         *,
         scope: str,
         amount: int,

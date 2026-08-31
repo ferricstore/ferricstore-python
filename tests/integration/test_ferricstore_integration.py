@@ -328,6 +328,7 @@ def _integration_client_options() -> dict[str, Any]:
     username = os.environ.get("FERRICSTORE_USERNAME")
     password = os.environ.get("FERRICSTORE_PASSWORD")
     ca_file = os.environ.get("FERRICSTORE_CA_FILE")
+    http2 = os.environ.get("FERRICSTORE_HTTP2")
     if username is not None:
         options["username"] = username
     if password is not None:
@@ -336,6 +337,8 @@ def _integration_client_options() -> dict[str, Any]:
         context = ssl.create_default_context(cafile=ca_file)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         options["ssl_context"] = context
+    if http2 is not None:
+        options["http2"] = http2.lower() in {"1", "true", "yes"}
     return options
 
 

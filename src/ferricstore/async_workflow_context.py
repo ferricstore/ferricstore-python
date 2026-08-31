@@ -4,7 +4,7 @@ import asyncio
 import builtins
 import inspect
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 from ferricstore.async_client_core import AsyncFlowClient
 from ferricstore.async_queue_runtime import (
@@ -27,14 +27,14 @@ from ferricstore.types import (
     EffectResult,
     FlowRecord,
 )
+from ferricstore.workflow_applied import AppliedWorkflowStep
+from ferricstore.workflow_durable_context import AsyncDurableWorkflowContextMixin
 from ferricstore.workflow_effect_core import (
     resolve_effect_replay,
     resolve_external_id,
     resolve_operation_digest,
 )
-
-if TYPE_CHECKING:
-    from ferricstore.async_workflow_runtime import AsyncWorkflow
+from ferricstore.workflow_types import AsyncWorkflowHost
 
 
 class AsyncWorkflowFlowCommands:
@@ -779,15 +779,18 @@ class AsyncWorkflowEffect:
         return max(int((asyncio.get_running_loop().time() - self._started_at) * 1000), 0)
 
 
-class AsyncWorkflowContext:
+class AsyncWorkflowContext(AsyncDurableWorkflowContextMixin):
     """Async workflow handler context with value-ref helpers."""
 
-    def __init__(self, workflow: AsyncWorkflow, job: AsyncFlowJob, state_name: str) -> None:
+    client: AsyncFlowClient
+
+    def __init__(self, workflow: AsyncWorkflowHost, job: AsyncFlowJob, state_name: str) -> None:
         self.workflow = workflow
         self.client = workflow.client
         self.job = job
         self.state_name = state_name
         self.flow = AsyncWorkflowFlowCommands(self)
+        self._applied_step: AppliedWorkflowStep | None = None
         self._value_cache: dict[str, Any] = {}
         self._governance_attributes: dict[str, Any] = {}
 

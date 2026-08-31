@@ -205,7 +205,7 @@ def _build_flow_query_protocol_command(
     key = _FLOW_ID_QUERY_ARGUMENTS.get(name)
     if key is not None:
         payload = {key: _require_arg(args, 0, name)}
-        payload.update(_option_map(args[1:]))
+        payload.update(_option_map(args[1:], value_names_only=name == "FLOW.GET"))
         return ProtocolCommand(opcode, payload)
     if name in {
         "FLOW.STATS",
