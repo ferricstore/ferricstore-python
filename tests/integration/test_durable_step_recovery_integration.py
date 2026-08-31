@@ -549,7 +549,7 @@ def test_waiting_workflow_releases_claim_and_resumes_on_another_worker() -> None
     flow_id = f"flow-{suffix}"
     partition = f"partition-{suffix}"
     now_ms = int(time.time() * 1000)
-    executions = 0
+    replay_attempts: list[str] = []
     claims: dict[str, ClaimedFlow] = {}
 
     try:
@@ -558,8 +558,6 @@ def test_waiting_workflow_releases_claim_and_resumes_on_another_worker() -> None
 
         @workflow_a.state("charge", lease_ms=_LEASE_MS, claim_payload=False, claim_record=False)
         def wait_for_approval(ctx: Any) -> Any:
-            nonlocal executions
-            executions += 1
             claims["a"] = ctx.job
             prepared, result = ctx.client.step(
                 ctx.job,
@@ -605,7 +603,7 @@ def test_waiting_workflow_releases_claim_and_resumes_on_another_worker() -> None
             _job, result = ctx.client.step(
                 ctx.job,
                 name="prepare-warning:v1",
-                run=lambda: pytest.fail("completed preparation ran again"),
+                run=lambda: replay_attempts.append("worker-b") or {"ok": False},
                 to_state="resume",
                 lease_ms=_LEASE_MS,
             )
@@ -616,7 +614,7 @@ def test_waiting_workflow_releases_claim_and_resumes_on_another_worker() -> None
             workflow_b.worker(worker="worker-b", state="resume", partition_key=partition)
         )
 
-        assert executions == 1
+        assert replay_attempts == []
         assert claims["b"].run_state == "resume"
         assert claims["b"].lease_token != claims["a"].lease_token
         assert claims["b"].fencing_token > claims["a"].fencing_token

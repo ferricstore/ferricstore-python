@@ -253,6 +253,13 @@ client.transition(
 Mutators are ack-only by default. Set `return_record=True` only when the caller
 needs the new record immediately.
 
+For a claimed workflow that must keep running under a refreshed lease, prefer
+`client.advance(job, to_state=...)`. For a durable closure plus state change,
+use `job, result = client.step(job, name=..., run=..., to_state=...)`. These
+APIs infer the identity, partition, run state, lease, and fencing token from the
+claim; `step_continue()` is retained only as a deprecated low-level alias. See
+[Durable steps and chainable state changes](workflow.md#durable-steps-and-chainable-state-changes).
+
 ## Governance budgets
 
 Budget commands return `BudgetResult`, a typed object that is also compatible

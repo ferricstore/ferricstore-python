@@ -267,13 +267,20 @@ order = client.workflow(
 
 
 @order.state("created")
-def created(job):
-    charge_card(job.payload)
-    return transition("charged")
+def created(ctx):
+    charge_result = ctx.step(
+        name="charge-customer:v1",
+        run=lambda: charge_card(
+            ctx.payload,
+            idempotency_key=f"{ctx.id}:charge-customer:v1",
+        ),
+        to_state="charge_recorded",
+    )
+    return transition("receipt_pending", payload=charge_result)
 
 
-@order.state("charged")
-def charged(job):
+@order.state("receipt_pending")
+def receipt_pending(job):
     send_receipt(job.id)
     return complete(result=b"ok")
 
@@ -286,8 +293,30 @@ order.start(
     idempotent=True,
 )
 
-order.worker(states=["created", "charged"], concurrency=10, batch_size=100).run()
+order.worker(states=["created", "receipt_pending"], concurrency=10, batch_size=100).run()
 ```
+
+`ctx.step(...)` is the easiest durable boundary inside a workflow handler. It
+stores the closure result, moves the workflow, and makes the refreshed lease
+available to the handler automatically. Its `name` must remain stable across retries.
+External calls still need a stable provider idempotency key because a worker can
+stop after the provider succeeds but before FerricStore commits the result.
+
+For custom claim loops, use the same operations directly:
+
+```python
+job = client.advance(job, to_state="validated")
+job, result = client.step(
+    job,
+    name="charge-customer:v1",
+    run=charge_customer,
+    to_state="charge_recorded",
+)
+```
+
+Both methods infer the workflow identity, current state, lease, and fencing
+token from `job`. `step_continue()` remains only as a deprecated low-level
+migration alias.
 
 Derived workflow partitions use collision-free `fpk:<byte-length>:<value>`
 encoding in 0.6.0. Drain flows created with the old colon-joined derived keys
