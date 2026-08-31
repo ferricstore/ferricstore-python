@@ -4599,6 +4599,28 @@ def test_protocol_flow_payload_flag_uses_shared_option_boundaries() -> None:
     }
 
 
+def test_protocol_flow_get_encodes_requested_named_values_as_a_name_list() -> None:
+    command = build_protocol_command(
+        "FLOW.GET",
+        "flow-1",
+        "PARTITION",
+        "tenant-a",
+        "VALUE",
+        "charge-result",
+        "VALUE",
+        "audit-result",
+        "VALUE_MAX_BYTES",
+        4096,
+    )
+
+    assert command.payload == {
+        "id": "flow-1",
+        "partition_key": "tenant-a",
+        "values": ["charge-result", "audit-result"],
+        "value_max_bytes": 4096,
+    }
+
+
 @pytest.mark.parametrize("reserved_payload", [b"ITEMS", b"ITEMS_EXT"])
 def test_protocol_flow_many_item_marker_ignores_opaque_payload_values(
     reserved_payload: bytes,
@@ -8438,6 +8460,43 @@ def test_protocol_encodes_simple_claim_due_to_compact_request():
     assert command.flags == _FLAG_CUSTOM_PAYLOAD
     assert isinstance(command.payload, bytes)
     assert command.payload[0] == 0x91
+
+
+def test_protocol_compact_claim_due_preserves_server_reclaim_defaults() -> None:
+    implicit = build_protocol_command(
+        "FLOW.CLAIM_DUE",
+        "email",
+        "STATE",
+        "queued",
+        "WORKER",
+        "worker-1",
+        "LEASE_MS",
+        30_000,
+        "LIMIT",
+        1,
+        "RETURN",
+        "JOBS_COMPACT",
+    )
+    explicit = build_protocol_command(
+        "FLOW.CLAIM_DUE",
+        "email",
+        "STATE",
+        "queued",
+        "WORKER",
+        "worker-1",
+        "LEASE_MS",
+        30_000,
+        "LIMIT",
+        1,
+        "RETURN",
+        "JOBS_COMPACT",
+        "RECLAIM_EXPIRED",
+        "true",
+        "RECLAIM_RATIO",
+        25,
+    )
+
+    assert implicit.payload == explicit.payload
 
 
 def test_protocol_encodes_simple_complete_many_to_compact_request():

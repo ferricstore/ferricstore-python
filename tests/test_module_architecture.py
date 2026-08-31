@@ -34,6 +34,17 @@ def _top_level_imports(name: str) -> set[str]:
     return imports
 
 
+def _all_module_imports(name: str) -> set[str]:
+    tree = ast.parse((PACKAGE / f"{name}.py").read_text())
+    imports: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module is not None:
+            imports.add(node.module)
+        elif isinstance(node, ast.Import):
+            imports.update(alias.name for alias in node.names)
+    return imports
+
+
 def _assert_acyclic_modules(modules: set[str]) -> None:
     graph = {
         module: {
@@ -247,6 +258,16 @@ def test_workflow_mutation_planning_has_one_shared_boundary() -> None:
             "async_workflow_runtime",
         }
     )
+
+
+def test_workflow_execution_layers_do_not_hide_type_checking_import_cycles() -> None:
+    """Static-only annotations must preserve the same inward dependency direction."""
+
+    assert "ferricstore.workflow_models" not in _all_module_imports("workflow_execution")
+    assert "ferricstore.workflow_runtime" not in _all_module_imports("workflow_models")
+    assert "ferricstore.workflow_models" not in _all_module_imports("workflow_budget")
+    assert "ferricstore.async_workflow_runtime" not in _all_module_imports("async_workflow_context")
+    assert "ferricstore.async_workflow_context" not in _all_module_imports("async_workflow_budget")
 
 
 def test_raw_pipeline_encoding_is_a_dedicated_acyclic_boundary() -> None:

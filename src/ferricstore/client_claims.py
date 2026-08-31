@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import builtins
+import inspect
+import warnings
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, cast
@@ -26,7 +28,24 @@ from ferricstore.client_helpers import (
 )
 from ferricstore.client_sessions import CommandPipeline
 from ferricstore.client_state import _ClientMixinBase
-from ferricstore.errors import FerricStoreError, map_exception
+from ferricstore.durable_step import (
+    ClaimedJob,
+    claimed_from_record,
+    decode_committed_result,
+    durable_mutation_outcome_is_unknown,
+    durable_step_value_name,
+    encode_step_result,
+    refreshed_claim,
+    step_outcome_unknown,
+    validate_claimed_job,
+    validate_step_preflight,
+    value_ref,
+)
+from ferricstore.errors import (
+    FerricStoreError,
+    RequestOutcomeUnknownError,
+    map_exception,
+)
 from ferricstore.lifecycle_core import (
     try_set_future_exception,
     try_set_future_result,
@@ -43,6 +62,7 @@ class _ClientClaimsMixin(_ClientMixinBase):
         _record_or_get: Callable[..., FlowRecord]
         _records: Callable[[Any], builtins.list[FlowRecord]]
         _records_or_response: Callable[[Any], builtins.list[FlowRecord] | Any]
+        value_mget: Callable[..., builtins.list[Any]]
         pipeline: Callable[[], CommandPipeline]
 
     def claim_due(
@@ -477,6 +497,12 @@ class _ClientClaimsMixin(_ClientMixinBase):
         worker: str | None = None,
         return_job: bool = False,
     ) -> FlowRecord | ClaimedFlow:
+        warnings.warn(
+            "step_continue() is deprecated; use advance(job, to_state=...) or "
+            "step(job, name=..., run=..., to_state=...)",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         args = _step_continue_args(
             self.codec,
             id,
@@ -502,6 +528,139 @@ class _ClientClaimsMixin(_ClientMixinBase):
         if return_job:
             return ClaimedFlow.from_resp(response)
         return self._record_or_get(response, id, partition_key)
+
+    def advance(
+        self,
+        job: ClaimedJob,
+        *,
+        to_state: str,
+        lease_ms: int = 30_000,
+        now_ms: int | None = None,
+    ) -> ClaimedFlow:
+        """Atomically advance a claimed workflow and return its refreshed claim."""
+
+        validate_claimed_job(job, to_state=to_state)
+        from_state = cast(str, job.run_state)
+        args = _step_continue_args(
+            self.codec,
+            job.id,
+            lease_token=job.lease_token,
+            from_state=from_state,
+            to_state=to_state,
+            fencing_token=job.fencing_token,
+            lease_ms=lease_ms,
+            partition_key=job.partition_key,
+            payload=None,
+            values=None,
+            value_refs=None,
+            drop_values=None,
+            override_values=None,
+            attributes_merge=None,
+            attributes_delete=None,
+            state_meta=None,
+            now_ms=now_ms,
+            worker=None,
+            return_job=True,
+        )
+        try:
+            response = self.executor.execute_command(*args)
+        except RequestOutcomeUnknownError as exc:
+            raise step_outcome_unknown(exc) from exc
+        except FerricStoreError as exc:
+            if durable_mutation_outcome_is_unknown(exc):
+                raise step_outcome_unknown(exc) from exc
+            raise
+        except Exception as exc:
+            raise step_outcome_unknown(exc) from exc
+        try:
+            return refreshed_claim(job, response, to_state=to_state)
+        except Exception as exc:
+            raise step_outcome_unknown(exc) from exc
+
+    def step(
+        self,
+        job: ClaimedJob,
+        *,
+        name: str,
+        run: Callable[[], Any],
+        to_state: str,
+        lease_ms: int = 30_000,
+        now_ms: int | None = None,
+    ) -> tuple[ClaimedFlow, Any]:
+        """Execute, journal, and atomically advance one durable workflow step."""
+
+        validate_claimed_job(job, to_state=to_state)
+        from_state = cast(str, job.run_state)
+        value_name = durable_step_value_name(name)
+        if not callable(run):
+            raise TypeError("run must be callable")
+
+        current = self.extend_lease(
+            job.id,
+            job.lease_token,
+            fencing_token=job.fencing_token,
+            lease_ms=lease_ms,
+            partition_key=job.partition_key,
+            now_ms=now_ms,
+        )
+        validate_step_preflight(job, current)
+        committed_ref = value_ref(current, value_name)
+        if committed_ref is not None:
+            if current.run_state != to_state:
+                raise FerricStoreError("committed durable step did not reach its target state")
+            response = self.executor.execute_command("FLOW.VALUE.MGET", committed_ref)
+            stored = require_batch_items(
+                response,
+                1,
+                operation="FLOW.VALUE.MGET durable step result",
+            )
+            return claimed_from_record(current, job), decode_committed_result(self.codec, stored[0])
+
+        result = run()
+        if inspect.isawaitable(result):
+            close = getattr(result, "close", None)
+            if callable(close):
+                close()
+            raise TypeError("sync step() run closure must not return an awaitable")
+        encoded_result, stored_result = encode_step_result(self.codec, result)
+
+        args = _step_continue_args(
+            self.codec,
+            job.id,
+            lease_token=job.lease_token,
+            from_state=from_state,
+            to_state=to_state,
+            fencing_token=job.fencing_token,
+            lease_ms=lease_ms,
+            partition_key=job.partition_key,
+            payload=None,
+            values=None,
+            value_refs=None,
+            drop_values=None,
+            override_values=None,
+            attributes_merge=None,
+            attributes_delete=None,
+            state_meta=None,
+            now_ms=now_ms,
+            worker=None,
+            return_job=True,
+        )
+        args.extend(["VALUE", value_name, encoded_result])
+        try:
+            response = self.executor.execute_command(*args)
+        except RequestOutcomeUnknownError as exc:
+            raise step_outcome_unknown(exc) from exc
+        except FerricStoreError as exc:
+            if durable_mutation_outcome_is_unknown(exc):
+                raise step_outcome_unknown(exc) from exc
+            raise
+        except Exception as exc:
+            raise step_outcome_unknown(exc) from exc
+        try:
+            refreshed = refreshed_claim(job, response, to_state=to_state)
+        except Exception as exc:
+            raise step_outcome_unknown(exc) from exc
+        return refreshed, stored_result
 
     def complete_many(
         self,

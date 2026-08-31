@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any, Protocol, cast
 
 from ferricstore.async_client_core import AsyncFlowClient
 from ferricstore.async_queue_runtime import AsyncErrorMode, AsyncFlowJob, AsyncWorkflowHandler
 from ferricstore.async_workflow_context import AsyncWorkflowContext
 from ferricstore.batch_core import BatchValueMatcher, run_async_fanout
+from ferricstore.errors import FerricStoreError
 from ferricstore.lifecycle_core import raise_primary_with_cleanup
 from ferricstore.mutation_core import JobMutation, MutationBatchPlan
 from ferricstore.types import BudgetPolicy, ClaimedFlow, FencedItem, FlowStateMode
 from ferricstore.worker_core import validate_many_result
+from ferricstore.workflow_applied import AppliedWorkflowStep
 from ferricstore.workflow_mutations import complete_mutation_options
 from ferricstore.workflow_types import Complete, Fail, Retry, Transition, fail, retry
 
@@ -61,7 +64,9 @@ async def handle_claimed_batch(
 
     on_error = self.error_modes.get(state_name, self.on_error)
 
-    async def run_one(job: AsyncFlowJob) -> Transition | Complete | Retry | Fail:
+    async def run_one(
+        job: AsyncFlowJob,
+    ) -> Transition | Complete | Retry | Fail | AppliedWorkflowStep:
         ctx = AsyncWorkflowContext(cast(Any, self), job, state_name)
         budget = None
         try:
@@ -87,10 +92,26 @@ async def handle_claimed_batch(
                     exc = preserved
             if not isinstance(exc, Exception):
                 raise exc
+            if ctx._applied_step is not None:
+                return AppliedWorkflowStep(
+                    ctx._applied_step.job,
+                    ctx._applied_step.result,
+                    exc,
+                    ctx._applied_step.uncertain,
+                )
             if on_error == "raise":
                 raise exc
             value = fail(error=str(exc)) if on_error == "fail" else retry(error=str(exc))
             return self._merge_governance_attributes(value, ctx._governance_attributes)
+        if ctx._applied_step is not None:
+            return replace(
+                ctx._applied_step,
+                continuation=self._merge_governance_attributes(
+                    value,
+                    ctx._governance_attributes,
+                ),
+                has_continuation=True,
+            )
         return self._merge_governance_attributes(value, ctx._governance_attributes)
 
     outcomes = await run_async_fanout(
@@ -101,16 +122,45 @@ async def handle_claimed_batch(
         stop_on_error=on_error == "raise",
     )
 
-    first = outcomes[0]
+    if any(isinstance(outcome, AppliedWorkflowStep) for outcome in outcomes):
+        for job, outcome in zip(jobs, outcomes, strict=True):
+            if isinstance(outcome, AppliedWorkflowStep):
+                if outcome.error is not None:
+                    continue
+                if not outcome.has_continuation:
+                    raise FerricStoreError("applied workflow step lost its handler continuation")
+                if not isinstance(outcome.job, ClaimedFlow):
+                    raise FerricStoreError(
+                        "applied workflow step returned an invalid refreshed claim"
+                    )
+                await self._apply_uniform(
+                    state_name,
+                    [outcome.job],
+                    cast(Transition | Complete | Retry | Fail, outcome.continuation),
+                )
+            else:
+                await self._apply_uniform(
+                    state_name,
+                    [cast(ClaimedFlow, job)],
+                    outcome,
+                )
+        for outcome in outcomes:
+            if isinstance(outcome, AppliedWorkflowStep) and outcome.error is not None:
+                raise outcome.error
+        return len(jobs)
+
+    normal_outcomes = cast(list[Transition | Complete | Retry | Fail], outcomes)
+    first = normal_outcomes[0]
     first_matcher = BatchValueMatcher(first)
-    if all(first_matcher.matches(outcome) for outcome in outcomes):
+    if all(first_matcher.matches(outcome) for outcome in normal_outcomes):
         await self._apply_uniform(state_name, cast(list[ClaimedFlow], jobs), first)
         return len(jobs)
 
     apply_job_mutations = getattr(self.client, "apply_job_mutations", None)
     if callable(apply_job_mutations):
         plan = MutationBatchPlan.build(
-            self._job_mutation(job, outcome) for job, outcome in zip(jobs, outcomes, strict=True)
+            self._job_mutation(job, outcome)
+            for job, outcome in zip(jobs, normal_outcomes, strict=True)
         )
         response = apply_job_mutations(plan.mutations)
         if inspect.isawaitable(response):
@@ -124,7 +174,7 @@ async def handle_claimed_batch(
 
     complete_job_mutations = getattr(self.client, "complete_job_mutations", None)
     if callable(complete_job_mutations) and all(
-        isinstance(outcome, Complete) for outcome in outcomes
+        isinstance(outcome, Complete) for outcome in normal_outcomes
     ):
         response = complete_job_mutations(
             [
@@ -132,7 +182,7 @@ async def handle_claimed_batch(
                     cast(ClaimedFlow, job),
                     complete_mutation_options(cast(Complete, outcome)),
                 )
-                for job, outcome in zip(jobs, outcomes, strict=True)
+                for job, outcome in zip(jobs, normal_outcomes, strict=True)
             ]
         )
         if inspect.isawaitable(response):
@@ -144,7 +194,7 @@ async def handle_claimed_batch(
         )
         return len(jobs)
 
-    for job, outcome in zip(jobs, outcomes, strict=True):
+    for job, outcome in zip(jobs, normal_outcomes, strict=True):
         await self._apply_uniform(state_name, [cast(ClaimedFlow, job)], outcome)
     return len(jobs)
 

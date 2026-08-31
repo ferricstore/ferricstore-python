@@ -20,7 +20,7 @@ from ferricstore.async_workflow_execution import handle_claimed_batch
 from ferricstore.client_autobatch import AutobatchFlowClient
 from ferricstore.client_sessions import TransactionSession
 from ferricstore.commands import DataCommandsMixin
-from ferricstore.errors import EffectAlreadyReservedError, InvalidCommandError
+from ferricstore.errors import EffectAlreadyReservedError, FerricStoreError, InvalidCommandError
 from ferricstore.legacy_worker import Worker
 from ferricstore.lifecycle_core import RetryableResourceSet
 from ferricstore.protocol_async import AsyncProtocolAdapter
@@ -872,6 +872,19 @@ def test_default_tls_context_is_cached_across_reconnects(
     assert context.verify_mode == ssl.CERT_REQUIRED
     assert context.check_hostname is True
     assert context.minimum_version is ssl.TLSVersion.TLSv1_2
+
+
+@pytest.mark.parametrize("adapter_type", [ProtocolAdapter, AsyncProtocolAdapter])
+def test_native_transport_rejects_custom_tls_contexts_below_tls12(
+    adapter_type: type[ProtocolAdapter] | type[AsyncProtocolAdapter],
+) -> None:
+    adapter = object.__new__(adapter_type)
+    adapter.tls = True
+    adapter.ssl_context = SimpleNamespace(minimum_version=0)
+    adapter._default_ssl_context = None
+
+    with pytest.raises(FerricStoreError, match=r"TLS 1\.2"):
+        adapter._tls_context()
 
 
 @pytest.mark.parametrize(
