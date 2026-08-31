@@ -122,6 +122,104 @@ payment.start(
 `Workflow` subclasses remain supported for framework-style codebases, but
 `WorkflowClient.workflow(...)` is the primary SDK style.
 
+## Durable steps and chainable state changes
+
+Use `ctx.step(...)` inside a registered handler. It is the ergonomic form: the
+context retains the refreshed claim, so a following transition, completion, or
+durable step automatically uses the new lease and fencing token.
+
+```python
+@payment.state("created", lease_ms=30_000)
+def created(ctx):
+    charge = ctx.step(
+        name="charge-customer:v1",
+        run=lambda: stripe.charge(
+            amount=150,
+            idempotency_key=f"{ctx.id}:charge-customer:v1",
+        ),
+        to_state="charge_recorded",
+    )
+    return transition("schedule_warning", payload=charge)
+```
+
+The name identifies the journal entry and must remain stable across retries.
+FerricStore executes the closure only when no committed result exists. A
+reclaimed workflow with a committed result reads that result without executing
+the closure again.
+
+An external operation still needs a stable provider idempotency key. A worker
+can stop after the provider accepts the call but before FerricStore commits the
+result; the replacement worker then invokes the closure with the same provider
+key. Provider-side idempotency ensures this recovery creates one external
+effect.
+
+For a custom claim loop, use the client methods directly:
+
+```python
+job = client.advance(job, to_state="validated")
+
+job, charge = client.step(
+    job,
+    name="charge-customer:v1",
+    run=lambda: stripe.charge(
+        amount=150,
+        idempotency_key=f"{job.id}:charge-customer:v1",
+    ),
+    to_state="charge_recorded",
+)
+```
+
+`advance()` and `step()` read the flow ID, partition key, logical run state,
+lease token, and fencing token from the claimed job. Do not pass a worker or a
+`return_job` flag. Both operations return a refreshed `ClaimedFlow`; direct
+`step()` additionally returns the stored result. `step_continue()` remains a
+deprecated low-level migration alias:
+
+| Old call | Replacement |
+| --- | --- |
+| `step_continue(...)` for a state change | `advance(job, to_state=...)` |
+| External or replayable work | `step(job, name=..., run=..., to_state=...)` |
+
+### Waiting without pinning a worker
+
+After preparing a timer, signal, or approval, return a normal waiting
+transition. That transition persists the wait and releases the refreshed claim:
+
+```python
+@payment.state("created")
+def created(ctx):
+    ctx.step(
+        name="prepare-warning:v1",
+        run=prepare_warning,
+        to_state="warning_prepared",
+    )
+    return transition("waiting_for_warning", run_at_ms=warning_at_ms)
+```
+
+A waiting workflow does not occupy a worker. When the timer, signal, or
+approval makes it runnable, any worker can acquire a fresh lease and continue.
+If no worker is running, the workflow remains durable until one becomes
+available.
+
+### Async durable steps
+
+The async workflow context has the same shape. The closure may return either a
+value or an awaitable:
+
+```python
+@workflow.state("created")
+async def created(ctx):
+    charge = await ctx.step(
+        name="charge-customer:v1",
+        run=lambda: stripe.charge_async(
+            amount=150,
+            idempotency_key=f"{ctx.id}:charge-customer:v1",
+        ),
+        to_state="charge_recorded",
+    )
+    return transition("receipt_pending", payload=charge)
+```
+
 ## Governance budgets in workflows
 
 Use `BudgetPolicy` when a state should reserve capacity before it runs and
