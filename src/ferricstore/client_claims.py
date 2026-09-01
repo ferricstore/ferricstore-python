@@ -570,6 +570,8 @@ class _ClientClaimsMixin(_ClientMixinBase):
             if durable_mutation_outcome_is_unknown(exc):
                 raise step_outcome_unknown(exc) from exc
             raise
+        except (TypeError, ValueError, OverflowError):
+            raise
         except Exception as exc:
             raise step_outcome_unknown(exc) from exc
         try:
@@ -653,6 +655,8 @@ class _ClientClaimsMixin(_ClientMixinBase):
         except FerricStoreError as exc:
             if durable_mutation_outcome_is_unknown(exc):
                 raise step_outcome_unknown(exc) from exc
+            raise
+        except (TypeError, ValueError, OverflowError):
             raise
         except Exception as exc:
             raise step_outcome_unknown(exc) from exc

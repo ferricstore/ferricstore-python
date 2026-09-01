@@ -13,6 +13,36 @@ from ferricstore.errors import (
 from ferricstore.types import ClaimedFlow, FlowRecord
 
 _STEP_VALUE_PREFIX = "__ferricstore_step__:sha256:"
+_DEFINITELY_REJECTED_HTTP_STATUSES = {
+    400,
+    401,
+    403,
+    404,
+    405,
+    406,
+    411,
+    413,
+    414,
+    415,
+    422,
+    426,
+    431,
+}
+_DEFINITELY_REJECTED_ERROR_CODES = {
+    "auth",
+    "unauthorized",
+    "noperm",
+    "forbidden",
+    "bad_request",
+    "invalid_command",
+    "invalid_request",
+    "not_found",
+    "flow_not_found",
+    "stale_lease",
+    "wrong_state",
+    "conflict",
+    "request_too_large",
+}
 ClaimedJob = ClaimedFlow | FlowRecord
 
 
@@ -41,15 +71,13 @@ def durable_mutation_outcome_is_unknown(exc: FerricStoreError) -> bool:
 
     if not isinstance(exc, HttpError):
         return False
+    if exc.status_code == 408 or exc.error_code == "request_timeout":
+        return True
     if exc.safe_to_retry is True:
         return False
-    if exc.error_code in {"forbidden", "request_too_large", "unauthorized"}:
+    if exc.error_code in _DEFINITELY_REJECTED_ERROR_CODES:
         return False
-    if exc.status_code is None:
-        return True
-    if 200 <= exc.status_code < 300:
-        return True
-    return exc.status_code >= 500
+    return exc.status_code not in _DEFINITELY_REJECTED_HTTP_STATUSES
 
 
 def durable_step_value_name(name: str) -> str:

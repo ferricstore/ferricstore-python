@@ -690,6 +690,26 @@ def test_sync_context_step_transport_uncertainty_surfaces_without_a_stale_retry(
             retryable=True,
             safe_to_retry=False,
         ),
+        HttpError(
+            "request timed out after dispatch",
+            status_code=408,
+            error_code="proxy_timeout",
+            retryable=True,
+            safe_to_retry=False,
+        ),
+        HttpError(
+            "server request deadline expired",
+            error_code="request_timeout",
+            retryable=True,
+            safe_to_retry=False,
+        ),
+        HttpError(
+            "future intermediary status",
+            status_code=499,
+            error_code="client_closed_request",
+            retryable=False,
+            safe_to_retry=False,
+        ),
     ],
 )
 def test_advance_treats_ambiguous_http_failures_as_outcome_unknown(error: HttpError) -> None:
@@ -729,6 +749,16 @@ def test_advance_preserves_definite_http_rejections(error: HttpError) -> None:
     client = FlowClient(SequenceExecutor([error]))
 
     with pytest.raises(HttpError) as raised:
+        client.advance(_job(), to_state="warn")
+
+    assert raised.value is error
+
+
+def test_advance_preserves_local_encoding_failure_as_not_sent() -> None:
+    error = ValueError("local request encoding failed")
+    client = FlowClient(SequenceExecutor([error]))
+
+    with pytest.raises(ValueError) as raised:
         client.advance(_job(), to_state="warn")
 
     assert raised.value is error
@@ -1179,15 +1209,36 @@ def test_async_context_advance_transport_uncertainty_surfaces_without_stale_retr
     asyncio.run(scenario())
 
 
-def test_async_context_advance_http_uncertainty_prevents_a_stale_retry() -> None:
-    async def scenario() -> None:
-        error = HttpError(
+@pytest.mark.parametrize(
+    "error",
+    [
+        HttpError(
             "malformed successful response",
             status_code=200,
             error_code="invalid_response",
             retryable=False,
             safe_to_retry=False,
-        )
+        ),
+        HttpError(
+            "request timed out after dispatch",
+            status_code=408,
+            error_code="request_timeout",
+            retryable=True,
+            safe_to_retry=False,
+        ),
+        HttpError(
+            "future intermediary status",
+            status_code=499,
+            error_code="client_closed_request",
+            retryable=False,
+            safe_to_retry=False,
+        ),
+    ],
+)
+def test_async_context_advance_http_uncertainty_prevents_a_stale_retry(
+    error: HttpError,
+) -> None:
+    async def scenario() -> None:
         executor = AsyncSequenceExecutor([error, [b"OK"]])
         workflow = AsyncWorkflow(
             AsyncFlowClient(executor),
@@ -1207,6 +1258,19 @@ def test_async_context_advance_http_uncertainty_prevents_a_stale_retry() -> None
 
         assert raised.value is error
         assert [call[0] for call in executor.calls] == ["FLOW.STEP_CONTINUE"]
+
+    asyncio.run(scenario())
+
+
+def test_async_advance_preserves_local_encoding_failure_as_not_sent() -> None:
+    async def scenario() -> None:
+        error = ValueError("local request encoding failed")
+        client = AsyncFlowClient(AsyncSequenceExecutor([error]))
+
+        with pytest.raises(ValueError) as raised:
+            await client.advance(_job(), to_state="warn")
+
+        assert raised.value is error
 
     asyncio.run(scenario())
 
