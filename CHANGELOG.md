@@ -6,6 +6,8 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.13.1 - 2026-09-01
+
 - Reject whitespace-only and malformed-Unicode durable step names before any
   network I/O so distinct logical operations cannot collapse onto the same
   journal identity.
