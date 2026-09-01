@@ -55,6 +55,7 @@ def test_publish_requires_tag_validation_and_live_integration() -> None:
     assert "integration:" in workflow
     assert "scripts/run_native_integration.sh" in workflow
     assert "needs: [build, integration]" in workflow
+    assert "skip-existing: true" in workflow
 
 
 def test_native_integration_runner_uses_an_isolated_docker_network() -> None:

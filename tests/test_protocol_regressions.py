@@ -44,9 +44,24 @@ from ferricstore.protocol import (
 )
 from ferricstore.protocol_codec import decode_value, encode_value
 from ferricstore.protocol_common import _endpoint_adapter_is_idle, _endpoint_from_url
+from ferricstore.protocol_constants import _OPCODES
 from ferricstore.protocol_framing import decompress_response, send_frames
 from ferricstore.topology_lifecycle import EndpointAdapterLifecycle, SyncSingleFlight
 from tests.flow_query_contract import with_flow_query_contract
+
+
+def test_unknown_native_status_makes_mutation_outcome_unknown_without_replay() -> None:
+    response = ProtocolResponse(
+        1,
+        _OPCODES["FLOW.STEP_CONTINUE"],
+        1,
+        0,
+        99,
+        {"message": "future native status"},
+    )
+
+    with pytest.raises(RequestOutcomeUnknownError, match="unknown native protocol status"):
+        protocol_module._response_value(response)
 
 
 @pytest.mark.parametrize("retry_after_ms", [True, -1, "1", b"1", 1.5, 2**64])
