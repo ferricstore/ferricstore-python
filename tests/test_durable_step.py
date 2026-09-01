@@ -249,6 +249,10 @@ def test_durable_helpers_reject_incomplete_claims_before_network_or_closure() ->
         client.advance(incomplete, to_state="next")
     with pytest.raises(ValueError, match="name"):
         client.step(_job(), name="", run=closure, to_state="next")
+    with pytest.raises(ValueError, match="name"):
+        client.step(_job(), name="   ", run=closure, to_state="next")
+    with pytest.raises(ValueError, match="valid Unicode"):
+        client.step(_job(), name="charge:\ud800", run=closure, to_state="next")
 
     assert ran is False
     assert executor.calls == []

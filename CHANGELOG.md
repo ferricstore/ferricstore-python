@@ -6,6 +6,12 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+- Reject whitespace-only and malformed-Unicode durable step names before any
+  network I/O so distinct logical operations cannot collapse onto the same
+  journal identity.
+- Refresh locked patch releases for the SDK development and optional framework
+  integration dependency sets.
+
 ## 0.13.0 - 2026-08-31
 
 - Add chainable synchronous and asynchronous `advance(job, to_state=...)`
