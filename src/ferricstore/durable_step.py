@@ -83,7 +83,11 @@ def durable_mutation_outcome_is_unknown(exc: FerricStoreError) -> bool:
 def durable_step_value_name(name: str) -> str:
     if not isinstance(name, str) or not name.strip():
         raise ValueError("step name must be a non-empty string")
-    return _STEP_VALUE_PREFIX + hashlib.sha256(name.encode("utf-8")).hexdigest()
+    try:
+        encoded_name = name.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("step name must contain valid Unicode") from exc
+    return _STEP_VALUE_PREFIX + hashlib.sha256(encoded_name).hexdigest()
 
 
 def validate_claimed_job(job: ClaimedJob, *, to_state: str) -> None:
