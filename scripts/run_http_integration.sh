@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-image="${FERRICSTORE_IMAGE:-quay.io/ferricstore/ferricstore:0.11.15@sha256:8d86005f22eac945ee13bd4c909f3149435be1dca747839e091830d238d4b752}"
+image="${FERRICSTORE_IMAGE:-quay.io/ferricstore/ferricstore:0.11.17@sha256:b1f260a5f01c8976c31daa828e375c8bb2e173f66e8ffc384b548a8b3d223230}"
 container="ferricstore-python-http-integration-$$"
 tls_dir="$(mktemp -d /tmp/ferricstore-python-http-integration.XXXXXX)"
 username="sdk-http"
