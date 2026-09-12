@@ -9,7 +9,7 @@ Current version:
 ```
 
 Python SDK `0.13.1` requires FerricStore `0.11.4` or newer and validates the
-native TCP and request/response HTTP transports against FerricStore 0.11.14.
+native TCP and request/response HTTP transports against FerricStore 0.11.15.
 Native wire protocol v1 is unchanged.
 
 ## What alpha means
