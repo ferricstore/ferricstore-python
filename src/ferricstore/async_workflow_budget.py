@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 from ferricstore.errors import FerricStoreError
 from ferricstore.governance_validation import validate_workflow_budget_options
 from ferricstore.lifecycle_core import await_cancellation_safe, raise_primary_with_cleanup
 from ferricstore.types import BudgetResult
-
-if TYPE_CHECKING:
-    from ferricstore.async_workflow_context import AsyncWorkflowContext
+from ferricstore.workflow_types import AsyncWorkflowBudgetContext
 
 
 class AsyncWorkflowBudget:
@@ -17,7 +15,7 @@ class AsyncWorkflowBudget:
 
     def __init__(
         self,
-        ctx: AsyncWorkflowContext,
+        ctx: AsyncWorkflowBudgetContext,
         *,
         scope: str,
         amount: int,

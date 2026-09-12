@@ -5,12 +5,22 @@ from typing import Any
 from ferricstore.batch_core import is_pipeline_status_batch
 from ferricstore.errors import FerricStoreError, OverloadedError, classify_server_error
 from ferricstore.protocol_common import _error_message, _map_get, _optional_text
-from ferricstore.protocol_constants import _STATUS_BUSY, _STATUS_OK, ProtocolResponse
+from ferricstore.protocol_constants import (
+    _KNOWN_RESPONSE_STATUSES,
+    _STATUS_BUSY,
+    _STATUS_OK,
+    ProtocolResponse,
+)
+from ferricstore.protocol_retry import request_outcome_error
 
 
 def _response_value(response: ProtocolResponse) -> Any:
     if response.status == _STATUS_OK:
         return response.value
+    if response.status not in _KNOWN_RESPONSE_STATUSES:
+        message = f"unknown native protocol status {response.status}"
+        cause = FerricStoreError(message, raw=response)
+        raise request_outcome_error(response.opcode, cause, message=message)
 
     message = _error_message(response.value)
     retryable = _optional_bool_field(response.value, "retryable")

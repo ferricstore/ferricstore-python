@@ -21,16 +21,21 @@ from ferricstore.types import (
     EffectResult,
     FlowRecord,
 )
+from ferricstore.workflow_applied import AppliedWorkflowStep
 from ferricstore.workflow_budget import WorkflowBudget as WorkflowBudget
+from ferricstore.workflow_durable_context import SyncDurableWorkflowContextMixin
 from ferricstore.workflow_effect_core import (
     resolve_effect_replay,
     resolve_external_id,
     resolve_operation_digest,
 )
+from ferricstore.workflow_types import (
+    FLOW_MANY_BATCH_LIMIT as FLOW_MANY_BATCH_LIMIT,
+)
+from ferricstore.workflow_types import WorkflowHost
 
 if TYPE_CHECKING:
     from ferricstore.client_core import FlowClient
-    from ferricstore.workflow_runtime import Workflow
 
 _PROTOCOL_URL_SCHEMES = {"ferric", "ferrics"}
 
@@ -43,8 +48,6 @@ def _close_resource_safely(resource: Any) -> None:
 def _is_protocol_url(value: str) -> bool:
     return urlparse(value).scheme.lower() in _PROTOCOL_URL_SCHEMES
 
-
-FLOW_MANY_BATCH_LIMIT = 1000
 
 _CURRENT_PARTITION = object()
 
@@ -736,14 +739,22 @@ class WorkflowEffect:
         return max(int((time.perf_counter() - self._started_at) * 1000), 0)
 
 
-class WorkflowContext:
+class WorkflowContext(SyncDurableWorkflowContextMixin):
     """Handler context with current job metadata and Flow command helpers."""
 
-    __slots__ = ("_governance_attributes", "_value_cache", "flow", "job", "state_name", "workflow")
+    __slots__ = (
+        "_applied_step",
+        "_governance_attributes",
+        "_value_cache",
+        "flow",
+        "job",
+        "state_name",
+        "workflow",
+    )
 
     def __init__(
         self,
-        workflow: Workflow,
+        workflow: WorkflowHost,
         job: FlowRecord | ClaimedFlow,
         state_name: str,
     ) -> None:
@@ -751,6 +762,7 @@ class WorkflowContext:
         self.job = job
         self.state_name = state_name
         self.flow = WorkflowFlowCommands(self)
+        self._applied_step: AppliedWorkflowStep | None = None
         self._governance_attributes: dict[str, Any] = {}
         self._value_cache: dict[str, Any] = {}
 

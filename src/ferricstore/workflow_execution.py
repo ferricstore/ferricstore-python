@@ -10,12 +10,10 @@ from ferricstore.errors import FerricStoreError
 from ferricstore.mutation_core import JobMutation, MutationBatchPlan
 from ferricstore.types import ClaimedFlow, FencedItem, FlowRecord
 from ferricstore.worker_core import validate_many_result
-from ferricstore.workflow_models import (
-    FLOW_MANY_BATCH_LIMIT,
-    WorkflowContext,
-)
+from ferricstore.workflow_applied import AppliedWorkflowStep
 from ferricstore.workflow_mutations import complete_mutation_options
 from ferricstore.workflow_types import (
+    FLOW_MANY_BATCH_LIMIT,
     Complete,
     Fail,
     Handler,
@@ -37,17 +35,23 @@ class WorkflowExecutionHost(Protocol):
         self,
         job: FlowRecord | ClaimedFlow,
         state_name: str,
-    ) -> WorkflowContext: ...
+    ) -> Any:
+        pass
 
-    def _handler_for(self, state_name: str) -> Handler: ...
+    def _handler_for(self, state_name: str) -> Handler:
+        pass
+
+    def _logical_state(self, job: FlowRecord | ClaimedFlow) -> str:
+        pass
 
     def _run_handler_with_context(
         self,
         handler: Handler,
-        ctx: WorkflowContext,
+        ctx: Any,
         state_name: str,
         job: FlowRecord | ClaimedFlow,
-    ) -> Outcome: ...
+    ) -> Outcome | AppliedWorkflowStep:
+        pass
 
     def _exception_outcome(
         self,
@@ -55,7 +59,8 @@ class WorkflowExecutionHost(Protocol):
         exc: Exception,
         *,
         state_name: str,
-    ) -> Outcome: ...
+    ) -> Outcome:
+        pass
 
     def _apply_uniform_batch(
         self,
@@ -64,13 +69,15 @@ class WorkflowExecutionHost(Protocol):
         outcome: Outcome,
         *,
         materialize: bool = True,
-    ) -> builtins.list[FlowRecord | bytes] | int: ...
+    ) -> builtins.list[FlowRecord | bytes] | int:
+        pass
 
     def _job_mutation(
         self,
         job: FlowRecord | ClaimedFlow,
         outcome: Outcome,
-    ) -> JobMutation: ...
+    ) -> JobMutation:
+        pass
 
     def apply(
         self,
@@ -78,19 +85,23 @@ class WorkflowExecutionHost(Protocol):
         outcome: Outcome,
         *,
         state_name: str | None = None,
-    ) -> FlowRecord | bytes: ...
+    ) -> FlowRecord | bytes:
+        pass
 
     def _uniform_partition_key(
         self,
         jobs: Sequence[FlowRecord | ClaimedFlow],
-    ) -> str | bytes | None: ...
+    ) -> str | bytes | None:
+        pass
 
     def _uniform_current_state(
         self,
         jobs: Sequence[FlowRecord | ClaimedFlow],
-    ) -> str | None: ...
+    ) -> str | None:
+        pass
 
-    def _validate_transition_policy(self, outcome: Transition) -> None: ...
+    def _validate_transition_policy(self, outcome: Transition) -> None:
+        pass
 
     def _batch_response_list(
         self,
@@ -98,7 +109,86 @@ class WorkflowExecutionHost(Protocol):
         expected: int,
         *,
         operation: str,
-    ) -> builtins.list[FlowRecord | bytes]: ...
+    ) -> builtins.list[FlowRecord | bytes]:
+        pass
+
+
+def _required_first_outcome(outcome: Outcome | None) -> Outcome:
+    if outcome is None:
+        raise FerricStoreError("workflow batch planner lost its first handler outcome")
+    return outcome
+
+
+def _apply_continuation(
+    self: WorkflowExecutionHost,
+    marker: AppliedWorkflowStep,
+    *,
+    state_name: str,
+) -> FlowRecord | bytes:
+    if marker.error is not None:
+        return b"OK"
+    if not marker.has_continuation:
+        raise FerricStoreError("applied workflow step lost its handler continuation")
+    return self.apply(
+        marker.job,
+        cast(Outcome, marker.continuation),
+        state_name=state_name,
+    )
+
+
+def handle_mixed_state_batch(
+    self: WorkflowExecutionHost,
+    jobs: Sequence[FlowRecord | ClaimedFlow],
+) -> builtins.list[FlowRecord | bytes]:
+    if not jobs:
+        return []
+
+    planned: builtins.list[tuple[FlowRecord | ClaimedFlow, str, Outcome | AppliedWorkflowStep]] = []
+    for job in jobs:
+        state_name = self._logical_state(job)
+        handler = self._handler_for(state_name)
+        ctx = self.context(job, state_name)
+        try:
+            outcome = self._run_handler_with_context(handler, ctx, state_name, job)
+        except Exception as exc:
+            outcome = self._exception_outcome(job, exc, state_name=state_name)
+        planned.append((job, state_name, outcome))
+
+    if any(isinstance(outcome, AppliedWorkflowStep) for _job, _state, outcome in planned):
+        results = [
+            _apply_continuation(self, outcome, state_name=state_name)
+            if isinstance(outcome, AppliedWorkflowStep)
+            else self.apply(job, outcome, state_name=state_name)
+            for job, state_name, outcome in planned
+        ]
+        for _job, _state, outcome in planned:
+            if isinstance(outcome, AppliedWorkflowStep) and outcome.error is not None:
+                raise outcome.error
+        return results
+
+    normal_planned = cast(
+        builtins.list[tuple[FlowRecord | ClaimedFlow, str, Outcome]],
+        planned,
+    )
+    _first_job, first_state, first_outcome = normal_planned[0]
+    first_matcher = BatchValueMatcher(first_outcome)
+    if all(
+        state_name == first_state and first_matcher.matches(outcome)
+        for _job, state_name, outcome in normal_planned
+    ):
+        return cast(
+            builtins.list[FlowRecord | bytes],
+            self._apply_uniform_batch(
+                [job for job, _state_name, _outcome in normal_planned],
+                first_state,
+                first_outcome,
+            ),
+        )
+
+    return [
+        self.apply(job, outcome, state_name=state_name)
+        for job, state_name, outcome in normal_planned
+    ]
 
 
 def handle_known_state_batch(
@@ -113,7 +203,9 @@ def handle_known_state_batch(
 
     handler = self._handler_for(state_name)
     mixed_outcomes: builtins.list[Outcome] | None = None
+    outcomes_with_applied: builtins.list[Outcome | AppliedWorkflowStep] | None = None
     first_matcher: BatchValueMatcher | None = None
+    first_outcome: Outcome | None = None
 
     for idx, job in enumerate(jobs):
         ctx = self.context(job, state_name)
@@ -121,6 +213,18 @@ def handle_known_state_batch(
             outcome = self._run_handler_with_context(handler, ctx, state_name, job)
         except Exception as exc:
             outcome = self._exception_outcome(job, exc, state_name=state_name)
+
+        if isinstance(outcome, AppliedWorkflowStep) or outcomes_with_applied is not None:
+            if outcomes_with_applied is None:
+                if idx == 0:
+                    outcomes_with_applied = []
+                elif mixed_outcomes is not None:
+                    outcomes_with_applied = list(mixed_outcomes)
+                else:
+                    first = _required_first_outcome(first_outcome)
+                    outcomes_with_applied = [first for _ in range(idx)]
+            outcomes_with_applied.append(outcome)
+            continue
 
         if idx == 0:
             first_outcome = outcome
@@ -130,15 +234,37 @@ def handle_known_state_batch(
         if mixed_outcomes is None:
             if first_matcher is not None and first_matcher.matches(outcome):
                 continue
-            mixed_outcomes = [first_outcome for _ in range(idx)]
+            first = _required_first_outcome(first_outcome)
+            mixed_outcomes = [first for _ in range(idx)]
 
         mixed_outcomes.append(outcome)
+
+    if outcomes_with_applied is not None:
+        if materialize:
+            materialized_results = [
+                _apply_continuation(self, outcome, state_name=state_name)
+                if isinstance(outcome, AppliedWorkflowStep)
+                else self.apply(job, outcome, state_name=state_name)
+                for job, outcome in zip(jobs, outcomes_with_applied, strict=True)
+            ]
+        else:
+            for job, outcome in zip(jobs, outcomes_with_applied, strict=True):
+                if isinstance(outcome, AppliedWorkflowStep):
+                    _apply_continuation(self, outcome, state_name=state_name)
+                else:
+                    self.apply(job, outcome, state_name=state_name)
+        for outcome in outcomes_with_applied:
+            if isinstance(outcome, AppliedWorkflowStep) and outcome.error is not None:
+                raise outcome.error
+        if materialize:
+            return materialized_results
+        return len(jobs)
 
     if mixed_outcomes is None:
         return self._apply_uniform_batch(
             jobs,
             state_name,
-            first_outcome,
+            _required_first_outcome(first_outcome),
             materialize=materialize,
         )
 

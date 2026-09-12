@@ -157,7 +157,7 @@ def _compact_flow_claim_due_payload(payload: dict[str, Any]) -> bytes | None:
     lease_ms = _compact_i64(payload.get("lease_ms"))
     limit = _compact_i64(payload.get("limit"))
     block_ms = _compact_i64(payload.get("block_ms", -1))
-    reclaim_ratio = _compact_i64(payload.get("reclaim_ratio", 0))
+    reclaim_ratio = _compact_i64(payload.get("reclaim_ratio", 25))
     priority = _compact_i64(payload.get("priority", _I64_MIN))
     if (
         type_value is None
@@ -189,7 +189,7 @@ def _compact_flow_claim_due_payload(payload: dict[str, Any]) -> bytes | None:
                 lease_ms,
                 limit,
                 block_ms,
-                1 if payload.get("reclaim_expired") else 0,
+                1 if payload.get("reclaim_expired", True) else 0,
                 reclaim_ratio,
                 priority,
                 return_mode,

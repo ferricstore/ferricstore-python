@@ -25,10 +25,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -61,10 +61,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.13"
           cache: pip
@@ -87,10 +87,10 @@ jobs:
       FERRICSTORE_IMAGE: ${{ inputs.ferricstore_image || 'quay.io/ferricstore/ferricstore:0.11.15@sha256:8d86005f22eac945ee13bd4c909f3149435be1dca747839e091830d238d4b752' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.13"
           cache: pip
@@ -102,7 +102,7 @@ jobs:
 
       - name: Checkout FerricStore server
         if: ${{ env.FERRICSTORE_IMAGE == 'ferricstore-sdk-ci:local' }}
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ferricstore/ferricstore
           path: ferricstore-server
@@ -113,7 +113,13 @@ jobs:
 
       - name: Run native integration tests
         run: scripts/run_native_integration.sh
-      - name: Run authenticated TLS HTTP integration tests
+      - name: Run authenticated TLS HTTP/1.1 integration tests
         env:
           FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.15@sha256:8d86005f22eac945ee13bd4c909f3149435be1dca747839e091830d238d4b752
+          FERRICSTORE_HTTP2: "0"
+        run: scripts/run_http_integration.sh
+      - name: Run authenticated TLS HTTP/2 integration tests
+        env:
+          FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.15@sha256:8d86005f22eac945ee13bd4c909f3149435be1dca747839e091830d238d4b752
+          FERRICSTORE_HTTP2: "1"
         run: scripts/run_http_integration.sh

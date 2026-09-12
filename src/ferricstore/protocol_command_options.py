@@ -76,7 +76,11 @@ def _generic_option_map(args: tuple[Any, ...]) -> dict[str, Any]:
     return {_command_token(args[idx]).lower(): args[idx + 1] for idx in range(0, len(args), 2)}
 
 
-def _option_map(args: tuple[Any, ...]) -> dict[str, Any]:
+def _option_map(
+    args: tuple[Any, ...],
+    *,
+    value_names_only: bool = False,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     option_plan = FlowOptionPlan(args)
     idx = 0
@@ -131,6 +135,10 @@ def _option_map(args: tuple[Any, ...]) -> dict[str, Any]:
             continue
         if token == "VALUE":
             name = _text(_require_arg(args, idx + 1, "VALUE"))
+            if value_names_only:
+                payload.setdefault("values", []).append(name)
+                idx += 2
+                continue
             value = _require_arg(args, idx + 2, "VALUE")
             payload.setdefault("values", {})[name] = value
             idx += 3

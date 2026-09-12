@@ -36,6 +36,7 @@ from ferricstore.config_validation import (
     validate_nonnegative_int,
     validate_optional_flow_priority,
     validate_optional_nonnegative_int,
+    validate_partition_key_sequence,
     validate_positive_int,
     validate_string_sequence,
 )
@@ -92,6 +93,8 @@ class AsyncWorkflow(_AsyncWorkflowProducerMixin):
         states: Sequence[str] | None = None,
         initial_state: str | None = None,
         partition_by: Sequence[str] = (),
+        partition_key: str | bytes | None = None,
+        partition_keys: Sequence[str | bytes] | None = None,
         workers: int = 1,
         concurrency: int = 1,
         command_connections: int | None = None,
@@ -147,6 +150,13 @@ class AsyncWorkflow(_AsyncWorkflowProducerMixin):
         if initial_state not in state_names:
             raise ValueError("initial_state must be included in states")
         resolved_partition_by = validate_string_sequence(partition_by, name="partition_by")
+        if partition_key is not None and partition_keys is not None:
+            raise ValueError("partition_key and partition_keys are mutually exclusive")
+        resolved_partition_keys = (
+            list(validate_partition_key_sequence(partition_keys, allow_empty=False))
+            if partition_keys is not None
+            else None
+        )
         resolved_value_config = value_config if value_config is not None else ValueConfig()
         resolved_claim_values = (
             list(validate_string_sequence(claim_values, name="claim_values"))
@@ -182,6 +192,8 @@ class AsyncWorkflow(_AsyncWorkflowProducerMixin):
         self.states = state_names
         self.initial_state = initial_state
         self.partition_by = resolved_partition_by
+        self.partition_key = partition_key
+        self.partition_keys = resolved_partition_keys
         self.workers = workers
         self.concurrency = concurrency
         self.batch_size = min(batch_size, FLOW_MANY_BATCH_LIMIT)
@@ -733,8 +745,22 @@ class AsyncWorkflow(_AsyncWorkflowProducerMixin):
     def _next_claim_partition(
         self, worker_index: int
     ) -> tuple[str | bytes | None, list[str | bytes] | None]:
-        del worker_index
-        return None, None
+        worker_index %= self.workers
+        if self.partition_key is not None:
+            return self.partition_key, None
+        if self.partition_keys is None:
+            return None, None
+
+        count = min(self.claim_partition_batch_size, len(self.partition_keys))
+        cursor = self._partition_cursors[worker_index]
+        keys = [
+            self.partition_keys[(cursor + offset) % len(self.partition_keys)]
+            for offset in range(count)
+        ]
+        self._partition_cursors[worker_index] = (cursor + count) % len(self.partition_keys)
+        if len(keys) == 1:
+            return keys[0], None
+        return None, keys
 
     @staticmethod
     def _uniform_partition_key(jobs: list[ClaimedFlow]) -> str | bytes | None:

@@ -8,24 +8,37 @@ order = client.workflow(
 )
 
 
+def charge_card(payload: bytes, *, idempotency_key: str) -> bytes:
+    print(f"charge {payload!r} with idempotency key {idempotency_key}")
+    return b"charge-accepted"
+
+
 @order.state("created", lease_ms=30_000, claim_payload=True)
-def created(job):
-    return transition("charged", payload=job.payload)
+def created(ctx):
+    charge = ctx.step(
+        name="charge-customer:v1",
+        run=lambda: charge_card(
+            ctx.payload,
+            idempotency_key=f"{ctx.id}:charge-customer:v1",
+        ),
+        to_state="charge_recorded",
+    )
+    return transition("receipt_pending", payload=charge)
 
 
-@order.state("charged", lease_ms=30_000, claim_payload=True)
-def charged(job):
+@order.state("receipt_pending", lease_ms=30_000, claim_payload=True)
+def receipt_pending(job):
     return complete(result=b"ok")
 
 
 if __name__ == "__main__":
-    partition_key = "tenant-a:order-1"
-    order.start(
+    started = order.start(
         "order-1",
         tenant_id="tenant-a",
         order_id="order-1",
         payload=b"order payload",
     )
+    partition_key = started.partition_key
     order.run_once("created", worker="worker-1", partition_key=partition_key)
-    order.run_once("charged", worker="worker-1", partition_key=partition_key)
+    order.run_once("receipt_pending", worker="worker-1", partition_key=partition_key)
     print(client.get("order-1", partition_key=partition_key))

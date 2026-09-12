@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import runpy
 from pathlib import Path
 
@@ -19,14 +20,14 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 
 
 def test_compact_query_storage_release_versions_are_current() -> None:
-    assert __version__ == "0.12.0"
+    assert __version__ == "0.13.1"
     assert MINIMUM_SERVER_VERSION == "0.11.4"
 
     status = (REPOSITORY / "docs" / "status.md").read_text()
     assert f"Current version:\n\n```text\n{__version__}\n```" in status
 
     changelog = (REPOSITORY / "CHANGELOG.md").read_text()
-    assert "## 0.12.0 - 2026-08-27" in changelog
+    assert "## 0.13.1 - 2026-09-01" in changelog
 
 
 def test_package_version_has_one_build_metadata_source() -> None:
@@ -54,6 +55,7 @@ def test_publish_requires_tag_validation_and_live_integration() -> None:
     assert "integration:" in workflow
     assert "scripts/run_native_integration.sh" in workflow
     assert "needs: [build, integration]" in workflow
+    assert "skip-existing: true" in workflow
 
 
 def test_native_integration_runner_uses_an_isolated_docker_network() -> None:
@@ -111,7 +113,11 @@ def test_tls_http_integration_is_required_by_ci_and_publish() -> None:
         integration_job = workflow.split("\n  integration:", 1)[1]
         if "\n  publish:" in integration_job:
             integration_job = integration_job.split("\n  publish:", 1)[0]
-        assert "actions/setup-python@v6" in integration_job
+        assert re.search(
+            r"^\s*uses:\s+actions/setup-python@v\d+\s*$",
+            integration_job,
+            re.MULTILINE,
+        )
         assert 'python -m pip install -e ".[dev]"' in integration_job
 
     readme = (REPOSITORY / "README.md").read_text()

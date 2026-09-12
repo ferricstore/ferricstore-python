@@ -34,13 +34,20 @@ order = client.workflow(
 
 
 @order.state("created")
-def created(job):
-    charge_card(job.payload)
-    return transition("charged")
+def created(ctx):
+    charge = ctx.step(
+        name="charge-customer:v1",
+        run=lambda: charge_card(
+            ctx.payload,
+            idempotency_key=f"{ctx.id}:charge-customer:v1",
+        ),
+        to_state="charge_recorded",
+    )
+    return transition("receipt_pending", payload=charge)
 
 
-@order.state("charged")
-def charged(job):
+@order.state("receipt_pending")
+def receipt_pending(job):
     send_receipt(job.id)
     return complete(result=b"ok")
 
@@ -52,6 +59,12 @@ order.start(
     payload=b"order payload",
 )
 ```
+
+The step name is the durable journal identity and must remain stable across retries.
+Also pass a stable provider idempotency key to an external API: a worker can stop
+after the provider succeeds but before FerricStore stores the step result. On
+recovery, the same step returns a committed result without running the closure
+again, or safely retries an uncommitted closure.
 
 Production workers normally run forever through `WorkflowWorker` or your own
 scheduler. `run_once` is useful for tests and examples.

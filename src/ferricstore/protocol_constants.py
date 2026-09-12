@@ -96,7 +96,35 @@ _OP_FLOW_RUN_STEPS_MANY = 0x0224
 _STATUS_OK = 0
 
 
+_STATUS_ERROR = 1
+
+
+_STATUS_AUTH = 2
+
+
+_STATUS_NOPERM = 3
+
+
 _STATUS_BUSY = 4
+
+
+_STATUS_REROUTE = 5
+
+
+_STATUS_BAD_REQUEST = 6
+
+
+_KNOWN_RESPONSE_STATUSES = frozenset(
+    {
+        _STATUS_OK,
+        _STATUS_ERROR,
+        _STATUS_AUTH,
+        _STATUS_NOPERM,
+        _STATUS_BUSY,
+        _STATUS_REROUTE,
+        _STATUS_BAD_REQUEST,
+    }
+)
 
 
 _COMPACT_FLOW_CLAIM_JOBS = 0x80
@@ -648,6 +676,7 @@ __all__ = [
     "_FLOW_RECORD_FIELD_KEYS_LEN",
     "_HEADER",
     "_I64_MIN",
+    "_KNOWN_RESPONSE_STATUSES",
     "_MAGIC",
     "_MAX_LANE_ID",
     "_NULL_U32",

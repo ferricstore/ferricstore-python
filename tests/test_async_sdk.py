@@ -331,6 +331,30 @@ def test_async_multiworker_runtimes_are_not_limited_by_internal_partition_count(
     assert instance.workers == 300
 
 
+def test_async_workflow_claim_partitions_are_explicit_and_rotate_in_batches() -> None:
+    fixed = AsyncWorkflow(FakeExecutor(), type="order", partition_key="tenant-a")
+    rotating = AsyncWorkflow(
+        FakeExecutor(),
+        type="order",
+        workers=2,
+        partition_keys=["tenant-a", "tenant-b", "tenant-c"],
+        claim_partition_batch_size=2,
+    )
+
+    assert fixed._next_claim_partition(0) == ("tenant-a", None)
+    assert rotating._next_claim_partition(0) == (None, ["tenant-a", "tenant-b"])
+    assert rotating._next_claim_partition(0) == (None, ["tenant-c", "tenant-a"])
+    assert rotating._next_claim_partition(1) == (None, ["tenant-a", "tenant-b"])
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        AsyncWorkflow(
+            FakeExecutor(),
+            type="order",
+            partition_key="tenant-a",
+            partition_keys=["tenant-b"],
+        )
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [

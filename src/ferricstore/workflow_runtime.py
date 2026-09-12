@@ -6,7 +6,6 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
-from ferricstore.batch_core import BatchValueMatcher
 from ferricstore.client_core import FlowClient
 from ferricstore.config_validation import validate_string_sequence
 from ferricstore.errors import FerricStoreError
@@ -37,7 +36,12 @@ from ferricstore.types import (
 from ferricstore.worker_core import (
     validate_many_result,
 )
-from ferricstore.workflow_execution import apply_uniform_batch, handle_known_state_batch
+from ferricstore.workflow_applied import AppliedWorkflowStep
+from ferricstore.workflow_execution import (
+    apply_uniform_batch,
+    handle_known_state_batch,
+    handle_mixed_state_batch,
+)
 from ferricstore.workflow_models import (
     WORKFLOW_WORKER_CONFIG_KEYS,
     WorkflowContext,
@@ -459,43 +463,22 @@ class Workflow(_WorkflowProducerMixin):
             outcome = self._run_handler_with_context(handler, ctx, state_name, job)
         except Exception as exc:
             return self._handle_exception(job, exc, state_name=state_name)
+        if isinstance(outcome, AppliedWorkflowStep):
+            if outcome.error is not None:
+                raise outcome.error
+            if not outcome.has_continuation:
+                raise FerricStoreError("applied workflow step lost its handler continuation")
+            return self.apply(
+                outcome.job,
+                cast(Outcome, outcome.continuation),
+                state_name=state_name,
+            )
         return self.apply(job, outcome, state_name=state_name)
 
     def handle_batch(
         self, jobs: Sequence[FlowRecord | ClaimedFlow]
     ) -> builtins.list[FlowRecord | bytes]:
-        if not jobs:
-            return []
-
-        planned: builtins.list[tuple[FlowRecord | ClaimedFlow, str, Outcome]] = []
-        for job in jobs:
-            state_name = self._logical_state(job)
-            handler = self._handler_for(state_name)
-            ctx = self.context(job, state_name)
-            try:
-                outcome = self._run_handler_with_context(handler, ctx, state_name, job)
-            except Exception as exc:
-                outcome = self._exception_outcome(job, exc, state_name=state_name)
-            planned.append((job, state_name, outcome))
-
-        _first_job, first_state, first_outcome = planned[0]
-        first_matcher = BatchValueMatcher(first_outcome)
-        if all(
-            state_name == first_state and first_matcher.matches(outcome)
-            for _job, state_name, outcome in planned
-        ):
-            return cast(
-                builtins.list[FlowRecord | bytes],
-                self._apply_uniform_batch(
-                    [job for job, _state_name, _outcome in planned],
-                    first_state,
-                    first_outcome,
-                ),
-            )
-
-        return [
-            self.apply(job, outcome, state_name=state_name) for job, state_name, outcome in planned
-        ]
+        return handle_mixed_state_batch(self, jobs)
 
     def _handle_known_state_batch(
         self,
@@ -569,7 +552,7 @@ class Workflow(_WorkflowProducerMixin):
         ctx: WorkflowContext,
         state_name: str,
         job: FlowRecord | ClaimedFlow,
-    ) -> Outcome:
+    ) -> Outcome | AppliedWorkflowStep:
         budget = ctx._state_budget(self._states[state_name].budget)
         try:
             if budget is not None:
@@ -591,8 +574,24 @@ class Workflow(_WorkflowProducerMixin):
                     exc = preserved
             if not isinstance(exc, Exception):
                 raise exc
+            if ctx._applied_step is not None:
+                return AppliedWorkflowStep(
+                    ctx._applied_step.job,
+                    ctx._applied_step.result,
+                    exc,
+                    ctx._applied_step.uncertain,
+                )
             outcome = self._exception_outcome(job, exc, state_name=state_name)
             return self._merge_governance_attributes(outcome, ctx._governance_attributes)
+        if ctx._applied_step is not None:
+            return replace(
+                ctx._applied_step,
+                continuation=self._merge_governance_attributes(
+                    outcome,
+                    ctx._governance_attributes,
+                ),
+                has_continuation=True,
+            )
         return self._merge_governance_attributes(outcome, ctx._governance_attributes)
 
     @staticmethod
