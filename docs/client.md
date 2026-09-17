@@ -395,8 +395,14 @@ client.rewind(
     to_event="event-id",
     partition_key="tenant-a:order-1",
     expect_state="failed",
+    reason="manual correction",
 )
 ```
+
+`reason` is encoded with the client's configured codec and stored by the
+server as the rewind reason. This replaces the beta-only `reason_ref` keyword;
+callers should pass the reason value directly. The removed `reason_ref`
+keyword is rejected before network I/O.
 
 ## `retry`
 

@@ -6,6 +6,17 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.13.2 - 2026-09-17
+
+- Request complete `RECORDS` claim responses whenever `claim_due` or `reclaim`
+  asks for full records, preserving leases, selected named values, and
+  attributes across native protocol decoding.
+- Encode policy retry settings under the nested `retry` and `backoff` fields
+  expected by the FerricStore policy contract.
+- Align the beta rewind API with the `reason` protocol field, codec-encode the
+  supplied reason, and reject the removed `reason_ref` keyword before network
+  I/O.
+
 ## 0.13.1 - 2026-09-01
 
 - Reject whitespace-only and malformed-Unicode durable step names before any

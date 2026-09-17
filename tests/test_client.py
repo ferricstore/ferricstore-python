@@ -1934,6 +1934,8 @@ def test_claim_due_can_target_priority():
         "tenant:1",
         "PRIORITY",
         0,
+        "RETURN",
+        "RECORDS",
         "RECLAIM_EXPIRED",
         "false",
     )
@@ -1999,6 +2001,8 @@ def test_claim_due_omits_state_when_none():
         "tenant:1",
         "PRIORITY",
         0,
+        "RETURN",
+        "RECORDS",
     )
 
 
@@ -2035,6 +2039,8 @@ def test_claim_due_can_target_multiple_states():
         "tenant:1",
         "PRIORITY",
         0,
+        "RETURN",
+        "RECORDS",
     )
 
 
@@ -2069,6 +2075,8 @@ def test_claim_due_can_request_selected_named_values():
         100,
         "PARTITION",
         "tenant:1",
+        "RETURN",
+        "RECORDS",
         "VALUE",
         "order",
         "VALUE_MAX_BYTES",
@@ -2992,7 +3000,7 @@ def test_flow_worker_can_claim_named_values_without_compact_return():
     assert result.claimed == 1
     assert result.completed == 1
     claim = executor.calls[0]
-    assert "RETURN" not in claim
+    assert claim[claim.index("RETURN") + 1] == "RECORDS"
     assert claim[claim.index("VALUE") : claim.index("VALUE") + 2] == ("VALUE", "order")
     assert claim[claim.index("VALUE_MAX_BYTES") : claim.index("VALUE_MAX_BYTES") + 2] == (
         "VALUE_MAX_BYTES",

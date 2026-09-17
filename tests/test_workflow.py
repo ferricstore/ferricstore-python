@@ -829,7 +829,15 @@ def test_state_config_controls_claim_payload_and_mutation_return():
         1,
     )
     assert "NOW" not in claim
-    assert claim[10:] == ("PARTITION", "tenant:order", "PRIORITY", 0, "NOPAYLOAD")
+    assert claim[10:] == (
+        "PARTITION",
+        "tenant:order",
+        "PRIORITY",
+        0,
+        "RETURN",
+        "RECORDS",
+        "NOPAYLOAD",
+    )
     assert executor.calls[1][0] == "FLOW.TRANSITION"
     assert "PAYLOAD" not in executor.calls[1]
     assert len(executor.calls) == 2

@@ -98,6 +98,8 @@ def _claim_due_command_args(
         else:
             return_mode = "JOBS_COMPACT"
         _append(args, "RETURN", return_mode)
+    else:
+        _append(args, "RETURN", "RECORDS")
     _append(args, "BLOCK", block_ms)
     _append_payload_read(args, payload, payload_max_bytes)
     _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
@@ -154,6 +156,8 @@ def _reclaim_command_args(
     _append_priority(args, priority)
     if not include_record:
         _append(args, "RETURN", "JOBS_COMPACT_ATTRS" if include_attributes else "JOBS_COMPACT")
+    else:
+        _append(args, "RETURN", "RECORDS")
     _append_payload_read(args, payload, payload_max_bytes)
     _append_value_return(args, values=values, value_max_bytes=value_max_bytes)
     return args
