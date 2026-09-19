@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import ssl
 import time
 import uuid
 from typing import Any
@@ -34,6 +35,27 @@ def ferricstore_url() -> str:
     if os.environ.get("FERRICSTORE_INTEGRATION") != "1":
         pytest.skip("set FERRICSTORE_INTEGRATION=1 to run FerricStore integration tests")
     return os.environ.get("FERRICSTORE_URL", "ferric://127.0.0.1:6388")
+
+
+def _client_options(url: str) -> dict[str, Any]:
+    if not url.startswith(("http://", "https://")):
+        return {}
+    options: dict[str, Any] = {}
+    username = os.environ.get("FERRICSTORE_USERNAME")
+    password = os.environ.get("FERRICSTORE_PASSWORD")
+    ca_file = os.environ.get("FERRICSTORE_CA_FILE")
+    http2 = os.environ.get("FERRICSTORE_HTTP2")
+    if username is not None:
+        options["username"] = username
+    if password is not None:
+        options["password"] = password
+    if ca_file is not None:
+        context = ssl.create_default_context(cafile=ca_file)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        options["ssl_context"] = context
+    if http2 is not None:
+        options["http2"] = http2.lower() in {"1", "true", "yes"}
+    return options
 
 
 def _wire_payload(command_args: tuple[Any, ...]) -> dict[bytes, Any]:
@@ -272,7 +294,10 @@ def _policy_roundtrip(
 
 
 def test_sync_policy_retry_roundtrip_preserves_nested_fields(ferricstore_url: str) -> None:
-    client = FlowClient.from_url(ferricstore_url)
+    client = FlowClient.from_url(
+        ferricstore_url,
+        **_client_options(ferricstore_url),
+    )
     try:
         _policy_roundtrip(
             client,
@@ -299,7 +324,10 @@ def test_sync_policy_retry_roundtrip_preserves_nested_fields(ferricstore_url: st
 
 def test_async_policy_retry_roundtrip_preserves_nested_fields(ferricstore_url: str) -> None:
     async def run() -> None:
-        client = AsyncFlowClient.from_url(ferricstore_url)
+        client = AsyncFlowClient.from_url(
+            ferricstore_url,
+            **_client_options(ferricstore_url),
+        )
         type_policy = RetryPolicy(
             max_retries=5,
             backoff="linear",
@@ -398,7 +426,10 @@ def _rewind_roundtrip(client: FlowClient, *, reason: str) -> None:
 
 
 def test_sync_rewind_reason_roundtrip(ferricstore_url: str) -> None:
-    client = FlowClient.from_url(ferricstore_url)
+    client = FlowClient.from_url(
+        ferricstore_url,
+        **_client_options(ferricstore_url),
+    )
     try:
         _rewind_roundtrip(client, reason="sync-rewind-reason")
     finally:
@@ -407,7 +438,10 @@ def test_sync_rewind_reason_roundtrip(ferricstore_url: str) -> None:
 
 def test_async_rewind_reason_roundtrip(ferricstore_url: str) -> None:
     async def run() -> None:
-        client = AsyncFlowClient.from_url(ferricstore_url)
+        client = AsyncFlowClient.from_url(
+            ferricstore_url,
+            **_client_options(ferricstore_url),
+        )
         try:
             suffix = uuid.uuid4().hex
             flow_type = f"py-sdk-async-rewind-{suffix}"

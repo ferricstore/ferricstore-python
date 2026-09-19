@@ -77,7 +77,9 @@ authenticated="$(curl --silent --show-error --output /dev/null --write-out '%{ht
 if [ "$#" -eq 0 ]; then
   set -- \
     tests/integration/test_ferricstore_integration.py \
-    tests/integration/test_durable_step_recovery_integration.py
+    tests/integration/test_durable_step_recovery_integration.py \
+    tests/integration/test_claim_due_contract_regressions.py \
+    tests/integration/test_policy_rewind_contract_regressions.py
 fi
 
 env PYTHONPATH="$root_dir/src${PYTHONPATH:+:$PYTHONPATH}" FERRICSTORE_INTEGRATION=1 FERRICSTORE_URL="https://127.0.0.1:$port" FERRICSTORE_USERNAME="$username" FERRICSTORE_PASSWORD="$password" FERRICSTORE_CA_FILE="$tls_dir/ca.pem" FERRICSTORE_HTTP_COMMAND_COVERAGE=1 python -m pytest -q "$@"

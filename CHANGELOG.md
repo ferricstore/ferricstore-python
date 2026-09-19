@@ -6,6 +6,15 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.13.3 - 2026-09-19
+
+- Encode `FLOW.CREATE` over HTTP with the native structured descriptor so
+  payloads, attributes, state metadata, and named values preserve their
+  typed fields; retain the generic compatibility fallback for indexed state
+  metadata and other non-`CREATE` commands.
+- Exercise claim, policy, and rewind HTTP contract regressions through the
+  default authenticated HTTP/1.1 and HTTP/2 integration selections.
+
 ## 0.13.2 - 2026-09-17
 
 - Request complete `RECORDS` claim responses whenever `claim_due` or `reclaim`

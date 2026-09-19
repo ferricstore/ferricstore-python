@@ -20,14 +20,14 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 
 
 def test_compact_query_storage_release_versions_are_current() -> None:
-    assert __version__ == "0.13.2"
+    assert __version__ == "0.13.3"
     assert MINIMUM_SERVER_VERSION == "0.11.4"
 
     status = (REPOSITORY / "docs" / "status.md").read_text()
     assert f"Current version:\n\n```text\n{__version__}\n```" in status
 
     changelog = (REPOSITORY / "CHANGELOG.md").read_text()
-    assert "## 0.13.2 - 2026-09-17" in changelog
+    assert "## 0.13.3 - 2026-09-19" in changelog
 
 
 def test_package_version_has_one_build_metadata_source() -> None:
@@ -108,6 +108,8 @@ def test_tls_http_integration_is_required_by_ci_and_publish() -> None:
         "ACL authorization probe unexpectedly allowed SET",
         "unauthenticated HTTP request returned",
         "tests/integration/test_ferricstore_integration.py",
+        "tests/integration/test_claim_due_contract_regressions.py",
+        "tests/integration/test_policy_rewind_contract_regressions.py",
     ):
         assert required in runner
 

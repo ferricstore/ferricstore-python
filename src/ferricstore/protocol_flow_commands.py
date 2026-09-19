@@ -57,7 +57,10 @@ from ferricstore.protocol_flow_payloads import (
 def _build_flow_protocol_command(name: str, args: tuple[Any, ...]) -> ProtocolCommand:
     command = _build_native_flow_protocol_command(name, args)
     payload = command.payload
-    if isinstance(payload, dict) and ("indexed_state_meta" in payload or "state_meta" in payload):
+    if isinstance(payload, dict) and (
+        "indexed_state_meta" in payload
+        or ("state_meta" in payload and name != "FLOW.CREATE")
+    ):
         return _command_exec_protocol_command(name, args)
     return command
 

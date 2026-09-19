@@ -4872,9 +4872,10 @@ def test_protocol_command_only_tokens_are_semantic_options_not_opaque_values() -
 
     assert get.opcode != _OP_COMMAND_EXEC
     assert get.payload == {"id": "STATE_META"}
-    assert create.opcode != _OP_COMMAND_EXEC
+    assert create.opcode == 0x0201
     assert create.payload["payload"] == b"STATE_META"
-    assert command_only.opcode == _OP_COMMAND_EXEC
+    assert command_only.opcode == 0x0201
+    assert command_only.payload["state_meta"] == {"version": 1}
 
 
 def test_topology_routed_command_builds_protocol_payload_once(monkeypatch: Any) -> None:
@@ -5235,23 +5236,13 @@ def test_protocol_builds_flow_state_meta_and_indexed_policy_payloads():
         "version",
         1,
     )
-    assert create == ProtocolCommand(
-        _OP_COMMAND_EXEC,
-        {
-            "command": "FLOW.CREATE",
-            "args": [
-                "f1",
-                "TYPE",
-                "order",
-                "STATE",
-                "accept",
-                "STATE_META",
-                "version",
-                1,
-            ],
-        },
-        1,
-    )
+    assert create.opcode == 0x0201
+    assert create.payload == {
+        "id": "f1",
+        "type": "order",
+        "state": "accept",
+        "state_meta": {"version": 1},
+    }
 
     complete = build_protocol_command(
         "FLOW.COMPLETE",
