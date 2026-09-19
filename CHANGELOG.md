@@ -16,6 +16,8 @@ The project is currently public alpha. APIs may change before `1.0`.
 - Align the beta rewind API with the `reason` protocol field, codec-encode the
   supplied reason, and reject the removed `reason_ref` keyword before network
   I/O.
+- Refresh the pinned current-server integration image to FerricStore OSS 0.11.19
+  while retaining the FerricStore 0.11.4 compatibility-floor lane.
 
 ## 0.13.1 - 2026-09-01
 
