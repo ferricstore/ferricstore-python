@@ -80,7 +80,7 @@ def _build_flow_creation_protocol_command(
         return ProtocolCommand(opcode, payload)
     if name == "FLOW.CLAIM_DUE":
         payload = {"type": _require_arg(args, 0, name)}
-        payload.update(_option_map(args[1:]))
+        payload.update(_option_map(args[1:], value_names_only=True))
         _collapse_states(payload)
         compact = _compact_flow_claim_due_payload(payload)
         if compact is not None:
@@ -193,6 +193,23 @@ _FLOW_ID_QUERY_ARGUMENTS = {
     "FLOW.SIGNAL": "id",
 }
 
+_FLOW_RETRY_BACKOFF_FIELD_NAMES = {
+    "BACKOFF": "kind",
+    "BASE_MS": "base_ms",
+    "MAX_MS": "max_ms",
+    "JITTER_PCT": "jitter_pct",
+}
+_FLOW_RETRY_POLICY_FIELDS = frozenset(
+    {
+        "MAX_RETRIES",
+        "BACKOFF",
+        "BASE_MS",
+        "MAX_MS",
+        "JITTER_PCT",
+        "EXHAUSTED_TO",
+    }
+)
+
 
 def _build_flow_query_protocol_command(
     name: str, args: tuple[Any, ...], opcode: int
@@ -247,6 +264,8 @@ def _build_flow_value_policy_protocol_command(
         payload = {"type": _require_arg(args, 0, name)}
         if name == "FLOW.POLICY.SET":
             payload.update(_flow_policy_set_option_map(args[1:]))
+        elif name == "FLOW.RECLAIM":
+            payload.update(_option_map(args[1:], value_names_only=True))
         else:
             payload.update(_option_map(args[1:]))
         return ProtocolCommand(opcode, payload)
@@ -435,17 +454,34 @@ def _flow_policy_set_option_map(args: tuple[Any, ...]) -> dict[str, Any]:
 
 def _flow_policy_option_map(args: tuple[Any, ...]) -> dict[str, Any]:
     payload: dict[str, Any] = {}
+    retry: dict[str, Any] = {}
+    backoff: dict[str, Any] = {}
     idx = 0
     while idx < len(args):
         token = _command_token(args[idx])
+        value = _require_arg(args, idx + 1, token)
+        if token in _FLOW_RETRY_POLICY_FIELDS:
+            if token == "MAX_RETRIES":
+                retry["max_retries"] = value
+            elif token == "EXHAUSTED_TO":
+                retry["exhausted_to"] = value
+            else:
+                backoff[_FLOW_RETRY_BACKOFF_FIELD_NAMES[token]] = value
+            idx += 2
+            continue
+
         mapped_field = _FLOW_POLICY_FIELD_NAMES.get(token) or _FIELD_NAMES.get(token)
         if mapped_field is None:
             raise InvalidCommandError(
                 f"FerricStore protocol transport does not support option {token}"
             )
-        value = _require_arg(args, idx + 1, token)
         payload[mapped_field] = _coerce_bool(value) if mapped_field in _BOOL_FIELDS else value
         idx += 2
+
+    if backoff:
+        retry["backoff"] = backoff
+    if retry:
+        payload["retry"] = retry
     return payload
 
 

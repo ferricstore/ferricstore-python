@@ -20,14 +20,14 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 
 
 def test_compact_query_storage_release_versions_are_current() -> None:
-    assert __version__ == "0.13.1"
+    assert __version__ == "0.13.2"
     assert MINIMUM_SERVER_VERSION == "0.11.4"
 
     status = (REPOSITORY / "docs" / "status.md").read_text()
     assert f"Current version:\n\n```text\n{__version__}\n```" in status
 
     changelog = (REPOSITORY / "CHANGELOG.md").read_text()
-    assert "## 0.13.1 - 2026-09-01" in changelog
+    assert "## 0.13.2 - 2026-09-17" in changelog
 
 
 def test_package_version_has_one_build_metadata_source() -> None:
@@ -56,6 +56,16 @@ def test_publish_requires_tag_validation_and_live_integration() -> None:
     assert "scripts/run_native_integration.sh" in workflow
     assert "needs: [build, integration]" in workflow
     assert "skip-existing: true" in workflow
+
+
+def test_rewind_reason_requires_oss_0119_without_changing_compatibility_smoke() -> None:
+    readme = (REPOSITORY / "README.md").read_text()
+    assert "Rewind reason persistence requires FerricStore OSS 0.11.19 or newer" in readme
+
+    workflow = (REPOSITORY / ".github" / "workflows" / "extended-validation.yml").read_text()
+    compatibility_job = workflow.split("  compatibility:", 1)[1].split("\n  tls-auth:", 1)[0]
+    assert "tests/compatibility" in compatibility_job
+    assert "test_policy_rewind_contract_regressions.py" not in compatibility_job
 
 
 def test_native_integration_runner_uses_an_isolated_docker_network() -> None:

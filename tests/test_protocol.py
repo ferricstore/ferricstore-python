@@ -4621,6 +4621,25 @@ def test_protocol_flow_get_encodes_requested_named_values_as_a_name_list() -> No
     }
 
 
+@pytest.mark.parametrize("command_name", ["FLOW.CLAIM_DUE", "FLOW.RECLAIM"])
+def test_protocol_flow_claim_reads_encode_requested_named_values_as_names(
+    command_name: str,
+) -> None:
+    command = build_protocol_command(
+        command_name,
+        "order",
+        "WORKER",
+        "worker-1",
+        "VALUE",
+        "order",
+        "VALUE_MAX_BYTES",
+        1024,
+    )
+
+    assert command.payload["values"] == ["order"]
+    assert command.payload["value_max_bytes"] == 1024
+
+
 @pytest.mark.parametrize("reserved_payload", [b"ITEMS", b"ITEMS_EXT"])
 def test_protocol_flow_many_item_marker_ignores_opaque_payload_values(
     reserved_payload: bytes,
@@ -5282,7 +5301,7 @@ def test_protocol_builds_native_flow_policy_state_modes_payload():
         {
             "type": "order",
             "states": {
-                "queued": {"mode": "FIFO", "max_retries": 5},
+                "queued": {"mode": "FIFO", "retry": {"max_retries": 5}},
                 "ready": {"mode": "PARALLEL"},
             },
         },

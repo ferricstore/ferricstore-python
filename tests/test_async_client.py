@@ -58,6 +58,8 @@ class FakeAsyncExecutor:
             b"payload": b'{"ok":true}',
         }
         if command in {"FLOW.CLAIM_DUE", "FLOW.RECLAIM"}:
+            if "RETURN" in args and args[args.index("RETURN") + 1] == "RECORDS":
+                return [record]
             if "RETURN" in args and str(args[args.index("RETURN") + 1]).endswith("_ATTRS"):
                 return [[b"f1", b"tenant:1", b"lease", 7, {b"tenant": b"acme"}]]
             return [[b"f1", b"tenant:1", b"lease", 7]]

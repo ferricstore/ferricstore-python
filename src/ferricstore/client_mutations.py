@@ -456,7 +456,7 @@ class _ClientMutationsMixin(_ClientMixinBase):
         partition_key: str | bytes | None = None,
         expect_state: str | None = None,
         run_at_ms: int | None = None,
-        reason_ref: str | None = None,
+        reason: Any = None,
         now_ms: int | None = None,
         return_record: bool = False,
     ) -> FlowRecord | bytes:
@@ -471,7 +471,7 @@ class _ClientMutationsMixin(_ClientMixinBase):
         _append(args, "PARTITION", partition_key)
         _append(args, "EXPECT_STATE", expect_state)
         _append(args, "RUN_AT", run_at_ms)
-        _append(args, "REASON_REF", reason_ref)
+        _append(args, "REASON", self.codec.encode(reason) if reason is not None else None)
         response = self.executor.execute_command(*args)
         if not return_record:
             return _flow_return(response)
