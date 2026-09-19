@@ -58,6 +58,16 @@ def test_publish_requires_tag_validation_and_live_integration() -> None:
     assert "skip-existing: true" in workflow
 
 
+def test_rewind_reason_requires_oss_0119_without_changing_compatibility_smoke() -> None:
+    readme = (REPOSITORY / "README.md").read_text()
+    assert "Rewind reason persistence requires FerricStore OSS 0.11.19 or newer" in readme
+
+    workflow = (REPOSITORY / ".github" / "workflows" / "extended-validation.yml").read_text()
+    compatibility_job = workflow.split("  compatibility:", 1)[1].split("\n  tls-auth:", 1)[0]
+    assert "tests/compatibility" in compatibility_job
+    assert "test_policy_rewind_contract_regressions.py" not in compatibility_job
+
+
 def test_native_integration_runner_uses_an_isolated_docker_network() -> None:
     runner = (REPOSITORY / "scripts" / "run_native_integration.sh").read_text()
 

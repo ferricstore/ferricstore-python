@@ -13,6 +13,9 @@ batches, compact Pub/Sub mode 35 for homogeneous `PUBLISH` pipelines, and the
 `pubsub_batch_v1` event codec for compatible subscriptions. Native wire
 protocol v1 and generic compatibility paths remain.
 
+Rewind reason persistence requires FerricStore OSS 0.11.19 or newer; the SDK's
+general compatibility floor remains 0.11.4.
+
 FerricFlow keeps each workflow or job's state and history in one durable place. It
 is an explicit durable state pipeline, not a hidden deterministic replay engine:
 
