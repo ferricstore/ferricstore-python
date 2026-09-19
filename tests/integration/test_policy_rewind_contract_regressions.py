@@ -200,9 +200,10 @@ def test_async_rewind_wire_payload_uses_encoded_reason() -> None:
 def test_sync_rewind_rejects_unsupported_reason_ref() -> None:
     executor = _RecordingExecutor(response=b"OK")
     client = FlowClient(executor)
+    unsupported_kwargs: dict[str, Any] = {"reason_ref": "unsupported"}
 
     with pytest.raises(TypeError, match="reason_ref"):
-        client.rewind("flow-1", to_event="created-1", reason_ref="unsupported")  # type: ignore[call-arg]
+        client.rewind("flow-1", to_event="created-1", **unsupported_kwargs)
     assert executor.calls == []
 
 
@@ -210,13 +211,10 @@ def test_async_rewind_rejects_unsupported_reason_ref() -> None:
     async def run() -> None:
         executor = _AsyncRecordingExecutor(response=b"OK")
         client = AsyncFlowClient(executor)
+        unsupported_kwargs: dict[str, Any] = {"reason_ref": "unsupported"}
 
         with pytest.raises(TypeError, match="reason_ref"):
-            await client.rewind(  # type: ignore[call-arg]
-                "flow-1",
-                to_event="created-1",
-                reason_ref="unsupported",
-            )
+            await client.rewind("flow-1", to_event="created-1", **unsupported_kwargs)
         assert executor.calls == []
 
     asyncio.run(run())
