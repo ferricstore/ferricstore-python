@@ -23,6 +23,7 @@ from ferricstore.flow_query_request import _with_flow_query_command_options
 from ferricstore.http_coalescing import CommandCoalescer
 from ferricstore.http_transport import JsonHttpTransport, _HttpDeadline
 from ferricstore.protocol_commands import build_protocol_command
+from ferricstore.protocol_constants import _OP_COMMAND_EXEC
 
 _command_name = _http_command_policy.command_name
 _command_values = _http_command_policy.command_values
@@ -34,6 +35,7 @@ _unwrapped_command_values = _http_command_policy.unwrapped_command_values
 
 _HTTP_STRUCTURED_FLOW_COMMANDS = frozenset(
     {
+        "FLOW.CREATE",
         "FLOW.QUERY",
         "FLOW.VALUE.MGET",
         "FLOW.STEP_CONTINUE",
@@ -561,6 +563,8 @@ def _structured_flow_command(values: list[Any], index: int, *, compact: bool) ->
         opcode = build_protocol_command(name, *values[1:]).opcode
     else:
         protocol_command = build_protocol_command(name, *values[1:])
+        if protocol_command.opcode == _OP_COMMAND_EXEC:
+            return _structured_command_exec(values, index, compact=compact)
         if not isinstance(protocol_command.payload, Mapping):
             raise InvalidCommandError(f"{name} cannot use a compact native payload over HTTP")
         payload = protocol_command.payload

@@ -229,6 +229,195 @@ def test_structured_flow_commands_reuse_native_payload_builders(compact: bool) -
 
 
 @pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("async_adapter", [False, True])
+def test_flow_create_uses_native_descriptor_for_extended_options(
+    compact: bool,
+    async_adapter: bool,
+) -> None:
+    command = (
+        "FLOW.CREATE",
+        "flow-1",
+        "TYPE",
+        "checkout",
+        "STATE",
+        "queued",
+        "NOW",
+        100,
+        "PARTITION",
+        "tenant-1",
+        "PAYLOAD",
+        b'{"kind":"claim"}',
+        "IDEMPOTENT",
+        True,
+        "ATTRIBUTE",
+        "tenant",
+        "acme",
+        "VALUE",
+        "result",
+        b'"value"',
+    )
+
+    async def run_async(url: str) -> None:
+        adapter = AsyncHttpAdapter(url, compact=compact)
+        try:
+            await adapter.execute_command(*command)
+        finally:
+            await adapter.close()
+
+    def responder(_envelope: dict[str, Any]) -> Response:
+        return 200, {"results": [{"status": "ok", "value": None}]}, {}
+
+    with proxy_server(responder) as (url, state):
+        if async_adapter:
+            asyncio.run(run_async(url))
+        else:
+            adapter = HttpAdapter(url, compact=compact)
+            try:
+                adapter.execute_command(*command)
+            finally:
+                adapter.close()
+
+    descriptor = _decode_wire(state.requests[0]["commands"][0])
+    assert descriptor == {
+        "command": "FLOW.CREATE",
+        "opcode": 0x0201,
+        "payload": {
+            "id": "flow-1",
+            "type": "checkout",
+            "state": "queued",
+            "now_ms": 100,
+            "partition_key": "tenant-1",
+            "payload": b'{"kind":"claim"}',
+            "idempotent": True,
+            "attributes": {"tenant": "acme"},
+            "values": {"result": b'"value"'},
+        },
+    }
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("async_adapter", [False, True])
+def test_flow_create_state_meta_uses_native_descriptor(
+    compact: bool,
+    async_adapter: bool,
+) -> None:
+    command = (
+        "FLOW.CREATE",
+        "flow-1",
+        "TYPE",
+        "checkout",
+        "STATE",
+        "queued",
+        "NOW",
+        100,
+        "PAYLOAD",
+        b'{"kind":"claim"}',
+        "ATTRIBUTE",
+        "tenant",
+        "acme",
+        "STATE_META",
+        "attempt",
+        7,
+        "VALUE",
+        "result",
+        b'"value"',
+    )
+
+    async def run_async(url: str) -> None:
+        adapter = AsyncHttpAdapter(url, compact=compact)
+        try:
+            await adapter.execute_command(*command)
+        finally:
+            await adapter.close()
+
+    def responder(_envelope: dict[str, Any]) -> Response:
+        return 200, {"results": [{"status": "ok", "value": None}]}, {}
+
+    with proxy_server(responder) as (url, state):
+        if async_adapter:
+            asyncio.run(run_async(url))
+        else:
+            adapter = HttpAdapter(url, compact=compact)
+            try:
+                adapter.execute_command(*command)
+            finally:
+                adapter.close()
+
+    descriptor = _decode_wire(state.requests[0]["commands"][0])
+    assert descriptor == {
+        "command": "FLOW.CREATE",
+        "opcode": 0x0201,
+        "payload": {
+            "id": "flow-1",
+            "type": "checkout",
+            "state": "queued",
+            "now_ms": 100,
+            "payload": b'{"kind":"claim"}',
+            "attributes": {"tenant": "acme"},
+            "state_meta": {"attempt": 7},
+            "values": {"result": b'"value"'},
+        },
+    }
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_flow_create_indexed_state_meta_keeps_command_exec_fallback(compact: bool) -> None:
+    adapter = HttpAdapter("http://127.0.0.1:1", compact=compact)
+    command = (
+        "FLOW.CREATE",
+        "flow-1",
+        "TYPE",
+        "checkout",
+        "STATE",
+        "queued",
+        "INDEXED_STATE_META",
+        "attempt",
+        "STATE_META",
+        "attempt",
+        7,
+    )
+
+    try:
+        descriptor = _decode_wire(adapter._encode_command(command, 0))
+    finally:
+        adapter.close()
+
+    assert descriptor["command"] == "COMMAND_EXEC"
+    assert descriptor["opcode"] == 0x0100
+    assert _decode_wire(descriptor["payload"]) == {
+        "command": "FLOW.CREATE",
+        "args": list(command[1:]),
+    }
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_non_create_state_meta_keeps_command_exec_fallback(compact: bool) -> None:
+    adapter = HttpAdapter("http://127.0.0.1:1", compact=compact)
+    command = (
+        "FLOW.STEP_CONTINUE",
+        "flow-1",
+        b"lease",
+        "running",
+        "ready",
+        "STATE_META",
+        "attempt",
+        7,
+    )
+
+    try:
+        descriptor = _decode_wire(adapter._encode_command(command, 0))
+    finally:
+        adapter.close()
+
+    assert descriptor["command"] == "COMMAND_EXEC"
+    assert descriptor["opcode"] == 0x0100
+    assert _decode_wire(descriptor["payload"]) == {
+        "command": "FLOW.STEP_CONTINUE",
+        "args": list(command[1:]),
+    }
+
+
+@pytest.mark.parametrize("compact", [False, True])
 def test_flow_value_mget_uses_its_existing_native_opcode_over_http(compact: bool) -> None:
     adapter = HttpAdapter("http://127.0.0.1:1", compact=compact)
 
