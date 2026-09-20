@@ -20,14 +20,14 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 
 
 def test_compact_query_storage_release_versions_are_current() -> None:
-    assert __version__ == "0.13.3"
+    assert __version__ == "0.13.4"
     assert MINIMUM_SERVER_VERSION == "0.11.4"
 
     status = (REPOSITORY / "docs" / "status.md").read_text()
     assert f"Current version:\n\n```text\n{__version__}\n```" in status
 
     changelog = (REPOSITORY / "CHANGELOG.md").read_text()
-    assert "## 0.13.3 - 2026-09-19" in changelog
+    assert "## 0.13.4 - 2026-09-20" in changelog
 
 
 def test_package_version_has_one_build_metadata_source() -> None:

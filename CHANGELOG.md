@@ -6,6 +6,11 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.13.4 - 2026-09-20
+
+- Refresh the pinned current-server integration image to FerricStore OSS 0.11.20
+  and validate the release against its immutable manifest.
+
 ## 0.13.3 - 2026-09-19
 
 - Encode `FLOW.CREATE` over HTTP with the native structured descriptor so
