@@ -1,8 +1,35 @@
 from __future__ import annotations
 
+import math
+import threading
 from base64 import b64encode
 from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse
+
+_MAX_RETRY_AFTER_MS = 2**64 - 1
+_MAX_RETRY_AFTER_SECONDS_EXCLUSIVE = Decimal("18446744073709551.616")
+
+
+def _optional_retry_after_ms(value: object) -> int | None:
+    if type(value) is not int or not 0 <= value <= _MAX_RETRY_AFTER_MS:
+        return None
+    return value
+
+
+def _retry_after_ms_from_header(value: object) -> int | None:
+    try:
+        seconds = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not seconds.is_finite() or seconds < 0 or seconds >= _MAX_RETRY_AFTER_SECONDS_EXCLUSIVE:
+        return None
+    _, digits, exponent = seconds.as_tuple()
+    if not any(digits):
+        return 0
+    exponent = int(exponent) + 3
+    digits = digits[: max(0, len(digits) + min(exponent, 0))]
+    return _optional_retry_after_ms(int("".join(map(str, digits)) or "0") * 10 ** max(exponent, 0))
 
 
 def validate_base_url(url: str) -> str:
@@ -40,9 +67,17 @@ def validate_path(path: str) -> str:
 def validate_timeout(value: float | None) -> float | None:
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError("timeout must be positive or None")
-    return float(value)
+    try:
+        normalized = float(value)
+    except OverflowError:
+        raise ValueError("timeout must be positive or None") from None
+    if normalized <= 0 or not math.isfinite(normalized):
+        raise ValueError("timeout must be positive or None")
+    if normalized > threading.TIMEOUT_MAX:
+        raise ValueError("timeout exceeds platform wait limit")
+    return normalized
 
 
 def validate_positive_int(value: int, *, name: str) -> int:

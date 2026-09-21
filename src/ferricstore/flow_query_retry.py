@@ -168,7 +168,7 @@ def _unbounded_zero_delay_retry(
     policy = backpressure.policy
     if policy.max_retries is not None or policy.max_elapsed_ms is not None:
         return False
-    if exc.retry_after_ms is not None and exc.retry_after_ms > 0:
+    if backpressure._retry_after_delay(exc.retry_after_ms) > 0:
         return False
     return not isinstance(exc, OverloadedError) or (
         policy.base_delay_ms <= 0 or policy.max_delay_ms <= 0

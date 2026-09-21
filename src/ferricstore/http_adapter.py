@@ -21,7 +21,11 @@ from ferricstore.errors import (
 )
 from ferricstore.flow_query_request import _with_flow_query_command_options
 from ferricstore.http_coalescing import CommandCoalescer
-from ferricstore.http_transport import JsonHttpTransport, _HttpDeadline
+from ferricstore.http_transport import (
+    JsonHttpTransport,
+    _HttpDeadline,
+)
+from ferricstore.http_validation import _optional_retry_after_ms
 from ferricstore.protocol_commands import build_protocol_command
 from ferricstore.protocol_constants import _OP_COMMAND_EXEC
 
@@ -348,7 +352,10 @@ class HttpAdapter:
         return self._slots.acquire(timeout=remaining)
 
     def _command_deadline(self, commands: Sequence[Sequence[Any]]) -> _HttpDeadline:
-        return _HttpDeadline(_effective_timeout(commands, self._transport.timeout))
+        timeout = _effective_timeout(commands, self._transport.timeout)
+        if timeout is not None:
+            timeout = min(timeout, threading.TIMEOUT_MAX)
+        return _HttpDeadline(timeout)
 
 
 class AsyncHttpAdapter:
@@ -510,9 +517,17 @@ def _positive_int(value: int, *, name: str) -> int:
 
 
 def _nonnegative_number(value: float, *, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a non-negative number")
-    return float(value)
+    try:
+        normalized = float(value)
+    except OverflowError:
+        raise ValueError(f"{name} must be a non-negative number") from None
+    if normalized < 0 or not math.isfinite(normalized):
+        raise ValueError(f"{name} must be a non-negative number")
+    if normalized / 1_000.0 > threading.TIMEOUT_MAX:
+        raise ValueError(f"{name} exceeds platform wait limit")
+    return normalized
 
 
 def _encode_json_bytes(value: Any) -> bytes:
@@ -662,10 +677,7 @@ def _command_result(result: Any, *, binary: bool = False) -> Any:
     code = code_value if isinstance(code_value, str) else "upstream_error"
     message_value = details.get("message")
     message = message_value if isinstance(message_value, str) else code.replace("_", " ")
-    retry_after_value = details.get("retry_after_ms")
-    retry_after_ms = (
-        retry_after_value if isinstance(retry_after_value, int) and retry_after_value >= 0 else None
-    )
+    retry_after_ms = _optional_retry_after_ms(details.get("retry_after_ms"))
     retryable = details.get("retryable") is True
     safe_to_retry = details.get("safe_to_retry") is True
     if code in {"overload", "overloaded"}:

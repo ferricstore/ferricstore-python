@@ -17,6 +17,8 @@ from ferricstore.config_validation import (
     validate_thread_wait_milliseconds,
 )
 
+_MAX_RETRY_AFTER_MS = 2**64 - 1
+
 
 @dataclass(frozen=True, slots=True)
 class BackpressurePolicy:
@@ -288,9 +290,16 @@ class BackpressureController:
             return wait_delay
 
     def _retry_after_delay(self, retry_after_ms: int | None) -> float:
-        if retry_after_ms is None:
+        if (
+            type(retry_after_ms) is not int
+            or retry_after_ms < 0
+            or retry_after_ms > _MAX_RETRY_AFTER_MS
+        ):
             return 0.0
-        return min(max(retry_after_ms, 0) / 1000.0, threading.TIMEOUT_MAX)
+        platform_limit_ms = threading.TIMEOUT_MAX * 1000.0
+        if retry_after_ms >= platform_limit_ms:
+            return threading.TIMEOUT_MAX
+        return retry_after_ms / 1000.0
 
     def _delay_for_attempt(self, attempt: int) -> float:
         base = max(self.policy.base_delay_ms, 0.0) / 1000.0

@@ -3,6 +3,14 @@ from __future__ import annotations
 import re
 from typing import Any, TypedDict
 
+_MAX_RETRY_AFTER_MS = 2**64 - 1
+
+
+def _optional_retry_after_ms(value: object) -> int | None:
+    if type(value) is not int or not 0 <= value <= _MAX_RETRY_AFTER_MS:
+        return None
+    return value
+
 
 class _RetryMetadata(TypedDict):
     retryable: bool | None
@@ -29,7 +37,7 @@ class FerricStoreError(RuntimeError):
         self.raw = raw
         self.retryable = retryable
         self.safe_to_retry = safe_to_retry
-        self.retry_after_ms = retry_after_ms
+        self.retry_after_ms = _optional_retry_after_ms(retry_after_ms)
 
 
 class FlowNotFoundError(FerricStoreError):
@@ -160,10 +168,11 @@ def classify_server_error(
     retry_after_ms: int | None = None,
 ) -> FerricStoreError:
     lower = message.lower()
+    validated_retry_after_ms = _optional_retry_after_ms(retry_after_ms)
     metadata: _RetryMetadata = {
         "retryable": retryable,
         "safe_to_retry": safe_to_retry,
-        "retry_after_ms": retry_after_ms,
+        "retry_after_ms": validated_retry_after_ms,
     }
 
     if "overloaded" in lower or "busy" in lower:
@@ -171,8 +180,8 @@ def classify_server_error(
             message,
             raw=raw,
             retry_after_ms=(
-                retry_after_ms
-                if retry_after_ms is not None
+                validated_retry_after_ms
+                if validated_retry_after_ms is not None
                 else _int_field(lower, "retry_after_ms")
             ),
             reason=_str_field(lower, "reason"),
@@ -201,15 +210,20 @@ def classify_server_error(
         raw=raw,
         retryable=retryable,
         safe_to_retry=safe_to_retry,
-        retry_after_ms=retry_after_ms,
+        retry_after_ms=validated_retry_after_ms,
     )
 
 
 def _int_field(message: str, name: str) -> int | None:
-    match = re.search(rf"\b{name}=([0-9]+)\b", message)
+    match = re.search(rf"\b{name}=([0-9]+)(?![0-9.])\b", message)
     if not match:
         return None
-    return int(match.group(1))
+    digits = match.group(1).lstrip("0")
+    if not digits:
+        return 0
+    if len(digits) > len(str(_MAX_RETRY_AFTER_MS)):
+        return None
+    return _optional_retry_after_ms(int(digits))
 
 
 def _str_field(message: str, name: str) -> str | None:

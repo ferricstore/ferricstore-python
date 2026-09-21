@@ -848,7 +848,7 @@ def _http_transport_error(method: str, reason: Any) -> HttpError:
 def _decode_json_object(raw: bytes, *, status_code: int) -> dict[str, Any]:
     try:
         value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, ValueError) as exc:
         raise HttpError(
             "FerricStore HTTP endpoint returned invalid JSON",
             status_code=status_code,
@@ -872,7 +872,7 @@ def _decode_json_object(raw: bytes, *, status_code: int) -> dict[str, Any]:
 def _decode_error_object(raw: bytes, *, status_code: int) -> dict[str, Any]:
     try:
         value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, ValueError):
         value = None
     if isinstance(value, dict):
         return value
@@ -898,9 +898,9 @@ def _response_error(
     code = code_value if isinstance(code_value, str) else "http_error"
     message_value = details.get("message")
     message = message_value if isinstance(message_value, str) else code.replace("_", " ")
-    body_retry_after = payload.get("retry_after_ms")
-    if retry_after_ms is None and isinstance(body_retry_after, int) and body_retry_after >= 0:
-        retry_after_ms = body_retry_after
+    retry_after_ms = http_validation._optional_retry_after_ms(retry_after_ms)
+    if retry_after_ms is None:
+        retry_after_ms = http_validation._optional_retry_after_ms(payload.get("retry_after_ms"))
     raw = {"status_code": status_code, "body": payload}
     if status_code in {429, 503} or code in {"overload", "overloaded"}:
         return OverloadedError(
@@ -924,15 +924,9 @@ def _response_error(
 
 def _retry_after_ms(headers: Any) -> int | None:
     value = headers.get("Retry-After") if headers is not None else None
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
-    try:
-        seconds = float(value)
-    except (TypeError, ValueError):
-        return None
-    if seconds < 0:
-        return None
-    return int(seconds * 1000)
+    return http_validation._retry_after_ms_from_header(value)
 
 
 __all__ = [
