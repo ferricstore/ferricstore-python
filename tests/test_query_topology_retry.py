@@ -152,7 +152,7 @@ def test_sync_zero_deadline_disables_retry_and_pressure_deadline_budget(
 
     assert execute_flow_query_read_with_retry(operation, controller, deadline_ms=0) == "sent"
     assert calls == 2
-    assert sleeps == [0.1]
+    assert sleeps == [0.1, 0]
 
 
 def test_async_zero_deadline_disables_retry_and_pressure_deadline_budget(
@@ -200,7 +200,7 @@ def test_async_zero_deadline_disables_retry_and_pressure_deadline_budget(
         )
         return result, calls, sleeps
 
-    assert asyncio.run(run()) == ("sent", 2, [0.1])
+    assert asyncio.run(run()) == ("sent", 2, [0.1, 0])
 
 
 def test_sync_shared_pressure_rechecks_absolute_remaining_budget(

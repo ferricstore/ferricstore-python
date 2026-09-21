@@ -948,6 +948,74 @@ def test_coalescing_never_joins_a_blocking_command_to_an_independent_request() -
     assert all(len(request["commands"]) == 1 for request in state.requests)
 
 
+@pytest.mark.parametrize("blocking_timeout", [10**400, -(10**400)])
+def test_coalescing_isolates_invalid_blocking_sync_commands(blocking_timeout: int) -> None:
+    barrier = threading.Barrier(2)
+    blocking = ("BLPOP", "jobs", blocking_timeout)
+
+    with proxy_server(command_responder) as (url, state):
+        adapter = HttpAdapter(
+            url,
+            max_connections=2,
+            coalesce_window_ms=50,
+            coalesce_max_items=2,
+        )
+
+        def execute(command: tuple[Any, ...]) -> Any:
+            barrier.wait()
+            return adapter.execute_command(*command)
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                assert list(executor.map(execute, [blocking, ("PING",)])) == [
+                    [b"BLPOP", b"jobs", blocking_timeout],
+                    [b"PING"],
+                ]
+        finally:
+            adapter.close()
+
+    assert len(state.requests) == 2
+    assert all(len(request["commands"]) == 1 for request in state.requests)
+
+
+@pytest.mark.parametrize("blocking_timeout", [10**400, -(10**400)])
+def test_coalescing_isolates_invalid_blocking_async_commands(blocking_timeout: int) -> None:
+    blocking = ("BLPOP", "jobs", blocking_timeout)
+
+    async def run(url: str) -> list[Any]:
+        adapter = AsyncHttpAdapter(
+            url,
+            max_connections=2,
+            max_concurrent_requests=2,
+            coalesce_window_ms=50,
+            coalesce_max_items=2,
+        )
+        ready = asyncio.Event()
+
+        async def execute(command: tuple[Any, ...]) -> Any:
+            await ready.wait()
+            return await adapter.execute_command(*command)
+
+        try:
+            tasks = [
+                asyncio.create_task(execute(blocking)),
+                asyncio.create_task(execute(("PING",))),
+            ]
+            ready.set()
+            return await asyncio.gather(*tasks)
+        finally:
+            await adapter.close()
+
+    with proxy_server(command_responder) as (url, state):
+        assert asyncio.run(run(url)) == [
+            [b"BLPOP", b"jobs", blocking_timeout],
+            [b"PING"],
+        ]
+
+    assert len(state.requests) == 2
+    assert all(len(request["commands"]) == 1 for request in state.requests)
+
+
 def test_ordered_batch_keeps_blocking_and_normal_commands_in_one_request() -> None:
     with proxy_server(command_responder) as (url, state):
         adapter = HttpAdapter(url, timeout=0.05, coalesce_window_ms=50)
@@ -1365,6 +1433,52 @@ def test_blocking_batch_aggregates_sequential_waits_but_explicit_deadline_wins()
 
     assert observed[0] is not None and observed[0] >= 0.08
     assert observed[1] is not None and observed[1] < 0.05
+
+
+@pytest.mark.parametrize("async_adapter", [False, True])
+def test_public_http_adapters_saturate_overflowed_batch_deadlines(
+    async_adapter: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[float | None] = []
+    monkeypatch.setattr(http_transport_module, "monotonic", lambda: 0.0)
+    commands = [
+        ("BLPOP", "one", 1e308),
+        ("BLPOP", "two", 1e308),
+    ]
+
+    def request_json(
+        _method: str,
+        _path: str,
+        *,
+        body: dict[str, Any],
+        _deadline: http_transport_module._HttpDeadline,
+    ) -> tuple[int, dict[str, Any]]:
+        observed.append(_deadline.remaining())
+        return 200, {
+            "encoding": "ferricstore-json-v1",
+            "results": [{"status": "ok", "value": None} for _command in body["commands"]],
+        }
+
+    async def run_async() -> None:
+        adapter = AsyncHttpAdapter("https://proxy.example.com", timeout=0.02)
+        adapter._sync._transport.request_json = request_json  # type: ignore[method-assign]
+        try:
+            assert await adapter.execute_batch(commands) == [None, None]
+        finally:
+            await adapter.close()
+
+    if async_adapter:
+        asyncio.run(run_async())
+    else:
+        adapter = HttpAdapter("https://proxy.example.com", timeout=0.02)
+        adapter._transport.request_json = request_json  # type: ignore[method-assign]
+        try:
+            assert adapter.execute_batch(commands) == [None, None]
+        finally:
+            adapter.close()
+
+    assert observed == [threading.TIMEOUT_MAX]
 
 
 def test_nonblocking_flow_claim_zero_keeps_the_implicit_http_deadline() -> None:
@@ -2163,6 +2277,118 @@ def test_http_effective_blocking_deadline_stays_within_platform_wait_limit(
         adapter.close()
 
 
+@pytest.mark.parametrize("async_adapter", [False, True])
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_public_http_adapters_reject_nonstandard_json_constants(
+    async_adapter: bool,
+    constant: str,
+) -> None:
+    raw = b'{"results":[{"status":"ok","value":' + constant.encode("ascii") + b"}]}"
+
+    def responder(_envelope: dict[str, Any]) -> Response:
+        return 200, raw, {}
+
+    async def run_async(url: str) -> str:
+        adapter = AsyncHttpAdapter(url)
+        try:
+            with pytest.raises(HttpError) as raised:
+                await adapter.execute_command("GET", "key")
+            return raised.value.error_code
+        finally:
+            await adapter.close()
+
+    with proxy_server(responder) as (url, _state):
+        if async_adapter:
+            error_code = asyncio.run(run_async(url))
+        else:
+            adapter = HttpAdapter(url)
+            try:
+                with pytest.raises(HttpError) as raised:
+                    adapter.execute_command("GET", "key")
+                error_code = raised.value.error_code
+            finally:
+                adapter.close()
+
+    assert error_code == "invalid_response"
+
+
+@pytest.mark.parametrize("async_adapter", [False, True])
+@pytest.mark.parametrize("response_kind", ["deep", "overflow", "malformed", "surrogate"])
+def test_public_http_adapters_reject_malformed_json_results(
+    async_adapter: bool,
+    response_kind: str,
+) -> None:
+    if response_kind == "deep":
+        depth = 1_200
+        raw = b'{"results":[{"status":"ok","value":' + (b"[" * depth + b"0" + b"]" * depth) + b"}]}"
+    elif response_kind == "overflow":
+        raw = b'{"results":[{"status":"ok","value":1e999999}]}'
+    elif response_kind == "malformed":
+        raw = b'{"results":[{"value":"missing status"}]}'
+    else:
+        raw = b'{"results":[{"status":"ok","value":"\\ud800"}]}'
+
+    def responder(_envelope: dict[str, Any]) -> Response:
+        return 200, raw, {}
+
+    async def run_async(url: str) -> str:
+        adapter = AsyncHttpAdapter(url)
+        try:
+            with pytest.raises(HttpError) as raised:
+                await adapter.execute_command("GET", "key")
+            return raised.value.error_code
+        finally:
+            await adapter.close()
+
+    with proxy_server(responder) as (url, _state):
+        if async_adapter:
+            error_code = asyncio.run(run_async(url))
+        else:
+            adapter = HttpAdapter(url)
+            try:
+                with pytest.raises(HttpError) as raised:
+                    adapter.execute_command("GET", "key")
+                error_code = raised.value.error_code
+            finally:
+                adapter.close()
+
+    assert error_code == "invalid_response"
+
+
+@pytest.mark.parametrize("async_adapter", [False, True])
+@pytest.mark.parametrize("blocking_timeout", [10**400, -(10**400)])
+def test_public_http_adapters_keep_deadlines_for_overflowed_blocking_timeout(
+    async_adapter: bool,
+    blocking_timeout: int,
+) -> None:
+    def responder(envelope: dict[str, Any]) -> Response:
+        time.sleep(0.1)
+        return command_responder(envelope)
+
+    async def run_async(url: str) -> str:
+        adapter = AsyncHttpAdapter(url, timeout=0.02)
+        try:
+            with pytest.raises(HttpError) as raised:
+                await adapter.execute_command("BLPOP", "jobs", blocking_timeout)
+            return raised.value.error_code
+        finally:
+            await adapter.close()
+
+    with proxy_server(responder) as (url, _state):
+        if async_adapter:
+            error_code = asyncio.run(run_async(url))
+        else:
+            adapter = HttpAdapter(url, timeout=0.02)
+            try:
+                with pytest.raises(HttpError) as raised:
+                    adapter.execute_command("BLPOP", "jobs", blocking_timeout)
+                error_code = raised.value.error_code
+            finally:
+                adapter.close()
+
+    assert error_code == "transport_timeout"
+
+
 def test_http_adapter_empty_batch_is_a_noop() -> None:
     with proxy_server(command_responder) as (url, state):
         adapter = HttpAdapter(url)
@@ -2819,7 +3045,7 @@ def test_unbounded_retry_yields_for_invalid_direct_retry_hint(
 
     asyncio.run(run())
 
-    assert sync_sleeps == [0.001]
+    assert sync_sleeps == [0]
     assert async_sleeps == sync_sleeps
 
 

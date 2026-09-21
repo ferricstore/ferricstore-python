@@ -1503,6 +1503,35 @@ def test_enqueue_default_backpressure_retries_until_server_recovers():
     assert len(executor.calls) == 13
 
 
+@pytest.mark.parametrize(
+    ("max_retries", "max_elapsed_ms"),
+    [(None, None), (2, None), (None, 1_000), (2, 1_000)],
+)
+def test_enqueue_zero_delay_retry_yields_cooperatively(
+    max_retries,
+    max_elapsed_ms,
+    monkeypatch,
+):
+    sleeps = []
+    monkeypatch.setattr("ferricstore.client_support.time.sleep", sleeps.append)
+    executor = OverloadThenAckExecutor(overloads=2)
+    client = FlowClient(
+        executor,
+        backpressure=BackpressurePolicy(
+            max_retries=max_retries,
+            max_elapsed_ms=max_elapsed_ms,
+            base_delay_ms=0,
+            max_delay_ms=0,
+            jitter=0,
+            shared=False,
+        ),
+    )
+
+    assert client.enqueue("f1", type="order", payload=b"hello", now_ms=100) == b"OK"
+    assert len(executor.calls) == 3
+    assert sleeps == [0, 0]
+
+
 def test_backpressure_delay_saturates_without_overflow():
     controller = BackpressureController(
         BackpressurePolicy(base_delay_ms=5, max_delay_ms=500, jitter=0, shared=False)

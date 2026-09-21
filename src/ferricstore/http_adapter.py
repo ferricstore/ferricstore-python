@@ -222,7 +222,26 @@ class HttpAdapter:
         deadline: _HttpDeadline,
     ) -> list[Any]:
         results, binary = self._request_batch_with_deadline(commands, deadline)
-        return [_command_result(result, binary=binary) for result in results]
+        try:
+            for result in results:
+                _validate_json_value(result)
+            return [_command_result(result, binary=binary) for result in results]
+        except (
+            MemoryError,
+            RecursionError,
+            UnicodeError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ) as exc:
+            raise HttpError(
+                "FerricStore HTTP endpoint returned an invalid command result",
+                status_code=200,
+                error_code="invalid_response",
+                raw=results,
+                retryable=False,
+                safe_to_retry=False,
+            ) from exc
 
     def _request_batch_with_deadline(
         self,
@@ -645,6 +664,17 @@ def _native_value(value: Any) -> Any:
     return value
 
 
+def _validate_json_value(value: Any) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("HTTP JSON response contains a non-finite number")
+    if isinstance(value, list):
+        for item in value:
+            _validate_json_value(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _validate_json_value(item)
+
+
 def _command_result(result: Any, *, binary: bool = False) -> Any:
     if not isinstance(result, dict):
         raise HttpError(
@@ -656,6 +686,15 @@ def _command_result(result: Any, *, binary: bool = False) -> Any:
             safe_to_retry=False,
         )
     status = result.get("status")
+    if not isinstance(status, str):
+        raise HttpError(
+            "FerricStore HTTP endpoint command result has an invalid status",
+            status_code=200,
+            error_code="invalid_response",
+            raw=result,
+            retryable=False,
+            safe_to_retry=False,
+        )
     if status == "ok":
         value = result.get("value")
         if binary:

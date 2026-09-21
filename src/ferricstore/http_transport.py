@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from contextvars import ContextVar
 from http.client import HTTPConnection, HTTPException, HTTPResponse, HTTPSConnection
 from time import monotonic
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit
 from urllib.request import (
@@ -845,10 +845,14 @@ def _http_transport_error(method: str, reason: Any) -> HttpError:
     )
 
 
+def _reject_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
 def _decode_json_object(raw: bytes, *, status_code: int) -> dict[str, Any]:
     try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, ValueError) as exc:
+        value = json.loads(raw, parse_constant=_reject_json_constant)
+    except (UnicodeError, ValueError, RecursionError, MemoryError) as exc:
         raise HttpError(
             "FerricStore HTTP endpoint returned invalid JSON",
             status_code=status_code,
@@ -871,8 +875,8 @@ def _decode_json_object(raw: bytes, *, status_code: int) -> dict[str, Any]:
 
 def _decode_error_object(raw: bytes, *, status_code: int) -> dict[str, Any]:
     try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, ValueError):
+        value = json.loads(raw, parse_constant=_reject_json_constant)
+    except (UnicodeError, ValueError, RecursionError, MemoryError):
         value = None
     if isinstance(value, dict):
         return value

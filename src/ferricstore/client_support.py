@@ -20,6 +20,8 @@ from ferricstore.types import (
     FlowStatePolicyLike,
 )
 
+_ZERO_RETRY_DELAY_SECONDS = 0.0
+
 
 class _ClientSupportMixin(_ClientMixinBase):
     def _index_query(self, command: str, key: str, **kwargs: Any) -> builtins.list[FlowRecord]:
@@ -147,4 +149,11 @@ class _ClientSupportMixin(_ClientMixinBase):
                 )
                 if not retry_scheduled:
                     raise
+                policy = self.backpressure.policy
+                if self.backpressure._retry_after_delay(exc.retry_after_ms) <= 0 and (
+                    not isinstance(exc, OverloadedError)
+                    or policy.base_delay_ms <= 0
+                    or policy.max_delay_ms <= 0
+                ):
+                    time.sleep(_ZERO_RETRY_DELAY_SECONDS)
                 attempt += 1

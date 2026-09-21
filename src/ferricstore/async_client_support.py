@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import builtins
 import time
 from typing import Any, cast
@@ -18,6 +19,8 @@ from ferricstore.types import (
     FlowRecord,
     FlowStatePolicyLike,
 )
+
+_ZERO_RETRY_DELAY_SECONDS = 0.0
 
 
 class _AsyncClientSupportMixin(_AsyncClientMixinBase):
@@ -158,4 +161,11 @@ class _AsyncClientSupportMixin(_AsyncClientMixinBase):
                 )
                 if not retry_scheduled:
                     raise
+                policy = self.backpressure.policy
+                if self.backpressure._retry_after_delay(exc.retry_after_ms) <= 0 and (
+                    not isinstance(exc, OverloadedError)
+                    or policy.base_delay_ms <= 0
+                    or policy.max_delay_ms <= 0
+                ):
+                    await asyncio.sleep(_ZERO_RETRY_DELAY_SECONDS)
                 attempt += 1
