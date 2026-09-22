@@ -1669,6 +1669,46 @@ def test_async_enqueue_default_backpressure_retries_until_server_recovers():
     run(main())
 
 
+@pytest.mark.parametrize(
+    ("max_retries", "max_elapsed_ms"),
+    [(None, None), (2, None), (None, 1_000), (2, 1_000)],
+)
+def test_async_enqueue_zero_delay_retry_yields_cooperatively(
+    max_retries,
+    max_elapsed_ms,
+    monkeypatch,
+):
+    sleeps = []
+
+    original_sleep = asyncio.sleep
+
+    async def cooperative_sleep(delay):
+        sleeps.append(delay)
+        await original_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", cooperative_sleep)
+
+    async def main():
+        executor = OverloadThenAckAsyncExecutor(overloads=2)
+        client = AsyncFlowClient(
+            executor,
+            backpressure=BackpressurePolicy(
+                max_retries=max_retries,
+                max_elapsed_ms=max_elapsed_ms,
+                base_delay_ms=0,
+                max_delay_ms=0,
+                jitter=0,
+                shared=False,
+            ),
+        )
+
+        assert await client.enqueue("f1", type="order", payload=b"hello", now_ms=100) == b"OK"
+        assert len(executor.calls) == 3
+
+    run(main())
+    assert sleeps == [0, 0]
+
+
 def test_async_enqueue_stops_after_backpressure_retry_budget():
     async def main():
         executor = OverloadThenAckAsyncExecutor(overloads=2)

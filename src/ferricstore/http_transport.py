@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from contextvars import ContextVar
 from http.client import HTTPConnection, HTTPException, HTTPResponse, HTTPSConnection
 from time import monotonic
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit
 from urllib.request import (
@@ -845,10 +845,14 @@ def _http_transport_error(method: str, reason: Any) -> HttpError:
     )
 
 
+def _reject_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
 def _decode_json_object(raw: bytes, *, status_code: int) -> dict[str, Any]:
     try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = json.loads(raw, parse_constant=_reject_json_constant)
+    except (UnicodeError, ValueError, RecursionError, MemoryError) as exc:
         raise HttpError(
             "FerricStore HTTP endpoint returned invalid JSON",
             status_code=status_code,
@@ -871,8 +875,8 @@ def _decode_json_object(raw: bytes, *, status_code: int) -> dict[str, Any]:
 
 def _decode_error_object(raw: bytes, *, status_code: int) -> dict[str, Any]:
     try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        value = json.loads(raw, parse_constant=_reject_json_constant)
+    except (UnicodeError, ValueError, RecursionError, MemoryError):
         value = None
     if isinstance(value, dict):
         return value
@@ -898,9 +902,9 @@ def _response_error(
     code = code_value if isinstance(code_value, str) else "http_error"
     message_value = details.get("message")
     message = message_value if isinstance(message_value, str) else code.replace("_", " ")
-    body_retry_after = payload.get("retry_after_ms")
-    if retry_after_ms is None and isinstance(body_retry_after, int) and body_retry_after >= 0:
-        retry_after_ms = body_retry_after
+    retry_after_ms = http_validation._optional_retry_after_ms(retry_after_ms)
+    if retry_after_ms is None:
+        retry_after_ms = http_validation._optional_retry_after_ms(payload.get("retry_after_ms"))
     raw = {"status_code": status_code, "body": payload}
     if status_code in {429, 503} or code in {"overload", "overloaded"}:
         return OverloadedError(
@@ -924,15 +928,9 @@ def _response_error(
 
 def _retry_after_ms(headers: Any) -> int | None:
     value = headers.get("Retry-After") if headers is not None else None
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
-    try:
-        seconds = float(value)
-    except (TypeError, ValueError):
-        return None
-    if seconds < 0:
-        return None
-    return int(seconds * 1000)
+    return http_validation._retry_after_ms_from_header(value)
 
 
 __all__ = [

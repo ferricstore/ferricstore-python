@@ -2,12 +2,12 @@
 
 Python SDK for FerricStore and FerricFlow.
 
-Status: public alpha `0.13.4`. APIs may change before `1.0`, but the SDK is
+Status: public alpha `0.13.5`. APIs may change before `1.0`, but the SDK is
 tested against command construction, queue/workflow handlers, leases, retries,
 history, indexed attributes, named values, idempotent create, worker loops,
 async flows, and local FerricStore integration scenarios.
 
-Python SDK `0.13.4` requires FerricStore `0.11.4` or newer. With FerricStore
+Python SDK `0.13.5` requires FerricStore `0.11.4` or newer. With FerricStore
 0.11.11 it negotiates compact Stream mode 34 for homogeneous auto-ID `XADD`
 batches, compact Pub/Sub mode 35 for homogeneous `PUBLISH` pipelines, and the
 `pubsub_batch_v1` event codec for compatible subscriptions. Native wire
@@ -102,7 +102,7 @@ Run the repository's complete HTTP-compatible integration surface through a
 real TLS listener and ACL boundary with:
 
 ```bash
-FERRICSTORE_IMAGE=quay.io/ferricstore/ferricstore:0.11.20@sha256:aeec52c27c3afb6e462f659c16b75898d9e9fd6833c8830194f7252ef4916e4f \
+FERRICSTORE_IMAGE=quay.io/ferricstore/ferricstore:0.11.21@sha256:d297c91414ecf206671685d6e74efcec715e5f14a96c5cef09ac5d8c4664c74b \
   scripts/run_http_integration.sh
 ```
 

@@ -271,7 +271,11 @@ def test_non_overload_query_retry_does_not_mutate_shared_pressure(
     assert client.backpressure._state.blocked_until == 0
 
 
-def test_sync_non_overload_query_retries_follow_policy_beyond_three_attempts() -> None:
+def test_sync_non_overload_query_retries_follow_policy_beyond_three_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("ferricstore.flow_query_retry.time.sleep", sleeps.append)
     error = FerricStoreError(
         "query_projection_changed",
         retryable=True,
@@ -292,9 +296,18 @@ def test_sync_non_overload_query_retries_follow_policy_beyond_three_attempts() -
 
     assert result.records == ()
     assert len(executor.calls) == 5
+    assert sleeps == [0, 0, 0, 0]
 
 
-def test_async_non_overload_query_retries_follow_policy_beyond_three_attempts() -> None:
+def test_async_non_overload_query_retries_follow_policy_beyond_three_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
     error = FerricStoreError(
         "query_projection_changed",
         retryable=True,
@@ -320,6 +333,7 @@ def test_async_non_overload_query_retries_follow_policy_beyond_three_attempts() 
         assert len(executor.calls) == 5
 
     asyncio.run(run())
+    assert sleeps == [0, 0, 0, 0]
 
 
 def test_sync_fully_unbounded_zero_delay_query_retries_yield_cpu(
@@ -346,7 +360,7 @@ def test_sync_fully_unbounded_zero_delay_query_retries_yield_cpu(
     result = FlowClient(executor, backpressure=policy).query(QUERY, {"partition": "tenant-a"})
 
     assert result.records == ()
-    assert sleeps == [0.001, 0.001]
+    assert sleeps == [0, 0]
 
 
 def test_async_fully_unbounded_zero_delay_query_retries_yield_cpu(
@@ -381,7 +395,7 @@ def test_async_fully_unbounded_zero_delay_query_retries_yield_cpu(
         assert result.records == ()
 
     asyncio.run(run())
-    assert sleeps == [0.001, 0.001]
+    assert sleeps == [0, 0]
 
 
 def test_query_indexes_retries_safe_response_and_enforces_requested_filter(

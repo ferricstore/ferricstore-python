@@ -6,6 +6,14 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.13.5 - 2026-09-22
+
+- Harden HTTP retry metadata and response validation against malformed,
+  non-finite, oversized, and platform-invalid values, while keeping zero-delay
+  sync and async retries cooperative.
+- Refresh the pinned current-server integration image to FerricStore OSS 0.11.21
+  and validate the release against its immutable manifest.
+
 ## 0.13.4 - 2026-09-20
 
 - Refresh the pinned current-server integration image to FerricStore OSS 0.11.20

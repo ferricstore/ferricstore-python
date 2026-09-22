@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -57,6 +58,24 @@ HTTP_UNSUPPORTED_COMMANDS = frozenset(
 )
 
 _MAX_COMMAND_EXEC_DEPTH = 8
+_HTTP_BLOCKING_COMMANDS = frozenset(
+    {
+        "BLPOP",
+        "BRPOP",
+        "BLMOVE",
+        "BRPOPLPUSH",
+        "BZPOPMIN",
+        "BZPOPMAX",
+        "BLMPOP",
+        "BZMPOP",
+        "XREAD",
+        "XREADGROUP",
+        "WAIT",
+        "WAITAOF",
+        "FLOW.CLAIM_DUE",
+        "FLOW.SCHEDULE.FIRE_DUE",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +134,9 @@ def effective_command_values(values: Sequence[Any], index: int) -> list[Any]:
 
 
 def is_blocking_command(command: Sequence[Any]) -> bool:
+    values = effective_command_values(command_values(command, 0), 0)
+    if command_name(values[0], 0).upper() in _HTTP_BLOCKING_COMMANDS:
+        return True
     budget = blocking_command_budget(command)
     return budget.disable_default or budget.extension > 0
 
@@ -128,13 +150,13 @@ def effective_timeout(
         budget = blocking_command_budget(command)
         if budget.disable_default:
             return None
-        extension += budget.extension
-        if not math.isfinite(extension):
-            return None
+        extension = min(extension + budget.extension, threading.TIMEOUT_MAX)
     if base_timeout is None:
         return None
     effective = base_timeout + extension
-    return effective if math.isfinite(effective) else None
+    if not math.isfinite(effective):
+        return threading.TIMEOUT_MAX
+    return min(effective, threading.TIMEOUT_MAX)
 
 
 def blocking_command_budget(command: Sequence[Any]) -> HttpCommandBudget:
@@ -192,10 +214,10 @@ def _blocking_duration(value: Any, unit: float) -> float | None:
     try:
         number = float(value)
     except OverflowError:
-        return math.inf
+        return None
     except (TypeError, ValueError):
         return None
-    if math.isnan(number) or number < 0:
+    if not math.isfinite(number) or number < 0:
         return None
     return number * unit
 

@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib
 import json
+import math
 import socket
 import threading
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
+from decimal import Inexact, localcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -18,13 +21,22 @@ import pytest
 
 import ferricstore.http_adapter as http_adapter_module
 import ferricstore.http_transport as http_transport_module
-from ferricstore import AsyncFlowClient, AsyncHttpAdapter, FlowClient, HttpAdapter
+import ferricstore.http_validation as http_validation_module
+from ferricstore import (
+    AsyncFlowClient,
+    AsyncHttpAdapter,
+    BackpressurePolicy,
+    FlowClient,
+    HttpAdapter,
+)
+from ferricstore.backpressure import BackpressureController
 from ferricstore.errors import (
     FerricStoreError,
     FlowAlreadyExistsError,
     HttpError,
     InvalidCommandError,
     OverloadedError,
+    classify_server_error,
 )
 from ferricstore.http_connection_pool import _KeepAlivePool
 
@@ -936,6 +948,74 @@ def test_coalescing_never_joins_a_blocking_command_to_an_independent_request() -
     assert all(len(request["commands"]) == 1 for request in state.requests)
 
 
+@pytest.mark.parametrize("blocking_timeout", [10**400, -(10**400)])
+def test_coalescing_isolates_invalid_blocking_sync_commands(blocking_timeout: int) -> None:
+    barrier = threading.Barrier(2)
+    blocking = ("BLPOP", "jobs", blocking_timeout)
+
+    with proxy_server(command_responder) as (url, state):
+        adapter = HttpAdapter(
+            url,
+            max_connections=2,
+            coalesce_window_ms=50,
+            coalesce_max_items=2,
+        )
+
+        def execute(command: tuple[Any, ...]) -> Any:
+            barrier.wait()
+            return adapter.execute_command(*command)
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                assert list(executor.map(execute, [blocking, ("PING",)])) == [
+                    [b"BLPOP", b"jobs", blocking_timeout],
+                    [b"PING"],
+                ]
+        finally:
+            adapter.close()
+
+    assert len(state.requests) == 2
+    assert all(len(request["commands"]) == 1 for request in state.requests)
+
+
+@pytest.mark.parametrize("blocking_timeout", [10**400, -(10**400)])
+def test_coalescing_isolates_invalid_blocking_async_commands(blocking_timeout: int) -> None:
+    blocking = ("BLPOP", "jobs", blocking_timeout)
+
+    async def run(url: str) -> list[Any]:
+        adapter = AsyncHttpAdapter(
+            url,
+            max_connections=2,
+            max_concurrent_requests=2,
+            coalesce_window_ms=50,
+            coalesce_max_items=2,
+        )
+        ready = asyncio.Event()
+
+        async def execute(command: tuple[Any, ...]) -> Any:
+            await ready.wait()
+            return await adapter.execute_command(*command)
+
+        try:
+            tasks = [
+                asyncio.create_task(execute(blocking)),
+                asyncio.create_task(execute(("PING",))),
+            ]
+            ready.set()
+            return await asyncio.gather(*tasks)
+        finally:
+            await adapter.close()
+
+    with proxy_server(command_responder) as (url, state):
+        assert asyncio.run(run(url)) == [
+            [b"BLPOP", b"jobs", blocking_timeout],
+            [b"PING"],
+        ]
+
+    assert len(state.requests) == 2
+    assert all(len(request["commands"]) == 1 for request in state.requests)
+
+
 def test_ordered_batch_keeps_blocking_and_normal_commands_in_one_request() -> None:
     with proxy_server(command_responder) as (url, state):
         adapter = HttpAdapter(url, timeout=0.05, coalesce_window_ms=50)
@@ -1353,6 +1433,52 @@ def test_blocking_batch_aggregates_sequential_waits_but_explicit_deadline_wins()
 
     assert observed[0] is not None and observed[0] >= 0.08
     assert observed[1] is not None and observed[1] < 0.05
+
+
+@pytest.mark.parametrize("async_adapter", [False, True])
+def test_public_http_adapters_saturate_overflowed_batch_deadlines(
+    async_adapter: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[float | None] = []
+    monkeypatch.setattr(http_transport_module, "monotonic", lambda: 0.0)
+    commands = [
+        ("BLPOP", "one", 1e308),
+        ("BLPOP", "two", 1e308),
+    ]
+
+    def request_json(
+        _method: str,
+        _path: str,
+        *,
+        body: dict[str, Any],
+        _deadline: http_transport_module._HttpDeadline,
+    ) -> tuple[int, dict[str, Any]]:
+        observed.append(_deadline.remaining())
+        return 200, {
+            "encoding": "ferricstore-json-v1",
+            "results": [{"status": "ok", "value": None} for _command in body["commands"]],
+        }
+
+    async def run_async() -> None:
+        adapter = AsyncHttpAdapter("https://proxy.example.com", timeout=0.02)
+        adapter._sync._transport.request_json = request_json  # type: ignore[method-assign]
+        try:
+            assert await adapter.execute_batch(commands) == [None, None]
+        finally:
+            await adapter.close()
+
+    if async_adapter:
+        asyncio.run(run_async())
+    else:
+        adapter = HttpAdapter("https://proxy.example.com", timeout=0.02)
+        adapter._transport.request_json = request_json  # type: ignore[method-assign]
+        try:
+            assert adapter.execute_batch(commands) == [None, None]
+        finally:
+            adapter.close()
+
+    assert observed == [threading.TIMEOUT_MAX]
 
 
 def test_nonblocking_flow_claim_zero_keeps_the_implicit_http_deadline() -> None:
@@ -2076,6 +2202,193 @@ def test_http_adapter_validates_security_and_resource_options() -> None:
         HttpAdapter("https://proxy.example.com", max_connections=0)
 
 
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf")])
+def test_http_adapter_rejects_nonfinite_timeout(timeout: float) -> None:
+    with pytest.raises(ValueError, match="timeout"):
+        HttpAdapter("https://proxy.example.com", timeout=timeout)
+
+
+@pytest.mark.parametrize("window_ms", [float("nan"), float("inf"), float("-inf")])
+def test_http_adapter_rejects_nonfinite_coalescing_window(window_ms: float) -> None:
+    with pytest.raises(ValueError, match="coalesce_window_ms"):
+        HttpAdapter("https://proxy.example.com", coalesce_window_ms=window_ms)
+
+
+def test_http_adapter_accepts_platform_wait_limit_values() -> None:
+    timeout = threading.TIMEOUT_MAX
+    window_ms = timeout * 1_000.0
+    assert math.isfinite(timeout)
+    assert math.isfinite(window_ms)
+
+    adapter = HttpAdapter(
+        "https://proxy.example.com",
+        timeout=timeout,
+        coalesce_window_ms=window_ms,
+    )
+    adapter.close()
+
+
+def test_async_http_adapter_accepts_platform_wait_limit_values() -> None:
+    async def run() -> None:
+        adapter = AsyncHttpAdapter(
+            "https://proxy.example.com",
+            timeout=threading.TIMEOUT_MAX,
+            coalesce_window_ms=threading.TIMEOUT_MAX * 1_000.0,
+        )
+        await adapter.close()
+
+    asyncio.run(run())
+
+
+def test_http_adapter_rejects_timeout_above_platform_wait_limit() -> None:
+    timeout = threading.TIMEOUT_MAX + 1.0
+    assert math.isfinite(timeout)
+
+    with pytest.raises(ValueError, match="timeout"):
+        HttpAdapter("https://proxy.example.com", timeout=timeout)
+
+
+def test_http_adapter_rejects_coalescing_window_above_platform_wait_limit() -> None:
+    window_ms = (threading.TIMEOUT_MAX + 1.0) * 1_000.0
+    assert math.isfinite(window_ms)
+
+    with pytest.raises(ValueError, match="coalesce_window_ms"):
+        HttpAdapter(
+            "https://proxy.example.com",
+            timeout=None,
+            coalesce_window_ms=window_ms,
+        )
+
+
+def test_http_effective_blocking_deadline_stays_within_platform_wait_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(http_transport_module, "monotonic", lambda: 0.0)
+    adapter = HttpAdapter(
+        "https://proxy.example.com",
+        timeout=threading.TIMEOUT_MAX,
+        max_connections=1,
+        max_concurrent_requests=2,
+    )
+    try:
+        deadline = adapter._command_deadline([("BLPOP", "jobs", 1.0)])
+        assert deadline.remaining() == threading.TIMEOUT_MAX
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize("async_adapter", [False, True])
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_public_http_adapters_reject_nonstandard_json_constants(
+    async_adapter: bool,
+    constant: str,
+) -> None:
+    raw = b'{"results":[{"status":"ok","value":' + constant.encode("ascii") + b"}]}"
+
+    def responder(_envelope: dict[str, Any]) -> Response:
+        return 200, raw, {}
+
+    async def run_async(url: str) -> str:
+        adapter = AsyncHttpAdapter(url)
+        try:
+            with pytest.raises(HttpError) as raised:
+                await adapter.execute_command("GET", "key")
+            return raised.value.error_code
+        finally:
+            await adapter.close()
+
+    with proxy_server(responder) as (url, _state):
+        if async_adapter:
+            error_code = asyncio.run(run_async(url))
+        else:
+            adapter = HttpAdapter(url)
+            try:
+                with pytest.raises(HttpError) as raised:
+                    adapter.execute_command("GET", "key")
+                error_code = raised.value.error_code
+            finally:
+                adapter.close()
+
+    assert error_code == "invalid_response"
+
+
+@pytest.mark.parametrize("async_adapter", [False, True])
+@pytest.mark.parametrize("response_kind", ["deep", "overflow", "malformed", "surrogate"])
+def test_public_http_adapters_reject_malformed_json_results(
+    async_adapter: bool,
+    response_kind: str,
+) -> None:
+    if response_kind == "deep":
+        depth = 1_200
+        raw = b'{"results":[{"status":"ok","value":' + (b"[" * depth + b"0" + b"]" * depth) + b"}]}"
+    elif response_kind == "overflow":
+        raw = b'{"results":[{"status":"ok","value":1e999999}]}'
+    elif response_kind == "malformed":
+        raw = b'{"results":[{"value":"missing status"}]}'
+    else:
+        raw = b'{"results":[{"status":"ok","value":"\\ud800"}]}'
+
+    def responder(_envelope: dict[str, Any]) -> Response:
+        return 200, raw, {}
+
+    async def run_async(url: str) -> str:
+        adapter = AsyncHttpAdapter(url)
+        try:
+            with pytest.raises(HttpError) as raised:
+                await adapter.execute_command("GET", "key")
+            return raised.value.error_code
+        finally:
+            await adapter.close()
+
+    with proxy_server(responder) as (url, _state):
+        if async_adapter:
+            error_code = asyncio.run(run_async(url))
+        else:
+            adapter = HttpAdapter(url)
+            try:
+                with pytest.raises(HttpError) as raised:
+                    adapter.execute_command("GET", "key")
+                error_code = raised.value.error_code
+            finally:
+                adapter.close()
+
+    assert error_code == "invalid_response"
+
+
+@pytest.mark.parametrize("async_adapter", [False, True])
+@pytest.mark.parametrize("blocking_timeout", [10**400, -(10**400)])
+def test_public_http_adapters_keep_deadlines_for_overflowed_blocking_timeout(
+    async_adapter: bool,
+    blocking_timeout: int,
+) -> None:
+    def responder(envelope: dict[str, Any]) -> Response:
+        time.sleep(0.1)
+        return command_responder(envelope)
+
+    async def run_async(url: str) -> str:
+        adapter = AsyncHttpAdapter(url, timeout=0.02)
+        try:
+            with pytest.raises(HttpError) as raised:
+                await adapter.execute_command("BLPOP", "jobs", blocking_timeout)
+            return raised.value.error_code
+        finally:
+            await adapter.close()
+
+    with proxy_server(responder) as (url, _state):
+        if async_adapter:
+            error_code = asyncio.run(run_async(url))
+        else:
+            adapter = HttpAdapter(url, timeout=0.02)
+            try:
+                with pytest.raises(HttpError) as raised:
+                    adapter.execute_command("BLPOP", "jobs", blocking_timeout)
+                error_code = raised.value.error_code
+            finally:
+                adapter.close()
+
+    assert error_code == "transport_timeout"
+
+
 def test_http_adapter_empty_batch_is_a_noop() -> None:
     with proxy_server(command_responder) as (url, state):
         adapter = HttpAdapter(url)
@@ -2291,6 +2604,457 @@ def test_error_response_fallbacks_and_retry_after_validation() -> None:
     assert http_transport_module._retry_after_ms({"Retry-After": "invalid"}) is None
     assert http_transport_module._retry_after_ms({"Retry-After": "-1"}) is None
     assert http_transport_module._retry_after_ms(None) is None
+
+
+@pytest.mark.parametrize("header", ["nan", "inf", "-inf", "1e308", "1e309"])
+def test_retry_after_ignores_nonfinite_header_values(header: str) -> None:
+    assert http_transport_module._retry_after_ms({"Retry-After": header}) is None
+
+
+def test_retry_after_ignores_huge_integer_header_values() -> None:
+    assert http_transport_module._retry_after_ms({"Retry-After": 10**400}) is None
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("0.1259", 125),
+        ("18446744073709551.6159", 2**64 - 1),
+        ("18446744073709551.616", None),
+    ],
+)
+def test_retry_after_truncates_decimal_milliseconds_without_rounding(
+    header: str,
+    expected: int | None,
+) -> None:
+    assert http_transport_module._retry_after_ms({"Retry-After": header}) == expected
+
+
+@pytest.mark.parametrize("trap_inexact", [False, True])
+def test_retry_after_import_and_boundaries_ignore_decimal_context(
+    trap_inexact: bool,
+) -> None:
+    maximum = 2**64 - 1
+    try:
+        with localcontext() as context:
+            context.prec = 1
+            context.traps[Inexact] = trap_inexact
+            validation = importlib.reload(http_validation_module)
+
+            assert validation._optional_retry_after_ms(maximum) == maximum
+            assert validation._retry_after_ms_from_header("18446744073709551.6159") == maximum
+            assert validation._retry_after_ms_from_header("18446744073709551.616") is None
+            assert (
+                http_transport_module._retry_after_ms({"Retry-After": "18446744073709551.6159"})
+                == maximum
+            )
+    finally:
+        importlib.reload(http_validation_module)
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [("1e-1000000", 0), ("0e+1000000000", 0), ("1e+1000000", None)],
+)
+def test_retry_after_handles_pathological_decimal_exponents(
+    header: str,
+    expected: int | None,
+) -> None:
+    assert http_transport_module._retry_after_ms({"Retry-After": header}) == expected
+
+
+def test_retry_after_ignores_boolean_header_values() -> None:
+    assert http_transport_module._retry_after_ms({"Retry-After": True}) is None
+
+
+def test_http_body_retry_after_ignores_boolean_metadata() -> None:
+    payload = {
+        "error": {"code": "overloaded", "message": "busy"},
+        "retry_after_ms": True,
+    }
+    response_error = http_transport_module._response_error(
+        "GET",
+        503,
+        payload,
+        retry_after_ms=None,
+    )
+    assert isinstance(response_error, OverloadedError)
+    assert response_error.retry_after_ms is None
+
+    with pytest.raises(OverloadedError) as raised:
+        http_adapter_module._command_result(
+            {
+                "status": "error",
+                "error": {
+                    "code": "overloaded",
+                    "message": "busy",
+                    "retry_after_ms": True,
+                },
+            }
+        )
+    assert raised.value.retry_after_ms is None
+
+
+def test_http_error_decoder_contains_json_integer_overflow() -> None:
+    raw = b'{"error":{"code":"overloaded","message":"busy"},"retry_after_ms":' + b"9" * 5_000 + b"}"
+
+    fallback = http_transport_module._decode_error_object(raw, status_code=503)
+
+    assert fallback["error"]["code"] == "http_error"
+
+
+@pytest.mark.parametrize("async_adapter", [False, True])
+def test_public_http_adapters_preserve_near_u64_retry_after_header(
+    async_adapter: bool,
+) -> None:
+    maximum = 2**64 - 1
+    seconds = "18446744073709551.615"
+
+    def responder(_envelope: dict[str, Any]) -> Response:
+        return (
+            503,
+            {"error": {"code": "overloaded", "message": "busy"}},
+            {"Retry-After": seconds},
+        )
+
+    async def run_async(url: str) -> int | None:
+        adapter = AsyncHttpAdapter(url)
+        try:
+            with pytest.raises(OverloadedError) as raised:
+                await adapter.execute_command("GET", "key")
+            return raised.value.retry_after_ms
+        finally:
+            await adapter.close()
+
+    with proxy_server(responder) as (url, _state):
+        if async_adapter:
+            observed = asyncio.run(run_async(url))
+        else:
+            adapter = HttpAdapter(url)
+            try:
+                with pytest.raises(OverloadedError) as raised:
+                    adapter.execute_command("GET", "key")
+                observed = raised.value.retry_after_ms
+            finally:
+                adapter.close()
+
+    assert observed == maximum
+
+
+@pytest.mark.parametrize("async_adapter", [False, True])
+@pytest.mark.parametrize("retry_after_ms", [2**64, 10**400])
+def test_public_http_adapters_ignore_oversized_body_retry_after(
+    async_adapter: bool,
+    retry_after_ms: int,
+) -> None:
+    def responder(_envelope: dict[str, Any]) -> Response:
+        return (
+            503,
+            {
+                "error": {"code": "overloaded", "message": "busy"},
+                "retry_after_ms": retry_after_ms,
+            },
+            {},
+        )
+
+    async def run_async(url: str) -> int | None:
+        adapter = AsyncHttpAdapter(url)
+        try:
+            with pytest.raises(OverloadedError) as raised:
+                await adapter.execute_command("GET", "key")
+            return raised.value.retry_after_ms
+        finally:
+            await adapter.close()
+
+    with proxy_server(responder) as (url, _state):
+        if async_adapter:
+            observed = asyncio.run(run_async(url))
+        else:
+            adapter = HttpAdapter(url)
+            try:
+                with pytest.raises(OverloadedError) as raised:
+                    adapter.execute_command("GET", "key")
+                observed = raised.value.retry_after_ms
+            finally:
+                adapter.close()
+
+    assert observed is None
+
+
+@pytest.mark.parametrize("async_adapter", [False, True])
+@pytest.mark.parametrize(
+    ("retry_after_ms", "expected"),
+    [
+        (2**64 - 1, 2**64 - 1),
+        (2**64, None),
+        (10**400, None),
+    ],
+)
+def test_public_http_adapters_validate_200_command_retry_after(
+    async_adapter: bool,
+    retry_after_ms: int,
+    expected: int | None,
+) -> None:
+    def responder(_envelope: dict[str, Any]) -> Response:
+        return (
+            200,
+            {
+                "results": [
+                    {
+                        "status": "error",
+                        "error": {
+                            "code": "overloaded",
+                            "message": "busy",
+                            "retry_after_ms": retry_after_ms,
+                        },
+                    }
+                ]
+            },
+            {},
+        )
+
+    async def run_async(url: str) -> int | None:
+        adapter = AsyncHttpAdapter(url)
+        try:
+            with pytest.raises(OverloadedError) as raised:
+                await adapter.execute_command("GET", "key")
+            return raised.value.retry_after_ms
+        finally:
+            await adapter.close()
+
+    with proxy_server(responder) as (url, _state):
+        if async_adapter:
+            observed = asyncio.run(run_async(url))
+        else:
+            adapter = HttpAdapter(url)
+            try:
+                with pytest.raises(OverloadedError) as raised:
+                    adapter.execute_command("GET", "key")
+                observed = raised.value.retry_after_ms
+            finally:
+                adapter.close()
+
+    assert observed == expected
+
+
+@pytest.mark.parametrize("retry_after_ms", [2**64, 10**400])
+def test_http_response_error_ignores_oversized_body_retry_after(retry_after_ms: int) -> None:
+    error = http_transport_module._response_error(
+        "GET",
+        503,
+        {
+            "error": {"code": "overloaded", "message": "busy"},
+            "retry_after_ms": retry_after_ms,
+        },
+        retry_after_ms=None,
+    )
+
+    assert isinstance(error, OverloadedError)
+    assert error.retry_after_ms is None
+
+
+@pytest.mark.parametrize("retry_after_ms", [2**64, 10**400])
+def test_http_command_result_ignores_oversized_body_retry_after(retry_after_ms: int) -> None:
+    with pytest.raises(OverloadedError) as raised:
+        http_adapter_module._command_result(
+            {
+                "status": "error",
+                "error": {
+                    "code": "overloaded",
+                    "message": "busy",
+                    "retry_after_ms": retry_after_ms,
+                },
+            }
+        )
+
+    assert raised.value.retry_after_ms is None
+
+
+def test_http_body_retry_after_accepts_unsigned_64_bit_maximum() -> None:
+    maximum = 2**64 - 1
+    response_error = http_transport_module._response_error(
+        "GET",
+        503,
+        {
+            "error": {"code": "overloaded", "message": "busy"},
+            "retry_after_ms": maximum,
+        },
+        retry_after_ms=None,
+    )
+    assert isinstance(response_error, OverloadedError)
+    assert response_error.retry_after_ms == maximum
+
+    with pytest.raises(OverloadedError) as raised:
+        http_adapter_module._command_result(
+            {
+                "status": "error",
+                "error": {
+                    "code": "overloaded",
+                    "message": "busy",
+                    "retry_after_ms": maximum,
+                },
+            }
+        )
+    assert raised.value.retry_after_ms == maximum
+
+
+@pytest.mark.parametrize("retry_after_ms", [True, 1.5, -1, 2**64, 10**400])
+def test_http_response_error_validates_direct_retry_after_argument(
+    retry_after_ms: Any,
+) -> None:
+    error = http_transport_module._response_error(
+        "GET",
+        503,
+        {"error": {"code": "overloaded", "message": "busy"}},
+        retry_after_ms=retry_after_ms,
+    )
+
+    assert isinstance(error, OverloadedError)
+    assert error.retry_after_ms is None
+
+
+@pytest.mark.parametrize("retry_after_ms", [True, 1.5, -1, 2**64, 10**400])
+def test_server_error_retry_after_metadata_keeps_unsigned_64_bit_bounds(
+    retry_after_ms: Any,
+) -> None:
+    direct = classify_server_error("busy", retry_after_ms=retry_after_ms)
+    textual = classify_server_error(f"busy retry_after_ms={retry_after_ms}")
+
+    assert direct.retry_after_ms is None
+    assert textual.retry_after_ms is None
+
+
+def test_server_error_text_retry_after_accepts_leading_zeroes() -> None:
+    error = classify_server_error("busy retry_after_ms=" + ("0" * 24) + "2000")
+
+    assert error.retry_after_ms == 2_000
+
+
+@pytest.mark.parametrize("retry_after_ms", [True, 1.5, -1, 2**64, 10**400])
+def test_error_constructors_normalize_invalid_retry_after_metadata(
+    retry_after_ms: Any,
+) -> None:
+    errors = (
+        FerricStoreError("busy", retry_after_ms=retry_after_ms),
+        HttpError("busy", retry_after_ms=retry_after_ms),
+        OverloadedError("busy", retry_after_ms=retry_after_ms),
+    )
+
+    assert [error.retry_after_ms for error in errors] == [None, None, None]
+
+
+@pytest.mark.parametrize("retry_after_ms", [float("nan"), float("inf"), 10**400])
+def test_backpressure_ignores_invalid_direct_retry_after_without_overflow(
+    retry_after_ms: Any,
+) -> None:
+    controller = BackpressureController(
+        BackpressurePolicy(base_delay_ms=0, max_delay_ms=0, jitter=0, shared=False)
+    )
+
+    assert controller._retry_after_delay(retry_after_ms) == 0.0
+
+
+def test_backpressure_sync_async_retry_after_capping_is_identical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sync_sleeps: list[float] = []
+    async_sleeps: list[float] = []
+
+    async def async_sleep(delay: float) -> None:
+        async_sleeps.append(delay)
+
+    monkeypatch.setattr("ferricstore.backpressure.time.sleep", sync_sleeps.append)
+    monkeypatch.setattr(asyncio, "sleep", async_sleep)
+    policy = BackpressurePolicy(base_delay_ms=0, max_delay_ms=0, jitter=0, shared=False)
+    sync_controller = BackpressureController(policy)
+    async_controller = BackpressureController(policy)
+
+    assert sync_controller.record_overload(0, retry_after_ms=2**64 - 1)
+
+    async def run() -> None:
+        assert await async_controller.record_overload_async(0, retry_after_ms=2**64 - 1)
+
+    asyncio.run(run())
+
+    assert sync_sleeps == [threading.TIMEOUT_MAX]
+    assert async_sleeps == sync_sleeps
+
+
+def test_unbounded_retry_yields_for_invalid_direct_retry_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ferricstore.flow_query_retry import (
+        execute_flow_query_read_with_retry,
+        execute_flow_query_read_with_retry_async,
+    )
+
+    sync_sleeps: list[float] = []
+    async_sleeps: list[float] = []
+    error = FerricStoreError(
+        "busy",
+        retryable=True,
+        safe_to_retry=True,
+    )
+    error.retry_after_ms = 10**400
+    policy = BackpressurePolicy(
+        max_retries=None,
+        max_elapsed_ms=None,
+        base_delay_ms=0,
+        max_delay_ms=0,
+        jitter=0,
+        shared=False,
+    )
+
+    async def async_sleep(delay: float) -> None:
+        async_sleeps.append(delay)
+
+    monkeypatch.setattr("ferricstore.flow_query_retry.time.sleep", sync_sleeps.append)
+    monkeypatch.setattr(asyncio, "sleep", async_sleep)
+    sync_values = iter([error, "ok"])
+
+    def sync_operation() -> str:
+        value = next(sync_values)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    assert (
+        execute_flow_query_read_with_retry(
+            sync_operation,
+            BackpressureController(policy),
+        )
+        == "ok"
+    )
+
+    async_values = iter([error, "ok"])
+
+    async def async_operation() -> str:
+        value = next(async_values)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    async def run() -> None:
+        assert (
+            await execute_flow_query_read_with_retry_async(
+                async_operation,
+                BackpressureController(policy),
+            )
+            == "ok"
+        )
+
+    asyncio.run(run())
+
+    assert sync_sleeps == [0]
+    assert async_sleeps == sync_sleeps
+
+
+def test_unsigned_64_bit_retry_after_maximum_is_capped_without_overflow() -> None:
+    controller = BackpressureController(
+        BackpressurePolicy(base_delay_ms=0, max_delay_ms=0, jitter=0, shared=False)
+    )
+
+    assert controller._retry_after_delay(2**64 - 1) == threading.TIMEOUT_MAX
 
 
 @pytest.mark.parametrize("flag", ["http2", "compact"])

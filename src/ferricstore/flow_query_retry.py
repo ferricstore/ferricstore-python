@@ -10,7 +10,7 @@ from ferricstore.errors import FerricStoreError, OverloadedError
 
 _T = TypeVar("_T")
 _RETRY_MANAGED: ContextVar[bool] = ContextVar("ferricstore_flow_query_retry", default=False)
-_MIN_UNBOUNDED_RETRY_DELAY_SECONDS = 0.001
+_ZERO_RETRY_DELAY_SECONDS = 0.0
 
 
 def execute_flow_query_read_with_retry(
@@ -48,8 +48,8 @@ def execute_flow_query_read_with_retry(
                 deadline_ms=deadline_ms,
             ):
                 raise
-            if _unbounded_zero_delay_retry(exc, backpressure):
-                time.sleep(_MIN_UNBOUNDED_RETRY_DELAY_SECONDS)
+            if _zero_delay_retry(exc, backpressure):
+                time.sleep(_ZERO_RETRY_DELAY_SECONDS)
             attempt += 1
         else:
             backpressure.record_success()
@@ -91,10 +91,10 @@ async def execute_flow_query_read_with_retry_async(
                 deadline_ms=deadline_ms,
             ):
                 raise
-            if _unbounded_zero_delay_retry(exc, backpressure):
+            if _zero_delay_retry(exc, backpressure):
                 import asyncio
 
-                await asyncio.sleep(_MIN_UNBOUNDED_RETRY_DELAY_SECONDS)
+                await asyncio.sleep(_ZERO_RETRY_DELAY_SECONDS)
             attempt += 1
         else:
             backpressure.record_success()
@@ -159,16 +159,14 @@ def _server_declares_safe_retry(exc: FerricStoreError) -> bool:
     return exc.retryable is True and exc.safe_to_retry is True
 
 
-def _unbounded_zero_delay_retry(
+def _zero_delay_retry(
     exc: FerricStoreError,
     backpressure: BackpressureController,
 ) -> bool:
-    """Yield a fully unbounded loop when neither server nor policy provides delay."""
+    """Yield when neither server nor policy provides a retry delay."""
 
     policy = backpressure.policy
-    if policy.max_retries is not None or policy.max_elapsed_ms is not None:
-        return False
-    if exc.retry_after_ms is not None and exc.retry_after_ms > 0:
+    if backpressure._retry_after_delay(exc.retry_after_ms) > 0:
         return False
     return not isinstance(exc, OverloadedError) or (
         policy.base_delay_ms <= 0 or policy.max_delay_ms <= 0
