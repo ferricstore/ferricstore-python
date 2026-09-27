@@ -66,7 +66,7 @@ jobs:
     name: FerricStore integration
     runs-on: ubuntu-latest
     env:
-      FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.21@sha256:d297c91414ecf206671685d6e74efcec715e5f14a96c5cef09ac5d8c4664c74b
+      FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.23@sha256:120e0bba201fd3038befea54b100accf0ef8ff21563fdd113c3fc7b019555dcd
 
     steps:
       - name: Checkout
@@ -87,12 +87,12 @@ jobs:
         run: scripts/run_native_integration.sh
       - name: Run authenticated TLS HTTP/1.1 integration tests
         env:
-          FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.21@sha256:d297c91414ecf206671685d6e74efcec715e5f14a96c5cef09ac5d8c4664c74b
+          FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.23@sha256:120e0bba201fd3038befea54b100accf0ef8ff21563fdd113c3fc7b019555dcd
           FERRICSTORE_HTTP2: "0"
         run: scripts/run_http_integration.sh
       - name: Run authenticated TLS HTTP/2 integration tests
         env:
-          FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.21@sha256:d297c91414ecf206671685d6e74efcec715e5f14a96c5cef09ac5d8c4664c74b
+          FERRICSTORE_IMAGE: quay.io/ferricstore/ferricstore:0.11.23@sha256:120e0bba201fd3038befea54b100accf0ef8ff21563fdd113c3fc7b019555dcd
           FERRICSTORE_HTTP2: "1"
         run: scripts/run_http_integration.sh
 
