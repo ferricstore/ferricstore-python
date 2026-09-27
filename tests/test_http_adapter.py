@@ -1324,9 +1324,14 @@ def test_http_timeout_includes_waiting_for_client_capacity() -> None:
 def test_finite_blocking_commands_extend_the_default_http_deadline(
     command: tuple[Any, ...],
     minimum_timeout: float,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     observed: list[float | None] = []
     adapter = HttpAdapter("https://proxy.example.com", timeout=0.02)
+    # This test checks the configured deadline, not the time spent reaching
+    # the request stub; a live clock can consume part of a 50 ms allowance.
+    frozen_now = http_transport_module.monotonic()
+    monkeypatch.setattr(http_transport_module, "monotonic", lambda: frozen_now)
 
     def request_json(
         _method: str,
