@@ -7,7 +7,7 @@ The project is currently public alpha. APIs may change before `1.0`.
 ## Unreleased
 
 - Refresh current-server integration and documentation pins to the immutable
-  FerricStore OSS 0.11.23 image. The 0.11.4 compatibility floor remains unchanged.
+  FerricStore OSS 0.11.24 image. The 0.11.4 compatibility floor remains unchanged.
 
 ## 0.13.5 - 2026-09-22
 
