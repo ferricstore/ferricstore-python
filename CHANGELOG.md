@@ -11,7 +11,7 @@ The project is currently public alpha. APIs may change before `1.0`.
   0x0311 and `CLUSTER.FEATURES.RAISE` 0x0312). Retries treat `CLUSTER.FEATURES`
   as read-only and a raise as a mutation.
 - Refresh current-server integration and documentation pins to the immutable
-  FerricStore OSS 0.11.24 image. The 0.11.4 compatibility floor remains unchanged.
+  FerricStore OSS 0.12.0 image. The 0.11.4 compatibility floor remains unchanged.
 
 ## 0.13.5 - 2026-09-22
 
