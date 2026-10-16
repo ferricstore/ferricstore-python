@@ -117,6 +117,12 @@ class _ClientManagementMixin(_ClientMixinBase):
     def cluster_role(self) -> Any:
         return self.executor.execute_command("CLUSTER.ROLE")
 
+    def cluster_features(self) -> Any:
+        return _parse_kv_response(self.executor.execute_command("CLUSTER.FEATURES"))
+
+    def cluster_features_raise(self, level: int) -> Any:
+        return _parse_kv_response(self.executor.execute_command("CLUSTER.FEATURES.RAISE", level))
+
     def cluster_join(self, node: str, *, replace: bool = False) -> bool:
         args: builtins.list[Any] = ["CLUSTER.JOIN", node]
         if replace:

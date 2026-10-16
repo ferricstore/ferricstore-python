@@ -323,6 +323,8 @@ _BASIC_COMMAND_FAMILIES: tuple[tuple[frozenset[str], _BasicCommandBuilder], ...]
                 "FERRICSTORE.HOTNESS",
                 "FERRICSTORE.METRICS",
                 "FERRICSTORE.BLOBGC",
+                "CLUSTER.FEATURES",
+                "CLUSTER.FEATURES.RAISE",
             }
         ),
         _build_admin_protocol_command,

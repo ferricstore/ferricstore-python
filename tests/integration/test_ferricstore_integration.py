@@ -48,7 +48,8 @@ _NATIVE_PROTOCOL_COMMANDS: set[str] = set(
     ACL APPEND AUTH BF.ADD BF.CARD BF.EXISTS BF.INFO BF.MADD BF.MEXISTS BF.RESERVE
     BGSAVE BITCOUNT BITOP BITPOS BLMOVE BLMPOP BLPOP BRPOP CAS CF.ADD CF.ADDNX
     CF.COUNT CF.DEL CF.EXISTS CF.INFO CF.MEXISTS CF.RESERVE CLIENT CLUSTER.DEMOTE
-    CLUSTER.FAILOVER CLUSTER.HEALTH CLUSTER.JOIN CLUSTER.KEYSLOT CLUSTER.LEAVE
+    CLUSTER.FAILOVER CLUSTER.FEATURES CLUSTER.FEATURES.RAISE CLUSTER.HEALTH CLUSTER.JOIN
+    CLUSTER.KEYSLOT CLUSTER.LEAVE
     CLUSTER.PROMOTE CLUSTER.ROLE CLUSTER.SLOTS CLUSTER.STATS CLUSTER.STATUS
     CMS.INCRBY CMS.INFO CMS.INITBYDIM CMS.INITBYPROB CMS.MERGE CMS.QUERY COMMAND
     CONFIG COPY DBSIZE DEBUG DECR DECRBY DEL DISCARD ECHO EXEC EXISTS EXPIRE
@@ -103,6 +104,7 @@ _NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED: dict[str, str] = {
     "BGSAVE": "admin persistence command; not part of normal SDK app command coverage",
     "CLUSTER.DEMOTE": "mutates cluster topology",
     "CLUSTER.FAILOVER": "mutates cluster topology",
+    "CLUSTER.FEATURES.RAISE": "raises the cluster feature level, which never goes back down",
     "CLUSTER.JOIN": "mutates cluster topology",
     "CLUSTER.LEAVE": "mutates cluster topology",
     "CLUSTER.PROMOTE": "mutates cluster topology",
@@ -1679,6 +1681,8 @@ def test_real_ferricstore_protocol_helpers_and_diagnostics() -> None:
         assert client.cluster_slots() is not None
         assert isinstance(client.cluster_status(), dict)
         assert client.cluster_role() is not None
+        features = client.cluster_features()
+        assert features["supported"] >= features["active"] >= 0
         assert client.ferricstore_config("GET", "*") is not None
         metrics = client.ferricstore_metrics()
         assert metrics
@@ -2113,6 +2117,8 @@ def test_real_ferricstore_native_protocol_store_and_admin_surface() -> None:
         assert client.cluster_slots() is not None
         assert isinstance(client.cluster_status(), dict)
         assert client.cluster_role() is not None
+        features = client.cluster_features()
+        assert features["supported"] >= features["active"] >= 0
         assert client.ferricstore_config("GET", "*") is not None
         metrics = client.ferricstore_metrics()
         assert metrics
