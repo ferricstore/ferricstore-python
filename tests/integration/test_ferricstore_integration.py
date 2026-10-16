@@ -104,7 +104,6 @@ _NATIVE_PROTOCOL_SHARED_INTEGRATION_EXCLUDED: dict[str, str] = {
     "BGSAVE": "admin persistence command; not part of normal SDK app command coverage",
     "CLUSTER.DEMOTE": "mutates cluster topology",
     "CLUSTER.FAILOVER": "mutates cluster topology",
-    "CLUSTER.FEATURES.RAISE": "raises the cluster feature level, which never goes back down",
     "CLUSTER.JOIN": "mutates cluster topology",
     "CLUSTER.LEAVE": "mutates cluster topology",
     "CLUSTER.PROMOTE": "mutates cluster topology",
@@ -1683,6 +1682,9 @@ def test_real_ferricstore_protocol_helpers_and_diagnostics() -> None:
         assert client.cluster_role() is not None
         features = client.cluster_features()
         assert features["supported"] >= features["active"] >= 0
+        # Level 0 is always rejected, so this exercises the raise without changing the cluster.
+        with pytest.raises(FerricStoreError, match="feature level must be a positive integer"):
+            client.cluster_features_raise(0)
         assert client.ferricstore_config("GET", "*") is not None
         metrics = client.ferricstore_metrics()
         assert metrics
@@ -2119,6 +2121,9 @@ def test_real_ferricstore_native_protocol_store_and_admin_surface() -> None:
         assert client.cluster_role() is not None
         features = client.cluster_features()
         assert features["supported"] >= features["active"] >= 0
+        # Level 0 is always rejected, so this exercises the raise without changing the cluster.
+        with pytest.raises(FerricStoreError, match="feature level must be a positive integer"):
+            client.cluster_features_raise(0)
         assert client.ferricstore_config("GET", "*") is not None
         metrics = client.ferricstore_metrics()
         assert metrics
