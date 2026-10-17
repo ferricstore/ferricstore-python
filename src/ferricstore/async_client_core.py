@@ -421,6 +421,14 @@ class _AsyncClientCoreMixin(_AsyncClientMixinBase):
     async def cluster_role(self) -> Any:
         return await self.executor.execute_command("CLUSTER.ROLE")
 
+    async def cluster_features(self) -> Any:
+        return _parse_kv_response(await self.executor.execute_command("CLUSTER.FEATURES"))
+
+    async def cluster_features_raise(self, level: int) -> Any:
+        return _parse_kv_response(
+            await self.executor.execute_command("CLUSTER.FEATURES.RAISE", level)
+        )
+
     async def cluster_join(self, node: str, *, replace: bool = False) -> bool:
         args: builtins.list[Any] = ["CLUSTER.JOIN", node]
         if replace:

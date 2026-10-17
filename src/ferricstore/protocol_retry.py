@@ -12,6 +12,7 @@ _NON_MUTATING_COMMANDS = frozenset(
         "BACKPRESSURE",
         "CLIENT.INFO",
         "CLIENT.SETNAME",
+        "CLUSTER.FEATURES",
         "CLUSTER.HEALTH",
         "CLUSTER.KEYSLOT",
         "CLUSTER.ROLE",

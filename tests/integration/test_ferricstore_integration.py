@@ -48,7 +48,8 @@ _NATIVE_PROTOCOL_COMMANDS: set[str] = set(
     ACL APPEND AUTH BF.ADD BF.CARD BF.EXISTS BF.INFO BF.MADD BF.MEXISTS BF.RESERVE
     BGSAVE BITCOUNT BITOP BITPOS BLMOVE BLMPOP BLPOP BRPOP CAS CF.ADD CF.ADDNX
     CF.COUNT CF.DEL CF.EXISTS CF.INFO CF.MEXISTS CF.RESERVE CLIENT CLUSTER.DEMOTE
-    CLUSTER.FAILOVER CLUSTER.HEALTH CLUSTER.JOIN CLUSTER.KEYSLOT CLUSTER.LEAVE
+    CLUSTER.FAILOVER CLUSTER.FEATURES CLUSTER.FEATURES.RAISE CLUSTER.HEALTH CLUSTER.JOIN
+    CLUSTER.KEYSLOT CLUSTER.LEAVE
     CLUSTER.PROMOTE CLUSTER.ROLE CLUSTER.SLOTS CLUSTER.STATS CLUSTER.STATUS
     CMS.INCRBY CMS.INFO CMS.INITBYDIM CMS.INITBYPROB CMS.MERGE CMS.QUERY COMMAND
     CONFIG COPY DBSIZE DEBUG DECR DECRBY DEL DISCARD ECHO EXEC EXISTS EXPIRE
@@ -1679,6 +1680,11 @@ def test_real_ferricstore_protocol_helpers_and_diagnostics() -> None:
         assert client.cluster_slots() is not None
         assert isinstance(client.cluster_status(), dict)
         assert client.cluster_role() is not None
+        features = client.cluster_features()
+        assert features["supported"] >= features["active"] >= 0
+        # Level 0 is always rejected, so this exercises the raise without changing the cluster.
+        with pytest.raises(FerricStoreError, match="feature level must be a positive integer"):
+            client.cluster_features_raise(0)
         assert client.ferricstore_config("GET", "*") is not None
         metrics = client.ferricstore_metrics()
         assert metrics
@@ -2113,6 +2119,11 @@ def test_real_ferricstore_native_protocol_store_and_admin_surface() -> None:
         assert client.cluster_slots() is not None
         assert isinstance(client.cluster_status(), dict)
         assert client.cluster_role() is not None
+        features = client.cluster_features()
+        assert features["supported"] >= features["active"] >= 0
+        # Level 0 is always rejected, so this exercises the raise without changing the cluster.
+        with pytest.raises(FerricStoreError, match="feature level must be a positive integer"):
+            client.cluster_features_raise(0)
         assert client.ferricstore_config("GET", "*") is not None
         metrics = client.ferricstore_metrics()
         assert metrics
