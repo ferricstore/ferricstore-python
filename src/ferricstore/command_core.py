@@ -64,9 +64,10 @@ _ALL_KEYS_COMMANDS = {
 
 _PAIR_KEYS_COMMANDS = {"MSET", "MSETNX"}
 
-# `numkeys key [key ...] [options]` (BLMPOP: `timeout numkeys key ...`).
+# `numkeys key [key ...] [options]` (BLMPOP, BZMPOP: `timeout numkeys key ...`).
 _COUNTED_KEYS_COMMANDS = {
     "BLMPOP",
+    "BZMPOP",
     "SINTERCARD",
     "ZDIFF",
     "ZINTER",
@@ -277,13 +278,14 @@ def command_route_keys(name: str, args: Sequence[Any]) -> tuple[Any, ...]:
         return values
     if normalized in _TWO_KEYS_COMMANDS:
         return values[:2]
-    if normalized in {"BLPOP", "BRPOP"}:
+    if normalized in {"BLPOP", "BRPOP", "BZPOPMIN", "BZPOPMAX"}:
         return values[:-1]
     if normalized == "BITOP":
         return values[1:]
     if normalized in _COUNTED_KEYS_COMMANDS:
-        offset = 2 if normalized == "BLMPOP" else 1
-        count_index = 1 if normalized == "BLMPOP" else 0
+        timeout_first = normalized in {"BLMPOP", "BZMPOP"}
+        offset = 2 if timeout_first else 1
+        count_index = 1 if timeout_first else 0
         count = _non_negative_int(values[count_index] if len(values) > count_index else None)
         return values[offset : offset + count] if count is not None else ()
     if normalized in {"XREAD", "XREADGROUP"}:

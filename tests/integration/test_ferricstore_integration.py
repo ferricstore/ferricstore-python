@@ -96,7 +96,7 @@ _NATIVE_PROTOCOL_COMMANDS: set[str] = set(
     ZINTERSTORE ZMSCORE ZPOPMAX ZPOPMIN ZRANDMEMBER ZRANGE ZRANGEBYSCORE
     ZRANGESTORE ZRANK ZREM ZREVRANGE ZREVRANGEBYSCORE ZREVRANK ZSCAN ZSCORE
     ZUNION ZUNIONSTORE ZLEXCOUNT ZMPOP ZRANGEBYLEX ZREMRANGEBYLEX ZREMRANGEBYRANK
-    ZREMRANGEBYSCORE ZREVRANGEBYLEX
+    ZREMRANGEBYSCORE ZREVRANGEBYLEX BZMPOP BZPOPMAX BZPOPMIN
     """.split()  # noqa: SIM905 - command contract stays readable as copied parser output
 )
 
@@ -1915,6 +1915,14 @@ def test_real_ferricstore_raw_store_command_families() -> None:
             assert client.command("ZREMRANGEBYRANK", zlex, 0, 0) == 1
             assert client.command("ZREMRANGEBYSCORE", zlex, "-inf", "(0") == 0
             assert client.command("ZMPOP", 1, zlex, "MIN", "COUNT", 2)
+
+        if "BZMPOP" in _command_catalog_names(client.command("COMMAND")):
+            zblock = f"{prefix}zblock"
+            assert client.command("ZADD", zblock, 1, "a", 2, "b", 3, "c") == 3
+            assert len(client.command("BZPOPMIN", zblock, 1)) == 3
+            assert len(client.command("BZPOPMAX", zblock, 1)) == 3
+            assert client.command("BZMPOP", 1, 1, zblock, "MIN")
+            assert client.command("BZPOPMIN", f"{prefix}zblock-empty", 0.05) is None
 
         stream = f"{prefix}stream"
         stream_id = client.command("XADD", stream, "*", "field", "value")

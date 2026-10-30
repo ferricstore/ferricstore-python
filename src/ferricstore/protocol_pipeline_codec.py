@@ -122,9 +122,9 @@ def _blocks_forever(args: Sequence[Any]) -> bool:
         name = _command_name(values[0])
         values = values[1:]
     candidate: Any = None
-    if name in {"BLPOP", "BRPOP", "BLMOVE"} and values:
+    if name in {"BLPOP", "BRPOP", "BLMOVE", "BZPOPMIN", "BZPOPMAX"} and values:
         candidate = values[-1]
-    elif name == "BLMPOP" and values:
+    elif name in {"BLMPOP", "BZMPOP"} and values:
         candidate = values[0]
     elif name in {"XREAD", "XREADGROUP"}:
         parsed = parse_stream_read(values, read_group=name == "XREADGROUP")

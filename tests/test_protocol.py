@@ -3705,6 +3705,15 @@ def test_protocol_stateful_command_exec_is_not_wrapped_in_pipeline_frame():
 
     assert protocol_module._pipeline_frame_supported(commands) is False
 
+    for blocking in (
+        ("BZPOPMIN", "jobs", 1),
+        ("BZPOPMAX", "jobs", 1),
+        ("BZMPOP", 1, 1, "jobs", "MIN"),
+    ):
+        assert (
+            protocol_module._pipeline_frame_supported([build_protocol_command(*blocking)]) is False
+        )
+
 
 def test_protocol_control_metadata_builders():
     assert build_protocol_command("OPTIONS").opcode == 0x000B
@@ -4753,6 +4762,10 @@ def test_protocol_create_many_cardinality_uses_grammar_item_marker() -> None:
         ),
         (("XREAD", "STREAMS", "BLOCK", 0), False),
         (("XREAD", "BLOCK", 0, "STREAMS", "orders", "$"), True),
+        (("BZPOPMIN", "jobs", 0), True),
+        (("BZPOPMAX", "a", "b", 1), False),
+        (("BZMPOP", 0, 1, "jobs", "MIN"), True),
+        (("BZMPOP", 2, 1, "jobs", "MAX"), False),
     ],
 )
 def test_protocol_blocking_timeout_uses_stream_command_grammar(
