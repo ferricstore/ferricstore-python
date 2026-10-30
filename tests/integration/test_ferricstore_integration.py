@@ -95,7 +95,8 @@ _NATIVE_PROTOCOL_COMMANDS: set[str] = set(
     XREVRANGE XTRIM ZADD ZCARD ZCOUNT ZDIFF ZDIFFSTORE ZINCRBY ZINTER ZINTERCARD
     ZINTERSTORE ZMSCORE ZPOPMAX ZPOPMIN ZRANDMEMBER ZRANGE ZRANGEBYSCORE
     ZRANGESTORE ZRANK ZREM ZREVRANGE ZREVRANGEBYSCORE ZREVRANK ZSCAN ZSCORE
-    ZUNION ZUNIONSTORE
+    ZUNION ZUNIONSTORE ZLEXCOUNT ZMPOP ZRANGEBYLEX ZREMRANGEBYLEX ZREMRANGEBYRANK
+    ZREMRANGEBYSCORE ZREVRANGEBYLEX
     """.split()  # noqa: SIM905 - command contract stays readable as copied parser output
 )
 
@@ -1903,6 +1904,17 @@ def test_real_ferricstore_raw_store_command_families() -> None:
             )
             assert client.command("ZDIFFSTORE", f"{prefix}zdiff", 2, zset_a, zset_b) == 1
             assert client.command("ZRANGESTORE", f"{prefix}zrange", zset_a, 0, -1) == 2
+
+        if "ZMPOP" in _command_catalog_names(client.command("COMMAND")):
+            zlex = f"{prefix}zlex"
+            assert client.command("ZADD", zlex, 0, "a", 0, "b", 0, "c", 0, "d") == 4
+            assert len(client.command("ZRANGEBYLEX", zlex, "[b", "+")) == 3
+            assert len(client.command("ZREVRANGEBYLEX", zlex, "+", "-", "LIMIT", 0, 1)) == 1
+            assert client.command("ZLEXCOUNT", zlex, "-", "+") == 4
+            assert client.command("ZREMRANGEBYLEX", zlex, "[d", "+") == 1
+            assert client.command("ZREMRANGEBYRANK", zlex, 0, 0) == 1
+            assert client.command("ZREMRANGEBYSCORE", zlex, "-inf", "(0") == 0
+            assert client.command("ZMPOP", 1, zlex, "MIN", "COUNT", 2)
 
         stream = f"{prefix}stream"
         stream_id = client.command("XADD", stream, "*", "field", "value")
