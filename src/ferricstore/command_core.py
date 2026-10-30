@@ -65,7 +65,15 @@ _ALL_KEYS_COMMANDS = {
 _PAIR_KEYS_COMMANDS = {"MSET", "MSETNX"}
 
 # `numkeys key [key ...] [options]` (BLMPOP: `timeout numkeys key ...`).
-_COUNTED_KEYS_COMMANDS = {"BLMPOP", "SINTERCARD", "ZDIFF", "ZINTER", "ZINTERCARD", "ZUNION"}
+_COUNTED_KEYS_COMMANDS = {
+    "BLMPOP",
+    "SINTERCARD",
+    "ZDIFF",
+    "ZINTER",
+    "ZINTERCARD",
+    "ZMPOP",
+    "ZUNION",
+}
 
 # `destination numkeys key [key ...] [options]`.
 _DESTINATION_COUNTED_KEYS_COMMANDS = {
@@ -228,15 +236,21 @@ _FIRST_KEY_COMMANDS = {
     "ZCARD",
     "ZCOUNT",
     "ZINCRBY",
+    "ZLEXCOUNT",
     "ZMSCORE",
     "ZPOPMAX",
     "ZPOPMIN",
     "ZRANDMEMBER",
     "ZRANGE",
+    "ZRANGEBYLEX",
     "ZRANGEBYSCORE",
     "ZRANK",
     "ZREM",
+    "ZREMRANGEBYLEX",
+    "ZREMRANGEBYRANK",
+    "ZREMRANGEBYSCORE",
     "ZREVRANGE",
+    "ZREVRANGEBYLEX",
     "ZREVRANGEBYSCORE",
     "ZREVRANK",
     "ZSCAN",
