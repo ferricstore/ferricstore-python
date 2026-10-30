@@ -92,9 +92,10 @@ _NATIVE_PROTOCOL_COMMANDS: set[str] = set(
     TDIGEST.REVRANK TDIGEST.TRIMMED_MEAN TOPK.ADD TOPK.COUNT TOPK.INCRBY TOPK.INFO
     TOPK.LIST TOPK.QUERY TOPK.RESERVE TTL TYPE UNLINK UNLOCK UNSUBSCRIBE UNWATCH
     WAIT WAITAOF WATCH XACK XADD XDEL XGROUP XINFO XLEN XRANGE XREAD XREADGROUP
-    XREVRANGE XTRIM ZADD ZCARD ZCOUNT ZINCRBY ZMSCORE ZPOPMAX ZPOPMIN
-    ZRANDMEMBER ZRANGE ZRANGEBYSCORE ZRANK ZREM ZREVRANGE ZREVRANGEBYSCORE
-    ZREVRANK ZSCAN ZSCORE
+    XREVRANGE XTRIM ZADD ZCARD ZCOUNT ZDIFF ZDIFFSTORE ZINCRBY ZINTER ZINTERCARD
+    ZINTERSTORE ZMSCORE ZPOPMAX ZPOPMIN ZRANDMEMBER ZRANGE ZRANGEBYSCORE
+    ZRANGESTORE ZRANK ZREM ZREVRANGE ZREVRANGEBYSCORE ZREVRANK ZSCAN ZSCORE
+    ZUNION ZUNIONSTORE
     """.split()  # noqa: SIM905 - command contract stays readable as copied parser output
 )
 
@@ -1879,6 +1880,29 @@ def test_real_ferricstore_raw_store_command_families() -> None:
         assert client.command("ZREM", zset, "b") == 1
         assert client.command("ZPOPMIN", zset, 1)
         assert client.command("ZPOPMAX", zset, 1)
+
+        # Servers before the sorted-set algebra commands do not list them.
+        if "ZUNIONSTORE" in _command_catalog_names(client.command("COMMAND")):
+            zset_a = f"{prefix}zset-a"
+            zset_b = f"{prefix}zset-b"
+            assert client.command("ZADD", zset_a, 1, "a", 2, "b") == 2
+            assert client.command("ZADD", zset_b, 3, "b", 4, "c") == 2
+            assert client.command("ZUNION", 2, zset_a, zset_b, "WITHSCORES")
+            assert client.command("ZINTER", 2, zset_a, zset_b)
+            assert client.command("ZDIFF", 2, zset_a, zset_b)
+            assert client.command("ZINTERCARD", 2, zset_a, zset_b, "LIMIT", 10) == 1
+            assert (
+                client.command("ZUNIONSTORE", f"{prefix}zunion", 2, zset_a, zset_b, "WEIGHTS", 1, 2)
+                == 3
+            )
+            assert (
+                client.command(
+                    "ZINTERSTORE", f"{prefix}zinter", 2, zset_a, zset_b, "AGGREGATE", "MAX"
+                )
+                == 1
+            )
+            assert client.command("ZDIFFSTORE", f"{prefix}zdiff", 2, zset_a, zset_b) == 1
+            assert client.command("ZRANGESTORE", f"{prefix}zrange", zset_a, 0, -1) == 2
 
         stream = f"{prefix}stream"
         stream_id = client.command("XADD", stream, "*", "field", "value")

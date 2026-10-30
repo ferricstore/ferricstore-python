@@ -64,6 +64,18 @@ _ALL_KEYS_COMMANDS = {
 
 _PAIR_KEYS_COMMANDS = {"MSET", "MSETNX"}
 
+# `numkeys key [key ...] [options]` (BLMPOP: `timeout numkeys key ...`).
+_COUNTED_KEYS_COMMANDS = {"BLMPOP", "SINTERCARD", "ZDIFF", "ZINTER", "ZINTERCARD", "ZUNION"}
+
+# `destination numkeys key [key ...] [options]`.
+_DESTINATION_COUNTED_KEYS_COMMANDS = {
+    "CMS.MERGE",
+    "TDIGEST.MERGE",
+    "ZDIFFSTORE",
+    "ZINTERSTORE",
+    "ZUNIONSTORE",
+}
+
 _TWO_KEYS_COMMANDS = {
     "BLMOVE",
     "COPY",
@@ -73,6 +85,7 @@ _TWO_KEYS_COMMANDS = {
     "RENAMENX",
     "RPOPLPUSH",
     "SMOVE",
+    "ZRANGESTORE",
 }
 
 _FIRST_KEY_COMMANDS = {
@@ -254,14 +267,14 @@ def command_route_keys(name: str, args: Sequence[Any]) -> tuple[Any, ...]:
         return values[:-1]
     if normalized == "BITOP":
         return values[1:]
-    if normalized in {"BLMPOP", "SINTERCARD"}:
+    if normalized in _COUNTED_KEYS_COMMANDS:
         offset = 2 if normalized == "BLMPOP" else 1
         count_index = 1 if normalized == "BLMPOP" else 0
         count = _non_negative_int(values[count_index] if len(values) > count_index else None)
         return values[offset : offset + count] if count is not None else ()
     if normalized in {"XREAD", "XREADGROUP"}:
         return _stream_keys(values, read_group=normalized == "XREADGROUP")
-    if normalized in {"CMS.MERGE", "TDIGEST.MERGE"}:
+    if normalized in _DESTINATION_COUNTED_KEYS_COMMANDS:
         count = _non_negative_int(values[1] if len(values) > 1 else None)
         return values[:1] + values[2 : 2 + count] if count is not None else ()
     if normalized in {"OBJECT", "XGROUP", "XINFO"}:
