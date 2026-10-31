@@ -8,8 +8,9 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 - Add sharded Pub/Sub: `spublish()`, `ssubscribe()` and `sunsubscribe()` on the
   sync and async clients and Pub/Sub sessions. Shard messages arrive as
-  `PubSubMessage(kind="smessage")`, and closing a session also leaves its
-  shard channels. Needs a FerricStore server with SSUBSCRIBE.
+  `PubSubMessage(kind="smessage")`. Closing a session that used SSUBSCRIBE
+  also leaves its shard channels; other sessions close as before, so older
+  servers are unaffected. Needs a FerricStore server with SSUBSCRIBE.
 
 - Add `cluster_features()` and `cluster_features_raise(level)` on the sync and
   async clients for FerricStore 0.12.0 cluster feature levels (`CLUSTER.FEATURES`

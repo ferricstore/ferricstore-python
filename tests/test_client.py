@@ -332,9 +332,51 @@ def test_pubsub_cleanup_failure_unsubscribes_patterns_and_invalidates_session():
 
     assert ("UNSUBSCRIBE",) in session.calls
     assert ("PUNSUBSCRIBE",) in session.calls
-    assert ("SUNSUBSCRIBE",) in session.calls
+    assert ("SUNSUBSCRIBE",) not in session.calls
     assert session.invalidated
     assert session.closed
+
+
+def test_pubsub_close_leaves_shard_channels_only_after_ssubscribe():
+    # A server without SSUBSCRIBE must still close plain sessions cleanly.
+    class SessionExecutor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Any, ...]] = []
+
+        def execute_command(self, *args: Any) -> Any:
+            self.calls.append(args)
+            return b"OK"
+
+        def invalidate(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class RootExecutor:
+        def __init__(self) -> None:
+            self.sessions: list[SessionExecutor] = []
+
+        def execute_command(self, *_args: Any) -> Any:
+            return b"OK"
+
+        def acquire_session(self) -> SessionExecutor:
+            self.sessions.append(SessionExecutor())
+            return self.sessions[-1]
+
+    root = RootExecutor()
+    client = FlowClient(root)
+
+    plain = client.pubsub_session()
+    plain.subscribe("jobs")
+    plain.close()
+
+    shard = client.pubsub_session()
+    shard.ssubscribe("orders")
+    shard.close()
+
+    assert ("SUNSUBSCRIBE",) not in root.sessions[0].calls
+    assert root.sessions[1].calls[-1] == ("SUNSUBSCRIBE",)
 
 
 def test_autobatch_rejects_response_cardinality_mismatch():
