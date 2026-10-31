@@ -96,7 +96,8 @@ _NATIVE_PROTOCOL_COMMANDS: set[str] = set(
     ZINTERSTORE ZMSCORE ZPOPMAX ZPOPMIN ZRANDMEMBER ZRANGE ZRANGEBYSCORE
     ZRANGESTORE ZRANK ZREM ZREVRANGE ZREVRANGEBYSCORE ZREVRANK ZSCAN ZSCORE
     ZUNION ZUNIONSTORE ZLEXCOUNT ZMPOP ZRANGEBYLEX ZREMRANGEBYLEX ZREMRANGEBYRANK
-    ZREMRANGEBYSCORE ZREVRANGEBYLEX BZMPOP BZPOPMAX BZPOPMIN
+    ZREMRANGEBYSCORE ZREVRANGEBYLEX BZMPOP BZPOPMAX BZPOPMIN XAUTOCLAIM XCLAIM
+    XPENDING XSETID
     """.split()  # noqa: SIM905 - command contract stays readable as copied parser output
 )
 
@@ -1934,6 +1935,26 @@ def test_real_ferricstore_raw_store_command_families() -> None:
         group = f"group-{suffix}"
         assert _ok(client.command("XGROUP", "CREATE", stream, group, "0"))
         assert client.command("XACK", stream, group, stream_id) >= 0
+
+        if "XCLAIM" in _command_catalog_names(client.command("COMMAND")):
+            assert client.command("XREADGROUP", "GROUP", group, "alice", "STREAMS", stream, ">")
+            assert client.command("XPENDING", stream, group)[0] >= 1
+            assert client.command("XPENDING", stream, group, "-", "+", 10)
+            assert client.command("XINFO", "GROUPS", stream)
+            assert client.command("XINFO", "CONSUMERS", stream, group)
+            # The writes run from cluster feature level 11.
+            try:
+                claimed = client.command("XCLAIM", stream, group, "bob", 0, stream_id, "JUSTID")
+            except FerricStoreError as error:
+                assert "feature level 11" in str(error)
+            else:
+                assert claimed == [stream_id]
+                assert client.command("XAUTOCLAIM", stream, group, "carol", 0, "0-0", "JUSTID")
+                assert client.command("XGROUP", "CREATECONSUMER", stream, group, "dave") == 1
+                assert client.command("XGROUP", "DELCONSUMER", stream, group, "dave") == 0
+                assert _ok(client.command("XGROUP", "SETID", stream, group, "$"))
+                assert _ok(client.command("XSETID", stream, stream_id))
+
         assert client.command("XTRIM", stream, "MAXLEN", "~", 10) >= 0
         assert client.command("XDEL", stream, stream_id) >= 0
 
