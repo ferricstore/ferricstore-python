@@ -239,7 +239,7 @@ class PubSubMessage:
     ) -> PubSubMessage:
         if isinstance(value, (list, tuple)) and value:
             kind = _str(value[0], "event")
-            if kind == "message" and len(value) >= 3:
+            if kind in ("message", "smessage") and len(value) >= 3:
                 message = value[2]
                 if decode is not None:
                     message = decode(message)

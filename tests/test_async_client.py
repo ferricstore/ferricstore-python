@@ -313,6 +313,7 @@ def test_async_pubsub_cleanup_failure_unsubscribes_patterns_and_invalidates_sess
 
         assert ("UNSUBSCRIBE",) in session.calls
         assert ("PUNSUBSCRIBE",) in session.calls
+        assert ("SUNSUBSCRIBE",) in session.calls
         assert session.invalidated
         assert session.closed
 

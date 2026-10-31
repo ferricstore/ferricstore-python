@@ -612,6 +612,17 @@ class DataCommandsMixin:
     def punsubscribe(self, *patterns: str) -> Any:
         return self.command("PUNSUBSCRIBE", *patterns)
 
+    def spublish(self, channel: str, message: Any, *, encode: bool = True) -> int:
+        return int(
+            self.command("SPUBLISH", channel, self.codec.encode(message) if encode else message)
+        )
+
+    def ssubscribe(self, *channels: str) -> Any:
+        return self.command("SSUBSCRIBE", *channels)
+
+    def sunsubscribe(self, *channels: str) -> Any:
+        return self.command("SUNSUBSCRIBE", *channels)
+
     def pubsub(self, subcommand: str, *args: Any) -> Any:
         return self.command("PUBSUB", subcommand, *args)
 

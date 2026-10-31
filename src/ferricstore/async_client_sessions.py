@@ -153,6 +153,14 @@ class AsyncPubSubSession:
         session_client = await self._session_client()
         return await session_client.punsubscribe(*patterns)
 
+    async def ssubscribe(self, *channels: str) -> Any:
+        session_client = await self._session_client()
+        return await session_client.ssubscribe(*channels)
+
+    async def sunsubscribe(self, *channels: str) -> Any:
+        session_client = await self._session_client()
+        return await session_client.sunsubscribe(*channels)
+
     async def get_message(
         self,
         *,
@@ -182,7 +190,7 @@ class AsyncPubSubSession:
         if self._active_client is None:
             return
         error: BaseException | None = None
-        for cleanup in (self.unsubscribe, self.punsubscribe):
+        for cleanup in (self.unsubscribe, self.punsubscribe, self.sunsubscribe):
             try:
                 await cleanup()
             except BaseException as exc:

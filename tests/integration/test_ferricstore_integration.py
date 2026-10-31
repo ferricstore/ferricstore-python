@@ -99,6 +99,7 @@ _NATIVE_PROTOCOL_COMMANDS: set[str] = set(
     ZREMRANGEBYSCORE ZREVRANGEBYLEX BZMPOP BZPOPMAX BZPOPMIN XAUTOCLAIM XCLAIM
     XPENDING XSETID HMSET TOUCH TIME LATENCY LMPOP LCS SORT SORT_RO BITFIELD
     BITFIELD_RO HEXPIREAT HPEXPIREAT HPEXPIRETIME BF.INSERT CF.INSERT CF.INSERTNX
+    SPUBLISH SSUBSCRIBE SUNSUBSCRIBE
     """.split()  # noqa: SIM905 - command contract stays readable as copied parser output
 )
 
@@ -3106,6 +3107,31 @@ def test_real_ferricstore_native_protocol_named_session_and_data_structure_surfa
             assert pattern_message.message == {"event": 2}
             pattern_pubsub.punsubscribe(pattern)
             pattern_pubsub.close()
+
+            # Shard channels are their own namespace: PUBLISH never reaches an
+            # SSUBSCRIBE subscriber, so the first message is the SPUBLISH one.
+            shard_pubsub = client.pubsub_session()
+            shard_channel = f"{channel}:shard"
+            ack = shard_pubsub.ssubscribe(shard_channel)
+            assert [[_text(ack[0][0]), _text(ack[0][1]), ack[0][2]]] == [
+                ["ssubscribe", shard_channel, 1]
+            ]
+            producer.publish(shard_channel, {"event": "plain"})
+            assert producer.spublish(shard_channel, {"event": "shard"}) >= 1
+            shard_message = shard_pubsub.get_message(timeout=3)
+            assert shard_message is not None
+            assert shard_message.kind == "smessage"
+            assert shard_message.channel == shard_channel
+            assert shard_message.message == {"event": "shard"}
+            assert [_text(v) for v in client.pubsub("SHARDCHANNELS", shard_channel)] in (
+                [shard_channel],
+                [],
+            )
+            numsub = client.pubsub("SHARDNUMSUB", shard_channel)
+            assert _text(numsub[0]) == shard_channel and numsub[1] in (0, 1)
+            ack = shard_pubsub.sunsubscribe(shard_channel)
+            assert _text(ack[0][0]) == "sunsubscribe" and ack[0][2] == 0
+            shard_pubsub.close()
     finally:
         with suppress(Exception):
             if keys:
@@ -3437,6 +3463,7 @@ def test_real_ferricstore_named_data_helpers_cover_native_protocol_surface() -> 
                     "QUEUED",
                 )
         assert call("publish", key("channel"), {"event": "helper"}) >= 0
+        assert call("spublish", key("channel"), {"event": "helper"}) >= 0
         assert call("pubsub", "CHANNELS") is not None
 
         non_docker_safe_helpers = {
@@ -3448,6 +3475,8 @@ def test_real_ferricstore_named_data_helpers_cover_native_protocol_surface() -> 
             "unsubscribe",
             "psubscribe",
             "punsubscribe",
+            "ssubscribe",
+            "sunsubscribe",
         }
         session_only_helpers = {"discard", "multi", "transaction_exec", "unwatch", "watch"}
         public_helpers = {

@@ -143,6 +143,12 @@ class PubSubSession:
     def punsubscribe(self, *patterns: str) -> Any:
         return self._session_client().punsubscribe(*patterns)
 
+    def ssubscribe(self, *channels: str) -> Any:
+        return self._session_client().ssubscribe(*channels)
+
+    def sunsubscribe(self, *channels: str) -> Any:
+        return self._session_client().sunsubscribe(*channels)
+
     def get_message(
         self,
         *,
@@ -172,7 +178,7 @@ class PubSubSession:
         if self._active_client is None:
             return
         error: BaseException | None = None
-        for cleanup in (self.unsubscribe, self.punsubscribe):
+        for cleanup in (self.unsubscribe, self.punsubscribe, self.sunsubscribe):
             try:
                 cleanup()
             except BaseException as exc:
