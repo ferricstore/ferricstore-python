@@ -531,6 +531,12 @@ def test_many_item_error_uses_bytes_mapping_reason_without_value() -> None:
         ("OBJECT", ("ENCODING", "object-key"), ("object-key",)),
         ("XINFO", ("STREAM", "stream-key"), ("stream-key",)),
         ("XGROUP", ("CREATE", "stream-key", "group", "$"), ("stream-key",)),
+        ("XGROUP", ("DESTROY", "stream-key", "group"), ("stream-key",)),
+        ("XINFO", ("CONSUMERS", "stream-key", "group"), ("stream-key",)),
+        ("XPENDING", ("stream-key", "group", "-", "+", 10), ("stream-key",)),
+        ("XCLAIM", ("stream-key", "group", "consumer", 0, "1-0"), ("stream-key",)),
+        ("XAUTOCLAIM", ("stream-key", "group", "consumer", 0, "0-0"), ("stream-key",)),
+        ("XSETID", ("stream-key", "1-0"), ("stream-key",)),
         ("MEMORY", ("USAGE", "memory-key"), ("memory-key",)),
         (
             "FLOW.CREATE",
