@@ -97,7 +97,8 @@ _NATIVE_PROTOCOL_COMMANDS: set[str] = set(
     ZRANGESTORE ZRANK ZREM ZREVRANGE ZREVRANGEBYSCORE ZREVRANK ZSCAN ZSCORE
     ZUNION ZUNIONSTORE ZLEXCOUNT ZMPOP ZRANGEBYLEX ZREMRANGEBYLEX ZREMRANGEBYRANK
     ZREMRANGEBYSCORE ZREVRANGEBYLEX BZMPOP BZPOPMAX BZPOPMIN XAUTOCLAIM XCLAIM
-    XPENDING XSETID
+    XPENDING XSETID HMSET TOUCH TIME LATENCY LMPOP LCS SORT SORT_RO BITFIELD
+    BITFIELD_RO HEXPIREAT HPEXPIREAT HPEXPIRETIME BF.INSERT CF.INSERT CF.INSERTNX
     """.split()  # noqa: SIM905 - command contract stays readable as copied parser output
 )
 
@@ -542,6 +543,54 @@ def _suffix() -> str:
 
 def _text(value: Any) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
+
+
+def _exercise_redis_gap_commands(client: Any, prefix: str) -> None:
+    """The commands FerricStore added after the Redis gap survey."""
+
+    # SORT ... STORE and BITFIELD's writes run from cluster feature level 12;
+    # below it each is refused, and every one is still sent.
+    def level_12(*args: Any) -> Any:
+        try:
+            return client.command(*args)
+        except FerricStoreError as error:
+            assert "feature level 12" in str(error)
+            return None
+
+    hash_key = f"{prefix}gap-hash"
+    assert _ok(client.command("HMSET", hash_key, "a", "1", "b", "2"))
+    assert client.command("TOUCH", hash_key, f"{prefix}gap-missing") == 1
+    seconds, micros = client.command("TIME")
+    assert int(_text(seconds)) > 0 and 0 <= int(_text(micros)) < 1_000_000
+    assert client.command("HEXPIREAT", hash_key, 4_000_000_000, "FIELDS", 1, "a") == [1]
+    assert client.command("HPEXPIREAT", hash_key, 4_000_000_000_000, "FIELDS", 1, "b") == [1]
+    assert client.command("HPEXPIRETIME", hash_key, "FIELDS", 1, "b") == [4_000_000_000_000]
+
+    list_key = f"{prefix}gap-list"
+    assert client.command("RPUSH", list_key, "3", "1", "2") == 3
+    assert [_text(v) for v in client.command("SORT", list_key)] == ["1", "2", "3"]
+    assert [_text(v) for v in client.command("SORT_RO", list_key, "DESC", "ALPHA")] == [
+        "3",
+        "2",
+        "1",
+    ]
+    assert level_12("SORT", list_key, "STORE", f"{prefix}gap-sorted") in (None, 3)
+    popped = client.command("LMPOP", 2, f"{prefix}gap-empty", list_key, "LEFT")
+    assert _text(popped[0]) == list_key and [_text(v) for v in popped[1]] == ["3"]
+
+    assert _ok(client.command("SET", f"{prefix}gap-a", "ohmytext"))
+    assert _ok(client.command("SET", f"{prefix}gap-b", "mynewtext"))
+    assert _text(client.command("LCS", f"{prefix}gap-a", f"{prefix}gap-b")) == "mytext"
+
+    bits = f"{prefix}gap-bits"
+    assert client.command("BITFIELD", bits, "GET", "u8", 0) == [0]
+    assert level_12("BITFIELD", bits, "SET", "u8", 0, 7) in (None, [0])
+    assert client.command("BITFIELD_RO", bits, "GET", "u8", 0) in ([0], [7])
+
+    assert client.command("BF.INSERT", f"{prefix}gap-bf", "CAPACITY", 100, "ITEMS", "a") == [1]
+    assert client.command("CF.INSERT", f"{prefix}gap-cf", "ITEMS", "a") == [1]
+    assert client.command("CF.INSERTNX", f"{prefix}gap-cf", "ITEMS", "a", "b") == [0, 1]
+    assert isinstance(client.command("LATENCY", "LATEST"), list)
 
 
 def _ok(value: Any) -> bool:
@@ -1964,6 +2013,9 @@ def test_real_ferricstore_raw_store_command_families() -> None:
 
         assert client.command("XTRIM", stream, "MAXLEN", "~", 10) >= 0
         assert client.command("XDEL", stream, stream_id) >= 0
+
+        if "LCS" in _command_catalog_names(client.command("COMMAND")):
+            _exercise_redis_gap_commands(client, prefix)
 
         bitmap = f"{prefix}bitmap"
         assert client.command("SETBIT", bitmap, 7, 1) == 0

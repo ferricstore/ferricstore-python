@@ -24,6 +24,7 @@ _CONTROL_COMMANDS = {
     "HELLO",
     "INFO",
     "KEYS",
+    "LATENCY",
     "MULTI",
     "OPTIONS",
     "PING",
@@ -41,6 +42,7 @@ _CONTROL_COMMANDS = {
     "SLOWLOG",
     "STARTUP",
     "SUBSCRIBE",
+    "TIME",
     "UNSUBSCRIBE",
     "UNWATCH",
     "WINDOW_UPDATE",
@@ -58,6 +60,7 @@ _ALL_KEYS_COMMANDS = {
     "SINTERSTORE",
     "SUNION",
     "SUNIONSTORE",
+    "TOUCH",
     "UNLINK",
     "WATCH",
 }
@@ -68,6 +71,7 @@ _PAIR_KEYS_COMMANDS = {"MSET", "MSETNX"}
 _COUNTED_KEYS_COMMANDS = {
     "BLMPOP",
     "BZMPOP",
+    "LMPOP",
     "SINTERCARD",
     "ZDIFF",
     "ZINTER",
@@ -89,6 +93,7 @@ _TWO_KEYS_COMMANDS = {
     "BLMOVE",
     "COPY",
     "GEOSEARCHSTORE",
+    "LCS",
     "LMOVE",
     "RENAME",
     "RENAMENX",
@@ -103,10 +108,13 @@ _FIRST_KEY_COMMANDS = {
     "BF.CARD",
     "BF.EXISTS",
     "BF.INFO",
+    "BF.INSERT",
     "BF.MADD",
     "BF.MEXISTS",
     "BF.RESERVE",
     "BITCOUNT",
+    "BITFIELD",
+    "BITFIELD_RO",
     "BITPOS",
     "CF.ADD",
     "CF.ADDNX",
@@ -153,9 +161,11 @@ _FIRST_KEY_COMMANDS = {
     "HKEYS",
     "HLEN",
     "HMGET",
+    "HMSET",
+    "HPERSIST",
     "HPEXPIRE",
     "HPEXPIREAT",
-    "HPERSIST",
+    "HPEXPIRETIME",
     "HPTTL",
     "HRANDFIELD",
     "HSCAN",
@@ -199,6 +209,7 @@ _FIRST_KEY_COMMANDS = {
     "SISMEMBER",
     "SMEMBERS",
     "SMISMEMBER",
+    "SORT_RO",
     "SPOP",
     "SRANDMEMBER",
     "SREM",
@@ -301,9 +312,31 @@ def command_route_keys(name: str, args: Sequence[Any]) -> tuple[Any, ...]:
         return values[1:2]
     if normalized == "MEMORY":
         return values[1:2] if values and _command_token(values[0]) == "USAGE" else ()
+    if normalized == "SORT":
+        return _sort_keys(values)
     if normalized in _FIRST_KEY_COMMANDS:
         return values[:1]
     return ()
+
+
+def _sort_keys(args: tuple[Any, ...]) -> tuple[Any, ...]:
+    """SORT's key and its STORE destination, skipping its other options' values."""
+    if not args:
+        return ()
+    keys: tuple[Any, ...] = args[:1]
+    index = 1
+    while index < len(args):
+        token = _command_token(args[index])
+        if token == "STORE" and index + 1 < len(args):
+            keys += (args[index + 1],)
+            index += 2
+        elif token in {"BY", "GET"}:
+            index += 2
+        elif token == "LIMIT":
+            index += 3
+        else:
+            index += 1
+    return keys
 
 
 def _stream_keys(args: tuple[Any, ...], *, read_group: bool) -> tuple[Any, ...]:
