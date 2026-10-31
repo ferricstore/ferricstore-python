@@ -332,8 +332,51 @@ def test_pubsub_cleanup_failure_unsubscribes_patterns_and_invalidates_session():
 
     assert ("UNSUBSCRIBE",) in session.calls
     assert ("PUNSUBSCRIBE",) in session.calls
+    assert ("SUNSUBSCRIBE",) not in session.calls
     assert session.invalidated
     assert session.closed
+
+
+def test_pubsub_close_leaves_shard_channels_only_after_ssubscribe():
+    # A server without SSUBSCRIBE must still close plain sessions cleanly.
+    class SessionExecutor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Any, ...]] = []
+
+        def execute_command(self, *args: Any) -> Any:
+            self.calls.append(args)
+            return b"OK"
+
+        def invalidate(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class RootExecutor:
+        def __init__(self) -> None:
+            self.sessions: list[SessionExecutor] = []
+
+        def execute_command(self, *_args: Any) -> Any:
+            return b"OK"
+
+        def acquire_session(self) -> SessionExecutor:
+            self.sessions.append(SessionExecutor())
+            return self.sessions[-1]
+
+    root = RootExecutor()
+    client = FlowClient(root)
+
+    plain = client.pubsub_session()
+    plain.subscribe("jobs")
+    plain.close()
+
+    shard = client.pubsub_session()
+    shard.ssubscribe("orders")
+    shard.close()
+
+    assert ("SUNSUBSCRIBE",) not in root.sessions[0].calls
+    assert root.sessions[1].calls[-1] == ("SUNSUBSCRIBE",)
 
 
 def test_autobatch_rejects_response_cardinality_mismatch():
@@ -1181,6 +1224,40 @@ def test_pubsub_session_decodes_push_array_event_shapes():
     assert message.pattern == "jobs:*"
     assert message.channel == "jobs:1"
     assert message.message == {"job": 1}
+
+
+def test_pubsub_session_decodes_shard_messages():
+    message = PubSubMessage.from_event(
+        [b"smessage", b"orders", b'{"id":1}'], decode=JsonCodec().decode
+    )
+
+    assert message.kind == "smessage"
+    assert message.channel == "orders"
+    assert message.message == {"id": 1}
+
+    event = {
+        "event": "PUBSUB_MESSAGE",
+        "at_ms": 1,
+        "payload": {"kind": "smessage", "channel": "orders", "message": b'{"id":2}'},
+    }
+    message = PubSubMessage.from_event(event, decode=JsonCodec().decode)
+    assert (message.kind, message.channel, message.message) == ("smessage", "orders", {"id": 2})
+
+
+def test_shard_pubsub_helpers_send_the_shard_commands():
+    executor = FakeExecutor()
+    client = FlowClient(executor, codec=JsonCodec())
+    executor.responses.extend([1, "OK", "OK"])
+
+    assert client.spublish("orders", {"id": 1}) == 1
+    client.ssubscribe("orders", "billing")
+    client.sunsubscribe()
+
+    assert executor.calls == [
+        ("SPUBLISH", "orders", b'{"id":1}'),
+        ("SSUBSCRIBE", "orders", "billing"),
+        ("SUNSUBSCRIBE",),
+    ]
 
 
 def test_transaction_context_uses_named_helpers_inside_multi():

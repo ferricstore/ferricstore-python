@@ -125,6 +125,9 @@ class PubSubSession:
         self.client = client
         self._active_client: FlowClient | None = None
         self._owns_client = False
+        # Closing sends SUNSUBSCRIBE only after an SSUBSCRIBE, so sessions on
+        # servers without sharded Pub/Sub still close cleanly.
+        self._shard_subscribed = False
 
     def _session_client(self) -> FlowClient:
         if self._active_client is None:
@@ -142,6 +145,14 @@ class PubSubSession:
 
     def punsubscribe(self, *patterns: str) -> Any:
         return self._session_client().punsubscribe(*patterns)
+
+    def ssubscribe(self, *channels: str) -> Any:
+        session_client = self._session_client()
+        self._shard_subscribed = True
+        return session_client.ssubscribe(*channels)
+
+    def sunsubscribe(self, *channels: str) -> Any:
+        return self._session_client().sunsubscribe(*channels)
 
     def get_message(
         self,
@@ -172,7 +183,10 @@ class PubSubSession:
         if self._active_client is None:
             return
         error: BaseException | None = None
-        for cleanup in (self.unsubscribe, self.punsubscribe):
+        cleanups = [self.unsubscribe, self.punsubscribe]
+        if self._shard_subscribed:
+            cleanups.append(self.sunsubscribe)
+        for cleanup in cleanups:
             try:
                 cleanup()
             except BaseException as exc:
@@ -190,6 +204,7 @@ class PubSubSession:
         finally:
             self._active_client = None
             self._owns_client = False
+            self._shard_subscribed = False
         if error is not None:
             raise error
 

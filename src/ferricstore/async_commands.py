@@ -642,6 +642,19 @@ class AsyncDataCommandsMixin:
     async def punsubscribe(self, *patterns: str) -> Any:
         return await self.command("PUNSUBSCRIBE", *patterns)
 
+    async def spublish(self, channel: str, message: Any, *, encode: bool = True) -> int:
+        return int(
+            await self.command(
+                "SPUBLISH", channel, self.codec.encode(message) if encode else message
+            )
+        )
+
+    async def ssubscribe(self, *channels: str) -> Any:
+        return await self.command("SSUBSCRIBE", *channels)
+
+    async def sunsubscribe(self, *channels: str) -> Any:
+        return await self.command("SUNSUBSCRIBE", *channels)
+
     async def pubsub(self, subcommand: str, *args: Any) -> Any:
         return await self.command("PUBSUB", subcommand, *args)
 

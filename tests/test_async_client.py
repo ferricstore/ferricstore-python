@@ -274,6 +274,50 @@ def test_async_transaction_state_machine_accepts_byte_command_names():
     run(main())
 
 
+def test_async_pubsub_close_leaves_shard_channels_only_after_ssubscribe():
+    class SessionExecutor:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def execute_command(self, *args):
+            self.calls.append(args)
+            return b"OK"
+
+        async def invalidate(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+    class RootExecutor:
+        def __init__(self) -> None:
+            self.sessions = []
+
+        async def execute_command(self, *_args):
+            return b"OK"
+
+        async def acquire_session(self) -> SessionExecutor:
+            self.sessions.append(SessionExecutor())
+            return self.sessions[-1]
+
+    async def run() -> None:
+        root = RootExecutor()
+        client = AsyncFlowClient(root)
+
+        plain = client.pubsub_session()
+        await plain.subscribe("jobs")
+        await plain.close()
+
+        shard = client.pubsub_session()
+        await shard.ssubscribe("orders")
+        await shard.close()
+
+        assert ("SUNSUBSCRIBE",) not in root.sessions[0].calls
+        assert root.sessions[1].calls[-1] == ("SUNSUBSCRIBE",)
+
+    asyncio.run(run())
+
+
 def test_async_pubsub_cleanup_failure_unsubscribes_patterns_and_invalidates_session():
     class SessionExecutor:
         def __init__(self) -> None:
@@ -313,6 +357,7 @@ def test_async_pubsub_cleanup_failure_unsubscribes_patterns_and_invalidates_sess
 
         assert ("UNSUBSCRIBE",) in session.calls
         assert ("PUNSUBSCRIBE",) in session.calls
+        assert ("SUNSUBSCRIBE",) not in session.calls
         assert session.invalidated
         assert session.closed
 
