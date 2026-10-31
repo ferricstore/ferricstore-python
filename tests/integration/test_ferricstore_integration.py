@@ -594,6 +594,30 @@ def _exercise_redis_gap_commands(client: Any, prefix: str) -> None:
     assert isinstance(client.command("LATENCY", "LATEST"), list)
 
 
+def _exercise_shard_pubsub(client: FlowClient, producer: FlowClient, shard_channel: str) -> None:
+    """Shard channels are their own namespace: PUBLISH never reaches an
+    SSUBSCRIBE subscriber, so the first message is the SPUBLISH one."""
+    shard_pubsub = client.pubsub_session()
+    ack = shard_pubsub.ssubscribe(shard_channel)
+    assert [[_text(ack[0][0]), _text(ack[0][1]), ack[0][2]]] == [["ssubscribe", shard_channel, 1]]
+    producer.publish(shard_channel, {"event": "plain"})
+    assert producer.spublish(shard_channel, {"event": "shard"}) >= 1
+    shard_message = shard_pubsub.get_message(timeout=3)
+    assert shard_message is not None
+    assert shard_message.kind == "smessage"
+    assert shard_message.channel == shard_channel
+    assert shard_message.message == {"event": "shard"}
+    assert [_text(v) for v in client.pubsub("SHARDCHANNELS", shard_channel)] in (
+        [shard_channel],
+        [],
+    )
+    numsub = client.pubsub("SHARDNUMSUB", shard_channel)
+    assert _text(numsub[0]) == shard_channel and numsub[1] in (0, 1)
+    ack = shard_pubsub.sunsubscribe(shard_channel)
+    assert _text(ack[0][0]) == "sunsubscribe" and ack[0][2] == 0
+    shard_pubsub.close()
+
+
 def _ok(value: Any) -> bool:
     return value in (True, b"OK", "OK", 1)
 
@@ -3108,30 +3132,8 @@ def test_real_ferricstore_native_protocol_named_session_and_data_structure_surfa
             pattern_pubsub.punsubscribe(pattern)
             pattern_pubsub.close()
 
-            # Shard channels are their own namespace: PUBLISH never reaches an
-            # SSUBSCRIBE subscriber, so the first message is the SPUBLISH one.
-            shard_pubsub = client.pubsub_session()
-            shard_channel = f"{channel}:shard"
-            ack = shard_pubsub.ssubscribe(shard_channel)
-            assert [[_text(ack[0][0]), _text(ack[0][1]), ack[0][2]]] == [
-                ["ssubscribe", shard_channel, 1]
-            ]
-            producer.publish(shard_channel, {"event": "plain"})
-            assert producer.spublish(shard_channel, {"event": "shard"}) >= 1
-            shard_message = shard_pubsub.get_message(timeout=3)
-            assert shard_message is not None
-            assert shard_message.kind == "smessage"
-            assert shard_message.channel == shard_channel
-            assert shard_message.message == {"event": "shard"}
-            assert [_text(v) for v in client.pubsub("SHARDCHANNELS", shard_channel)] in (
-                [shard_channel],
-                [],
-            )
-            numsub = client.pubsub("SHARDNUMSUB", shard_channel)
-            assert _text(numsub[0]) == shard_channel and numsub[1] in (0, 1)
-            ack = shard_pubsub.sunsubscribe(shard_channel)
-            assert _text(ack[0][0]) == "sunsubscribe" and ack[0][2] == 0
-            shard_pubsub.close()
+            if "SSUBSCRIBE" in _command_catalog_names(client.command("COMMAND")):
+                _exercise_shard_pubsub(client, producer, f"{channel}:shard")
     finally:
         with suppress(Exception):
             if keys:
@@ -3463,7 +3465,9 @@ def test_real_ferricstore_named_data_helpers_cover_native_protocol_surface() -> 
                     "QUEUED",
                 )
         assert call("publish", key("channel"), {"event": "helper"}) >= 0
-        assert call("spublish", key("channel"), {"event": "helper"}) >= 0
+        shard_pubsub = "SPUBLISH" in _command_catalog_names(client.command("COMMAND"))
+        if shard_pubsub:
+            assert call("spublish", key("channel"), {"event": "helper"}) >= 0
         assert call("pubsub", "CHANNELS") is not None
 
         non_docker_safe_helpers = {
@@ -3484,7 +3488,16 @@ def test_real_ferricstore_named_data_helpers_cover_native_protocol_surface() -> 
             for name, value in DataCommandsMixin.__dict__.items()
             if callable(value) and not name.startswith("_")
         }
-        assert public_helpers - covered - non_docker_safe_helpers - session_only_helpers == set()
+        # Servers before sharded Pub/Sub (the 0.12.0 CI image) have no SPUBLISH.
+        unavailable_helpers = set() if shard_pubsub else {"spublish"}
+        assert (
+            public_helpers
+            - covered
+            - non_docker_safe_helpers
+            - session_only_helpers
+            - unavailable_helpers
+            == set()
+        )
     finally:
         with suppress(Exception):
             if keys:
