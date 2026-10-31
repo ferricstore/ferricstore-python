@@ -1942,18 +1942,25 @@ def test_real_ferricstore_raw_store_command_families() -> None:
             assert client.command("XPENDING", stream, group, "-", "+", 10)
             assert client.command("XINFO", "GROUPS", stream)
             assert client.command("XINFO", "CONSUMERS", stream, group)
-            # The writes run from cluster feature level 11.
-            try:
-                claimed = client.command("XCLAIM", stream, group, "bob", 0, stream_id, "JUSTID")
-            except FerricStoreError as error:
-                assert "feature level 11" in str(error)
-            else:
-                assert claimed == [stream_id]
-                assert client.command("XAUTOCLAIM", stream, group, "carol", 0, "0-0", "JUSTID")
-                assert client.command("XGROUP", "CREATECONSUMER", stream, group, "dave") == 1
-                assert client.command("XGROUP", "DELCONSUMER", stream, group, "dave") == 0
-                assert _ok(client.command("XGROUP", "SETID", stream, group, "$"))
-                assert _ok(client.command("XSETID", stream, stream_id))
+
+            # The writes run from cluster feature level 11; below it each is
+            # refused, and every one is still sent.
+            def level_11(*args: Any) -> Any:
+                try:
+                    return client.command(*args)
+                except FerricStoreError as error:
+                    assert "feature level 11" in str(error)
+                    return None
+
+            claimed = level_11("XCLAIM", stream, group, "bob", 0, stream_id, "JUSTID")
+            assert claimed in (None, [stream_id])
+            autoclaimed = level_11("XAUTOCLAIM", stream, group, "carol", 0, "0-0", "JUSTID")
+            assert autoclaimed is None or len(autoclaimed) == 3
+            assert level_11("XGROUP", "CREATECONSUMER", stream, group, "dave") in (None, 1)
+            assert level_11("XGROUP", "DELCONSUMER", stream, group, "dave") in (None, 0)
+            for args in (("XGROUP", "SETID", stream, group, "$"), ("XSETID", stream, stream_id)):
+                reply = level_11(*args)
+                assert reply is None or _ok(reply)
 
         assert client.command("XTRIM", stream, "MAXLEN", "~", 10) >= 0
         assert client.command("XDEL", stream, stream_id) >= 0
