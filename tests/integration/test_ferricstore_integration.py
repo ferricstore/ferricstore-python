@@ -3488,7 +3488,7 @@ def test_real_ferricstore_named_data_helpers_cover_native_protocol_surface() -> 
             for name, value in DataCommandsMixin.__dict__.items()
             if callable(value) and not name.startswith("_")
         }
-        # Servers before sharded Pub/Sub (the 0.12.0 CI image) have no SPUBLISH.
+        # Servers before sharded Pub/Sub (the 0.11.4 compatibility image) have no SPUBLISH.
         unavailable_helpers = set() if shard_pubsub else {"spublish"}
         assert (
             public_helpers
