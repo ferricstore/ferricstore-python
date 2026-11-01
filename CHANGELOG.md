@@ -6,6 +6,10 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+- Refresh current-server integration and documentation pins to the immutable
+  FerricStore OSS 0.12.17 image, so CI exercises the sharded Pub/Sub and other
+  commands it added. The 0.11.4 compatibility floor remains unchanged.
+
 - Add sharded Pub/Sub: `spublish()`, `ssubscribe()` and `sunsubscribe()` on the
   sync and async clients and Pub/Sub sessions. Shard messages arrive as
   `PubSubMessage(kind="smessage")`. Closing a session that used SSUBSCRIBE

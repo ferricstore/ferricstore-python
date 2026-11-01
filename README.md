@@ -102,7 +102,7 @@ Run the repository's complete HTTP-compatible integration surface through a
 real TLS listener and ACL boundary with:
 
 ```bash
-FERRICSTORE_IMAGE=quay.io/ferricstore/ferricstore:0.12.0@sha256:407cf38131e44c1702d03abfabe7406ede3696998df4b1748b7b7121f9504503 \
+FERRICSTORE_IMAGE=quay.io/ferricstore/ferricstore:0.12.17@sha256:5ac7baa9ac4c4c5ecbdf2af8e643b8cac0de5497b2d6bf3aa452597dc8f39df6 \
   scripts/run_http_integration.sh
 ```
 
