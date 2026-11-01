@@ -6,6 +6,16 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.14.0 - 2026-11-01
+
+- Route the commands FerricStore 0.12.16 and 0.12.17 added by their keys and
+  cover them in the live suite: ZUNION, ZINTER, ZDIFF and their STORE forms,
+  ZINTERCARD, ZRANGESTORE, ZRANGEBYLEX, ZREVRANGEBYLEX, ZLEXCOUNT,
+  ZREMRANGEBYRANK/SCORE/LEX, ZMPOP, the blocking BZPOPMIN, BZPOPMAX and BZMPOP
+  (on the session connection, as BLPOP), the stream group commands XPENDING,
+  XCLAIM, XAUTOCLAIM and XSETID, and HMSET, TOUCH, TIME, LATENCY, LMPOP, LCS,
+  SORT, SORT_RO, BITFIELD, BITFIELD_RO, HEXPIREAT, HPEXPIREAT, HPEXPIRETIME,
+  BF.INSERT, CF.INSERT and CF.INSERTNX.
 - Refresh current-server integration and documentation pins to the immutable
   FerricStore OSS 0.12.17 image, so CI exercises the sharded Pub/Sub and other
   commands it added. The 0.11.4 compatibility floor remains unchanged.
@@ -20,8 +30,6 @@ The project is currently public alpha. APIs may change before `1.0`.
   async clients for FerricStore 0.12.0 cluster feature levels (`CLUSTER.FEATURES`
   0x0311 and `CLUSTER.FEATURES.RAISE` 0x0312). Retries treat `CLUSTER.FEATURES`
   as read-only and a raise as a mutation.
-- Refresh current-server integration and documentation pins to the immutable
-  FerricStore OSS 0.12.0 image. The 0.11.4 compatibility floor remains unchanged.
 
 ## 0.13.5 - 2026-09-22
 
