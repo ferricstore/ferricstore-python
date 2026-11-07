@@ -6,6 +6,8 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.14.1 - 2026-11-07
+
 - Test against the immutable FerricStore OSS 0.12.18 image (from 0.12.17).
   The 0.11.4 compatibility floor remains unchanged.
 
