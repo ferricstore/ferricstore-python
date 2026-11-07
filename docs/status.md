@@ -9,7 +9,7 @@ Current version:
 ```
 
 Python SDK `0.14.0` requires FerricStore `0.11.4` or newer and validates the
-native TCP and request/response HTTP transports against FerricStore 0.12.17.
+native TCP and request/response HTTP transports against FerricStore 0.12.18.
 Native wire protocol v1 is unchanged.
 
 Rewind reason persistence requires FerricStore OSS 0.11.19 or newer; the SDK's
