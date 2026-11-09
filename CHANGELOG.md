@@ -6,6 +6,20 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+- `ctx.wait_for_children(...)` (sync and async) spawns a child group and parks
+  the parent in its wait state in one fenced command. The documented pattern,
+  `spawn_children(...)` followed by `return transition(wait_state)`, raced with
+  children that finished first: the transition then failed with
+  `FlowWrongStateError`, which ended a running `WorkflowWorker`.
+- `client.child_results(...)` and `ctx.flow.child_results(group_id)` (sync and
+  async) return a `ChildGroupResults`: each child's status and decoded result
+  or error, in one `FLOW.GET` and one `FLOW.VALUE.MGET`.
+- `examples/fanout_workflow.py` and a live test that runs it. `docs/children.md`
+  documents the group policies and that fan-in needs FerricStore 0.11.19 or
+  newer.
+- Test against the immutable FerricStore OSS 0.12.19 image (from 0.12.18).
+  The 0.11.4 compatibility floor remains unchanged.
+
 ## 0.14.1 - 2026-11-07
 
 - Test against the immutable FerricStore OSS 0.12.18 image (from 0.12.17).

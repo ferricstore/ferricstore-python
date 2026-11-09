@@ -48,6 +48,9 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "BackpressurePolicy": ("ferricstore.backpressure", "BackpressurePolicy"),
     "BudgetPolicy": ("ferricstore.types", "BudgetPolicy"),
     "BudgetResult": ("ferricstore.types", "BudgetResult"),
+    "ChildGroupResults": ("ferricstore.child_results", "ChildGroupResults"),
+    "ChildGroupSummary": ("ferricstore.child_results", "ChildGroupSummary"),
+    "ChildResult": ("ferricstore.child_results", "ChildResult"),
     "ChildSpec": ("ferricstore.types", "ChildSpec"),
     "CircuitBreakerStatus": ("ferricstore.types", "CircuitBreakerStatus"),
     "ClaimedFlow": ("ferricstore.types", "ClaimedFlow"),
@@ -240,6 +243,7 @@ if TYPE_CHECKING:
         AsyncWorkflowWorkerResult,
     )
     from ferricstore.backpressure import BackpressurePolicy
+    from ferricstore.child_results import ChildGroupResults, ChildGroupSummary, ChildResult
     from ferricstore.client import (
         AutobatchFlowClient,
         CommandPipeline,
@@ -395,6 +399,9 @@ __all__ = [
     "BackpressurePolicy",
     "BudgetPolicy",
     "BudgetResult",
+    "ChildGroupResults",
+    "ChildGroupSummary",
+    "ChildResult",
     "ChildSpec",
     "CircuitBreakerStatus",
     "ClaimedFlow",

@@ -4,6 +4,7 @@ import builtins
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
+from ferricstore.child_results import ChildGroupResults, child_group_get_args, read_child_group
 from ferricstore.client_helpers import (
     _append,
     _append_attributes,
@@ -64,6 +65,7 @@ class _ClientQueriesMixin(_ClientMixinBase):
     if TYPE_CHECKING:
         _index_query: Callable[..., builtins.list[FlowRecord]]
         _record: Callable[[dict[Any, Any]], FlowRecord]
+        value_mget: Callable[..., builtins.list[Any]]
         _records: Callable[[Any], builtins.list[FlowRecord]]
 
     def get(
@@ -81,6 +83,26 @@ class _ClientQueriesMixin(_ClientMixinBase):
         if value is None:
             return None
         return self._record(value)
+
+    def child_results(
+        self,
+        parent_id: str,
+        *,
+        partition_key: str | bytes | None = None,
+        group_id: str = "default",
+        max_bytes: int | None = None,
+    ) -> ChildGroupResults | None:
+        """Read a parent's child group: each child's status and decoded result or error.
+
+        Costs one ``FLOW.GET`` and one ``FLOW.VALUE.MGET``. Returns ``None`` when
+        the parent or the group does not exist.
+        """
+
+        record = self.executor.execute_command(*child_group_get_args(parent_id, partition_key))
+        read = read_child_group(record, group_id)
+        if read is None:
+            return None
+        return read.with_values(self.value_mget(read.refs, max_bytes=max_bytes))
 
     def query(
         self,

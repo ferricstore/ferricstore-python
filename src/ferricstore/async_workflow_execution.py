@@ -14,7 +14,7 @@ from ferricstore.lifecycle_core import raise_primary_with_cleanup
 from ferricstore.mutation_core import JobMutation, MutationBatchPlan
 from ferricstore.types import BudgetPolicy, ClaimedFlow, FencedItem, FlowStateMode
 from ferricstore.worker_core import validate_many_result
-from ferricstore.workflow_applied import AppliedWorkflowStep
+from ferricstore.workflow_applied import AppliedWorkflowStep, parked_step
 from ferricstore.workflow_mutations import complete_mutation_options
 from ferricstore.workflow_types import Complete, Fail, Retry, Transition, fail, retry
 
@@ -104,6 +104,8 @@ async def handle_claimed_batch(
             value = fail(error=str(exc)) if on_error == "fail" else retry(error=str(exc))
             return self._merge_governance_attributes(value, ctx._governance_attributes)
         if ctx._applied_step is not None:
+            if ctx._applied_step.parked:
+                return parked_step(ctx._applied_step, value)
             return replace(
                 ctx._applied_step,
                 continuation=self._merge_governance_attributes(
@@ -125,7 +127,7 @@ async def handle_claimed_batch(
     if any(isinstance(outcome, AppliedWorkflowStep) for outcome in outcomes):
         for job, outcome in zip(jobs, outcomes, strict=True):
             if isinstance(outcome, AppliedWorkflowStep):
-                if outcome.error is not None:
+                if outcome.error is not None or outcome.parked:
                     continue
                 if not outcome.has_continuation:
                     raise FerricStoreError("applied workflow step lost its handler continuation")
