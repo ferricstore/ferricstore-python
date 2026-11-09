@@ -11,6 +11,8 @@ This page maps common durable-work concepts to FerricFlow.
 | Temporal client | `WorkflowClient` / `QueueClient` producer |
 | Temporal task queue | Flow `type` plus `state` selector |
 | Temporal worker | long-running FerricFlow worker |
+| Temporal activity result | `ctx.step(name=..., run=..., to_state=...)` |
+| Temporal child workflows | `ctx.wait_for_children(...)` and `ctx.flow.child_results(...)` |
 | DBOS queued workflow | `QueueClient` |
 | DBOS workflow with steps | `WorkflowClient.workflow(...)` with explicit states |
 
@@ -47,7 +49,11 @@ worker claims by type/state and completes/transitions flow
 ```
 
 The important difference: FerricFlow is an explicit state pipeline, not
-deterministic replay.
+deterministic replay. A Flow resumes at its last committed state, not inside a
+function, so each `await` that must survive a crash becomes a named state. The
+FerricStore README's
+[Coming From Temporal](https://github.com/ferricstore/ferricstore#coming-from-temporal)
+section covers the concept mapping, what porting costs, operations, and testing.
 
 ```python
 orders = client.workflow(type="order", initial_state="created")

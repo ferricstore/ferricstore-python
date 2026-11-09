@@ -102,7 +102,7 @@ Run the repository's complete HTTP-compatible integration surface through a
 real TLS listener and ACL boundary with:
 
 ```bash
-FERRICSTORE_IMAGE=quay.io/ferricstore/ferricstore:0.12.18@sha256:e98e6ef91e028965598a2ed1b68981bab826a64749d97f6fecd6ecd4687bd3e1 \
+FERRICSTORE_IMAGE=quay.io/ferricstore/ferricstore:0.12.19@sha256:91364b8a9f1e20fc530154068c9a0dedbf11b2d134b92692b258feeb784eff7d \
   scripts/run_http_integration.sh
 ```
 
@@ -501,6 +501,7 @@ lane counts after profiling shows client-side saturation.
 - `examples/queue_worker.py`: queue producer and worker.
 - `examples/async_queue_worker.py`: async queue producer and worker.
 - `examples/state_machine_workflow.py`: explicit workflow runner.
+- `examples/fanout_workflow.py`: fan out to child Flows, wait for all of them, and read their results.
 - `examples/langgraph_checkpoint.py`: LangGraph state persisted in FerricStore.
 - `examples/langgraph_flow.py`: run a checkpointed LangGraph from FerricFlow.
 - `examples/protocol_commands.py`: FerricStore command helpers.
