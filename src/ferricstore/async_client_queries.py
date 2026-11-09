@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from typing import Any, cast
 
 from ferricstore.async_client_state import _AsyncClientMixinBase
+from ferricstore.child_results import ChildGroupResults, child_group_get_args, read_child_group
 from ferricstore.client_helpers import (
     _append,
     _append_attributes,
@@ -69,6 +70,28 @@ class _AsyncClientQueriesMixin(_AsyncClientMixinBase):
         if value is None:
             return None
         return self._record(value)
+
+    async def child_results(
+        self,
+        parent_id: str,
+        *,
+        partition_key: str | bytes | None = None,
+        group_id: str = "default",
+        max_bytes: int | None = None,
+    ) -> ChildGroupResults | None:
+        """Read a parent's child group: each child's status and decoded result or error.
+
+        Costs one ``FLOW.GET`` and one ``FLOW.VALUE.MGET``. Returns ``None`` when
+        the parent or the group does not exist.
+        """
+
+        record = await self.executor.execute_command(
+            *child_group_get_args(parent_id, partition_key)
+        )
+        read = read_child_group(record, group_id)
+        if read is None:
+            return None
+        return read.with_values(await self.value_mget(read.refs, max_bytes=max_bytes))
 
     async def query(
         self,

@@ -125,7 +125,7 @@ def _apply_continuation(
     *,
     state_name: str,
 ) -> FlowRecord | bytes:
-    if marker.error is not None:
+    if marker.error is not None or marker.parked:
         return b"OK"
     if not marker.has_continuation:
         raise FerricStoreError("applied workflow step lost its handler continuation")

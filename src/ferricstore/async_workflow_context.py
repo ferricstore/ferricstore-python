@@ -12,6 +12,7 @@ from ferricstore.async_queue_runtime import (
     AsyncFlowJob,
 )
 from ferricstore.async_workflow_budget import AsyncWorkflowBudget as AsyncWorkflowBudget
+from ferricstore.child_results import ChildGroupResults, require_child_group
 from ferricstore.flow_query_builder import _lineage_query_options
 from ferricstore.lifecycle_core import (
     await_cancellation_safe,
@@ -79,6 +80,19 @@ class AsyncWorkflowFlowCommands:
             partition_key=self._partition(partition_key),
             **kwargs,
         )
+
+    async def child_results(
+        self, group_id: str = "default", *, max_bytes: int | None = None
+    ) -> ChildGroupResults:
+        """Read one of this Flow's child groups; raises if the Flow has no such group."""
+
+        group = await self.client.child_results(
+            self._ctx.id,
+            partition_key=self._ctx.partition_key,
+            group_id=group_id,
+            max_bytes=max_bytes,
+        )
+        return require_child_group(self._ctx.id, group_id, group)
 
     async def history(
         self,

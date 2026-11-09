@@ -36,7 +36,7 @@ from ferricstore.types import (
 from ferricstore.worker_core import (
     validate_many_result,
 )
-from ferricstore.workflow_applied import AppliedWorkflowStep
+from ferricstore.workflow_applied import AppliedWorkflowStep, parked_step
 from ferricstore.workflow_execution import (
     apply_uniform_batch,
     handle_known_state_batch,
@@ -466,6 +466,8 @@ class Workflow(_WorkflowProducerMixin):
         if isinstance(outcome, AppliedWorkflowStep):
             if outcome.error is not None:
                 raise outcome.error
+            if outcome.parked:
+                return b"OK"
             if not outcome.has_continuation:
                 raise FerricStoreError("applied workflow step lost its handler continuation")
             return self.apply(
@@ -584,6 +586,8 @@ class Workflow(_WorkflowProducerMixin):
             outcome = self._exception_outcome(job, exc, state_name=state_name)
             return self._merge_governance_attributes(outcome, ctx._governance_attributes)
         if ctx._applied_step is not None:
+            if ctx._applied_step.parked:
+                return parked_step(ctx._applied_step, outcome)
             return replace(
                 ctx._applied_step,
                 continuation=self._merge_governance_attributes(

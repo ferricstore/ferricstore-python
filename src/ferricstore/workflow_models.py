@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
+from ferricstore.child_results import ChildGroupResults, require_child_group
 from ferricstore.flow_query_builder import _lineage_query_options
 from ferricstore.lifecycle_core import (
     raise_primary_with_cleanup,
@@ -106,6 +107,19 @@ class WorkflowFlowCommands:
             self._ctx.id if id is None else id,
             partition_key=self._partition(partition_key),
         )
+
+    def child_results(
+        self, group_id: str = "default", *, max_bytes: int | None = None
+    ) -> ChildGroupResults:
+        """Read one of this Flow's child groups; raises if the Flow has no such group."""
+
+        group = self.client.child_results(
+            self._ctx.id,
+            partition_key=self._ctx.partition_key,
+            group_id=group_id,
+            max_bytes=max_bytes,
+        )
+        return require_child_group(self._ctx.id, group_id, group)
 
     def history(
         self,
