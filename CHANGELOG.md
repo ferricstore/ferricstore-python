@@ -6,6 +6,8 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.15.0 - 2026-11-09
+
 - `ctx.wait_for_children(...)` (sync and async) spawns a child group and parks
   the parent in its wait state in one fenced command. The documented pattern,
   `spawn_children(...)` followed by `return transition(wait_state)`, raced with
