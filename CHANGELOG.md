@@ -6,6 +6,8 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+## 0.15.1 - 2026-11-14
+
 - Over HTTP, `spawn_children` and `ctx.wait_for_children(...)` send
   `FLOW.SPAWN_CHILDREN` as a structured command, like `FLOW.CREATE`. The text
   form has no syntax for values, so a fan-out with shared `values` or per-child
