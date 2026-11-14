@@ -6,6 +6,12 @@ The project is currently public alpha. APIs may change before `1.0`.
 
 ## Unreleased
 
+- Over HTTP, `spawn_children` and `ctx.wait_for_children(...)` send
+  `FLOW.SPAWN_CHILDREN` as a structured command, like `FLOW.CREATE`. The text
+  form has no syntax for values, so a fan-out with shared `values` or per-child
+  `values` failed over HTTP. The native protocol was not affected. The HTTP
+  integration lane now runs the child-group tests.
+
 ## 0.15.0 - 2026-11-09
 
 - `ctx.wait_for_children(...)` (sync and async) spawns a child group and parks
