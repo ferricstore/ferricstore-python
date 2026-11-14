@@ -276,7 +276,7 @@ def _partition_option_route_keys(
             mapper = _claim_partition_routing_key if claim else flow_logical_partition_routing_key
             keys = tuple(mapper(partition) for partition in partitions)
             return () if not keys or any(key is None for key in keys) else keys
-        if token in {"ITEMS", "ITEMS_EXT", "ITEMS_EXT_V2"}:
+        if token in {"ITEMS", "ITEMS_EXT", "ITEMS_EXT_V2", "ITEMS_MAPS"}:
             return None
         width = plan.option_width(index)
         if width is None or index + width > len(args):

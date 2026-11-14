@@ -193,14 +193,15 @@ def test_fanout_example_runs_to_completion():
         flow.close()
 
 
-# One case per spawn encoding: shared values only and per-child values. Over
-# HTTP each must reach the server as a structured command, since the text form
-# has no syntax for values.
+# One case per spawn encoding: shared values only, per-child values, and
+# per-child attributes. Over HTTP each must reach the server as a structured
+# command, since the text form has no syntax for values or attributes.
 @pytest.mark.parametrize(
     ("case", "child_values", "attributes"),
     [
         ("shared", False, None),
         ("per-child", True, None),
+        ("attributes", True, {"region": "eu"}),
     ],
 )
 def test_wait_for_children_writes_child_values(case, child_values, attributes):

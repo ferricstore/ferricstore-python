@@ -75,7 +75,7 @@ def find_flow_many_item_marker(
     index = start
     while index < len(args):
         token = command_token(args[index])
-        if token in {"ITEMS", "ITEMS_EXT", "ITEMS_EXT_V2"}:
+        if token in {"ITEMS", "ITEMS_EXT", "ITEMS_EXT_V2", "ITEMS_MAPS"}:
             return index, token
         width = plan.option_width(index)
         if width is None or index + width > len(args):

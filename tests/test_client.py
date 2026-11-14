@@ -3596,6 +3596,55 @@ def test_spawn_children_uses_extended_items_for_per_child_named_values():
     )
 
 
+def test_spawn_children_sends_child_attributes_as_item_maps():
+    executor = FakeExecutor()
+    client = FlowClient(executor)
+
+    client.spawn_children(
+        "parent-1",
+        [
+            ChildSpec("c1", "email", b"p1", values={"order": b"o1"}, attributes={"region": "eu"}),
+            ChildSpec("c2", "audit", b"p2", max_active_ms=5000),
+        ],
+        group_id="g1",
+        values={"shared": b"shared-bytes"},
+        value_refs={"profile": "profile-ref"},
+        now_ms=100,
+    )
+
+    call = executor.calls[0]
+    marker = call.index("ITEMS_MAPS")
+    assert call[:marker] == (
+        "FLOW.SPAWN_CHILDREN",
+        "parent-1",
+        "GROUP",
+        "g1",
+        "WAIT",
+        "all",
+        "NOW",
+        100,
+    )
+    assert call[marker + 1 :] == (
+        2,
+        {
+            "id": "c1",
+            "type": "email",
+            "payload": b"p1",
+            "values": {"shared": b"shared-bytes", "order": b"o1"},
+            "value_refs": {"profile": "profile-ref"},
+            "attributes": {"region": "eu"},
+        },
+        {
+            "id": "c2",
+            "type": "audit",
+            "payload": b"p2",
+            "values": {"shared": b"shared-bytes"},
+            "value_refs": {"profile": "profile-ref"},
+            "max_active_ms": 5000,
+        },
+    )
+
+
 def test_extended_many_items_preserve_explicit_empty_partition_keys():
     executor = FakeExecutor()
     client = FlowClient(executor)

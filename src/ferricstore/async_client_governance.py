@@ -14,6 +14,7 @@ from ferricstore.client_helpers import (
     _merge_named_map,
     _normalize_admin_response,
     _now_ms,
+    _spawn_child_item_map,
 )
 from ferricstore.config_validation import (
     normalize_optional_max_active_ms,
@@ -95,7 +96,15 @@ class _AsyncClientGovernanceMixin(_AsyncClientMixinBase):
         _append(args, "MAX_ACTIVE_MS", normalize_optional_max_active_ms(max_active_ms))
         mixed = any(child.partition_key is not None for child in children)
         has_child_max_active = any(child.max_active_ms is not None for child in children)
-        if _has_named_item_values(children) or has_child_max_active:
+        if any(child.attributes for child in children):
+            args.extend(["ITEMS_MAPS", len(children)])
+            for child in children:
+                if mixed and child.partition_key is None:
+                    raise ValueError("mixed spawn_children items require partition_key")
+                args.append(
+                    _spawn_child_item_map(self.codec, child, values=values, value_refs=value_refs)
+                )
+        elif _has_named_item_values(children) or has_child_max_active:
             args.extend(["ITEMS_EXT_V2" if has_child_max_active else "ITEMS_EXT", len(children)])
             for child in children:
                 if mixed and child.partition_key is None:
