@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from ferricstore.command_grammar import (
@@ -63,11 +64,34 @@ def _flow_spawn_children_payload(args: tuple[Any, ...]) -> dict[str, Any]:
             _parse_spawn_children_ext_v2 if token == "ITEMS_EXT_V2" else _parse_spawn_children_ext
         )
         payload["children"] = parser(args[item_token + 2 :], expected_count=item_count)
+    elif token == "ITEMS_MAPS":
+        item_count = require_nonnegative_count(
+            _require_arg(args, item_token + 1, "FLOW.SPAWN_CHILDREN ITEMS_MAPS"),
+            label="FLOW.SPAWN_CHILDREN ITEMS_MAPS",
+        )
+        payload["children"] = _parse_spawn_children_maps(
+            args[item_token + 2 :], expected_count=item_count
+        )
     else:
         mixed = item_token + 1 < len(args) and _command_token(args[item_token + 1]) == "MIXED"
         start = item_token + 2 if mixed else item_token + 1
         payload["children"] = _parse_spawn_children(args[start:], mixed)
     return payload
+
+
+def _parse_spawn_children_maps(
+    values: tuple[Any, ...],
+    *,
+    expected_count: int,
+) -> list[dict[str, Any]]:
+    if len(values) != expected_count:
+        raise InvalidCommandError("FLOW.SPAWN_CHILDREN ITEMS_MAPS count does not match items")
+    children: list[dict[str, Any]] = []
+    for value in values:
+        if not isinstance(value, Mapping) or not value.get("id"):
+            raise InvalidCommandError("FLOW.SPAWN_CHILDREN ITEMS_MAPS items must be maps with id")
+        children.append(dict(value))
+    return children
 
 
 def _parse_spawn_children(values: tuple[Any, ...], mixed: bool) -> list[dict[str, Any]]:

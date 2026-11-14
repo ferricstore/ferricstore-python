@@ -241,6 +241,42 @@ def test_structured_flow_commands_reuse_native_payload_builders(compact: bool) -
 
 
 @pytest.mark.parametrize("compact", [False, True])
+def test_spawn_children_uses_a_native_descriptor(compact: bool) -> None:
+    # The text FLOW.SPAWN_CHILDREN has no syntax for child values.
+    adapter = HttpAdapter("http://127.0.0.1:1", compact=compact)
+    command = (
+        "FLOW.SPAWN_CHILDREN",
+        "parent-1",
+        "GROUP",
+        "parts",
+        "WAIT",
+        "all",
+        "NOW",
+        100,
+        "ITEMS_EXT",
+        1,
+        "child-1",
+        "-",
+        "part",
+        b"payload",
+        1,
+        "rows",
+        b"3",
+        0,
+    )
+
+    try:
+        encoded = adapter._encode_command(command, 0)
+    finally:
+        adapter.close()
+
+    decoded = _decode_wire(encoded)
+    assert decoded["command"] == "FLOW.SPAWN_CHILDREN"
+    assert decoded["opcode"] == 0x0220
+    assert decoded["payload"]["children"][0]["values"] == {"rows": b"3"}
+
+
+@pytest.mark.parametrize("compact", [False, True])
 @pytest.mark.parametrize("async_adapter", [False, True])
 def test_flow_create_uses_native_descriptor_for_extended_options(
     compact: bool,

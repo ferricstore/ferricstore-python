@@ -12,6 +12,7 @@ from ferricstore.batch_core import (
 )
 from ferricstore.codecs import Codec
 from ferricstore.config_validation import (
+    normalize_optional_max_active_ms,
     validate_nonnegative_int,
     validate_optional_bool,
     validate_optional_flow_priority,
@@ -23,6 +24,7 @@ from ferricstore.model_core import _normalize_ref_meta
 from ferricstore.mutation_core import JobMutation, MutationKind
 from ferricstore.retry_policy import RetryPolicy
 from ferricstore.types import (
+    ChildSpec,
     ClaimedFlow,
     CreateItem,
     FencedItem,
@@ -213,6 +215,36 @@ def _merge_named_map(base: dict[str, Any] | None, item: dict[str, Any] | None) -
     if item:
         merged.update(item)
     return merged
+
+
+def _spawn_child_item_map(
+    codec: Codec,
+    child: ChildSpec,
+    *,
+    values: dict[str, Any] | None,
+    value_refs: dict[str, str] | None,
+) -> dict[str, Any]:
+    """One FLOW.SPAWN_CHILDREN ITEMS_MAPS item: the only form that carries attributes."""
+
+    item: dict[str, Any] = {
+        "id": child.id,
+        "type": child.type,
+        "payload": codec.encode(child.payload),
+    }
+    if child.partition_key is not None:
+        item["partition_key"] = child.partition_key
+    child_values = _merge_named_map(values, child.values)
+    if child_values:
+        item["values"] = {name: codec.encode(value) for name, value in child_values.items()}
+    child_refs = _merge_named_map(value_refs, child.value_refs)
+    if child_refs:
+        item["value_refs"] = child_refs
+    if child.attributes:
+        item["attributes"] = dict(child.attributes)
+    max_active_ms = normalize_optional_max_active_ms(child.max_active_ms)
+    if max_active_ms is not None:
+        item["max_active_ms"] = max_active_ms
+    return item
 
 
 def _has_named_item_values(items: builtins.list[Any]) -> bool:

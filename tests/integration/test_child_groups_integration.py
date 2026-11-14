@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import os
+import ssl
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -39,9 +41,27 @@ def _url() -> str:
     return os.environ.get("FERRICSTORE_URL", "ferric://127.0.0.1:6388")
 
 
+def _client_options() -> dict[str, Any]:
+    if not _url().startswith(("http://", "https://")):
+        return {}
+    options: dict[str, Any] = {}
+    username = os.environ.get("FERRICSTORE_USERNAME")
+    password = os.environ.get("FERRICSTORE_PASSWORD")
+    ca_file = os.environ.get("FERRICSTORE_CA_FILE")
+    if username is not None:
+        options["username"] = username
+    if password is not None:
+        options["password"] = password
+    if ca_file is not None:
+        context = ssl.create_default_context(cafile=ca_file)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        options["ssl_context"] = context
+    return options
+
+
 def test_readme_fanout_waits_for_every_device_and_reads_their_results():
     run_id = uuid.uuid4().hex
-    flow = FlowClient.from_url(_url(), codec=JsonCodec())
+    flow = FlowClient.from_url(_url(), codec=JsonCodec(), **_client_options())
     client = WorkflowClient(flow)
     campaign = client.workflow(type=f"campaign-{run_id}", initial_state="dispatch")
     device = client.workflow(type=f"device-command-{run_id}", initial_state="queued")
@@ -103,7 +123,7 @@ def test_readme_fanout_waits_for_every_device_and_reads_their_results():
 def test_async_wait_for_children_parks_the_parent_until_its_children_finish():
     async def run() -> None:
         run_id = uuid.uuid4().hex
-        flow = AsyncFlowClient.from_url(_url(), codec=JsonCodec())
+        flow = AsyncFlowClient.from_url(_url(), codec=JsonCodec(), **_client_options())
         parent = AsyncWorkflow(
             flow, type=f"async-parent-{run_id}", states=["start", "done"], batch_size=10
         )
@@ -158,7 +178,7 @@ def test_fanout_example_runs_to_completion():
     assert spec is not None and spec.loader is not None
     example = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(example)
-    flow = FlowClient.from_url(_url(), codec=JsonCodec())
+    flow = FlowClient.from_url(_url(), codec=JsonCodec(), **_client_options())
     try:
         campaign_id = f"campaign-{uuid.uuid4().hex}"
         assert example.run_campaign(flow, campaign_id, ["d1", "d2"]) == "completed"
@@ -169,5 +189,64 @@ def test_fanout_example_runs_to_completion():
             {"acknowledged": "d1"},
             {"acknowledged": "d2"},
         ]
+    finally:
+        flow.close()
+
+
+# One case per spawn encoding: shared values only, per-child values, and
+# per-child attributes. Over HTTP each must reach the server as a structured
+# command, since the text form has no syntax for values or attributes.
+@pytest.mark.parametrize(
+    ("case", "child_values", "attributes"),
+    [
+        ("shared", False, None),
+        ("per-child", True, None),
+        ("attributes", True, {"region": "eu"}),
+    ],
+)
+def test_wait_for_children_writes_child_values(case, child_values, attributes):
+    run_id = uuid.uuid4().hex
+    flow = FlowClient.from_url(_url(), codec=JsonCodec(), **_client_options())
+    client = WorkflowClient(flow)
+    partition = f"child-values:{run_id}"
+    parent = client.workflow(type=f"child-values-parent-{run_id}", initial_state="dispatch")
+    parent_id = f"child-values:{case}:{run_id}"
+    child_ids = [f"{parent_id}:a", f"{parent_id}:b"]
+
+    @parent.state("dispatch")
+    def dispatch(ctx):
+        ctx.wait_for_children(
+            [
+                ChildSpec(
+                    id=child_id,
+                    type=f"child-values-child-{run_id}",
+                    payload=index,
+                    partition_key=partition,
+                    values={"rows": 3 + index} if child_values else None,
+                    attributes=attributes,
+                )
+                for index, child_id in enumerate(child_ids)
+            ],
+            group_id="parts",
+            wait_state="waiting",
+            success="joined",
+            failure="failed_children",
+            values={"tenant": "acme"},
+        )
+
+    try:
+        parent.start(parent_id, payload={}, partition_key=partition)
+        assert parent.worker(states=["dispatch"], partition_key=partition).run_once().applied == 1
+        assert flow.get(parent_id, partition_key=partition).state == "waiting"
+        for index, child_id in enumerate(child_ids):
+            # One value per read: servers before 0.12.21 return only the first
+            # of several VALUE options in a text FLOW.GET.
+            tenant = flow.get(child_id, partition_key=partition, values=["tenant"])
+            assert tenant.values == {"tenant": "acme"}
+            if child_values:
+                rows = flow.get(child_id, partition_key=partition, values=["rows"])
+                assert rows.values == {"rows": 3 + index}
+            for name, want in (attributes or {}).items():
+                assert tenant.attributes[name] == want
     finally:
         flow.close()

@@ -2154,6 +2154,38 @@ def test_async_spawn_children_exposes_parent_guards_and_child_policies():
     run(main())
 
 
+def test_async_spawn_children_sends_child_attributes_as_item_maps():
+    async def main():
+        executor = FakeAsyncExecutor()
+        client = AsyncFlowClient(executor)
+
+        await client.spawn_children(
+            "parent-1",
+            [
+                ChildSpec(
+                    "c1", "email", b"p1", partition_key="tenant-a", attributes={"region": "eu"}
+                )
+            ],
+            partition_key="parent-p",
+            now_ms=100,
+        )
+
+        call = executor.calls[0]
+        marker = call.index("ITEMS_MAPS")
+        assert call[marker + 1 :] == (
+            1,
+            {
+                "id": "c1",
+                "type": "email",
+                "payload": b"p1",
+                "partition_key": "tenant-a",
+                "attributes": {"region": "eu"},
+            },
+        )
+
+    run(main())
+
+
 def test_async_many_commands_reject_items_from_different_explicit_partition():
     async def main():
         executor = FakeAsyncExecutor()

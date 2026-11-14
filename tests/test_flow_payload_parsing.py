@@ -93,6 +93,34 @@ def test_spawn_children_extended_payload_preserves_per_child_values_and_refs() -
     }
 
 
+def test_spawn_children_item_maps_payload_keeps_each_child_map() -> None:
+    child = {
+        "id": "child-1",
+        "type": "invoice",
+        "payload": b"payload",
+        "partition_key": "tenant-a",
+        "values": {"amount": b"10"},
+        "attributes": {"region": "eu"},
+    }
+
+    payload = _flow_spawn_children_payload(("parent-1", "GROUP", "g1", "ITEMS_MAPS", 1, child))
+
+    assert payload == {"id": "parent-1", "group_id": "g1", "children": [child]}
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("parent-1", "ITEMS_MAPS", 2, {"id": "child-1", "type": "t", "payload": b""}),
+        ("parent-1", "ITEMS_MAPS", 1, {"type": "t", "payload": b""}),
+        ("parent-1", "ITEMS_MAPS", 1, "child-1"),
+    ],
+)
+def test_spawn_children_item_maps_payload_rejects_malformed_items(args) -> None:
+    with pytest.raises(InvalidCommandError, match="ITEMS_MAPS"):
+        _flow_spawn_children_payload(args)
+
+
 @pytest.mark.parametrize(
     "call",
     [

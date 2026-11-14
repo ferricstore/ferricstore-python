@@ -165,6 +165,7 @@ FLOW_OPTION_TOKENS = frozenset(FLOW_OPTION_FIELD_NAMES) | frozenset(
         "DROP_VALUE",
         "ITEMS_EXT",
         "ITEMS_EXT_V2",
+        "ITEMS_MAPS",
         "NOPAYLOAD",
         "OVERRIDE_VALUE",
         "PARTITIONS",
@@ -191,7 +192,7 @@ class FlowOptionPlan:
 
         for index in range(size - 1, -1, -1):
             token = self.tokens[index]
-            if token in {"ITEMS", "ITEMS_EXT", "ITEMS_EXT_V2"}:
+            if token in {"ITEMS", "ITEMS_EXT", "ITEMS_EXT_V2", "ITEMS_MAPS"}:
                 valid[index] = 1
             elif token not in FLOW_OPTION_TOKENS:
                 continue
@@ -239,7 +240,7 @@ class FlowOptionPlan:
 
     def option_width(self, index: int) -> int | None:
         token = self.tokens[index]
-        if token not in FLOW_OPTION_TOKENS or token in {"ITEMS", "ITEMS_EXT"}:
+        if token not in FLOW_OPTION_TOKENS or token in {"ITEMS", "ITEMS_EXT", "ITEMS_MAPS"}:
             return None
         if token == "NOPAYLOAD" or (token == "PAYLOAD" and self.payload_is_flag(index)):
             return 1
