@@ -1224,7 +1224,10 @@ def test_compact_binary_payload_is_smaller_than_the_json_binary_envelope() -> No
 def test_compact_is_an_optional_packaging_extra() -> None:
     pyproject = (Path(__file__).parents[1] / "pyproject.toml").read_text()
     assert "compact = [" in pyproject
-    assert "msgpack>=" in pyproject
+    # msgpack before 1.2.3 leaks memory when strict_map_key rejects a map
+    # (GHSA-j586-36cw-2gc2), and compact responses are decoded with it.
+    assert '"msgpack>=1.2.3,<2"' in pyproject
+    assert "msgpack>=1.2.1" not in pyproject
 
 
 def test_compact_response_rejects_malformed_messagepack() -> None:
