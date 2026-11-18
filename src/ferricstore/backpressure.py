@@ -8,7 +8,7 @@ import weakref
 from collections.abc import Hashable
 from dataclasses import dataclass
 from importlib import import_module
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 from ferricstore.config_validation import (
     validate_bool,
@@ -56,10 +56,10 @@ class _BackpressureState:
 
 
 class BackpressureController:
-    _shared_states: weakref.WeakValueDictionary[Hashable, _BackpressureState] = (
+    _shared_states: ClassVar[weakref.WeakValueDictionary[Hashable, _BackpressureState]] = (
         weakref.WeakValueDictionary()
     )
-    _shared_states_lock = threading.Lock()
+    _shared_states_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(
         self,
