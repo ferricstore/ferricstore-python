@@ -1,4 +1,5 @@
 import importlib.util
+import time
 from argparse import Namespace
 from concurrent.futures import Future
 from pathlib import Path
@@ -1304,3 +1305,92 @@ def test_lowlevel_worker_does_not_block_while_producers_are_active(monkeypatch):
         ["run:partition:0", "run:partition:1", "run:partition:2", "run:partition:3"],
     ]
     assert [call["claim_block_ms"] for call in seen_claims] == [None, None, None]
+
+
+def test_live_run_stops_workers_and_raises_when_a_producer_fails(monkeypatch):
+    worker_saw_failure = []
+
+    def failing_create_flows(**_kwargs):
+        raise RuntimeError("producer connect refused")
+
+    def waiting_worker(**kwargs):
+        producers_failed = kwargs.get("producers_failed")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if producers_failed is not None and producers_failed.is_set():
+                worker_saw_failure.append(True)
+                break
+            time.sleep(0.01)
+        return {
+            "completed": 0,
+            "duplicate_completions": 0,
+            "claim_calls": 0,
+            "empty_claims": 0,
+            "claimed_items": 0,
+            "max_claim_batch": 0,
+            "fallback_claims": 0,
+            "worker_capacity": 0,
+            "wake_coalesce_sleeps": 0,
+            "wake_coalesce_ms": 0.0,
+            "process_pipeline_flushes": 0,
+            "process_pipeline_commands": 0,
+            "process_pipeline_max_depth": 0,
+        }
+
+    monkeypatch.setattr(bench, "create_flows", failing_create_flows)
+    monkeypatch.setattr(bench, "run_claim_worker", waiting_worker)
+
+    class FakeSharedClient:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        bench.FlowClient, "from_url", staticmethod(lambda *_args, **_kwargs: FakeSharedClient())
+    )
+
+    with pytest.raises(RuntimeError, match="producer connect refused"):
+        bench.run_queued_throughput(
+            Namespace(
+                url="ferric://127.0.0.1:6388",
+                queued_shape="live",
+                flows=4,
+                workers=1,
+                producers=1,
+                partitions=16,
+                claim_any=False,
+                partition_mode="auto",
+                worker_capacity=0,
+                worker_mode="polling",
+                worker_api="lowlevel",
+                create_batch_size=4,
+                claim_batch_size=500,
+                claim_drain_batches=1,
+                transport="many",
+                payload_bytes=0,
+                result_bytes=0,
+                work_command="none",
+                idle_sleep_ms=10.0,
+                max_idle_sleep_ms=50.0,
+                wake_coalesce_ms=5.0,
+                partial_claim_retries=1,
+                partial_claim_delay_ms=1.0,
+                reclaim_expired=False,
+                reclaim_ratio=25,
+                claim_priority=0,
+                claim_state="queued",
+                claim_states=None,
+                claim_job_only=True,
+                claim_block_ms=-1,
+                claim_drain_block_ms=-1,
+                complete_batch=True,
+                complete_async_depth=0,
+                independent_many=True,
+                complete_independent_many=False,
+                track_duplicates=False,
+                claim_partition_batch_size=2,
+                server_shards=16,
+                claim_prefetch=8,
+            )
+        )
+
+    assert worker_saw_failure, "workers kept polling after a producer failed"
