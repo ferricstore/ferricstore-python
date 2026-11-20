@@ -1005,6 +1005,7 @@ def run_claim_worker(
     worker_capacity: int,
     server_shards: int,
     producers_done: threading.Event,
+    producers_failed: threading.Event | None = None,
     claimed_total: list[int],
     completed: list[int],
     completed_ids: set[str],
@@ -1261,7 +1262,7 @@ def run_claim_worker(
 
     while True:
         drain_completed_completions()
-        if done():
+        if done() or (producers_failed is not None and producers_failed.is_set()):
             return finish()
         if all_claimed():
             if pending_completions:
@@ -1473,6 +1474,7 @@ def run_queue_api_worker(
     worker_capacity: int,
     server_shards: int,
     producers_done: threading.Event,
+    producers_failed: threading.Event | None = None,
     claimed_total: list[int],
     completed: list[int],
     completed_ids: set[str],
@@ -1635,7 +1637,7 @@ def run_queue_api_worker(
 
     try:
         while True:
-            if done():
+            if done() or (producers_failed is not None and producers_failed.is_set()):
                 break
             if producers_done.is_set() and all_claimed():
                 break
@@ -1864,6 +1866,9 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
     duplicate_completions = [0]
     completed_lock = threading.Lock()
     producers_done = threading.Event()
+    # Set when a producer raises, so workers stop instead of waiting for Flows
+    # that will never be created.
+    producers_failed = threading.Event()
     latency_sample_rate = getattr(
         args,
         "latency_sample_rate",
@@ -2050,6 +2055,7 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
                 worker_capacity=worker_capacity,
                 server_shards=args.server_shards,
                 producers_done=producers_done,
+                producers_failed=producers_failed,
                 claimed_total=claimed_total,
                 completed=completed,
                 completed_ids=completed_ids,
@@ -2086,8 +2092,12 @@ def run_queued_throughput(args: argparse.Namespace) -> dict[str, float | int | s
             create_started = time.perf_counter()
             create_futures = submit_create_jobs(executor)
 
-            for future in as_completed(create_futures):
-                create_results.append(future.result())
+            try:
+                for future in as_completed(create_futures):
+                    create_results.append(future.result())
+            except BaseException:
+                producers_failed.set()
+                raise
             create_finished = time.perf_counter()
             producers_done.set()
 
